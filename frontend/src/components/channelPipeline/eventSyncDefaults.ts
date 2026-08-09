@@ -36,6 +36,12 @@ export const DEFAULT_TIME_WINDOW_MINUTES = 30;
 /** Backend schema ceiling for time_window_minutes (24 hours). */
 export const MAX_TIME_WINDOW_MINUTES = 1440;
 
+/** Mirror of DEFAULT_PAST_EVENT_GRACE_HOURS in backend/services/event_sync_promote.py. */
+export const DEFAULT_PAST_EVENT_GRACE_HOURS = 4;
+
+/** Backend schema ceiling for past_event_grace_hours (3 days). */
+export const MAX_PAST_EVENT_GRACE_HOURS = 72;
+
 /**
  * Clamp an operator-entered attach threshold into the schema-legal range
  * [0, 1]. The 0.80 floor is the DEFAULT, not a hard minimum (bead

@@ -1967,6 +1967,43 @@ describe('EventSyncRuleEditor', () => {
       // No editor control for the cap — the key stays absent so the
       // backend default applies.
       expect(config).not.toHaveProperty('max_promote_per_run');
+      // The past-event filter is its own opt-in: turning promotion on does
+      // not turn it on, so the keys stay absent.
+      expect(config).not.toHaveProperty('skip_past_events');
+      expect(config).not.toHaveProperty('past_event_grace_hours');
+    });
+
+    it('emits the past-event filter with its grace once the box is ticked', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      // The grace box only appears once the filter itself is on.
+      expect(screen.queryByTestId('event-sync-past-event-grace')).toBeNull();
+      await user.click(screen.getByTestId('event-sync-skip-past-events'));
+      const grace = await screen.findByTestId('event-sync-past-event-grace');
+      await user.clear(grace);
+      await user.type(grace, '6');
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      const config = onSave.mock.calls[0][0].event_sync_config;
+      expect(config.skip_past_events).toBe(true);
+      expect(config.past_event_grace_hours).toBe(6);
     });
 
     it('round-trips a stored promotion config and preserves an API-set cap', async () => {

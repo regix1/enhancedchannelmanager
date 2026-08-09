@@ -156,6 +156,22 @@ export interface EventSyncConfig {
    * save so an API-set value survives a UI edit.
    */
   max_promote_per_run?: number;
+  /**
+   * When true, an event whose parsed start time has already gone by (plus
+   * `past_event_grace_hours`) is not promoted to a NEW channel. Providers
+   * leave finished events in the playlist for days. Blocks creates only —
+   * an already-promoted channel is never deleted by this, and events whose
+   * date was synthesized (`assume_current_date`) are never filtered.
+   * Absent means the filter is off.
+   */
+  skip_past_events?: boolean;
+  /**
+   * How long after its start time an event still counts as current for
+   * `skip_past_events` (0..72; backend default 4, filled only when the
+   * filter is on). Provider names carry a start time and never a duration,
+   * so this is what keeps a broadcast in progress from being dropped.
+   */
+  past_event_grace_hours?: number;
 }
 
 // =============================================================================
@@ -348,6 +364,9 @@ export interface EventSyncUnmatchedStream {
   /** bead ti939.4.1: true when the unit was trimmed by max_promote_per_run
    * this run (it re-surfaces next run — promotion is idempotent). */
   promote_capped?: boolean;
+  /** True when `skip_past_events` dropped this event because it already
+   * finished. Unlike `promote_capped` it does not re-surface next run. */
+  promote_skipped_past?: boolean;
 }
 
 /** bead ti939.4.1: one stream inside a promotion unit. */
@@ -382,6 +401,9 @@ export interface EventSyncPromotionPreview {
   cap: number;
   capped: boolean;
   cap_overage: number;
+  /** How many events `skip_past_events` dropped because they had already
+   * finished. 0 when the filter is off. */
+  skipped_past: number;
   units: EventSyncPromotionUnit[];
 }
 

@@ -407,6 +407,8 @@ backward compatibility; the rule editor now reads and writes the nested shape.
 | `promote_unmatched` | no (default **false**) | bead ti939.4.1: opt-in promotion of **unmatched secondary-only events** to ECM-managed channels — the ONE sanctioned exception to "ECM never creates channels". Absent means the feature is completely invisible (no preview keys, no Pass 4 participation). **With this on, ECM CREATES and DELETES channels** in `promote_target_group_id`. See [Promoting unmatched events](#promoting-unmatched-events-phase-3-opt-in). |
 | `promote_target_group_id` | when promoting | The **dedicated ECM-owned channel group** promoted event channels live in. Required when `promote_unmatched` is true. The master group (Dispatcharr-owned) and every secondary group are refused — ownership rails. Treat this group as ECM's: channels in it appear and disappear with the provider playlist. |
 | `max_promote_per_run` | no (default 25) | Per-run cap on **new** promoted channels (1–200; filled on promotion-enabled configs). On overage the run stops creating, warns, and records the overage. Adopting an existing promoted channel (idempotent re-runs) never consumes the cap. |
+| `skip_past_events` | no (default **false**) | When true, an event whose parsed start time has **already gone by** (plus `past_event_grace_hours`) is not promoted to a **new** channel. Providers routinely leave finished events in the playlist forever, so without this every one of them keeps minting a channel nobody can watch. Only **creates** are blocked: a channel already promoted is never deleted by this setting, and events with no genuinely parsed date (`assume_current_date` synthesized it) are never filtered. Absent means the filter does not exist for the rule. See [Skipping events that already finished](#skipping-events-that-already-finished). |
+| `past_event_grace_hours` | no (default 4) | How long after its start time an event still counts as current for `skip_past_events` (0–72; filled only when the filter is on). Provider names carry a start time and never a duration, so this is what keeps a broadcast in progress from being dropped mid-event. |
 
 ### Why validation is strict
 
@@ -1142,12 +1144,27 @@ auto-run, so new events show programme information automatically.
    Author them once, paste twice — don't invent a second grammar for the
    same names.
 
-2. **Ensure a Dispatcharr EPG source serves the profile's XMLTV** — an
-   XMLTV source whose URL is ECM's
-   `/api/dummy-epg/xmltv/<profile_id>` endpoint (the per-profile URL is
-   preferred; the combined `/api/dummy-epg/xmltv` also works). Without
-   one, the run warns (`event_sync_dummy_epg_no_source`) and assigns
-   nothing.
+2. **Ensure a Dispatcharr EPG source serves the profile's XMLTV** — in
+   Dispatcharr, add an XMLTV source pointing at ECM:
+
+   ```
+   http://<ecm-host>:<ecm-port>/api/dummy-epg/xmltv/<profile_id>
+   ```
+
+   Use the profile ID shown in ECM's dummy EPG profile list (the
+   combined `/api/dummy-epg/xmltv`, which merges every enabled profile,
+   also works). Without a source, the run warns
+   (`event_sync_dummy_epg_no_source`) and assigns nothing.
+
+   **No credentials needed.** Both XMLTV URLs answer `GET` without a
+   token even when ECM auth is on — Dispatcharr's XMLTV fetcher has
+   nowhere to put an ECM login. Leave the source's username/password
+   blank. The exemption covers reads only: everything else under
+   `/api/dummy-epg/` still needs a token, and so does a non-`GET` request
+   to the XMLTV URLs themselves. What is readable by anyone who can
+   reach ECM is the generated guide — channel names and programme
+   titles. If ECM's network is not trusted, restrict the path at your
+   reverse proxy; see `docs/auth_middleware.md`.
 
 3. **Reference the profile on the rule** — rule editor → Advanced →
    *Dummy EPG profile*, or set `dummy_epg_profile_id` in the config JSON.
@@ -1514,6 +1531,40 @@ providers' event schedules.
   (register-time invariant), and Pass 4 carries a second ownership rail
   that refuses to reconcile any id outside the target group.
 
+### Skipping events that already finished
+
+Most providers do not remove a live event from the M3U when it ends — last
+weekend's fights and last Tuesday's ball game sit in the playlist
+indefinitely. Promotion has no way to know they are over, so it keeps
+creating a channel for each one. One field run produced **184 promoted
+channels, 115 of them for events that had already happened.**
+
+`skip_past_events: true` stops that. An event counts as past once
+`start + past_event_grace_hours < now`, and a past event is simply not
+created.
+
+Three things it deliberately does **not** do:
+
+* **It never deletes.** The filter can only block a `create`. A promoted
+  channel that already exists stays in the plan and stays adopted, so the
+  lifecycle rule above still holds: a promoted channel disappears when its
+  stream leaves the playlist, never because a clock said so. Dropping an
+  adopted channel from the plan would hand Pass 4 an orphan to delete, and
+  that would be a timestamp-driven delete — exactly what the design
+  forbids.
+* **It never touches dateless events.** When `assume_current_date`
+  synthesized the date, the date was fabricated from "now" rather than
+  read off the provider name. Past-versus-future is meaningless for those,
+  and the answer would flip every midnight, so they always promote.
+* **It does not spend cap budget.** Filtering happens before
+  `max_promote_per_run`, so a playlist full of finished events cannot
+  starve the live ones of create slots.
+
+`past_event_grace_hours` (default 4, range 0–72) exists because a provider
+name gives a start time and never a duration. With the default, an event
+that started three hours ago is still treated as current and keeps its
+channel; at 0, an event is past the moment its start time passes.
+
 ### Preview parity
 
 The **preview computes the promotion plan with the same helper the live
@@ -1523,6 +1574,13 @@ The preview annotates each unmatched row (`would_promote`,
 `promote_action: create | attach_existing`, the derived channel name) and
 renders a **Would promote** section between the unmatched list and the
 parse failures. A preview (and a pipeline dry-run) creates nothing.
+
+Because the filter lives in that shared helper, preview and run agree on
+it automatically. The preview reports `promotion.skipped_past` (how many
+events were dropped as already finished) and marks each dropped row with
+`promote_skipped_past: true`, so "why did this event not get a channel?"
+is answerable without reading logs. The live run reports the same count as
+`skipped_past` on its promotion summary.
 
 ## Testing & pre-release verification
 

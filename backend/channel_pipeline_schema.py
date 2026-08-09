@@ -811,6 +811,10 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     "promote_unmatched",
     "promote_target_group_id",
     "max_promote_per_run",
+    # Past-event filter — keeps finished events (which providers leave in
+    # the playlist forever) from being promoted to new channels.
+    "skip_past_events",
+    "past_event_grace_hours",
 })
 
 # Ceiling for event_sync_config.max_attach_per_run. The cap is a blast-radius
@@ -1440,6 +1444,51 @@ def validate_event_sync_config(config: Any) -> list[str]:
                 f"promoted channels; on overage the run stops creating, "
                 f"warns and records the overage count (adoption of "
                 f"existing promoted channels never consumes the cap)",
+            ))
+
+    # Past-event filter. Providers leave finished events in the playlist, so
+    # without this every one of them promotes to a channel nobody can watch.
+    # Both keys stay ABSENT unless the operator sets them (the same
+    # invisibility contract as the promotion keys above) — an existing rule
+    # keeps promoting exactly what it promoted before.
+    skip_past_events = config.get("skip_past_events")
+    if skip_past_events is not None and not isinstance(skip_past_events, bool):
+        errors.append(_event_sync_error(
+            "skip_past_events", skip_past_events,
+            "a boolean (default false) — true stops events whose start time "
+            "has already gone by (plus past_event_grace_hours) from being "
+            "promoted to new channels; events with no genuinely parsed date "
+            "are never filtered, and channels already promoted are never "
+            "deleted by this setting (omit the key to keep the filter off)",
+        ))
+        skip_past_events = False
+
+    past_event_grace_hours = config.get("past_event_grace_hours")
+    if past_event_grace_hours is None:
+        if skip_past_events:
+            # Fill the default ONLY when the filter is on, so a rule that
+            # never asked for it stays byte-identical through validation.
+            from services.event_sync_promote import (
+                DEFAULT_PAST_EVENT_GRACE_HOURS,
+            )
+            config["past_event_grace_hours"] = DEFAULT_PAST_EVENT_GRACE_HOURS
+    else:
+        from services.event_sync_promote import (
+            DEFAULT_PAST_EVENT_GRACE_HOURS,
+            MAX_PAST_EVENT_GRACE_HOURS,
+        )
+        if (isinstance(past_event_grace_hours, bool)
+                or not isinstance(past_event_grace_hours, int)
+                or not (0 <= past_event_grace_hours
+                        <= MAX_PAST_EVENT_GRACE_HOURS)):
+            errors.append(_event_sync_error(
+                "past_event_grace_hours", past_event_grace_hours,
+                f"an integer between 0 and {MAX_PAST_EVENT_GRACE_HOURS} "
+                f"(default {DEFAULT_PAST_EVENT_GRACE_HOURS}) — how long "
+                f"after its start time an event still counts as current for "
+                f"skip_past_events, so a broadcast in progress is not "
+                f"dropped mid-event; only the start time is ever parsed "
+                f"from a provider name, never a duration",
             ))
 
     if errors:

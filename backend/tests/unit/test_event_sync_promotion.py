@@ -303,6 +303,142 @@ class TestPromotedChannelName:
         assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
 
 
+class TestSkipPastEvents:
+    """``skip_past_events``: finished events must not become channels.
+
+    Providers leave a live event in the M3U long after it ends, so without
+    this filter every finished game keeps minting a channel nobody can
+    watch. The filter blocks CREATES only — see the module docstring for
+    why an adopt unit can never be dropped on a clock.
+    """
+
+    # FROZEN_NOW is 2026-07-11 12:00 ET. With the 4-hour default grace:
+    # a start before 08:00 is past, 08:00 or later is still current.
+    FINISHED = EASTERN.localize(datetime(2026, 7, 8, 20, 0))
+    JUST_FINISHED = EASTERN.localize(datetime(2026, 7, 11, 6, 0))
+    IN_PROGRESS = EASTERN.localize(datetime(2026, 7, 11, 10, 0))
+
+    def _skip_config(self, **overrides):
+        return _promote_config(skip_past_events=True, **overrides)
+
+    def test_finished_event_is_not_created(self):
+        rows = [_resolved("old", DISPOSITION_UNMATCHED,
+                          _parsed("Fury vs. Usyk", self.FINISHED))]
+        plan = build_promotion_plan(
+            self._skip_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.units == ()
+        assert plan.skipped_past == 1
+        assert plan.skipped_past_units[0].channel_name.startswith("Fury")
+
+    def test_event_inside_the_grace_window_is_still_created(self):
+        """An event that started two hours ago is still on air — dropping
+        it would kill the channel mid-broadcast."""
+        rows = [_resolved("live", DISPOSITION_UNMATCHED,
+                          _parsed("Mercury vs. Aces", self.IN_PROGRESS))]
+        plan = build_promotion_plan(
+            self._skip_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.would_create == 1
+        assert plan.skipped_past == 0
+
+    def test_grace_boundary_is_the_only_thing_separating_the_two(self):
+        """Same start time, different grace: 4 hours keeps it, 0 drops it."""
+        rows = [_resolved("edge", DISPOSITION_UNMATCHED,
+                          _parsed("Edge Event", self.JUST_FINISHED))]
+        kept = build_promotion_plan(
+            self._skip_config(past_event_grace_hours=8), rows, {},
+            now=FROZEN_NOW,
+        )
+        dropped = build_promotion_plan(
+            self._skip_config(past_event_grace_hours=0), rows, {},
+            now=FROZEN_NOW,
+        )
+        assert kept.would_create == 1 and kept.skipped_past == 0
+        assert dropped.would_create == 0 and dropped.skipped_past == 1
+
+    def test_future_event_is_created(self):
+        rows = [_resolved(STREAM_FURY, DISPOSITION_UNMATCHED,
+                          _parsed("Fury vs. Usyk", START))]
+        plan = build_promotion_plan(
+            self._skip_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.would_create == 1
+        assert plan.skipped_past == 0
+
+    def test_dateless_event_is_never_filtered(self):
+        """The date on a synthesized parse was fabricated from "now", so
+        past-vs-future says nothing about the event and the verdict would
+        flip at midnight. Even a start that reads as long gone survives."""
+        parsed = _parsed(
+            "Fury vs Hall", self.FINISHED,
+            matched_pattern="dateless-title-time-ampm",
+        )
+        rows = [_resolved("FURY vs HALL 8PM", DISPOSITION_UNMATCHED, parsed)]
+        plan = build_promotion_plan(
+            self._skip_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.would_create == 1
+        assert plan.skipped_past == 0
+
+    def test_existing_promoted_channel_is_never_dropped_on_a_clock(self):
+        """The delete rail: an adopt unit dropped from the plan would leave
+        its channel out of the run's managed set, and Pass 4 would delete
+        it — a timestamp-driven delete the feature must never make."""
+        parsed = _parsed("Fury vs. Usyk", self.FINISHED)
+        rows = [_resolved("old", DISPOSITION_UNMATCHED, parsed)]
+        name = promoted_channel_name(parsed)
+        plan = build_promotion_plan(
+            self._skip_config(), rows, {name.lower(): 900}, now=FROZEN_NOW
+        )
+        assert plan.skipped_past == 0
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units[0].existing_channel_id == 900
+
+    def test_past_events_do_not_spend_cap_budget(self):
+        """Filtering runs before the cap, so a playlist full of finished
+        events cannot starve the live ones of create slots."""
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Alpha Event", self.FINISHED), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Beta Event", self.FINISHED), stream_id=2),
+            _resolved("c", DISPOSITION_UNMATCHED,
+                      _parsed("Gamma Event", START), stream_id=3),
+        ]
+        plan = build_promotion_plan(
+            self._skip_config(max_promote_per_run=1), rows, {},
+            now=FROZEN_NOW,
+        )
+        assert plan.skipped_past == 2
+        assert plan.capped is False
+        assert [u.rows[0].result.parsed.title for u in plan.units] \
+            == ["Gamma Event"]
+
+    @pytest.mark.parametrize("flag", [None, False])
+    def test_filter_is_inert_when_off(self, flag):
+        """A rule that never asked for the filter promotes exactly what it
+        promoted before, finished events included."""
+        overrides = {} if flag is None else {"skip_past_events": flag}
+        rows = [_resolved("old", DISPOSITION_UNMATCHED,
+                          _parsed("Fury vs. Usyk", self.FINISHED))]
+        plan = build_promotion_plan(
+            _promote_config(**overrides), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.would_create == 1
+        assert plan.skipped_past_units == ()
+
+    def test_off_config_never_reads_a_clock(self):
+        """No ``now`` passed and none needed — the default clock read is
+        gated behind the flag."""
+        rows = [_resolved("old", DISPOSITION_UNMATCHED,
+                          _parsed("Fury vs. Usyk", self.FINISHED))]
+        with patch("services.event_sync_promote.datetime") as fake_clock:
+            plan = build_promotion_plan(_promote_config(), rows, {})
+            assert fake_clock.now.call_count == 0
+        assert plan.would_create == 1
+
+
 # =========================================================================
 # Engine/executor integration against the stateful fixture Dispatcharr.
 # =========================================================================

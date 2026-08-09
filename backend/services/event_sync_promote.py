@@ -21,7 +21,15 @@ inputs (dry-run parity by construction — the same argument as
   provider playlist THIS run; Pass 4 orphan reconciliation deletes (per the
   rule's ``orphan_action``, default delete) when it drops out. NO wall-clock
   arithmetic, NO parsed or synthesized timestamps in any delete decision,
-  NO K-run counters. Nothing in this module reads a clock.
+  NO K-run counters.
+* **``skip_past_events`` blocks CREATES ONLY.** The opt-in past-event filter
+  is the single place a clock enters this module, and it may only ever
+  remove a unit whose action is ``create``. A unit that adopts an existing
+  promoted channel always stays in the plan: the caller registers the
+  plan's channels as the run's managed set, so dropping an adopt unit would
+  make Pass 4 see the channel as an orphan and delete it — a
+  timestamp-driven delete, which the invariant above forbids. The clock is
+  read only when the rule opted in, and ``now`` is injectable.
 * **Clustering: exact-event-key only.** Same-run unmatched streams (any
   provider) sharing a :func:`services.event_sync_review.master_event_key`
   form ONE promotion unit. NO fuzzy clustering; promoted channels do NOT
@@ -58,6 +66,7 @@ same isolation contract as ``services.event_sync_matcher``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from services.event_sync_matcher import (
     SYNTHESIZED_DATE_PATTERN_NAMES,
@@ -71,6 +80,8 @@ from services.event_sync_review import master_event_key
 
 __all__ = [
     "DEFAULT_MAX_PROMOTE_PER_RUN",
+    "DEFAULT_PAST_EVENT_GRACE_HOURS",
+    "MAX_PAST_EVENT_GRACE_HOURS",
     "MAX_PROMOTE_CEILING",
     "PROMOTABLE_DISPOSITIONS",
     "PROMOTE_ACTION_ATTACH_EXISTING",
@@ -78,6 +89,7 @@ __all__ = [
     "PromotionPlan",
     "PromotionUnit",
     "build_promotion_plan",
+    "event_is_past",
     "promoted_channel_name",
 ]
 
@@ -105,6 +117,43 @@ PROMOTABLE_DISPOSITIONS = frozenset({
     DISPOSITION_UNMATCHED,
     DISPOSITION_EXCLUDED,
 })
+
+# Hours after an event's parsed start before skip_past_events treats it as
+# finished. Providers leave finished events in the playlist indefinitely, so
+# without a filter every one of them mints a channel that nobody can watch.
+# The grace exists so a broadcast in progress is never dropped mid-event: a
+# 4-hour default covers a long ball game or a full fight card, and the parsed
+# start is the only time the name carries (no duration is ever available).
+DEFAULT_PAST_EVENT_GRACE_HOURS: int = 4
+
+# Ceiling for event_sync_config.past_event_grace_hours (validated in
+# channel_pipeline_schema.validate_event_sync_config). Three days — past that
+# the filter no longer filters anything a daily playlist contains.
+MAX_PAST_EVENT_GRACE_HOURS: int = 72
+
+
+def event_is_past(
+    parsed: ParsedEvent, grace_hours: int, now: datetime
+) -> bool:
+    """Has this event's parsed start plus its grace window already gone by?
+
+    ``False`` — meaning "do not treat this as finished" — for the two cases
+    where the question cannot be answered from the name:
+
+    * ``start is None``: no parsed time at all.
+    * ``matched_pattern`` in :data:`SYNTHESIZED_DATE_PATTERN_NAMES`: the
+      date component was fabricated from "now" (``assume_current_date``),
+      not read off the provider string. Judging a fabricated date past or
+      future says nothing about the event, and the verdict would flip every
+      day at midnight — so a dateless parse is never filtered.
+
+    ``now`` must be tz-aware (``parsed.start`` always is).
+    """
+    if parsed.start is None:
+        return False
+    if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:
+        return False
+    return parsed.start + timedelta(hours=grace_hours) < now
 
 
 def promoted_channel_name(parsed: ParsedEvent) -> str | None:
@@ -180,12 +229,16 @@ class PromotionPlan:
     create-units beyond the per-run cap — NOT realized this run (runs are
     idempotent: the remainder re-surfaces next run, mirroring the attach
     cap's posture). ``cap`` echoes the effective cap.
+    ``skipped_past_units`` are create-units ``skip_past_events`` dropped
+    because the event already finished; unlike capped units they are not
+    deferred — they will not come back unless the provider re-dates them.
     """
 
     units: tuple[PromotionUnit, ...]
     capped_units: tuple[PromotionUnit, ...]
     cap: int
     target_group_id: int | None
+    skipped_past_units: tuple[PromotionUnit, ...] = ()
 
     @property
     def capped(self) -> bool:
@@ -194,6 +247,10 @@ class PromotionPlan:
     @property
     def cap_overage(self) -> int:
         return len(self.capped_units)
+
+    @property
+    def skipped_past(self) -> int:
+        return len(self.skipped_past_units)
 
     @property
     def would_create(self) -> int:
@@ -224,6 +281,8 @@ def build_promotion_plan(
     config: dict,
     resolved,
     existing_name_to_id: dict[str, int],
+    *,
+    now: datetime | None = None,
 ) -> PromotionPlan:
     """Build the promotion plan for one rule's resolved streams.
 
@@ -237,6 +296,15 @@ def build_promotion_plan(
             create-vs-adopt decision. The caller supplies it from the same
             channel data its execution path resolves against, so plan and
             execution agree.
+        now: tz-aware anchor for ``skip_past_events``. Defaults to the
+            current UTC time, and is read ONLY when the rule turned that
+            flag on — a config without it never touches a clock. Injectable
+            so tests are deterministic.
+
+    ``skip_past_events`` is applied BEFORE the cap so finished events cannot
+    spend create budget that a live event needs, and only to create-units
+    (see the module docstring: dropping an adopt unit would hand Pass 4 a
+    delete it must never make from a timestamp).
 
     Determinism: units are ordered by event key (byte order), so cap
     trimming selects the same units on preview and run for identical
@@ -248,6 +316,12 @@ def build_promotion_plan(
     """
     cap = config.get("max_promote_per_run", DEFAULT_MAX_PROMOTE_PER_RUN)
     target_group_id = config.get("promote_target_group_id")
+    skip_past = bool(config.get("skip_past_events"))
+    grace_hours = config.get(
+        "past_event_grace_hours", DEFAULT_PAST_EVENT_GRACE_HOURS
+    )
+    if skip_past and now is None:
+        now = datetime.now(timezone.utc)
 
     by_key: dict[str, list] = {}
     for row in resolved:
@@ -263,6 +337,7 @@ def build_promotion_plan(
 
     units: list[PromotionUnit] = []
     capped_units: list[PromotionUnit] = []
+    skipped_past_units: list[PromotionUnit] = []
     creates = 0
     planned_names: dict[str, str] = {}  # lowercased name -> first event key
     for key in sorted(by_key):
@@ -286,6 +361,13 @@ def build_promotion_plan(
             existing_channel_id=existing_id,
         )
         if action == PROMOTE_ACTION_CREATE:
+            if (
+                skip_past
+                and now is not None
+                and event_is_past(parsed, grace_hours, now)
+            ):
+                skipped_past_units.append(unit)
+                continue
             if cap and creates >= cap:
                 capped_units.append(unit)
                 continue
@@ -298,4 +380,5 @@ def build_promotion_plan(
         capped_units=tuple(capped_units),
         cap=cap,
         target_group_id=target_group_id,
+        skipped_past_units=tuple(skipped_past_units),
     )

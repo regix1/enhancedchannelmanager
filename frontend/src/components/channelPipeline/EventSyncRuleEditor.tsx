@@ -70,6 +70,8 @@ import {
   DEFAULT_PATTERN_IDS,
   DEFAULT_TIME_WINDOW_MINUTES,
   MAX_TIME_WINDOW_MINUTES,
+  DEFAULT_PAST_EVENT_GRACE_HOURS,
+  MAX_PAST_EVENT_GRACE_HOURS,
   EVENT_ATTACH_FLOOR,
   clampAttachThreshold,
   selectionIsBuiltinDefaults,
@@ -377,6 +379,15 @@ export function EventSyncRuleEditor({
   );
   const [promoteTargetGroupId, setPromoteTargetGroupId] = useState<number | null>(
     config?.promote_target_group_id ?? null
+  );
+  // Past-event filter. Default OFF — the backend treats an absent key as
+  // false. Providers leave finished events in the playlist, so without this
+  // every one of them promotes to a channel nobody can watch.
+  const [skipPastEvents, setSkipPastEvents] = useState(
+    config?.skip_past_events ?? false
+  );
+  const [pastEventGraceText, setPastEventGraceText] = useState(
+    String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS)
   );
   // Phase 2 (ti939.3.3): optional dummy EPG profile auto-assigned to master
   // channels on every run. null = feature off (key omitted on save).
@@ -719,6 +730,28 @@ export function EventSyncRuleEditor({
     if (config?.max_promote_per_run != null) {
       built.max_promote_per_run = config.max_promote_per_run;
     }
+    // Past-event filter: emit when checked, and preserve an explicit stored
+    // value (absent means false on the backend, so an untouched legacy config
+    // stays without the keys). The grace rides along only while the filter is
+    // on — the backend fills its default on save.
+    if (skipPastEvents || config?.skip_past_events != null) {
+      built.skip_past_events = skipPastEvents;
+    }
+    if (skipPastEvents || config?.past_event_grace_hours != null) {
+      // 0 is a legal grace ("past the moment the start time passes"), so an
+      // empty/garbage box falls back to the default explicitly rather than
+      // through a falsy check that would turn 0 into 4.
+      const graceEntered = parseInt(pastEventGraceText, 10);
+      built.past_event_grace_hours = Math.min(
+        MAX_PAST_EVENT_GRACE_HOURS,
+        Math.max(
+          0,
+          Number.isFinite(graceEntered)
+            ? graceEntered
+            : DEFAULT_PAST_EVENT_GRACE_HOURS
+        )
+      );
+    }
 
     // --- Shared patterns (bead z4y4a: full round-trip) -------------------
     // Untouched patterns section + a saved `patterns` array → pass the
@@ -953,6 +986,9 @@ export function EventSyncRuleEditor({
       parseMasterFromStream !== (config?.parse_master_from_stream ?? false) ||
       promoteUnmatched !== (config?.promote_unmatched ?? false) ||
       promoteTargetGroupId !== (config?.promote_target_group_id ?? null) ||
+      skipPastEvents !== (config?.skip_past_events ?? false) ||
+      pastEventGraceText !==
+        String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS) ||
       dummyEpgProfileId !== (config?.dummy_epg_profile_id ?? null) ||
       streamSortField !== (rule?.stream_sort_field ?? '') ||
       streamSortOrder !== (rule?.stream_sort_order === 'asc' ? 'asc' : 'desc')
@@ -962,7 +998,8 @@ export function EventSyncRuleEditor({
     customShared, groupOverrides, timeWindowText, thresholdText, enforceTimeWindow,
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
-    promoteTargetGroupId, dummyEpgProfileId, config, rule,
+    promoteTargetGroupId, skipPastEvents, pastEventGraceText,
+    dummyEpgProfileId, config, rule,
     initial, customSharedMeta, streamSortField, streamSortOrder,
   ]);
   const dirtyRef = useRef(dirty);
@@ -1111,9 +1148,10 @@ export function EventSyncRuleEditor({
     (includeMasterGroupStreams ? 1 : 0) + (parseMasterFromStream ? 1 : 0);
   const guideChanged = dummyEpgProfileId != null ? 1 : 0;
   const streamOrderChanged = streamSortField ? 1 : 0;
-  // bead ti939.4.1: the promotion toggle is the only badge-worthy flag —
-  // the target group is meaningless without it.
-  const promotionChanged = promoteUnmatched ? 1 : 0;
+  // bead ti939.4.1: the promotion toggle is badge-worthy — the target group
+  // is meaningless without it. The past-event filter counts too: it changes
+  // which events get a channel at all.
+  const promotionChanged = (promoteUnmatched ? 1 : 0) + (skipPastEvents ? 1 : 0);
 
   /** Collapsed-subgroup "N changed" badge (S2). */
   const changedBadge = (count: number) =>
@@ -2191,6 +2229,51 @@ export function EventSyncRuleEditor({
                         Must be a dedicated group — the master group
                         (Dispatcharr-owned) and secondary groups are refused.
                         ECM creates and deletes promoted channels here.
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={skipPastEvents}
+                          onChange={e => setSkipPastEvents(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-skip-past-events"
+                        />
+                        <span>Skip events that have already finished</span>
+                      </label>
+                      <span className="form-hint">
+                        Most providers leave a finished event in the playlist
+                        for days, so without this each one keeps getting its
+                        own channel. Channels already promoted are never
+                        deleted by this setting, and events whose date had to
+                        be assumed are never skipped.
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && skipPastEvents && (
+                    <div className="form-group">
+                      <label htmlFor={`${id}-past-event-grace`}>
+                        Keep promoting for (hours after start)
+                      </label>
+                      <input
+                        id={`${id}-past-event-grace`}
+                        type="number"
+                        min={0}
+                        max={MAX_PAST_EVENT_GRACE_HOURS}
+                        value={pastEventGraceText}
+                        onChange={e => setPastEventGraceText(e.target.value)}
+                        disabled={isLoading}
+                        data-testid="event-sync-past-event-grace"
+                      />
+                      <span className="form-hint">
+                        A provider name gives a start time, never a duration —
+                        this is what keeps an event that is still on air from
+                        being dropped mid-broadcast (default{' '}
+                        {DEFAULT_PAST_EVENT_GRACE_HOURS}, max{' '}
+                        {MAX_PAST_EVENT_GRACE_HOURS}).
                       </span>
                     </div>
                   )}

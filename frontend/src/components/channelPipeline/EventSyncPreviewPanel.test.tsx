@@ -521,6 +521,7 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
         cap: 25,
         capped: false,
         cap_overage: 0,
+        skipped_past: 0,
         units: [
           {
             channel_name: 'Provider B Exclusive Fight @ Jul 11 09:00 PM',
@@ -643,5 +644,33 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     expect(
       within(section).getByText(/Promotion cap reached \(25\): 3 events deferred/)
     ).toBeInTheDocument();
+  });
+
+  it('says how many events were skipped for already having finished', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_past = 115;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-past').textContent
+    ).toMatch(/115 events skipped because they had already finished/);
+  });
+
+  it('says nothing about skipped events when none were skipped', () => {
+    render(
+      <EventSyncPreviewPanel
+        preview={promotedPreview()}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(screen.queryByTestId('event-sync-promote-skipped-past')).toBeNull();
   });
 });

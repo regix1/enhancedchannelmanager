@@ -4173,6 +4173,10 @@ class ChannelPipelineEngine:
                         f"promotion capped at {promo['cap']}, "
                         f"{promo['cap_overage']} deferred"
                     )
+                if promo.get("skipped_past"):
+                    extras.append(
+                        f"{promo['skipped_past']} finished event(s) skipped"
+                    )
             if summary["capped"]:
                 extras.append(
                     f"capped at {summary['cap']}, "

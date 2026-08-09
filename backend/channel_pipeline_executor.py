@@ -4733,6 +4733,11 @@ class ActionExecutor:
         * **Cap**: only units the plan marked realizable run; capped units
           are counted (the engine surfaces the warning). Adoption never
           consumes cap budget.
+        * **Past events**: with ``skip_past_events`` on, the plan has
+          already dropped finished events from the create list (counted as
+          ``skipped_past``). Nothing here deletes on a timestamp — a
+          promoted channel still lives or dies by whether its stream is in
+          the playlist.
 
         Returns the promotion summary the engine folds into the rule's
         event_sync summary and uses to register the managed set
@@ -4779,9 +4784,18 @@ class ActionExecutor:
             "cap": plan.cap,
             "capped": plan.capped,
             "cap_overage": plan.cap_overage,
+            "skipped_past": plan.skipped_past,
             "channel_ids": [],
             "promote_entries": [],
         }
+
+        if plan.skipped_past:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': skip_past_events dropped %d event(s) "
+                "whose start time has already gone by — no channel created "
+                "for them (already promoted channels are untouched)",
+                rule_name, plan.skipped_past,
+            )
 
         def _provenance(row, unit, channel_id, channel_name) -> dict:
             # Content fingerprint (provider_id + normalized-name hash +

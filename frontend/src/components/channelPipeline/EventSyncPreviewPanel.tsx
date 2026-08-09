@@ -471,7 +471,9 @@ export function EventSyncPreviewPanel({
                                 } '${row.promote_channel_name}'`
                               : row.promote_capped
                                 ? 'Deferred (per-run cap)'
-                                : 'No — incomplete parsed identity'}
+                                : row.promote_skipped_past
+                                  ? 'Skipped — event already finished'
+                                  : 'No — incomplete parsed identity'}
                           </td>
                         )}
                       </tr>
@@ -508,6 +510,18 @@ export function EventSyncPreviewPanel({
                     to the next run.
                   </span>
                 </div>
+              )}
+              {(preview.promotion.skipped_past ?? 0) > 0 && (
+                <p
+                  className="form-hint"
+                  data-testid="event-sync-promote-skipped-past"
+                >
+                  {preview.promotion.skipped_past} event
+                  {preview.promotion.skipped_past === 1 ? '' : 's'} skipped
+                  because they had already finished. Turn off &quot;Skip
+                  events that have already finished&quot; on the rule, or
+                  raise the grace hours, if you expected them here.
+                </p>
               )}
               {preview.promotion.units.length === 0 ? (
                 <p className="form-hint">

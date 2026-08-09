@@ -3368,6 +3368,18 @@ async def preview_event_sync(
                     "promote_channel_name": unit.channel_name,
                     "promote_capped": True,
                 }
+        # skip_past_events drops: say so on the row rather than letting the
+        # channel silently not appear — "why is this event missing" is the
+        # first question an operator asks of a filter they turned on.
+        for unit in plan.skipped_past_units:
+            for row in unit.rows:
+                promote_annotations[(row.stream.group_id,
+                                     row.stream.stream_id)] = {
+                    "would_promote": False,
+                    "promote_action": None,
+                    "promote_channel_name": unit.channel_name,
+                    "promote_skipped_past": True,
+                }
         promotion_out = {
             "enabled": True,
             "target_group_id": promote_target_group_id,
@@ -3378,6 +3390,7 @@ async def preview_event_sync(
             "cap": plan.cap,
             "capped": plan.capped,
             "cap_overage": plan.cap_overage,
+            "skipped_past": plan.skipped_past,
             "units": units_out,
         }
         # Annotate the unmatched rows in place — the operator reads the
@@ -3400,7 +3413,7 @@ async def preview_event_sync(
         "streams=%d would_attach=%d ambiguous=%d unmatched=%d parse_failed=%d "
         "excluded_by_operator=%d preflight_ok=%s truncated=%s "
         "stale_suspect=%d freshness_unknown=%d snapshot_covered=%d "
-        "would_promote=%s",
+        "would_promote=%s skipped_past=%s",
         master_group_id, secondary_group_ids, len(master_channels),
         len(resolution.resolved), counts[DISPOSITION_WOULD_ATTACH],
         counts[DISPOSITION_AMBIGUOUS], counts[DISPOSITION_UNMATCHED],
@@ -3408,6 +3421,7 @@ async def preview_event_sync(
         preflight["ok"], truncated,
         stale_suspect_streams, freshness_unknown_streams, snapshot_covered,
         promotion_out["would_promote"] if promotion_out else "off",
+        promotion_out["skipped_past"] if promotion_out else "off",
     )
 
     return {

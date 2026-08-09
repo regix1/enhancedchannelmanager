@@ -819,3 +819,71 @@ class TestPromotionKeys:
         config = _valid_config(promote_target_group_id=-3)
         errors = validate_event_sync_config(config)
         assert any("promote_target_group_id" in e for e in errors)
+
+
+class TestSkipPastEventsKeys:
+    """The past-event filter's two keys.
+
+    Same opt-in contract as the promotion keys: absent means invisible, and
+    the grace default is filled only once the filter is switched on.
+    """
+
+    def test_absent_keys_stay_absent(self):
+        config = _valid_config()
+        assert validate_event_sync_config(config) == []
+        assert "skip_past_events" not in config
+        assert "past_event_grace_hours" not in config
+
+    def test_enabling_fills_the_grace_default(self):
+        from services.event_sync_promote import (
+            DEFAULT_PAST_EVENT_GRACE_HOURS,
+        )
+
+        config = _valid_config(skip_past_events=True)
+        assert validate_event_sync_config(config) == []
+        assert config["past_event_grace_hours"] \
+            == DEFAULT_PAST_EVENT_GRACE_HOURS
+
+    def test_disabled_config_does_not_fill_the_grace_default(self):
+        config = _valid_config(skip_past_events=False)
+        assert validate_event_sync_config(config) == []
+        assert "past_event_grace_hours" not in config
+
+    @pytest.mark.parametrize("bad", ["yes", 1, 0])
+    def test_non_bool_flag_rejected(self, bad):
+        config = _valid_config(skip_past_events=bad)
+        errors = validate_event_sync_config(config)
+        assert any("skip_past_events" in e for e in errors)
+
+    @pytest.mark.parametrize("bad", [-1, 73, True, "4", 2.5])
+    def test_bad_grace_rejected(self, bad):
+        config = _valid_config(
+            skip_past_events=True, past_event_grace_hours=bad
+        )
+        errors = validate_event_sync_config(config)
+        assert any("past_event_grace_hours" in e for e in errors)
+
+    def test_grace_bounds_accepted(self):
+        from services.event_sync_promote import MAX_PAST_EVENT_GRACE_HOURS
+
+        for good in (0, 4, MAX_PAST_EVENT_GRACE_HOURS):
+            config = _valid_config(
+                skip_past_events=True, past_event_grace_hours=good
+            )
+            assert validate_event_sync_config(config) == []
+            assert config["past_event_grace_hours"] == good
+
+    def test_grace_shape_validated_even_when_filter_is_off(self):
+        """A typo'd grace must not lie dormant until the toggle flips."""
+        config = _valid_config(past_event_grace_hours=999)
+        errors = validate_event_sync_config(config)
+        assert any("past_event_grace_hours" in e for e in errors)
+
+    def test_error_message_teaches_the_range_and_the_reason(self):
+        config = _valid_config(
+            skip_past_events=True, past_event_grace_hours=500
+        )
+        errors = validate_event_sync_config(config)
+        message = next(e for e in errors if "past_event_grace_hours" in e)
+        assert "between 0 and 72" in message
+        assert "in progress" in message
