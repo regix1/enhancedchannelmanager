@@ -13,6 +13,30 @@ ECM uses a global auth middleware in `main.py` that blocks unauthenticated reque
 - Token validation uses `decode_token_safe()` from `auth/dependencies.py` (non-raising, returns payload or None)
 - Per-endpoint `RequireAuthIfEnabled` / `RequireAdminIfEnabled` DI dependencies still exist for role-based checks (e.g., admin-only routes in `backup.py`)
 
+## Public read prefixes (`AUTH_EXEMPT_GET_PREFIXES`)
+
+`AUTH_EXEMPT_PATHS` matches a path exactly, so it cannot cover a route with
+a variable segment. `AUTH_EXEMPT_GET_PREFIXES` in `main.py` covers those,
+and only for `GET`/`HEAD` — a mutating route added under an exempt prefix
+later still needs a token.
+
+Current entry: `/api/dummy-epg/xmltv`, which covers the combined guide and
+`/api/dummy-epg/xmltv/{profile_id}`. Dispatcharr consumes ECM's dummy EPG by
+registering that URL as an XMLTV source, and its fetcher has nowhere to put
+an ECM credential — this API takes a bearer token in a header only, and
+there is no query-parameter credential path. Gating those reads makes the
+dummy EPG feature unable to deliver guide data at all once auth is on. Same
+trade-off already accepted for `/metrics`: they answer unauthenticated on
+the assumption that ECM's network is trusted (LAN / reverse proxy /
+tailnet). What is readable if that assumption stops holding is the generated
+guide — channel names and programme titles — and nothing else. The follow-up
+if it does is an IP allowlist at the reverse proxy (no code change) or a
+per-profile token in the URL validated in the handler.
+
+Because matching is `startswith`, any future route whose path begins with an
+entry is public to readers. Keep new `dummy-epg` routes outside the `xmltv`
+prefix.
+
 ## Known limitation: BaseException containment can't cover outer middleware bodies
 
 `BaseExceptionContainmentMiddleware` (`backend/main.py:205`) is registered

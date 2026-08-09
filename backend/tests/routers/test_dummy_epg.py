@@ -810,3 +810,109 @@ class TestForceRegenerate:
         # Verify cache was invalidated and set
         mock_cache.invalidate_prefix.assert_called_with("dummy_epg_xmltv")
         assert mock_cache.set.call_count >= 1
+
+
+# =============================================================================
+# Auth posture — the XMLTV reads answer without credentials
+# =============================================================================
+
+
+class _AuthOn:
+    """Auth settings that force the global middleware to demand a token."""
+    require_auth = True
+    setup_complete = True
+
+
+class TestXmltvUnauthenticatedAccess:
+    """Dispatcharr registers /api/dummy-epg/xmltv/<profile_id> as an XMLTV
+    source and cannot send an ECM bearer token, so both XMLTV reads must
+    answer with auth turned on. Everything else under /api/dummy-epg/ must
+    still be rejected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_combined_xmltv_answers_without_credentials(
+        self, async_client, test_session
+    ):
+        """GET /api/dummy-epg/xmltv returns the guide with auth enabled."""
+        _create_profile(test_session, name="Open Read")
+        cached_xml = '<?xml version="1.0"?><tv><channel id="ecm-1"/></tv>'
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = cached_xml
+
+        with patch("main.get_auth_settings", return_value=_AuthOn()), \
+             patch("routers.dummy_epg.cache", mock_cache):
+            response = await async_client.get("/api/dummy-epg/xmltv")
+
+        assert response.status_code == 200, response.text
+        assert 'id="ecm-1"' in response.text
+
+    @pytest.mark.asyncio
+    async def test_profile_xmltv_answers_without_credentials(
+        self, async_client, test_session
+    ):
+        """The per-profile URL is the one pasted into Dispatcharr, so the
+        variable {profile_id} segment must be exempt too.
+        """
+        profile = _create_profile(test_session, name="Open Profile Read")
+        cached_xml = '<?xml version="1.0"?><tv><channel id="ecm-7"/></tv>'
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = cached_xml
+
+        with patch("main.get_auth_settings", return_value=_AuthOn()), \
+             patch("routers.dummy_epg.cache", mock_cache):
+            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+
+        assert response.status_code == 200, response.text
+        assert 'id="ecm-7"' in response.text
+
+    @pytest.mark.asyncio
+    async def test_generate_still_requires_a_token(self, async_client):
+        """POST /api/dummy-epg/generate shares the dummy-epg prefix but
+        mutates cache state, so it must stay behind auth.
+        """
+        with patch("main.get_auth_settings", return_value=_AuthOn()):
+            response = await async_client.post("/api/dummy-epg/generate")
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Not authenticated"
+
+    @pytest.mark.asyncio
+    async def test_profile_list_still_requires_a_token(self, async_client):
+        """Opening the XMLTV reads must not open the rest of the router."""
+        with patch("main.get_auth_settings", return_value=_AuthOn()):
+            response = await async_client.get("/api/dummy-epg/profiles")
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Not authenticated"
+
+    @pytest.mark.asyncio
+    async def test_unrelated_api_route_still_requires_a_token(self, async_client):
+        """The prefix must not widen past dummy-epg."""
+        with patch("main.get_auth_settings", return_value=_AuthOn()):
+            response = await async_client.get("/api/channels")
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Not authenticated"
+
+    @pytest.mark.asyncio
+    async def test_non_get_on_the_xmltv_path_still_requires_a_token(
+        self, async_client
+    ):
+        """Only GET/HEAD is exempt. A POST to the same URL must be rejected
+        by the middleware before routing, so adding a mutating route under
+        the xmltv prefix later cannot inherit the exemption.
+        """
+        with patch("main.get_auth_settings", return_value=_AuthOn()):
+            response = await async_client.post("/api/dummy-epg/xmltv")
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Not authenticated"
+
+    def test_exempt_prefixes_cover_only_the_xmltv_reads(self):
+        """Structural check on the constant — catches an accidental
+        widening of the prefix during a refactor.
+        """
+        from main import AUTH_EXEMPT_GET_PREFIXES
+
+        assert AUTH_EXEMPT_GET_PREFIXES == ("/api/dummy-epg/xmltv",)

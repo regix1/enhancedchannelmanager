@@ -518,6 +518,31 @@ AUTH_EXEMPT_PATHS = {
     "/api/openapi.json",
 }
 
+# Public read prefixes. AUTH_EXEMPT_PATHS is an exact-match set, so it cannot
+# express a route with a variable segment like
+# /api/dummy-epg/xmltv/{profile_id}. Prefix form and plain startswith matching
+# mirror _TIMEOUT_EXEMPT_PREFIXES above.
+#
+# Auth decision — same trade-off already accepted for /metrics: Dispatcharr
+# consumes ECM's dummy EPG by registering /api/dummy-epg/xmltv/<profile_id> as
+# an XMLTV source, and its fetcher has nowhere to put an ECM credential (this
+# API takes a bearer token in a header only; there is no query-parameter
+# credential path). With auth on, gating these reads makes the dummy EPG
+# feature unable to deliver guide data at all, so they answer without
+# authentication on the assumption that ECM's network is trusted (LAN /
+# reverse proxy / tailnet). What is readable if that assumption stops holding:
+# channel names and programme titles for the generated events, nothing else.
+# The follow-up if it does is either an IP allowlist at the reverse proxy
+# (simplest, no code change) or a per-profile token in the URL validated in
+# the handler.
+#
+# Only GET and HEAD are exempt, so a mutating route added under this prefix
+# later still requires a token. Every path starting with one of these strings
+# is readable by anyone, so keep new dummy-epg routes outside the xmltv prefix.
+AUTH_EXEMPT_GET_PREFIXES = (
+    "/api/dummy-epg/xmltv",
+)
+
 from auth.settings import get_auth_settings
 from auth.dependencies import get_token_from_request, decode_token_safe
 
@@ -539,7 +564,10 @@ async def auth_middleware(request: Request, call_next):
         # Skip auth when it's not required or setup isn't complete
         if auth_settings.require_auth and auth_settings.setup_complete:
             # Check if path is exempt
-            if path not in AUTH_EXEMPT_PATHS:
+            is_exempt_read = request.method in ("GET", "HEAD") and any(
+                path.startswith(p) for p in AUTH_EXEMPT_GET_PREFIXES
+            )
+            if path not in AUTH_EXEMPT_PATHS and not is_exempt_read:
                 token = get_token_from_request(request)
                 # Allow MCP API key as alternative to JWT. Constant-time compare
                 # to avoid a timing oracle on the static key (bd-1wq7z.24 (a));

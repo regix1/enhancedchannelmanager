@@ -37,10 +37,12 @@ class _Settings:
 
 
 class _Request:
-    """Minimal request: middleware only reads ``.url.path``."""
+    """Minimal request: the middleware reads ``.url.path`` and ``.method``
+    (the method decides whether a public-read prefix applies)."""
 
-    def __init__(self, path):
+    def __init__(self, path, method="GET"):
         self.url = type("U", (), {"path": path})()
+        self.method = method
 
 
 async def _call_next_sentinel(request):
