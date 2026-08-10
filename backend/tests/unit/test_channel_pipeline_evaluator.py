@@ -835,3 +835,57 @@ class TestEvaluateConditions:
         ctx = StreamContext(stream_id=1, stream_name="ESPN")
         result = evaluate_conditions([], ctx)
         assert result is True
+
+
+class TestConditionEvaluatorChannelNumberPrefix:
+    """The per-group name sets have to see through the channel-number prefix
+    ``ActionExecutor._apply_channel_number_in_name`` writes.
+
+    That method uses ``settings.channel_number_separator``, which defaults to
+    ``-``. The name sets have always stripped the pipe form; on an instance
+    numbering its channel names with anything else, a stored
+    ``"500 - USA Network"`` was only keyed under that whole string and every
+    name condition reported the channel missing.
+    """
+
+    GROUP = 7
+
+    def _matches(self, channels, stream_name, separator):
+        evaluator = ConditionEvaluator(existing_channels=channels,
+                                       channel_number_separator=separator)
+        ctx = StreamContext(stream_id=1, stream_name=stream_name)
+        return evaluator.evaluate(
+            {"type": "normalized_name_in_group", "value": self.GROUP}, ctx
+        ).matched
+
+    def test_configured_separator_prefix_is_seen_through(self):
+        channels = [{"id": 100, "name": "500 - USA Network",
+                     "channel_group_id": self.GROUP}]
+        assert self._matches(channels, "USA Network", "-") is True
+
+    def test_the_pipe_form_still_matches_under_another_separator(self):
+        """The long-standing pipe pass is unconditional, so a name carrying
+        the older prefix is still found on an instance now writing ``-``."""
+        channels = [{"id": 100, "name": "500 | USA Network",
+                     "channel_group_id": self.GROUP}]
+        assert self._matches(channels, "USA Network", "-") is True
+
+    def test_a_title_opening_with_digits_survives_when_numbering_is_off(self):
+        """None means nothing wrote a prefix, so nothing may strip one — the
+        year here is part of the channel's name, not a number ECM put on it.
+        """
+        channels = [{"id": 100, "name": "2024 - Olympics Opening",
+                     "channel_group_id": self.GROUP}]
+        assert self._matches(channels, "Olympics Opening", None) is False
+
+    def test_the_global_name_set_sees_through_it_too(self):
+        """``normalized_name_exists`` reads the union of the per-group sets,
+        so it inherits the same spellings."""
+        channels = [{"id": 100, "name": "500 - USA Network",
+                     "channel_group_id": self.GROUP}]
+        evaluator = ConditionEvaluator(existing_channels=channels,
+                                       channel_number_separator="-")
+        ctx = StreamContext(stream_id=1, stream_name="USA Network")
+
+        result = evaluator.evaluate({"type": "normalized_name_exists"}, ctx)
+        assert result.matched is True

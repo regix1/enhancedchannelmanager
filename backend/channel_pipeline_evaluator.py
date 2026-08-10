@@ -11,6 +11,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 import safe_regex
+from channel_number_prefix import strip_channel_number_prefix
 from channel_pipeline_schema import Condition, ConditionType
 from date_placeholders import expand_date_placeholders
 
@@ -135,7 +136,7 @@ class ConditionEvaluator:
     """
 
     def __init__(self, existing_channels: list[dict] = None, existing_groups: list[dict] = None,
-                 normalization_engine=None):
+                 normalization_engine=None, channel_number_separator: Optional[str] = None):
         """
         Initialize the evaluator with existing channel/group data.
 
@@ -143,6 +144,14 @@ class ConditionEvaluator:
             existing_channels: List of existing channel dicts from Dispatcharr
             existing_groups: List of existing group dicts from Dispatcharr
             normalization_engine: Optional NormalizationEngine for normalized_name_in_group conditions
+            channel_number_separator: The separator
+                ``ActionExecutor._apply_channel_number_in_name`` currently
+                writes into channel names, or None when
+                ``include_channel_number_in_name`` is off and no name
+                carries a prefix ECM put there. Only the caller can see the
+                settings, and the per-group name sets below have to see
+                through whatever prefix is really on a stored name or a
+                name condition reports an existing channel missing.
         """
         self.existing_channels = existing_channels or []
         self.existing_groups = existing_groups or []
@@ -173,15 +182,31 @@ class ConditionEvaluator:
                 stripped = channel_number_prefix.sub('', raw)
                 if stripped != raw:
                     names.add(stripped.lower())
-                # Apply normalization engine to the stripped name
+                # Every spelling to key and normalize under: the pipe-stripped
+                # form above (the stored name itself when it carries no pipe
+                # prefix), plus the form the configured separator strips off.
+                # Without the second one a channel stored "500 - USA Network"
+                # is only ever keyed under that whole string, so a name
+                # condition asking about "USA Network" reports it missing and
+                # the rule acts on a channel that already exists.
+                unprefixed = [stripped]
+                if channel_number_separator:
+                    by_setting = strip_channel_number_prefix(raw, channel_number_separator)
+                    # Equal to raw on a channel with no prefix at all, and
+                    # already in the list when the separator IS the pipe.
+                    if by_setting != raw and by_setting not in unprefixed:
+                        names.add(by_setting.lower())
+                        unprefixed.append(by_setting)
+                # Apply normalization engine to the stripped name(s)
                 if self._normalization_engine:
-                    try:
-                        result = self._normalization_engine.normalize(stripped)
-                        normalized = result.normalized
-                        if normalized:
-                            names.add(normalized.lower())
-                    except Exception as e:
-                        logger.warning("[AUTO-CREATE-EVAL] Normalization failed for channel '%s': %s", stripped, e)
+                    for name in unprefixed:
+                        try:
+                            result = self._normalization_engine.normalize(name)
+                            normalized = result.normalized
+                            if normalized:
+                                names.add(normalized.lower())
+                        except Exception as e:
+                            logger.warning("[AUTO-CREATE-EVAL] Normalization failed for channel '%s': %s", name, e)
             self._channel_names_by_group[gid] = names
 
         # Build global set of all channel names across all groups for normalized_name_exists
