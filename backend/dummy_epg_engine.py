@@ -643,16 +643,20 @@ def generate_channel_xml(
 
             # Predicted end to next midnight. An event that runs past its
             # predicted length is still on air, so this block keeps the event's
-            # own title and live tag rather than declaring it over. It never
-            # carries the new tag: this is the same broadcast continuing, and
-            # a second new marker on an adjacent programme of the same title
-            # reads to a recorder as a second showing to record. [71]
+            # own title rather than declaring it over. It carries neither the
+            # live nor the new tag. A guide client badges every programme
+            # carrying the live tag, whether or not that programme is the one
+            # airing, so keeping it here left an event marked live for each
+            # hour between its predicted end and midnight; the badge now stops
+            # at the predicted end. A second new marker on an adjacent
+            # programme of the same title reads to a recorder as a second
+            # showing to record. [71]
             if end_dt < tomorrow_midnight:
                 programmes.append(_make_programme(
                     end_dt, tomorrow_midnight, channel_id_str,
                     title, description,
                     categories, poster_url,
-                    include_date_tag, include_live_tag, False,
+                    include_date_tag, False, False,
                 ))
         else:
             # No time extracted -- single 24-hour programme

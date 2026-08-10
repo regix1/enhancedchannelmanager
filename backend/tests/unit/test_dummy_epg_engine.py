@@ -1087,8 +1087,12 @@ def test_variant_without_duration_uses_profile_duration():
     assert prog_stop - prog_start == timedelta(minutes=240)
 
 
-def test_programme_after_predicted_end_stays_on_air():
-    """Past the predicted end the guide keeps the event title and the live tag."""
+def test_live_tag_stops_at_the_predicted_end():
+    """Past the predicted end the guide keeps the event title, not the live tag.
+
+    A guide client badges every programme carrying the tag, airing or not, so
+    carrying it here marked the event live until midnight. [71]
+    """
     name, start = _event_name_today()
     profile = {
         "program_duration": 180,
@@ -1105,8 +1109,12 @@ def test_programme_after_predicted_end_stays_on_air():
     after = [p for p in programmes if _programme_window(p)[0] == end]
     assert len(after) == 1
     assert after[0].find("title").text == "Big Game"
-    assert after[0].find("live") is not None
+    assert after[0].find("live") is None
     assert not any(p.find("title").text.startswith("Ended:") for p in programmes)
+
+    on_air = [p for p in programmes if p.find("live") is not None]
+    assert len(on_air) == 1
+    assert _programme_window(on_air[0])[0] == start
 
 
 def test_only_the_event_itself_is_marked_new():
