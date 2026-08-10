@@ -43,6 +43,19 @@ export const DEFAULT_PAST_EVENT_GRACE_HOURS = 4;
 export const MAX_PAST_EVENT_GRACE_HOURS = 72;
 
 /**
+ * The lead this editor offers when the operator first turns the limit on.
+ * It deliberately has no backend counterpart: the backend never fills
+ * `promote_lead_hours`, because an absent key means no lead limit at all.
+ */
+export const DEFAULT_PROMOTE_LEAD_HOURS = 24;
+
+/** Mirror of MIN_PROMOTE_LEAD_HOURS in backend/services/event_sync_promote.py. */
+export const MIN_PROMOTE_LEAD_HOURS = 1;
+
+/** Mirror of MAX_PROMOTE_LEAD_HOURS in backend/services/event_sync_promote.py (30 days). */
+export const MAX_PROMOTE_LEAD_HOURS = 720;
+
+/**
  * Clamp an operator-entered attach threshold into the schema-legal range
  * [0, 1]. The 0.80 floor is the DEFAULT, not a hard minimum (bead
  * krkm4-sibling): an operator may lower the auto-attach bar when their

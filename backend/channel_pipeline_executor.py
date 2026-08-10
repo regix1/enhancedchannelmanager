@@ -4803,6 +4803,24 @@ class ActionExecutor:
           from the managed set this method returns and Pass 4 applies the
           rule's own ``orphan_action`` to it. Subtraction is the whole
           mechanism — there is deliberately no delete call on this path.
+        * **Lead time**: with ``promote_lead_hours`` set, an event further
+          ahead than the window is not created yet (counted as
+          ``skipped_early``). It gates CREATES ONLY — an event that already
+          has a channel keeps it however far away it is, because
+          un-promoting it would delete and recreate the same channel every
+          day until the window opened.
+        * **Stream health**: with ``skip_dead_streams`` on, the streams
+          this run is about to turn into channels are health-checked and
+          the failures leave their unit's attach list
+          (``dead_streams_skipped``). A unit with no working stream left is
+          not realized (``skipped_all_dead``) — but its EXISTING channel,
+          if it has one, still joins ``channel_ids``, so a provider having
+          a bad hour can never make Pass 4 delete an operator's channel.
+          Health blocks creates and attaches; it never retires anything.
+          The check runs LAST, on the plan's post-cap units only: probing
+          dials the provider, so it sees the handful of streams that
+          survived the past filter, the lead window and the cap rather
+          than every parsed candidate.
 
         Returns the promotion summary the engine folds into the rule's
         event_sync summary and uses to register the managed set
@@ -4820,6 +4838,7 @@ class ActionExecutor:
             PROVIDER_ID_UNKNOWN,
             stream_name_hash,
         )
+        from services.event_sync_stream_health import find_dead_streams
 
         target_group_id = config["promote_target_group_id"]
 
@@ -4838,6 +4857,29 @@ class ActionExecutor:
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id
         )
+
+        if config.get("skip_dead_streams"):
+            # Plan first, then check ONLY the streams that plan is about to
+            # turn into channels. plan.units is what is left after the past
+            # filter, the lead window AND the cap, which on a real rule is
+            # a few dozen streams rather than the thousand-odd the parse
+            # produces — probing dials the provider, so everything cheap
+            # runs before it. The planner is pure, so replanning with the
+            # verdict costs nothing and keeps the health filter in the one
+            # place the preview reads it from too.
+            dead = await find_dead_streams(
+                [
+                    row.stream.stream_id
+                    for unit in plan.units for row in unit.rows
+                ],
+                client=self.client,
+                probe_missing=not exec_ctx.dry_run,
+            )
+            if dead:
+                plan = build_promotion_plan(
+                    config, resolution.resolved, existing_name_to_id,
+                    dead_stream_ids=dead,
+                )
 
         promo = {
             "target_group_id": target_group_id,
@@ -4859,6 +4901,9 @@ class ActionExecutor:
             "cap_overage": plan.cap_overage,
             "skipped_past": plan.skipped_past,
             "skipped_past_adopted": plan.skipped_past_adopted,
+            "skipped_early": plan.skipped_early,
+            "dead_streams_skipped": plan.dead_streams_skipped,
+            "skipped_all_dead": plan.skipped_all_dead,
             "channel_ids": [],
             "promote_entries": [],
         }
@@ -4870,6 +4915,23 @@ class ActionExecutor:
                 "for them, and %d already-promoted channel(s) leave the "
                 "managed set for orphan cleanup to act on",
                 rule_name, plan.skipped_past, plan.skipped_past_adopted,
+            )
+
+        if plan.skipped_early:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': promote_lead_hours held back %d "
+                "event(s) that are further ahead than the lead window — "
+                "each one promotes on its own once the window opens",
+                rule_name, plan.skipped_early,
+            )
+
+        if plan.dead_streams_skipped or plan.skipped_all_dead:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': the health check dropped %d "
+                "stream(s) that do not play, and %d event(s) had no working "
+                "stream left — no channel is deleted for this, any channel "
+                "they already have keeps its place",
+                rule_name, plan.dead_streams_skipped, plan.skipped_all_dead,
             )
 
         def _provenance(row, unit, channel_id, channel_name) -> dict:
@@ -4908,6 +4970,13 @@ class ActionExecutor:
             """
             if unit.existing_channel_id is not None:
                 promo["channel_ids"].append(unit.existing_channel_id)
+
+        # A failing stream is a reason not to CREATE a channel, never a
+        # reason to lose one. Every all-dead unit that already has a channel
+        # holds its place in the managed set, so Pass 4 leaves it alone and
+        # a provider outage cannot take an operator's channels with it.
+        for unit in plan.all_dead_units:
+            _keep_existing_channel(unit)
 
         for unit in plan.units:
             first = unit.rows[0]

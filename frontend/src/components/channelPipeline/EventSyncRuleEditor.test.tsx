@@ -2030,6 +2030,285 @@ describe('EventSyncRuleEditor', () => {
       expect(config.past_event_grace_hours).toBe(6);
     });
 
+    it('leaves promote_lead_hours absent until the operator asks for a limit', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      // Turning promotion on does not turn the lead window on, and the hours
+      // box only appears once the box is ticked.
+      expect(screen.getByTestId('event-sync-limit-promote-lead')).not.toBeChecked();
+      expect(screen.queryByTestId('event-sync-promote-lead-hours')).toBeNull();
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      const config = onSave.mock.calls[0][0].event_sync_config;
+      expect(config).not.toHaveProperty('promote_lead_hours');
+    });
+
+    it('emits the lead hours once the box is ticked', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      await user.click(screen.getByTestId('event-sync-limit-promote-lead'));
+      const lead = await screen.findByTestId('event-sync-promote-lead-hours');
+      // The default the editor offers is the one an operator sees first.
+      expect(lead).toHaveValue(24);
+      await user.clear(lead);
+      await user.type(lead, '48');
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_lead_hours
+      ).toBe(48);
+    });
+
+    it('clamps the lead hours to the schema ceiling', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 24,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      const lead = await screen.findByTestId('event-sync-promote-lead-hours');
+      await user.clear(lead);
+      await user.type(lead, '9999');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_lead_hours
+      ).toBe(720);
+    });
+
+    it('falls back to the default when the lead box is left empty', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 6,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      const lead = await screen.findByTestId('event-sync-promote-lead-hours');
+      await user.clear(lead);
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      // An empty box means the operator has not chosen, not "zero hours".
+      // Zero would block every promotion.
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_lead_hours
+      ).toBe(24);
+    });
+
+    it('starts checked from a stored lead window and round-trips it', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      expect(screen.getByTestId('event-sync-limit-promote-lead')).toBeChecked();
+      expect(
+        await screen.findByTestId('event-sync-promote-lead-hours')
+      ).toHaveValue(12);
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_lead_hours
+      ).toBe(12);
+    });
+
+    it('unticking the lead window drops the key so no limit is left behind', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(screen.getByTestId('event-sync-limit-promote-lead'));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      const config = onSave.mock.calls[0][0].event_sync_config;
+      // An absent key is the only way to say "no limit", so the stored value
+      // must not be written back the way an explicit false would be.
+      expect(config).not.toHaveProperty('promote_lead_hours');
+      expect(config.promote_unmatched).toBe(true);
+    });
+
+    it('says on the lead window that an existing channel is not taken away', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      const toggle = screen.getByTestId('event-sync-limit-promote-lead');
+      const toggleGroup = toggle.closest('.form-group')!;
+      expect(toggleGroup.textContent).toMatch(/never taken away/i);
+
+      await user.click(toggle);
+      const lead = await screen.findByTestId('event-sync-promote-lead-hours');
+      // The hours hint has to say the held-back events come back, or the
+      // operator reads the window as a filter that loses them.
+      expect(lead.closest('.form-group')!.textContent).toMatch(
+        /picked up on a later run/i
+      );
+    });
+
+    it('emits the stream health check once the box is ticked, and says what it costs', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      const toggle = await screen.findByTestId('event-sync-skip-dead-streams');
+      expect(toggle).not.toBeChecked();
+      // Both consequences have to be readable before the box is ticked: the
+      // run gets slower, and some events stop being promoted.
+      const toggleGroup = toggle.closest('.form-group')!;
+      expect(toggleGroup.textContent).toMatch(/adds time to every run/i);
+      expect(toggleGroup.textContent).toMatch(/streams all fail is not promoted/i);
+
+      await user.click(toggle);
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.skip_dead_streams
+      ).toBe(true);
+    });
+
+    it('unticking the stream health check writes an explicit false', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          skip_dead_streams: true,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      const toggle = await screen.findByTestId('event-sync-skip-dead-streams');
+      expect(toggle).toBeChecked();
+      await user.click(toggle);
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      // Unlike promote_lead_hours, false is expressible here, so the written
+      // false is what turns the stored true off. Dropping the key would leave
+      // the check running.
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.skip_dead_streams
+      ).toBe(false);
+    });
+
+    it('leaves the stream health key absent on a config that never had it', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      expect(
+        await screen.findByTestId('event-sync-skip-dead-streams')
+      ).not.toBeChecked();
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      const config = onSave.mock.calls[0][0].event_sync_config;
+      // Opening and saving a rule authored before this control existed must
+      // not start writing the key.
+      expect(config).not.toHaveProperty('skip_dead_streams');
+      expect(config.promote_unmatched).toBe(true);
+    });
+
     it('round-trips a stored promotion config and preserves an API-set cap', async () => {
       const user = userEvent.setup();
       seedPromoGroup();

@@ -979,6 +979,94 @@ class TestPromotionPreview:
         assert promo["units"][0]["existing_channel_id"] == 900
 
     @pytest.mark.asyncio
+    async def test_new_filters_off_report_zero(self, async_client):
+        """A rule that asked for neither filter still gets the counters, so
+        the panel has something to read; they are just zero."""
+        client = _mock_client()
+        resp = await _preview(
+            async_client, client,
+            {"event_sync_config": self._promote_config()},
+        )
+        promo = resp.json()["promotion"]
+        assert promo["skipped_early"] == 0
+        assert promo["dead_streams_skipped"] == 0
+        assert promo["skipped_all_dead"] == 0
+        assert "promote_skipped_early" not in resp.json()["unmatched_streams"][0]
+
+    @pytest.mark.asyncio
+    async def test_lead_window_holds_a_far_off_event_back(self, async_client):
+        """The corpus event starts 2026-07-11. Previewed ten days earlier
+        with a one-day lead window it is not promoted yet, and the row says
+        why rather than silently disappearing."""
+        import pytz
+
+        far_ahead = pytz.timezone("America/New_York").localize(
+            datetime(2026, 7, 1, 12, 0, 0)
+        )
+        client = _mock_client()
+        with patch("services.event_sync_promote.datetime") as promote_clock:
+            promote_clock.now.return_value = far_ahead
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    promote_lead_hours=24)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        promo = data["promotion"]
+        assert promo["would_promote"] == 0
+        assert promo["skipped_early"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["would_promote"] is False
+        assert row["promote_skipped_early"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_dead_stream_is_reported_without_probing(
+        self, async_client
+    ):
+        """The preview reads the health it already has. It must not probe,
+        because a probe writes a health row and this endpoint writes
+        nothing."""
+        client = _mock_client()
+        check = AsyncMock(return_value={301})
+        with patch("services.event_sync_stream_health.find_dead_streams",
+                   check):
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    skip_dead_streams=True)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        assert check.await_args.kwargs.get("probe_missing") is None
+        promo = data["promotion"]
+        assert promo["would_promote"] == 0
+        assert promo["skipped_all_dead"] == 1
+        assert promo["dead_streams_skipped"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["promote_stream_dead"] is True
+        assert row["promote_skipped_all_dead"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_health_check_is_not_run_when_the_rule_is_off(
+        self, async_client
+    ):
+        client = _mock_client()
+        check = AsyncMock(return_value=set())
+        with patch("services.event_sync_stream_health.find_dead_streams",
+                   check):
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config()},
+            )
+        assert resp.status_code == 200
+        assert check.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_preview_counts_equal_live_run_promotions(
         self, async_client, test_session
     ):

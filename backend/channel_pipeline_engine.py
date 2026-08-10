@@ -2162,9 +2162,21 @@ class ChannelPipelineEngine:
             except Exception as e:
                 logger.warning("[AUTO-CREATE-ENGINE] Failed to initialize normalization engine: %s", e)
 
+        # The separator _apply_channel_number_in_name writes into channel
+        # names, or None when include_channel_number_in_name is off and no
+        # name carries a prefix ECM put there. The evaluator has no settings
+        # of its own, and its per-group name sets have to see through
+        # whatever prefix is really on a stored name, so it is handed the
+        # same pair of settings the executor reads for its own indexes. [44]
+        channel_number_separator = None
+        if getattr(settings, 'include_channel_number_in_name', False):
+            channel_number_separator = getattr(
+                settings, 'channel_number_separator', '-') or '-'
+
         # Initialize evaluator (with normalization engine for normalized_name_in_group conditions)
         evaluator = ConditionEvaluator(self._existing_channels, self._existing_groups,
-                                       normalization_engine=norm_engine)
+                                       normalization_engine=norm_engine,
+                                       channel_number_separator=channel_number_separator)
 
         # Fetch all profile IDs if default profiles are configured OR any rule
         # uses an assign_channel_profile action. Honoring a per-rule profile
@@ -4181,6 +4193,21 @@ class ChannelPipelineEngine:
                     extras.append(
                         f"{promo['skipped_past_adopted']} promoted channel(s) "
                         f"left the managed set"
+                    )
+                if promo.get("skipped_early"):
+                    extras.append(
+                        f"{promo['skipped_early']} event(s) still too far "
+                        f"ahead to promote"
+                    )
+                if promo.get("dead_streams_skipped"):
+                    extras.append(
+                        f"{promo['dead_streams_skipped']} stream(s) dropped "
+                        f"as dead"
+                    )
+                if promo.get("skipped_all_dead"):
+                    extras.append(
+                        f"{promo['skipped_all_dead']} event(s) had no working "
+                        f"stream"
                     )
                 if promo.get("failed_units"):
                     extras.append(

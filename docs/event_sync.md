@@ -409,6 +409,8 @@ backward compatibility; the rule editor now reads and writes the nested shape.
 | `max_promote_per_run` | no (default 25) | Per-run cap on **new** promoted channels (1–200; filled on promotion-enabled configs). On overage the run stops creating, warns, and records the overage. Adopting an existing promoted channel (idempotent re-runs) never consumes the cap. |
 | `skip_past_events` | no (default **false**) | When true, an event whose parsed start time has **already gone by** (plus `past_event_grace_hours`) gets no new channel, **and any channel this rule already promoted for it stops being managed**, which hands that channel to the rule's `orphan_action` (delete by default). Providers routinely leave finished events in the playlist forever, so without this every one of them keeps minting a channel nobody can watch and nothing ever cleans them up. Events with no genuinely parsed date (`assume_current_date` synthesized it) are never filtered. Absent means the filter does not exist for the rule. See [Skipping events that already finished](#skipping-events-that-already-finished). |
 | `past_event_grace_hours` | no (default 4) | How long after its start time an event still counts as current for `skip_past_events` (0–72; filled only when the filter is on). Provider names carry a start time and never a duration, so this is what keeps a broadcast in progress from being skipped and its channel removed mid-event. |
+| `promote_lead_hours` | no (absent = **no lead limit**) | How far ahead of its start time an event may get a channel (1–720). An event further away than this waits; an event that already **has** a channel keeps it however far away it is, so this only ever stops a create. Never default-filled. See [Not promoting an event that is still days away](#not-promoting-an-event-that-is-still-days-away). |
+| `skip_dead_streams` | no (default **false**) | When true, the run checks the health of the streams it is about to turn into channels and leaves the failures out. An event whose streams all fail gets no channel. It **never deletes** a channel that already exists. See [Not promoting a stream that does not play](#not-promoting-a-stream-that-does-not-play). |
 
 ### Why validation is strict
 
@@ -1492,12 +1494,17 @@ providers' event schedules.
   streams are untouched, and only streams with a **complete parsed
   identity** (title + start) qualify: an identity-less stream can neither
   name a channel deterministically nor be recognized next run.
-* **Clustering — exact event key only:** same-run promotable streams (any
-  provider) sharing the same normalized event identity (cleaned title +
-  start; the exact key the review queue fingerprints on) form ONE
-  promotion unit → ONE channel. No fuzzy clustering. Promoted channels
-  never enter the matcher's candidate set (the resolver only ever reads
-  the master group).
+* **Clustering by title and a time window:** same-run
+  promotable streams (any provider) sharing the same normalized event
+  identity (cleaned title + start; the exact key the review queue
+  fingerprints on) form ONE promotion unit → ONE channel, and events whose
+  cleaned titles match exactly and whose starts are no further apart than
+  `time_window_minutes` are folded onto the same channel on top of that.
+  See [One event, two providers, two
+  clocks](#one-event-two-providers-two-clocks). Titles are still compared
+  exactly, so there is no fuzzy clustering. Promoted channels never enter
+  the matcher's candidate set (the resolver only ever reads the master
+  group).
 * **Deterministic naming from the key:** the channel name is derived
   purely from the event identity — cleaned title plus the LOCAL clock
   time, with the date **only when it was genuinely parsed** from the
@@ -1584,6 +1591,141 @@ mid-event. With the default, an event that started three hours ago is still
 treated as current and keeps its channel; at 0, an event is past the moment
 its start time passes.
 
+### One event, two providers, two clocks
+
+Two providers listing the same event rarely agree on when it starts. One
+publishes the broadcast time and the next the undercard, so a sprint car
+race shows up as `DIRTVISION 01 : Knoxville Raceway 7:15 pm` on one
+provider and `PPV EVENT 04: Knoxville Raceway (8.9 7:30 PM ET)` on
+another. Fifteen minutes apart is fifteen minutes apart, so each spelling
+used to get its own channel and you ended up with the same race twice.
+
+Promotion clusters on the cleaned title first and forgives a clock
+disagreement up to the rule's own `time_window_minutes` (default 30). Both
+listings above land on one channel, with both providers' streams attached
+to it.
+
+What it will not do:
+
+* **It never guesses that two titles mean the same event.** The cleaned
+  titles have to match exactly. `Free Practice 3 Fia Wec Lone Star Le Mans`
+  and `Qualifying Fia Wec Lone Star Le Mans` are different sessions with
+  different titles, so they keep their own channels even when they start
+  minutes apart.
+* **It never collapses a weekly show.** `Aew Dynamite @ Aug 12` and
+  `Aew Dynamite @ Aug 19` are seven days apart, far outside the widest
+  window a rule can set (24 hours).
+* **It never walks a cluster across the window.** Distance is measured
+  from the earliest start in a cluster, not from the previous event, so
+  a run of events twenty minutes apart cannot drag an hour of the schedule
+  onto one channel.
+* **It never folds a dateless listing.** When `assume_current_date`
+  synthesized the date, the clock says nothing about which event it is.
+
+The earliest start names the channel, so which provider the fetch happened
+to return first makes no difference to the channel name, and a re-run
+adopts the channel the previous run created.
+
+`enforce_time_window` is **not** consulted here. That setting governs
+whether a clock mismatch may block an attach to a master channel. Turning
+it off must not put a whole season on one channel, so clustering keeps
+using the window either way.
+
+### Not promoting an event that is still days away
+
+Providers publish an event days before it airs. Without a limit, a channel
+for a show two weeks out sits in the group for two weeks.
+
+`promote_lead_hours` sets how far ahead of its start time an event may get
+a channel. Set it to 24 and an event gets its channel the day before it
+airs. The key is absent by default, which means no lead limit at all, so
+an existing rule promotes exactly what it promoted before.
+
+**It only ever stops a channel from being created.** An event that already
+has a channel keeps it however far away it is. This is the deliberate
+opposite of `skip_past_events`: un-promoting a far-off event would delete
+its channel tonight and recreate it tomorrow, every day until the window
+opened.
+
+Like the past-event filter, it never touches a dateless listing, and it
+runs before `max_promote_per_run` so a playlist full of next month's shows
+cannot starve tonight's events of create slots. Held-back events are
+counted as `promotion.skipped_early` and each held row is marked
+`promote_skipped_early: true`.
+
+### Not promoting a stream that does not play
+
+A provider listing an event is not the same as a provider serving it. On
+one field instance only 6 of roughly 37,000 streams had ever been probed,
+so nothing stopped a dead stream from becoming a channel.
+
+`skip_dead_streams: true` checks the health of **only** the streams a run
+is about to turn into channels. A stream that fails is left out of the
+channel's stream list (`promotion.dead_streams_skipped`). An event whose
+streams all fail gets no channel at all (`promotion.skipped_all_dead`),
+and both are marked on the preview row (`promote_stream_dead`,
+`promote_skipped_all_dead`).
+
+**The check runs last, after every other filter.** Probing dials the
+provider, so it is by far the most expensive thing in a run and everything
+cheap goes first:
+
+1. parse and cluster the streams
+2. drop events that have already finished (`skip_past_events`)
+3. drop events beyond the lead window (`promote_lead_hours`)
+4. apply the per-run cap (`max_promote_per_run`)
+5. probe whatever is still standing
+
+On one live rule, step 2 alone took the candidate list from roughly 1,100
+streams down to about 59. Probing a stream for a game that finished three
+days ago is wasted work and needless load on the provider.
+
+Two things follow from that ordering:
+
+* **The two counts are relative to the final list**, not the playlist.
+  `dead_streams_skipped` and `skipped_all_dead` only ever count among the
+  streams that survived steps 2 to 4.
+* **An event that loses every stream has already spent its cap slot.**
+  That is deliberate. Applying the cap after the health check instead
+  would hand the freed slot to an event nobody probed, so the run would
+  create a channel for a stream it never checked, which is the exact thing
+  this setting exists to prevent. A wasted slot costs one deferred event
+  on a run that is idempotent anyway; an unchecked create costs a dead
+  channel.
+
+**It never deletes a channel.** A stream failing right now is a reason not
+to create a channel, never a reason to lose one, so an event that loses
+every stream keeps whatever channel it already has, and orphan cleanup
+does not touch it. A provider having a bad hour cannot take your channels
+with it.
+
+What counts as dead:
+
+* a stream that has struck out, meaning its consecutive probe failures have
+  reached the **Strike threshold** setting (default 3), which is the same
+  signal auto-creation's "skip struck streams" uses; or
+* a stream this run probed and could not reach.
+
+A single old failure is not enough. Streams fail transiently, and the
+strike threshold is the setting you already tuned to say how much failure
+is too much.
+
+Two limits worth knowing:
+
+* **A run probes at most 200 never-probed candidates.** Probing dials the
+  provider, so a first run on a large rule would otherwise hold the
+  pipeline open for a long time. Runs are idempotent, so the rest get
+  probed by a later run.
+* **The preview does not probe.** A probe stores a health record and the
+  preview endpoint writes nothing, so it reports the health it already
+  has. On a rule whose streams have never been probed the preview shows
+  nothing dead and the run that follows may still drop some. A pipeline
+  dry-run behaves the same way.
+
+Anything the check itself cannot do reads as "nothing is dead": no prober
+configured, the health table unreadable, a provider timing out on the
+lookup. An outage in ECM must never look like an outage at the provider.
+
 ### Preview parity
 
 The **preview computes the promotion plan with the same helper the live
@@ -1604,6 +1746,14 @@ row is marked `promote_skipped_past: true`, with
 channel, so "why did this event not get a channel?" and "which channels am
 I about to lose?" are both answerable without reading logs. The live run
 reports the same two counts on its promotion summary.
+
+The lead-time and health filters live in the same shared helper, so the
+preview reports `promotion.skipped_early`,
+`promotion.dead_streams_skipped` and `promotion.skipped_all_dead` beside
+the past-event counts, and marks the rows `promote_skipped_early`,
+`promote_stream_dead` and `promote_skipped_all_dead`. The one place
+preview and run can honestly differ is the health check: the preview reads
+existing health records and never probes, because probing writes.
 
 ## Testing & pre-release verification
 

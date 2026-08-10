@@ -36,11 +36,33 @@ inputs (dry-run parity by construction — the same argument as
   start or a synthesized date, and ``past_event_grace_hours`` keeps a
   broadcast still on air from being dropped mid-event. The clock is read
   only when the rule opted in, and ``now`` is injectable.
-* **Clustering: exact-event-key only.** Same-run unmatched streams (any
-  provider) sharing a :func:`services.event_sync_review.master_event_key`
-  form ONE promotion unit. NO fuzzy clustering; promoted channels do NOT
-  enter the matcher candidate set (they live in the promotion target group,
-  which the resolver never reads).
+* **Clustering: same cleaned title, starts within the time window.**
+  Same-run unmatched streams (any provider) sharing a
+  :func:`services.event_sync_review.master_event_key` form ONE promotion
+  unit, and keys that carry the SAME cleaned title with starts no further
+  apart than ``time_window_minutes`` are folded together on top of that.
+  Two providers list the same event with different clock times (one reads
+  the broadcast start, the other the undercard), and without the fold each
+  spelling mints its own channel. Titles are still compared EXACTLY — no
+  fuzzy clustering — so the fold only ever joins events the cleaner
+  already calls the same name. Promoted channels do NOT enter the matcher
+  candidate set (they live in the promotion target group, which the
+  resolver never reads).
+* **A promoted channel is never created for a dead stream.** With
+  ``skip_dead_streams`` on, the caller checks the health of exactly the
+  streams this plan is about to turn into channels — the survivors of
+  every other filter, the cap included, which is a far smaller list than
+  the parsed candidates — and passes the failures in as
+  ``dead_stream_ids``. Those streams leave their unit's attach list,
+  and a unit with nothing left is dropped. Health NEVER retires a channel:
+  a unit dropped this way keeps whatever channel it already has in the
+  run's managed set, so a provider having a bad hour cannot delete an
+  operator's channel.
+* **``promote_lead_hours`` gates CREATES ONLY.** An event further ahead
+  than the lead window is simply not created yet. An event that already
+  has a channel is NEVER un-promoted for being far away — that would
+  delete and recreate the same channel every day. This is the deliberate
+  opposite of ``skip_past_events`` above, which does divert adopt units.
 
 **Which dispositions are promotable (pinned semantics, AC-11):**
 
@@ -71,10 +93,11 @@ same isolation contract as ``services.event_sync_matcher``.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from services.event_sync_matcher import (
+    DEFAULT_TIME_WINDOW_MINUTES,
     SYNTHESIZED_DATE_PATTERN_NAMES,
     ParsedEvent,
 )
@@ -89,12 +112,15 @@ __all__ = [
     "DEFAULT_PAST_EVENT_GRACE_HOURS",
     "MAX_PAST_EVENT_GRACE_HOURS",
     "MAX_PROMOTE_CEILING",
+    "MAX_PROMOTE_LEAD_HOURS",
+    "MIN_PROMOTE_LEAD_HOURS",
     "PROMOTABLE_DISPOSITIONS",
     "PROMOTE_ACTION_ATTACH_EXISTING",
     "PROMOTE_ACTION_CREATE",
     "PromotionPlan",
     "PromotionUnit",
     "build_promotion_plan",
+    "event_is_early",
     "event_is_past",
     "promoted_channel_name",
 ]
@@ -137,6 +163,44 @@ DEFAULT_PAST_EVENT_GRACE_HOURS: int = 4
 # the filter no longer filters anything a daily playlist contains.
 MAX_PAST_EVENT_GRACE_HOURS: int = 72
 
+# Bounds for event_sync_config.promote_lead_hours (validated in
+# channel_pipeline_schema.validate_event_sync_config). There is deliberately
+# NO default: an absent key means no lead limit at all, the same
+# absent-means-off contract the other promotion keys follow. One hour is the
+# tightest useful window (below it a channel appears too late to find), and
+# thirty days is past the horizon any provider publishes.
+MIN_PROMOTE_LEAD_HOURS: int = 1
+MAX_PROMOTE_LEAD_HOURS: int = 720
+
+# Ceiling on how far apart two same-title starts may be and still fold into
+# one channel. Deliberately independent of event_sync_config
+# .time_window_minutes, which stays legal all the way to 1440: attaching and
+# clustering ask different questions, so one setting cannot answer both.
+# Attaching asks "is this the master channel for this event", and an
+# operator who widens that to a day is making a defensible call about a
+# provider with a sloppy clock. Clustering asks "are these two listings the
+# same broadcast", and that answer is never yes across a day. At 1440 the
+# fold merged six pairs of plainly different events out of 195 real keys
+# from one live rule: two days of the same tennis session, two games of a
+# baseball series.
+#
+# 60 minutes, fixed by both edges of that same real data:
+#
+# * The largest genuine disagreement between two providers listing ONE
+#   event is 30 minutes — TREX and IPTorrents carried a single race at
+#   7:00, 7:15 and 7:30 PM. Doubling it also absorbs a provider whose clock
+#   is a whole hour out, which is what a DST or timezone slip looks like and
+#   is the coarsest error of that kind.
+# * The closest pair of genuinely DIFFERENT events in the same data is 120
+#   minutes apart: back-to-back BMX park sessions at 16:45 and 18:45. The
+#   comparison below is inclusive, so a 120 ceiling would merge exactly
+#   those two; 60 keeps the same factor of two on this side.
+#
+# Nothing recurring comes near either edge — the shortest recurring gap
+# observed is a weekly show at 7 days. Over those 195 live keys, 30 and 60
+# both merge nothing, 120 merges the BMX pair, 1440 merges all six.
+MAX_CLUSTER_WINDOW_MINUTES: int = 60
+
 
 def event_is_past(
     parsed: ParsedEvent, grace_hours: int, now: datetime
@@ -160,6 +224,30 @@ def event_is_past(
     if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:
         return False
     return parsed.start + timedelta(hours=grace_hours) < now
+
+
+def event_is_early(
+    parsed: ParsedEvent, lead_hours: int, now: datetime
+) -> bool:
+    """Is this event's parsed start still further ahead than the lead window?
+
+    The mirror image of :func:`event_is_past`, and it refuses the same two
+    cases for the same reason — an event with no parsed start, or one whose
+    date was fabricated from "now" rather than read off the provider string,
+    cannot be judged early any more than it can be judged finished.
+
+    A ``True`` verdict only ever stops a channel from being CREATED yet. It
+    must never take an existing channel out of a run's managed set: the
+    event would lose its channel today and get it back tomorrow, every day
+    until the lead window opens.
+
+    ``now`` must be tz-aware (``parsed.start`` always is).
+    """
+    if parsed.start is None:
+        return False
+    if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:
+        return False
+    return parsed.start - timedelta(hours=lead_hours) > now
 
 
 def promoted_channel_name(parsed: ParsedEvent) -> str | None:
@@ -242,6 +330,21 @@ class PromotionPlan:
     (:attr:`skipped_past_adopted`) each leave a real channel out of the
     run's managed set, which hands it to Pass 4's ``orphan_action``, so
     that count is the destructive half and is surfaced on its own.
+
+    ``skipped_early_units`` are create-units ``promote_lead_hours`` held
+    back because the event is still further ahead than the lead window.
+    They come back on their own once the window opens, and no unit that
+    already has a channel is ever in here.
+
+    ``all_dead_units`` are units every one of whose streams failed the
+    health check, and ``dead_streams_skipped`` counts the individual
+    streams that failed. Both are counted among the units that survived
+    every earlier filter INCLUDING the cap, because that is the only set
+    the health check ever looks at, so neither is a whole-playlist figure.
+    Neither is a deletion signal either: the caller keeps an all-dead
+    unit's existing channel in the managed set, because a stream failing
+    right now says nothing about whether the operator still wants the
+    channel.
     """
 
     units: tuple[PromotionUnit, ...]
@@ -249,6 +352,9 @@ class PromotionPlan:
     cap: int
     target_group_id: int | None
     skipped_past_units: tuple[PromotionUnit, ...] = ()
+    skipped_early_units: tuple[PromotionUnit, ...] = ()
+    all_dead_units: tuple[PromotionUnit, ...] = ()
+    dead_streams_skipped: int = 0
 
     @property
     def capped(self) -> bool:
@@ -282,6 +388,14 @@ class PromotionPlan:
         )
 
     @property
+    def skipped_early(self) -> int:
+        return len(self.skipped_early_units)
+
+    @property
+    def skipped_all_dead(self) -> int:
+        return len(self.all_dead_units)
+
+    @property
     def would_create(self) -> int:
         return sum(1 for u in self.units if u.action == PROMOTE_ACTION_CREATE)
 
@@ -306,12 +420,113 @@ def _row_sort_key(row) -> tuple:
     )
 
 
+def _is_dateless(row) -> bool:
+    """Was this row's date fabricated from "now" rather than parsed?"""
+    return (
+        row.result.parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES
+    )
+
+
+def _fold_nearby_starts(
+    by_key: dict[str, list],
+    window_minutes: int,
+    existing_name_to_id: dict[str, int],
+) -> dict[str, list]:
+    """Fold same-title event keys whose starts are close into one key.
+
+    Two providers carrying the same event rarely agree on its start to the
+    minute: one publishes the broadcast time, the next the undercard, and a
+    fifteen-minute disagreement used to mint two channels for one event.
+    Keys are folded when BOTH hold:
+
+    * the cleaned titles are byte-equal (the fold never guesses that two
+      spellings mean the same event, it only forgives the clock); and
+    * the starts are no further apart than ``window_minutes``, or than
+      :data:`MAX_CLUSTER_WINDOW_MINUTES` when the rule asks for more. The
+      caller passes its own ``time_window_minutes`` straight through and
+      this is the only place that ceiling applies, so a rule keeps the full
+      window it was given for attaching and no setting can make the fold
+      reach across a day. See the constant for the numbers behind it.
+
+    A dateless key is never folded. Its date came from "now", so its start
+    carries no information about which event it is, and folding on a clock
+    alone would join two unrelated recurring slots.
+
+    Distance is measured from the EARLIEST start in a cluster, not from the
+    previous key, so a long chain of events each just inside the window
+    cannot walk a cluster across hours.
+
+    One key of each cluster survives and names the channel. It is the
+    earliest start, EXCEPT that a key whose derived name already has a
+    channel in the target group wins over one that does not: a provider
+    dropping its earlier listing would otherwise rename the channel, which
+    reads downstream as one channel retired and another created. Ties go to
+    byte order on the key, so preview and run choose the same survivor for
+    identical inputs.
+
+    Returns a new ``key -> rows`` map with each list sorted by
+    :func:`_row_sort_key` and the surviving key's own rows first, so the
+    caller can read the unit's identity off element zero. A key with
+    nothing to fold into keeps exactly the rows it had.
+    """
+    window = timedelta(
+        minutes=min(max(0, window_minutes), MAX_CLUSTER_WINDOW_MINUTES)
+    )
+    by_title: dict[str, list[str]] = {}
+    folded: dict[str, list] = {}
+    sorted_rows = {
+        key: sorted(rows, key=_row_sort_key)
+        for key, rows in by_key.items()
+    }
+    for key, rows in sorted_rows.items():
+        if _is_dateless(rows[0]):
+            folded[key] = list(rows)
+            continue
+        # Everything before the LAST separator is the cleaned title; the
+        # tail is the UTC start master_event_key appends.
+        by_title.setdefault(key.rsplit("|", 1)[0], []).append(key)
+
+    def _start(key: str) -> datetime:
+        return sorted_rows[key][0].result.parsed.start
+
+    def _already_has_a_channel(key: str) -> bool:
+        name = promoted_channel_name(sorted_rows[key][0].result.parsed)
+        return name is not None and name.lower() in existing_name_to_id
+
+    def _keep(cluster: list[str]) -> None:
+        survivor = min(
+            cluster,
+            key=lambda k: (not _already_has_a_channel(k), _start(k), k),
+        )
+        rows = list(sorted_rows[survivor])
+        for key in cluster:
+            if key != survivor:
+                rows.extend(sorted_rows[key])
+        folded[survivor] = rows
+
+    for title_keys in by_title.values():
+        cluster: list[str] = []
+        anchor_start: datetime | None = None
+        for key in sorted(title_keys, key=lambda k: (_start(k), k)):
+            if anchor_start is None or _start(key) - anchor_start > window:
+                if cluster:
+                    _keep(cluster)
+                cluster = [key]
+                anchor_start = _start(key)
+            else:
+                cluster.append(key)
+        if cluster:
+            _keep(cluster)
+    return folded
+
+
 def build_promotion_plan(
     config: dict,
     resolved,
     existing_name_to_id: dict[str, int],
     *,
     now: datetime | None = None,
+    dead_stream_ids: set[int] | None = None,
 ) -> PromotionPlan:
     """Build the promotion plan for one rule's resolved streams.
 
@@ -332,10 +547,17 @@ def build_promotion_plan(
             ``channel_number_prefix.channel_name_to_id`` builds exactly
             that map, and only the caller can see whether the settings
             write a prefix at all.
-        now: tz-aware anchor for ``skip_past_events``. Defaults to the
-            current UTC time, and is read ONLY when the rule turned that
-            flag on — a config without it never touches a clock. Injectable
-            so tests are deterministic.
+        now: tz-aware anchor for ``skip_past_events`` and
+            ``promote_lead_hours``. Defaults to the current UTC time, and
+            is read ONLY when the rule turned one of those on — a config
+            with neither never touches a clock. Injectable so tests are
+            deterministic.
+        dead_stream_ids: Stream ids the caller's health check just failed,
+            or ``None`` when the rule did not ask for one. Each such stream
+            leaves its unit's attach list; a unit left with none is dropped
+            into ``all_dead_units``. The check itself lives with the
+            caller because it reads the database and talks to the provider,
+            and this module stays pure.
 
     ``skip_past_events`` is applied BEFORE the cap so finished events cannot
     spend create budget that a live event needs, and to units of EITHER
@@ -343,6 +565,28 @@ def build_promotion_plan(
     the run's managed set and reaches Pass 4's ``orphan_action`` — see the
     module docstring for why that clock-driven delete is deliberate and
     what guards it.
+
+    ``promote_lead_hours`` is applied next and to CREATE units only, so an
+    event that already has a channel keeps it however far away it is. It
+    runs before the cap for the same reason the past filter does: an event
+    a fortnight out must not spend the budget tonight's event needs.
+
+    **The health filter runs dead last, after the cap**, so the caller only
+    ever has to check the handful of streams this run will really turn into
+    channels. Probing is by far the most expensive thing on this path, and
+    every cheap filter above throws work away before it: on a live rule the
+    finished-event filter alone took the candidate list from around 1,100
+    streams to around 59. Two things follow, and both are deliberate:
+
+    * ``dead_streams_skipped`` and ``skipped_all_dead`` count only among
+      the streams that survived every earlier filter. They are NOT
+      whole-playlist health figures and must not be read as any.
+    * a unit that turns out to have no working stream **has already spent
+      its cap slot**. The alternative, capping after the health check,
+      would hand the freed slot to a unit nobody probed, so the run would
+      create a channel for a stream it never checked — which is the thing
+      the health check exists to prevent. A wasted slot costs one deferred
+      event on an idempotent run; an unchecked create costs a dead channel.
 
     Determinism: units are ordered by event key (byte order), so cap
     trimming selects the same units on preview and run for identical
@@ -358,8 +602,20 @@ def build_promotion_plan(
     grace_hours = config.get(
         "past_event_grace_hours", DEFAULT_PAST_EVENT_GRACE_HOURS
     )
-    if skip_past and now is None:
+    lead_hours = config.get("promote_lead_hours")
+    if (skip_past or lead_hours is not None) and now is None:
         now = datetime.now(timezone.utc)
+    # Clustering forgives a clock disagreement of up to the rule's own
+    # matching window, and no further than MAX_CLUSTER_WINDOW_MINUTES —
+    # the fold applies that ceiling itself, so what is read here is the
+    # operator's setting unaltered and the attach path keeps all of it.
+    # enforce_time_window is deliberately NOT consulted: it governs whether
+    # a time mismatch may block an ATTACH to a master, and a rule that
+    # switched it off still must not end up with every week of a weekly
+    # show on one channel.
+    window_minutes = config.get(
+        "time_window_minutes", DEFAULT_TIME_WINDOW_MINUTES
+    )
 
     by_key: dict[str, list] = {}
     for row in resolved:
@@ -372,15 +628,27 @@ def build_promotion_plan(
             # above).
             continue
         by_key.setdefault(key, []).append(row)
+    by_key = _fold_nearby_starts(
+        by_key, window_minutes, existing_name_to_id
+    )
 
     units: list[PromotionUnit] = []
     capped_units: list[PromotionUnit] = []
     skipped_past_units: list[PromotionUnit] = []
+    skipped_early_units: list[PromotionUnit] = []
+    all_dead_units: list[PromotionUnit] = []
+    dead_streams_skipped = 0
     creates = 0
     planned_names: dict[str, str] = {}  # lowercased name -> first event key
     for key in sorted(by_key):
-        rows = sorted(by_key[key], key=_row_sort_key)
-        parsed = rows[0].result.parsed
+        clustered = by_key[key]
+        # The identity comes from element zero, which is the surviving
+        # key's own lowest-sorting row. After a fold the rest of the list
+        # carries a different start, so reading the identity off whatever
+        # sorts first would name the channel after a listing the key does
+        # not belong to.
+        parsed = clustered[0].result.parsed
+        rows = sorted(clustered, key=_row_sort_key)
         name = promoted_channel_name(parsed)
         if name is None:  # pragma: no cover — key is None first
             continue
@@ -408,11 +676,40 @@ def build_promotion_plan(
             # is what hands it to Pass 4's orphan_action. [20]
             skipped_past_units.append(unit)
             continue
+        if (
+            lead_hours is not None
+            and now is not None
+            and action == PROMOTE_ACTION_CREATE
+            and event_is_early(parsed, lead_hours, now)
+        ):
+            # CREATE units only. An event that already has a channel is
+            # never taken back off the operator for being far away.
+            skipped_early_units.append(unit)
+            continue
         if action == PROMOTE_ACTION_CREATE:
             if cap and creates >= cap:
                 capped_units.append(unit)
                 continue
             creates += 1
+        if dead_stream_ids:
+            live_rows = [
+                r for r in unit.rows
+                if r.stream.stream_id not in dead_stream_ids
+            ]
+            dropped = len(unit.rows) - len(live_rows)
+            if dropped:
+                dead_streams_skipped += dropped
+                if not live_rows:
+                    # No working stream behind this event. The unit is not
+                    # realized, and the CALLER keeps any channel it already
+                    # has in the managed set — health blocks creates and
+                    # attaches, it never retires a channel.
+                    all_dead_units.append(unit)
+                    continue
+                unit = replace(unit, rows=tuple(live_rows))
+        # Claimed by the unit that is actually realized, so a name whose
+        # unit lost every stream is not treated as already planned.
+        if action == PROMOTE_ACTION_CREATE:
             planned_names[name_lower] = key
         units.append(unit)
 
@@ -422,4 +719,7 @@ def build_promotion_plan(
         cap=cap,
         target_group_id=target_group_id,
         skipped_past_units=tuple(skipped_past_units),
+        skipped_early_units=tuple(skipped_early_units),
+        all_dead_units=tuple(all_dead_units),
+        dead_streams_skipped=dead_streams_skipped,
     )

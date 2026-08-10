@@ -887,3 +887,63 @@ class TestSkipPastEventsKeys:
         message = next(e for e in errors if "past_event_grace_hours" in e)
         assert "between 0 and 72" in message
         assert "in progress" in message
+
+
+class TestPromoteLeadHours:
+    """The lead-time window. Absent means no limit and is never filled."""
+
+    def test_absent_key_stays_absent(self):
+        config = _valid_config()
+        assert validate_event_sync_config(config) == []
+        assert "promote_lead_hours" not in config
+
+    def test_bounds_accepted(self):
+        from services.event_sync_promote import (
+            MAX_PROMOTE_LEAD_HOURS,
+            MIN_PROMOTE_LEAD_HOURS,
+        )
+
+        for good in (MIN_PROMOTE_LEAD_HOURS, 24, MAX_PROMOTE_LEAD_HOURS):
+            config = _valid_config(promote_lead_hours=good)
+            assert validate_event_sync_config(config) == []
+            assert config["promote_lead_hours"] == good
+
+    @pytest.mark.parametrize("bad", [0, -1, 721, True, "24", 2.5])
+    def test_out_of_range_or_wrong_type_rejected(self, bad):
+        config = _valid_config(promote_lead_hours=bad)
+        errors = validate_event_sync_config(config)
+        assert any("promote_lead_hours" in e for e in errors)
+
+    def test_error_message_teaches_the_range_and_the_create_only_rule(self):
+        config = _valid_config(promote_lead_hours=5000)
+        errors = validate_event_sync_config(config)
+        message = next(e for e in errors if "promote_lead_hours" in e)
+        assert "between 1 and 720" in message
+        assert "already HAS a channel" in message
+
+
+class TestSkipDeadStreams:
+    """The stream-health gate. Opt-in, and absent means invisible."""
+
+    def test_absent_key_stays_absent(self):
+        config = _valid_config()
+        assert validate_event_sync_config(config) == []
+        assert "skip_dead_streams" not in config
+
+    def test_bool_accepted(self):
+        for good in (True, False):
+            config = _valid_config(skip_dead_streams=good)
+            assert validate_event_sync_config(config) == []
+            assert config["skip_dead_streams"] is good
+
+    @pytest.mark.parametrize("bad", ["yes", 1, 0, 2.5])
+    def test_non_bool_rejected(self, bad):
+        config = _valid_config(skip_dead_streams=bad)
+        errors = validate_event_sync_config(config)
+        assert any("skip_dead_streams" in e for e in errors)
+
+    def test_error_message_says_it_never_deletes(self):
+        config = _valid_config(skip_dead_streams="yes")
+        errors = validate_event_sync_config(config)
+        message = next(e for e in errors if "skip_dead_streams" in e)
+        assert "never deletes a channel" in message

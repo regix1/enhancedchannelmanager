@@ -173,6 +173,23 @@ export interface EventSyncConfig {
    * so this is what keeps a broadcast in progress from being dropped.
    */
   past_event_grace_hours?: number;
+  /**
+   * When true, the run checks that the streams it is about to turn into
+   * channels can actually play, and leaves out the ones that fail. An event
+   * whose streams all fail gets no channel. A channel that already exists is
+   * never removed because a stream failed. The check contacts the provider,
+   * so it adds time to every run. Absent means the check is off.
+   */
+  skip_dead_streams?: boolean;
+  /**
+   * How far ahead of its start time an event may be promoted (1..720).
+   * An event further away than this is left alone and picked up on a later
+   * run. Absent means there is no lead limit, so an event promotes as soon
+   * as it parses. Gates CREATES only: a channel that already exists is
+   * never removed for being far away, because that would delete and
+   * recreate the same channel every day.
+   */
+  promote_lead_hours?: number;
 }
 
 // =============================================================================
@@ -372,6 +389,20 @@ export interface EventSyncUnmatchedStream {
    * leaves the set this rule manages and the rule's orphan cleanup decides
    * its fate. Only ever set alongside `promote_skipped_past`. */
   promote_skipped_past_adopted?: boolean;
+  /** True when `promote_lead_hours` held this event back because its start
+   * is further ahead than the lead window. Like `promote_capped` and unlike
+   * `promote_skipped_past`, it re-surfaces on a later run. Absent on a
+   * backend without the lead window. */
+  promote_skipped_early?: boolean;
+  /** True when this stream failed its health check. On its own it means the
+   * event still promotes on the streams that passed; alongside
+   * `promote_skipped_all_dead` it means nothing was left to attach. Absent
+   * on a backend without the health check. */
+  promote_stream_dead?: boolean;
+  /** True when EVERY stream behind this event failed its health check, so
+   * no channel is created. A channel the event already has is never retired
+   * for this. Only ever set alongside `promote_stream_dead`. */
+  promote_skipped_all_dead?: boolean;
 }
 
 /** bead ti939.4.1: one stream inside a promotion unit. */
@@ -416,6 +447,27 @@ export interface EventSyncPromotionPreview {
    * leaves the set this rule manages, so the rule's orphan cleanup decides
    * what happens to the channel. Always a subset of `skipped_past`. */
   skipped_past_adopted: number;
+  /**
+   * How many events are not promoted yet because their start is further
+   * ahead than `promote_lead_hours`. Each one comes back on a later run.
+   * 0 when no lead limit is set.
+   *
+   * This and the two health counts below are OPTIONAL, unlike the two
+   * skipped-past counts above: a backend built before the lead window and
+   * the stream health check omits them entirely, and the frontend can be
+   * deployed on its own (`scripts/deploy-frontend.sh`). Every reader
+   * defaults a missing count to 0 rather than rendering `undefined`.
+   */
+  skipped_early?: number;
+  /** How many individual streams were dropped because a health check could
+   * not play them. Their events still promote on the streams that passed.
+   * Absent on a backend without the health check. */
+  dead_streams_skipped?: number;
+  /** How many events were dropped because EVERY stream behind them failed
+   * the health check, leaving nothing to attach. Failing health blocks a
+   * new channel; it never retires one that already exists. Absent on a
+   * backend without the health check. */
+  skipped_all_dead?: number;
   units: EventSyncPromotionUnit[];
 }
 

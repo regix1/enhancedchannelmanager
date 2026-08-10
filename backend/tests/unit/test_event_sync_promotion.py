@@ -64,11 +64,13 @@ from channel_number_prefix import (
 )
 from services.event_sync_promote import (
     DEFAULT_MAX_PROMOTE_PER_RUN,
+    MAX_CLUSTER_WINDOW_MINUTES,
     PROMOTE_ACTION_ATTACH_EXISTING,
     PROMOTE_ACTION_CREATE,
     PromotionPlan,
     PromotionUnit,
     build_promotion_plan,
+    event_is_early,
     event_is_past,
     promoted_channel_name,
 )
@@ -616,6 +618,555 @@ class TestSkipPastEvents:
             plan = build_promotion_plan(_promote_config(), rows, {})
             assert fake_clock.now.call_count == 0
         assert plan.would_create == 1
+
+
+class TestClusteringAcrossProviderClocks:
+    """Two providers listing one event at slightly different times.
+
+    One provider publishes the broadcast start and the next the undercard,
+    so the same race shows up as 7:15 pm on one and 7:30 pm on the other.
+    Each spelling used to mint its own channel. Clustering forgives a
+    disagreement up to the rule's own time window and no further than
+    ``MAX_CLUSTER_WINDOW_MINUTES``, so two genuinely different events are
+    never joined.
+    """
+
+    RACE = EASTERN.localize(datetime(2026, 8, 9, 19, 15))
+
+    def _minutes_later(self, minutes):
+        return self.RACE + timedelta(minutes=minutes)
+
+    def test_same_title_a_quarter_hour_apart_forms_one_unit(self):
+        """The measured case: one race, two providers, 15 minutes apart."""
+        rows = [
+            _resolved("DIRTVISION 01 : Knoxville Raceway 7:15 pm",
+                      DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self.RACE),
+                      provider_id=2, stream_id=301),
+            _resolved("PPV EVENT 04: Knoxville Raceway 7:30 PM ET",
+                      DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(15)),
+                      provider_id=3, stream_id=555),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 1
+        assert [r.stream.stream_id for r in plan.units[0].rows] == [301, 555]
+
+    def test_the_earliest_start_names_the_channel(self):
+        """The representative is the earliest start, so the channel name
+        and the surviving event key do not depend on which provider the
+        fetch happened to return first."""
+        early = _parsed("Knoxville Raceway", self.RACE)
+        late = _parsed("Knoxville Raceway", self._minutes_later(15))
+        forward = [
+            _resolved("a", DISPOSITION_UNMATCHED, early, stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED, late, stream_id=2),
+        ]
+        backward = list(reversed(forward))
+        for rows in (forward, backward):
+            plan = build_promotion_plan(_promote_config(), rows, {})
+            assert len(plan.units) == 1
+            assert plan.units[0].channel_name == promoted_channel_name(early)
+            assert plan.units[0].event_key == master_event_key(early)
+
+    def test_the_name_follows_the_surviving_key_not_the_stream_order(self):
+        """Streams are ordered by provider and id for attaching, which has
+        nothing to do with which listing the channel is named after. Here
+        the LATER listing sorts first, and the name must still be the
+        earlier one's."""
+        early = _parsed("Knoxville Raceway", self.RACE)
+        rows = [
+            _resolved("late but first in stream order",
+                      DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(15)),
+                      provider_id=1, stream_id=1),
+            _resolved("early but last in stream order",
+                      DISPOSITION_UNMATCHED, early,
+                      provider_id=9, stream_id=999),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 1
+        assert plan.units[0].channel_name == promoted_channel_name(early)
+        assert plan.units[0].event_key == master_event_key(early)
+        # Attach order is still by provider and stream id.
+        assert [r.stream.stream_id for r in plan.units[0].rows] == [1, 999]
+
+    def test_an_existing_channel_outranks_the_earliest_start(self):
+        """A provider dropping its earlier listing must not rename the
+        channel. A key whose channel already exists survives the fold, so
+        the run adopts instead of creating a second one and retiring the
+        first."""
+        late = _parsed("Knoxville Raceway", self._minutes_later(15))
+        rows = [
+            _resolved("earlier listing", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self.RACE), stream_id=1),
+            _resolved("later listing", DISPOSITION_UNMATCHED, late,
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(), rows,
+            {promoted_channel_name(late).lower(): 915},
+        )
+        assert len(plan.units) == 1
+        assert plan.units[0].channel_name == promoted_channel_name(late)
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units[0].existing_channel_id == 915
+
+    def test_starts_beyond_the_window_stay_apart(self):
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self.RACE), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(45)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 2
+
+    def test_a_chain_of_near_starts_cannot_walk_across_the_window(self):
+        """Distance is measured from the cluster's earliest start, not from
+        the previous event, so twenty-minute steps cannot drag an hour of
+        the schedule onto one channel."""
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self.RACE), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(20)),
+                      stream_id=2),
+            _resolved("c", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(40)),
+                      stream_id=3),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 2
+        assert [len(u.rows) for u in plan.units] == [2, 1]
+
+    def test_a_weekly_show_never_collapses(self):
+        """Seven days apart is outside any window a rule can configure."""
+        aug12 = EASTERN.localize(datetime(2026, 8, 12, 20, 0))
+        rows = [
+            _resolved("AEW Dynamite Aug 12", DISPOSITION_UNMATCHED,
+                      _parsed("Aew Dynamite", aug12), stream_id=1),
+            _resolved("AEW Dynamite Aug 19", DISPOSITION_UNMATCHED,
+                      _parsed("Aew Dynamite", aug12 + timedelta(days=7)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(time_window_minutes=1440), rows, {}
+        )
+        assert len(plan.units) == 2
+
+    def test_practice_and_qualifying_stay_apart(self):
+        """Different sessions of one meeting carry different titles, so the
+        title test alone keeps them on their own channels even when they
+        start minutes apart."""
+        rows = [
+            _resolved("FP3", DISPOSITION_UNMATCHED,
+                      _parsed("Free Practice 3 Fia Wec Lone Star Le Mans",
+                              self.RACE),
+                      stream_id=1),
+            _resolved("Qualifying", DISPOSITION_UNMATCHED,
+                      _parsed("Qualifying Fia Wec Lone Star Le Mans",
+                              self._minutes_later(10)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 2
+
+    def test_dateless_slots_never_fold(self):
+        """A dateless start was fabricated from "now", so its clock says
+        nothing about which event it is and folding on it would join two
+        unrelated recurring slots."""
+        rows = [
+            _resolved("slot a", DISPOSITION_UNMATCHED,
+                      _parsed("Ppv Event", self.RACE,
+                              matched_pattern="dateless-title-time-ampm"),
+                      stream_id=1),
+            _resolved("slot b", DISPOSITION_UNMATCHED,
+                      _parsed("Ppv Event", self._minutes_later(15),
+                              matched_pattern="dateless-title-time-ampm"),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 2
+
+    def test_enforce_time_window_off_still_keeps_the_days_apart(self):
+        """``enforce_time_window`` governs whether a clock mismatch may
+        block an attach to a master. Clustering keeps using the window
+        regardless, because a rule that switched it off must not end up
+        with a whole season on one channel."""
+        aug12 = EASTERN.localize(datetime(2026, 8, 12, 20, 0))
+        rows = [
+            _resolved("week 1", DISPOSITION_UNMATCHED,
+                      _parsed("Aew Dynamite", aug12), stream_id=1),
+            _resolved("week 2", DISPOSITION_UNMATCHED,
+                      _parsed("Aew Dynamite", aug12 + timedelta(days=7)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(enforce_time_window=False), rows, {}
+        )
+        assert len(plan.units) == 2
+
+    def test_a_folded_unit_adopts_the_channel_of_its_earliest_start(self):
+        """Idempotence across the fold: the run after the one that created
+        the channel derives the same name and adopts it."""
+        early = _parsed("Knoxville Raceway", self.RACE)
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED, early, stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self._minutes_later(15)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(), rows,
+            {promoted_channel_name(early).lower(): 910},
+        )
+        assert len(plan.units) == 1
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units[0].existing_channel_id == 910
+
+    def test_the_ceiling_still_folds_at_its_own_boundary(self):
+        """A rule asking for more than the ceiling keeps folding right up to
+        it. An hour is the coarsest clock disagreement the fold forgives, so
+        two providers exactly that far apart are still one event."""
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway", self.RACE), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Knoxville Raceway",
+                              self._minutes_later(MAX_CLUSTER_WINDOW_MINUTES)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(time_window_minutes=1440), rows, {}
+        )
+        assert len(plan.units) == 1
+
+    def test_the_ceiling_holds_back_to_back_sessions_apart(self):
+        """Measured on live data: two BMX park sessions two hours apart are
+        different events. ``time_window_minutes`` is legal all the way to
+        1440, so without a ceiling of its own the fold would put them on one
+        channel."""
+        rows = [
+            _resolved("womens park", DISPOSITION_UNMATCHED,
+                      _parsed("Park Birmingham Uci Bmx Freestyle",
+                              EASTERN.localize(datetime(2026, 8, 9, 16, 45))),
+                      stream_id=1),
+            _resolved("mens park", DISPOSITION_UNMATCHED,
+                      _parsed("Park Birmingham Uci Bmx Freestyle",
+                              EASTERN.localize(datetime(2026, 8, 9, 18, 45))),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(time_window_minutes=1440), rows, {}
+        )
+        assert len(plan.units) == 2
+
+    def test_no_setting_merges_two_days_of_one_tournament(self):
+        """The rule the ceiling exists to keep: nothing folds across a day,
+        whatever the operator set. Measured on live data, where the same
+        tennis session ran at 12:30 on two consecutive days and the maximum
+        window put both on one channel."""
+        aug8 = EASTERN.localize(datetime(2026, 8, 8, 12, 30))
+        rows = [
+            _resolved("day 1", DISPOSITION_UNMATCHED,
+                      _parsed("Wta National Bank Open Womens Day Session",
+                              aug8),
+                      stream_id=1),
+            _resolved("day 2", DISPOSITION_UNMATCHED,
+                      _parsed("Wta National Bank Open Womens Day Session",
+                              aug8 + timedelta(days=1)),
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(time_window_minutes=1440), rows, {}
+        )
+        assert len(plan.units) == 2
+
+
+class TestPromoteLeadHours:
+    """``promote_lead_hours``: an event still days away waits its turn.
+
+    Providers publish a show days before it airs, so without a lead window
+    a channel for next week's card sits in the group all week. This is the
+    mirror of ``skip_past_events`` with one deliberate difference: it gates
+    CREATES ONLY. Un-promoting a far-off event that already has a channel
+    would delete and recreate the same channel every day.
+    """
+
+    SOON = EASTERN.localize(datetime(2026, 7, 12, 8, 0))
+    FAR = EASTERN.localize(datetime(2026, 7, 26, 20, 0))
+
+    def _lead_config(self, hours=24, **overrides):
+        return _promote_config(promote_lead_hours=hours, **overrides)
+
+    def test_event_beyond_the_window_is_not_created(self):
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED,
+                      _parsed("Aew All In", self.FAR)),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.units == ()
+        assert plan.skipped_early == 1
+        assert plan.would_create == 0
+
+    def test_event_inside_the_window_is_created(self):
+        rows = [
+            _resolved("soon", DISPOSITION_UNMATCHED,
+                      _parsed("Aew Dynamite", self.SOON)),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.skipped_early == 0
+        assert plan.would_create == 1
+
+    def test_the_window_boundary_is_the_only_thing_separating_the_two(self):
+        """The boundary is INCLUSIVE: an event exactly ``lead_hours`` away
+        is created, matching ``event_is_past``, where an event exactly at
+        its grace boundary has not finished yet. Bracketing at a minute
+        either side alone would let a ``>=`` slip through, so the exact
+        hour is pinned too."""
+        just_inside = FROZEN_NOW + timedelta(hours=23, minutes=59)
+        exactly_at = FROZEN_NOW + timedelta(hours=24)
+        just_outside = FROZEN_NOW + timedelta(hours=24, minutes=1)
+        assert event_is_early(
+            _parsed("x", just_inside), 24, FROZEN_NOW) is False
+        assert event_is_early(
+            _parsed("x", exactly_at), 24, FROZEN_NOW) is False
+        assert event_is_early(
+            _parsed("x", just_outside), 24, FROZEN_NOW) is True
+
+    def test_an_existing_channel_is_never_taken_back(self):
+        """The create-only rule, stated as the thing it protects: a far-off
+        event that already has a channel keeps it, so the channel is not
+        deleted tonight and recreated tomorrow."""
+        parsed = _parsed("Aew All In", self.FAR)
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED, parsed),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(), rows,
+            {promoted_channel_name(parsed).lower(): 920},
+            now=FROZEN_NOW,
+        )
+        assert plan.skipped_early == 0
+        assert len(plan.units) == 1
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units[0].existing_channel_id == 920
+
+    def test_dateless_event_is_never_held_back(self):
+        """The date was fabricated from "now", so an early-vs-late verdict
+        on it says nothing about the event."""
+        rows = [
+            _resolved("slot", DISPOSITION_UNMATCHED,
+                      _parsed("Ppv Event", self.FAR,
+                              matched_pattern="dateless-title-time-ampm")),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.skipped_early == 0
+        assert plan.would_create == 1
+
+    def test_event_with_no_parsed_start_is_never_early(self):
+        parsed = ParsedEvent(raw_name="no time here", title="Fury vs. Usyk",
+                             start=None, teams=None, matched_pattern=None)
+        assert event_is_early(parsed, 24, FROZEN_NOW) is False
+
+    def test_early_events_do_not_spend_cap_budget(self):
+        """Held-back events must not starve tonight's events of create
+        slots, so the lead filter runs before the cap."""
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Alpha Event", self.FAR), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Beta Event", self.FAR), stream_id=2),
+            _resolved("c", DISPOSITION_UNMATCHED,
+                      _parsed("Gamma Event", self.SOON), stream_id=3),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(max_promote_per_run=1), rows, {},
+            now=FROZEN_NOW,
+        )
+        assert plan.skipped_early == 2
+        assert plan.capped is False
+        assert [u.rows[0].result.parsed.title
+                for u in plan.units] == ["Gamma Event"]
+
+    def test_absent_key_promotes_an_event_however_far_away(self):
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED,
+                      _parsed("Aew All In", self.FAR)),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(), rows, {}, now=FROZEN_NOW
+        )
+        assert plan.skipped_early == 0
+        assert plan.would_create == 1
+
+    def test_absent_key_never_reads_a_clock(self):
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED,
+                      _parsed("Aew All In", self.FAR)),
+        ]
+        with patch("services.event_sync_promote.datetime") as fake_clock:
+            plan = build_promotion_plan(_promote_config(), rows, {})
+            assert fake_clock.now.call_count == 0
+        assert plan.would_create == 1
+
+
+class TestDeadStreamsAreNotPromoted:
+    """``skip_dead_streams`` at the planning layer.
+
+    The caller checks the health of the streams the plan is about to turn
+    into channels and hands the failures back here. A unit keeps promoting
+    on its survivors; a unit with no survivor is not realized. Neither
+    outcome deletes anything — the unit that loses every stream still
+    carries the id of the channel it already has, which is what the
+    executor puts back into the run's managed set.
+    """
+
+    def _rows(self):
+        return [
+            _resolved("dead one", DISPOSITION_UNMATCHED,
+                      _parsed("Fury vs. Usyk", START),
+                      provider_id=2, stream_id=301),
+            _resolved("working one", DISPOSITION_UNMATCHED,
+                      _parsed("Fury vs. Usyk", START),
+                      provider_id=3, stream_id=555),
+        ]
+
+    def test_a_dead_stream_leaves_the_attach_list(self):
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True), self._rows(), {},
+            dead_stream_ids={301},
+        )
+        assert len(plan.units) == 1
+        assert [r.stream.stream_id for r in plan.units[0].rows] == [555]
+        assert plan.dead_streams_skipped == 1
+        assert plan.skipped_all_dead == 0
+
+    def test_an_event_with_no_working_stream_is_not_created(self):
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True), self._rows(), {},
+            dead_stream_ids={301, 555},
+        )
+        assert plan.units == ()
+        assert plan.skipped_all_dead == 1
+        assert plan.dead_streams_skipped == 2
+
+    def test_an_all_dead_unit_still_carries_its_existing_channel_id(self):
+        """The rail that keeps a provider outage from deleting channels:
+        the unit is not realized, but it still names the channel the
+        executor has to keep in the managed set."""
+        parsed = _parsed("Fury vs. Usyk", START)
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True), self._rows(),
+            {promoted_channel_name(parsed).lower(): 930},
+            dead_stream_ids={301, 555},
+        )
+        assert plan.units == ()
+        assert plan.all_dead_units[0].existing_channel_id == 930
+
+    def test_an_all_dead_unit_has_already_spent_its_cap_slot(self):
+        """The health check is the LAST gate, so the cap has already been
+        applied when it runs and an all-dead unit's slot is gone for this
+        run. That is the deliberate choice: capping afterwards would hand
+        the freed slot to a unit nobody probed, and the run would create a
+        channel for a stream it never checked. Runs are idempotent, so the
+        deferred event comes back next run."""
+        rows = [
+            _resolved("dead", DISPOSITION_UNMATCHED,
+                      _parsed("Alpha Event", START), stream_id=1),
+            _resolved("live", DISPOSITION_UNMATCHED,
+                      _parsed("Beta Event", START), stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True, max_promote_per_run=1),
+            rows, {}, dead_stream_ids={1},
+        )
+        assert plan.skipped_all_dead == 1
+        assert plan.units == ()
+        assert plan.capped is True
+        assert [u.rows[0].result.parsed.title
+                for u in plan.capped_units] == ["Beta Event"]
+
+    def test_the_cap_decides_before_the_health_check_sees_anything(self):
+        """The order the caller depends on: whatever the cap defers is not
+        in ``plan.units``, so its streams are never probed."""
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED,
+                      _parsed("Alpha Event", START), stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED,
+                      _parsed("Beta Event", START), stream_id=2),
+            _resolved("c", DISPOSITION_UNMATCHED,
+                      _parsed("Gamma Event", START), stream_id=3),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True, max_promote_per_run=1),
+            rows, {},
+        )
+        candidates = [r.stream.stream_id
+                      for u in plan.units for r in u.rows]
+        assert candidates == [1]
+        assert plan.cap_overage == 2
+
+    def test_a_finished_or_early_event_is_never_a_probe_candidate(self):
+        """Both clocks run before the cap, so neither a finished event nor
+        one beyond the lead window reaches the health check."""
+        finished = EASTERN.localize(datetime(2026, 7, 8, 20, 0))
+        far = EASTERN.localize(datetime(2026, 7, 26, 20, 0))
+        soon = EASTERN.localize(datetime(2026, 7, 11, 20, 0))
+        rows = [
+            _resolved("old", DISPOSITION_UNMATCHED,
+                      _parsed("Alpha Event", finished), stream_id=1),
+            _resolved("far", DISPOSITION_UNMATCHED,
+                      _parsed("Beta Event", far), stream_id=2),
+            _resolved("now", DISPOSITION_UNMATCHED,
+                      _parsed("Gamma Event", soon), stream_id=3),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True, skip_past_events=True,
+                            promote_lead_hours=24),
+            rows, {}, now=FROZEN_NOW,
+        )
+        assert plan.skipped_past == 1
+        assert plan.skipped_early == 1
+        candidates = [r.stream.stream_id
+                      for u in plan.units for r in u.rows]
+        assert candidates == [3]
+
+    def test_no_dead_ids_leaves_the_plan_exactly_as_it_was(self):
+        plan = build_promotion_plan(
+            _promote_config(skip_dead_streams=True), self._rows(), {},
+            dead_stream_ids=set(),
+        )
+        assert len(plan.units[0].rows) == 2
+        assert plan.dead_streams_skipped == 0
+        assert plan.skipped_all_dead == 0
+
+    def test_a_finished_event_is_still_retired_when_its_streams_are_dead(self):
+        """Ordering rail: the past filter runs BEFORE the health filter, so
+        a finished event still leaves the managed set instead of being
+        rescued by the health filter's keep-the-channel rule."""
+        finished = EASTERN.localize(datetime(2026, 7, 8, 20, 0))
+        parsed = _parsed("Fury vs. Usyk", finished)
+        rows = [
+            _resolved("old", DISPOSITION_UNMATCHED, parsed, stream_id=301),
+        ]
+        plan = build_promotion_plan(
+            _promote_config(skip_past_events=True, skip_dead_streams=True),
+            rows, {promoted_channel_name(parsed).lower(): 940},
+            now=FROZEN_NOW, dead_stream_ids={301},
+        )
+        assert plan.skipped_past == 1
+        assert plan.skipped_past_adopted == 1
+        assert plan.skipped_all_dead == 0
+        assert plan.all_dead_units == ()
 
 
 # =========================================================================

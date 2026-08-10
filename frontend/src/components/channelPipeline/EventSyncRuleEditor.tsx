@@ -72,6 +72,9 @@ import {
   MAX_TIME_WINDOW_MINUTES,
   DEFAULT_PAST_EVENT_GRACE_HOURS,
   MAX_PAST_EVENT_GRACE_HOURS,
+  DEFAULT_PROMOTE_LEAD_HOURS,
+  MIN_PROMOTE_LEAD_HOURS,
+  MAX_PROMOTE_LEAD_HOURS,
   EVENT_ATTACH_FLOOR,
   clampAttachThreshold,
   selectionIsBuiltinDefaults,
@@ -388,6 +391,23 @@ export function EventSyncRuleEditor({
   );
   const [pastEventGraceText, setPastEventGraceText] = useState(
     String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS)
+  );
+  // Lead-time window. There is no boolean config key here: an absent
+  // promote_lead_hours IS the off state (no limit at all), so the presence
+  // of the stored value is what the box reads from and writes back.
+  // Providers list an event for weeks, so without this a show three weeks
+  // out already has a channel.
+  const [limitPromoteLead, setLimitPromoteLead] = useState(
+    config?.promote_lead_hours != null
+  );
+  const [promoteLeadText, setPromoteLeadText] = useState(
+    String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS)
+  );
+  // Stream health check. Default OFF — the backend treats an absent key as
+  // false. Checking a stream contacts the provider, so a run only pays that
+  // cost when the operator asks for it.
+  const [skipDeadStreams, setSkipDeadStreams] = useState(
+    config?.skip_dead_streams ?? false
   );
   // Phase 2 (ti939.3.3): optional dummy EPG profile auto-assigned to master
   // channels on every run. null = feature off (key omitted on save).
@@ -752,6 +772,35 @@ export function EventSyncRuleEditor({
         )
       );
     }
+    // Lead-time window: an absent key IS the off state on the backend (no
+    // limit at all), so an unticked box emits nothing even when the stored
+    // config carried a value. Writing it back would keep a limit the
+    // operator just turned off. skip_past_events needs the extra
+    // `config?.x != null` half because `false` is expressible there and has
+    // to be written to override a stored true; here there is nothing to
+    // override with but absence.
+    if (limitPromoteLead) {
+      // The schema floor is 1, not 0, so an empty or garbage box falls back
+      // to the default rather than clamping down to a lead that would block
+      // every promotion.
+      const leadEntered = parseInt(promoteLeadText, 10);
+      built.promote_lead_hours = Math.min(
+        MAX_PROMOTE_LEAD_HOURS,
+        Math.max(
+          MIN_PROMOTE_LEAD_HOURS,
+          Number.isFinite(leadEntered)
+            ? leadEntered
+            : DEFAULT_PROMOTE_LEAD_HOURS
+        )
+      );
+    }
+    // Stream health check: same shape as the past-event filter, not the lead
+    // window. `false` is expressible here, so an unticked box still has to be
+    // written back whenever the stored config carries the key — that written
+    // false is what turns a stored true off.
+    if (skipDeadStreams || config?.skip_dead_streams != null) {
+      built.skip_dead_streams = skipDeadStreams;
+    }
 
     // --- Shared patterns (bead z4y4a: full round-trip) -------------------
     // Untouched patterns section + a saved `patterns` array → pass the
@@ -989,6 +1038,10 @@ export function EventSyncRuleEditor({
       skipPastEvents !== (config?.skip_past_events ?? false) ||
       pastEventGraceText !==
         String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS) ||
+      limitPromoteLead !== (config?.promote_lead_hours != null) ||
+      promoteLeadText !==
+        String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS) ||
+      skipDeadStreams !== (config?.skip_dead_streams ?? false) ||
       dummyEpgProfileId !== (config?.dummy_epg_profile_id ?? null) ||
       streamSortField !== (rule?.stream_sort_field ?? '') ||
       streamSortOrder !== (rule?.stream_sort_order === 'asc' ? 'asc' : 'desc')
@@ -999,6 +1052,7 @@ export function EventSyncRuleEditor({
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
     promoteTargetGroupId, skipPastEvents, pastEventGraceText,
+    limitPromoteLead, promoteLeadText, skipDeadStreams,
     dummyEpgProfileId, config, rule,
     initial, customSharedMeta, streamSortField, streamSortOrder,
   ]);
@@ -1150,8 +1204,13 @@ export function EventSyncRuleEditor({
   const streamOrderChanged = streamSortField ? 1 : 0;
   // bead ti939.4.1: the promotion toggle is badge-worthy — the target group
   // is meaningless without it. The past-event filter counts too: it changes
-  // which events get a channel at all.
-  const promotionChanged = (promoteUnmatched ? 1 : 0) + (skipPastEvents ? 1 : 0);
+  // which events get a channel at all, and so do the lead-time window and
+  // the stream health check.
+  const promotionChanged =
+    (promoteUnmatched ? 1 : 0) +
+    (skipPastEvents ? 1 : 0) +
+    (limitPromoteLead ? 1 : 0) +
+    (skipDeadStreams ? 1 : 0);
 
   /** Collapsed-subgroup "N changed" badge (S2). */
   const changedBadge = (count: number) =>
@@ -2281,6 +2340,75 @@ export function EventSyncRuleEditor({
                         mid-broadcast (default{' '}
                         {DEFAULT_PAST_EVENT_GRACE_HOURS}, max{' '}
                         {MAX_PAST_EVENT_GRACE_HOURS}).
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={limitPromoteLead}
+                          onChange={e => setLimitPromoteLead(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-limit-promote-lead"
+                        />
+                        <span>Wait until an event is close before promoting it</span>
+                      </label>
+                      <span className="form-hint">
+                        Off by default, so an event gets its channel as soon
+                        as it shows up in the playlist. Providers list some
+                        events weeks ahead, so a show nobody can watch yet
+                        sits in the channel list the whole time. Turn this on
+                        to hold it back until its start time is near. A
+                        channel that already exists is never taken away for
+                        being far off.
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && limitPromoteLead && (
+                    <div className="form-group">
+                      <label htmlFor={`${id}-promote-lead`}>
+                        Promote this many hours before the start
+                      </label>
+                      <input
+                        id={`${id}-promote-lead`}
+                        type="number"
+                        min={MIN_PROMOTE_LEAD_HOURS}
+                        max={MAX_PROMOTE_LEAD_HOURS}
+                        value={promoteLeadText}
+                        onChange={e => setPromoteLeadText(e.target.value)}
+                        disabled={isLoading}
+                        data-testid="event-sync-promote-lead-hours"
+                      />
+                      <span className="form-hint">
+                        An event further ahead than this is left alone and
+                        picked up on a later run, so nothing is lost by
+                        waiting (default {DEFAULT_PROMOTE_LEAD_HOURS}, max{' '}
+                        {MAX_PROMOTE_LEAD_HOURS}).
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={skipDeadStreams}
+                          onChange={e => setSkipDeadStreams(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-skip-dead-streams"
+                        />
+                        <span>Check that streams play before promoting them</span>
+                      </label>
+                      <span className="form-hint">
+                        Off by default. When this is on, the run checks each
+                        stream it is about to turn into a channel and leaves
+                        out the ones that do not play, so an event whose
+                        streams all fail is not promoted and gets no channel.
+                        The check contacts your provider, so it adds time to
+                        every run. A channel that already exists is never
+                        taken away because a stream failed.
                       </span>
                     </div>
                   )}

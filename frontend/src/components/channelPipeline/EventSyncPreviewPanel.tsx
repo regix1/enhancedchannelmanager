@@ -16,6 +16,7 @@ import { useState } from 'react';
 import type {
   EventSyncPreviewResponse,
   EventSyncStreamRow,
+  EventSyncUnmatchedStream,
 } from '../../types/eventSync';
 import {
   BAND_META,
@@ -93,6 +94,100 @@ function skippedPastAdoptedText(count: number): string {
     'setting decides what happens to them. Orphan cleanup deletes channels ' +
     'by default.'
   );
+}
+
+/**
+ * Events held back by the lead-time window. Nothing is lost, so this reads
+ * as a plain note rather than a warning: the same events come back once
+ * their start time is near enough.
+ */
+function skippedEarlyText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 event is not close enough to its start time to be promoted yet. ' +
+      'It gets its channel on a later run.'
+    );
+  }
+  return (
+    `${count} events are not close enough to their start time to be ` +
+    'promoted yet. They get their channels on a later run.'
+  );
+}
+
+/**
+ * Streams the health check could not play. The event they belong to still
+ * gets its channel, so this is a note about which streams are on it.
+ */
+function deadStreamsSkippedText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 stream was dropped because it failed its health check. The event ' +
+      'it belongs to still promotes, on the streams that passed.'
+    );
+  }
+  return (
+    `${count} streams were dropped because they failed their health check. ` +
+    'The events they belong to still promote, on the streams that passed.'
+  );
+}
+
+/**
+ * The health count that costs the operator an event. Every stream behind
+ * these events failed, so there was nothing to attach and the event is
+ * missing from the plan entirely. It is the first thing to look at when an
+ * expected event is not listed below.
+ */
+function skippedAllDeadText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 event was not promoted because every stream behind it failed its ' +
+      'health check, so there was nothing left to attach.'
+    );
+  }
+  return (
+    `${count} events were not promoted because every stream behind them ` +
+    'failed their health check, so there was nothing left to attach.'
+  );
+}
+
+/**
+ * Why one unmatched row is or is not in the promotion plan, for its cell in
+ * the unmatched table.
+ *
+ * The order matters. A row whose event lost every stream carries both health
+ * flags, so the all-dead reading has to win over the single-stream one or the
+ * operator reads "one stream is bad" about an event that has no streams left.
+ * The final fallback is only reached by a row with no promotion annotation at
+ * all, which is what an incomplete parsed identity looks like. Every other
+ * reason has to be named above it, or a perfectly parsed row gets told its
+ * parse failed.
+ */
+function promotionRowReason(row: EventSyncUnmatchedStream): string {
+  if (row.would_promote) {
+    const kind =
+      row.promote_action === 'attach_existing'
+        ? 'existing channel'
+        : 'new channel';
+    return `Yes — ${kind} '${row.promote_channel_name}'`;
+  }
+  if (row.promote_capped) {
+    return 'Deferred (per-run cap)';
+  }
+  if (row.promote_skipped_past) {
+    return row.promote_skipped_past_adopted
+      ? 'Skipped — event already finished, and this rule stops managing its channel'
+      : 'Skipped — event already finished';
+  }
+  if (row.promote_skipped_early) {
+    return 'Deferred (further ahead than the lead window), so it gets its channel on a later run';
+  }
+  if (row.promote_skipped_all_dead) {
+    return 'Skipped because every stream for this event failed its health check, so there was nothing to attach';
+  }
+  if (row.promote_stream_dead) {
+    return 'Dropped because this stream failed its health check. The event still promotes on the streams that passed';
+  }
+  return 'No — incomplete parsed identity';
 }
 
 function summaryLine(summary: EventSyncPreviewResponse['summary']): string {
@@ -484,21 +579,7 @@ export function EventSyncPreviewPanel({
                             : 'None in time window'}
                         </td>
                         {preview.promotion && (
-                          <td>
-                            {row.would_promote
-                              ? `Yes — ${
-                                  row.promote_action === 'attach_existing'
-                                    ? 'existing channel'
-                                    : 'new channel'
-                                } '${row.promote_channel_name}'`
-                              : row.promote_capped
-                                ? 'Deferred (per-run cap)'
-                                : row.promote_skipped_past
-                                  ? row.promote_skipped_past_adopted
-                                    ? 'Skipped — event already finished, and this rule stops managing its channel'
-                                    : 'Skipped — event already finished'
-                                  : 'No — incomplete parsed identity'}
-                          </td>
+                          <td>{promotionRowReason(row)}</td>
                         )}
                       </tr>
                     ))}
@@ -559,6 +640,42 @@ export function EventSyncPreviewPanel({
                   <span>
                     {skippedPastAdoptedText(
                       preview.promotion.skipped_past_adopted
+                    )}
+                  </span>
+                </div>
+              )}
+              {/* The three counts below ride along only on a backend that
+                  has the lead window and the stream health check. A missing
+                  count reads as 0, so an older backend simply renders
+                  nothing here. */}
+              {(preview.promotion.skipped_early ?? 0) > 0 && (
+                <p
+                  className="form-hint"
+                  data-testid="event-sync-promote-skipped-early"
+                >
+                  {skippedEarlyText(preview.promotion.skipped_early ?? 0)}
+                </p>
+              )}
+              {(preview.promotion.dead_streams_skipped ?? 0) > 0 && (
+                <p
+                  className="form-hint"
+                  data-testid="event-sync-promote-dead-streams-skipped"
+                >
+                  {deadStreamsSkippedText(
+                    preview.promotion.dead_streams_skipped ?? 0
+                  )}
+                </p>
+              )}
+              {(preview.promotion.skipped_all_dead ?? 0) > 0 && (
+                <div
+                  className="warning-message"
+                  role="alert"
+                  data-testid="event-sync-promote-skipped-all-dead"
+                >
+                  <span className="material-icons">warning</span>
+                  <span>
+                    {skippedAllDeadText(
+                      preview.promotion.skipped_all_dead ?? 0
                     )}
                   </span>
                 </div>

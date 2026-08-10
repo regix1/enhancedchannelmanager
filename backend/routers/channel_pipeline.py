@@ -3339,6 +3339,41 @@ async def preview_event_sync(
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id
         )
+
+        if config.get("skip_dead_streams"):
+            # Health the preview can read WITHOUT writing: a probe stores a
+            # row, and this endpoint promises to store nothing, so the
+            # preview reports the verdicts that already exist and the run
+            # is the one that goes and asks the provider. On a rule whose
+            # streams have never been probed the preview therefore shows
+            # none dead and the run may still drop some.
+            from services.event_sync_stream_health import find_dead_streams
+
+            dead = await find_dead_streams([
+                row.stream.stream_id
+                for unit in plan.units for row in unit.rows
+            ])
+            if dead:
+                # Annotate the losing rows from the pre-health plan, which
+                # is the last place they still appear — the replan below
+                # takes them out of their unit. The unit loops that follow
+                # overwrite these entries where they have more to say.
+                for unit in plan.units:
+                    for row in unit.rows:
+                        if row.stream.stream_id in dead:
+                            promote_annotations[
+                                (row.stream.group_id, row.stream.stream_id)
+                            ] = {
+                                "would_promote": False,
+                                "promote_action": None,
+                                "promote_channel_name": unit.channel_name,
+                                "promote_stream_dead": True,
+                            }
+                plan = build_promotion_plan(
+                    config, resolution.resolved, existing_name_to_id,
+                    dead_stream_ids=dead,
+                )
+
         units_out = []
         for unit in plan.units:
             for row in unit.rows:
@@ -3395,6 +3430,31 @@ async def preview_event_sync(
                         unit.existing_channel_id is not None
                     ),
                 }
+        # Lead-time holds: the event is fine, it is just early. Saying so
+        # on the row is the difference between "my rule is broken" and
+        # "it appears the day before".
+        for unit in plan.skipped_early_units:
+            for row in unit.rows:
+                promote_annotations[(row.stream.group_id,
+                                     row.stream.stream_id)] = {
+                    "would_promote": False,
+                    "promote_action": None,
+                    "promote_channel_name": unit.channel_name,
+                    "promote_skipped_early": True,
+                }
+        # Every stream of an all-dead unit is dead by definition, so the
+        # row carries both flags and the operator sees which event lost
+        # its channel and why.
+        for unit in plan.all_dead_units:
+            for row in unit.rows:
+                promote_annotations[(row.stream.group_id,
+                                     row.stream.stream_id)] = {
+                    "would_promote": False,
+                    "promote_action": None,
+                    "promote_channel_name": unit.channel_name,
+                    "promote_stream_dead": True,
+                    "promote_skipped_all_dead": True,
+                }
         promotion_out = {
             "enabled": True,
             "target_group_id": promote_target_group_id,
@@ -3407,6 +3467,9 @@ async def preview_event_sync(
             "cap_overage": plan.cap_overage,
             "skipped_past": plan.skipped_past,
             "skipped_past_adopted": plan.skipped_past_adopted,
+            "skipped_early": plan.skipped_early,
+            "dead_streams_skipped": plan.dead_streams_skipped,
+            "skipped_all_dead": plan.skipped_all_dead,
             "units": units_out,
         }
         # Annotate the unmatched rows in place — the operator reads the
@@ -3429,7 +3492,8 @@ async def preview_event_sync(
         "streams=%d would_attach=%d ambiguous=%d unmatched=%d parse_failed=%d "
         "excluded_by_operator=%d preflight_ok=%s truncated=%s "
         "stale_suspect=%d freshness_unknown=%d snapshot_covered=%d "
-        "would_promote=%s skipped_past=%s skipped_past_adopted=%s",
+        "would_promote=%s skipped_past=%s skipped_past_adopted=%s "
+        "skipped_early=%s dead_streams_skipped=%s skipped_all_dead=%s",
         master_group_id, secondary_group_ids, len(master_channels),
         len(resolution.resolved), counts[DISPOSITION_WOULD_ATTACH],
         counts[DISPOSITION_AMBIGUOUS], counts[DISPOSITION_UNMATCHED],
@@ -3439,6 +3503,9 @@ async def preview_event_sync(
         promotion_out["would_promote"] if promotion_out else "off",
         promotion_out["skipped_past"] if promotion_out else "off",
         promotion_out["skipped_past_adopted"] if promotion_out else "off",
+        promotion_out["skipped_early"] if promotion_out else "off",
+        promotion_out["dead_streams_skipped"] if promotion_out else "off",
+        promotion_out["skipped_all_dead"] if promotion_out else "off",
     )
 
     return {

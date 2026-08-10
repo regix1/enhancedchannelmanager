@@ -727,6 +727,141 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     ).toBeNull();
   });
 
+  it('renders nothing for the lead-window and health counts when they are absent', () => {
+    // The fixture carries no skipped_early / dead_streams_skipped /
+    // skipped_all_dead at all, which is exactly what a backend built before
+    // those features sends. A missing count must read as 0, never as
+    // "undefined events".
+    const preview = promotedPreview();
+    expect(preview.promotion!.skipped_early).toBeUndefined();
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(screen.queryByTestId('event-sync-promote-skipped-early')).toBeNull();
+    expect(
+      screen.queryByTestId('event-sync-promote-dead-streams-skipped')
+    ).toBeNull();
+    expect(
+      screen.queryByTestId('event-sync-promote-skipped-all-dead')
+    ).toBeNull();
+    expect(
+      screen.getByTestId('event-sync-would-promote').textContent
+    ).not.toContain('undefined');
+  });
+
+  it('says how many events are waiting for their start time to come closer', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_early = 12;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    const early = screen.getByTestId('event-sync-promote-skipped-early');
+    expect(early.textContent).toMatch(
+      /12 events are not close enough to their start time to be promoted yet/
+    );
+    // Nothing is lost, so the copy has to say they come back.
+    expect(early.textContent).toMatch(/on a later run/);
+  });
+
+  it('says which streams the health check dropped, and that the event still promotes', () => {
+    const preview = promotedPreview();
+    preview.promotion!.dead_streams_skipped = 7;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    const dead = screen.getByTestId('event-sync-promote-dead-streams-skipped');
+    expect(dead.textContent).toMatch(
+      /7 streams were dropped because they failed their health check/
+    );
+    expect(dead.textContent).toMatch(/still promote, on the streams that passed/);
+  });
+
+  it('warns about the events that lost every stream behind them', () => {
+    const preview = promotedPreview();
+    preview.promotion!.dead_streams_skipped = 9;
+    preview.promotion!.skipped_all_dead = 3;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    // This is the count that answers "why is my event not in the list", so
+    // it stands apart from the per-stream note.
+    const allDead = screen.getByTestId('event-sync-promote-skipped-all-dead');
+    expect(allDead.textContent).toMatch(
+      /3 events were not promoted because every stream behind them failed their health check/
+    );
+    expect(allDead.textContent).toMatch(/nothing left to attach/);
+    expect(allDead).toHaveAttribute('role', 'alert');
+    expect(
+      screen.getByTestId('event-sync-promote-dead-streams-skipped')
+    ).toBeInTheDocument();
+  });
+
+  it('uses the singular for a single early, dead or all-dead count', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_early = 1;
+    preview.promotion!.dead_streams_skipped = 1;
+    preview.promotion!.skipped_all_dead = 1;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-early').textContent
+    ).toMatch(/1 event is not close enough to its start time/);
+    expect(
+      screen.getByTestId('event-sync-promote-dead-streams-skipped').textContent
+    ).toMatch(/1 stream was dropped because it failed its health check/);
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-all-dead').textContent
+    ).toMatch(/1 event was not promoted because every stream behind it failed/);
+  });
+
+  it('stays silent about the lead window and the health check at zero', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_early = 0;
+    preview.promotion!.dead_streams_skipped = 0;
+    preview.promotion!.skipped_all_dead = 0;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(screen.queryByTestId('event-sync-promote-skipped-early')).toBeNull();
+    expect(
+      screen.queryByTestId('event-sync-promote-dead-streams-skipped')
+    ).toBeNull();
+    expect(
+      screen.queryByTestId('event-sync-promote-skipped-all-dead')
+    ).toBeNull();
+  });
+
   it('marks the skipped row whose channel the rule is about to release', () => {
     const preview = promotedPreview();
     preview.promotion!.skipped_past = 2;
@@ -755,6 +890,78 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     expect(
       screen.getByText(/^Skipped — event already finished$/)
     ).toBeInTheDocument();
+  });
+
+  it('names the lead window on a row the lead window held back', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_early = 1;
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_skipped_early = true;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/further ahead than the lead window/)
+    ).toBeInTheDocument();
+    // The held-back row parsed fine, so only the fixture's genuinely
+    // identity-less second row may say otherwise. Two would mean the held
+    // row fell through to the fallback.
+    expect(screen.getAllByText(/incomplete parsed identity/)).toHaveLength(1);
+  });
+
+  it('tells a dropped stream apart from an event that lost every stream', () => {
+    const preview = promotedPreview();
+    preview.promotion!.dead_streams_skipped = 1;
+    preview.promotion!.skipped_all_dead = 1;
+    // One stream failed; its event still promotes on the others.
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_stream_dead = true;
+    // This event lost every stream, so it carries BOTH flags and has to
+    // read as the event being gone, not as one bad stream.
+    preview.unmatched_streams[1].would_promote = false;
+    preview.unmatched_streams[1].promote_action = null;
+    preview.unmatched_streams[1].promote_stream_dead = true;
+    preview.unmatched_streams[1].promote_skipped_all_dead = true;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/Dropped because this stream failed its health check/)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/every stream for this event failed its health check/)
+    ).toBeInTheDocument();
+    // Both rows now carry a health reason, so nothing may fall through.
+    expect(screen.queryByText(/incomplete parsed identity/)).toBeNull();
+  });
+
+  it('still says incomplete parsed identity when no annotation explains the row', () => {
+    // The fixture's second unmatched row has no parsed start and carries no
+    // promotion annotation, which is exactly the case the fallback is for.
+    render(
+      <EventSyncPreviewPanel
+        preview={promotedPreview()}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    // Only the fixture's identity-less row, never the one that promotes.
+    expect(
+      screen.getAllByText(/No — incomplete parsed identity/)
+    ).toHaveLength(1);
   });
 
   it('says nothing about skipped events when none were skipped', () => {

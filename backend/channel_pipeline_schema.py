@@ -815,6 +815,12 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     # the playlist forever) from being promoted to new channels.
     "skip_past_events",
     "past_event_grace_hours",
+    # Lead-time window — keeps an event that is still days away from
+    # getting its channel today.
+    "promote_lead_hours",
+    # Health gate — keeps a stream that does not play from becoming a
+    # channel.
+    "skip_dead_streams",
 })
 
 # Ceiling for event_sync_config.max_attach_per_run. The cap is a blast-radius
@@ -1491,6 +1497,45 @@ def validate_event_sync_config(config: Any) -> list[str]:
                 f"dropped mid-event; only the start time is ever parsed "
                 f"from a provider name, never a duration",
             ))
+
+    # Lead-time window. Providers publish an event days ahead of air, so
+    # without this a channel for next Saturday's show exists all week. The
+    # key is NEVER default-filled: absent means no lead limit, exactly like
+    # the promotion keys above, so a stored rule keeps promoting what it
+    # promoted before.
+    promote_lead_hours = config.get("promote_lead_hours")
+    if promote_lead_hours is not None:
+        from services.event_sync_promote import (
+            MAX_PROMOTE_LEAD_HOURS,
+            MIN_PROMOTE_LEAD_HOURS,
+        )
+        if (isinstance(promote_lead_hours, bool)
+                or not isinstance(promote_lead_hours, int)
+                or not (MIN_PROMOTE_LEAD_HOURS <= promote_lead_hours
+                        <= MAX_PROMOTE_LEAD_HOURS)):
+            errors.append(_event_sync_error(
+                "promote_lead_hours", promote_lead_hours,
+                f"an integer between {MIN_PROMOTE_LEAD_HOURS} and "
+                f"{MAX_PROMOTE_LEAD_HOURS} — how far ahead of its start "
+                f"time an event may get a channel; an event further away "
+                f"than this waits, and an event that already HAS a channel "
+                f"keeps it however far away it is (omit the key for no "
+                f"lead limit)",
+            ))
+
+    # Stream-health gate. Opt-in because it probes the provider, which
+    # costs time a run does not otherwise spend.
+    skip_dead_streams = config.get("skip_dead_streams")
+    if skip_dead_streams is not None and not isinstance(
+            skip_dead_streams, bool):
+        errors.append(_event_sync_error(
+            "skip_dead_streams", skip_dead_streams,
+            "a boolean (default false) — true checks the health of the "
+            "streams a run is about to turn into channels and leaves the "
+            "failures out, creating no channel for an event whose streams "
+            "all fail; it never deletes a channel that already exists "
+            "(omit the key to keep the check off)",
+        ))
 
     if errors:
         logger.warning(
