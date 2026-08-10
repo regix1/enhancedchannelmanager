@@ -99,6 +99,7 @@ class StruckStreamCleanupTask(TaskScheduler):
         client = get_client()
         removed_count = 0
         errors = []
+        kept_intact = []
 
         try:
             start = time.time()
@@ -132,6 +133,18 @@ class StruckStreamCleanupTask(TaskScheduler):
 
                 ch_streams = ch.get("streams", [])
                 filtered = [sid for sid in ch_streams if sid not in struck_set]
+                if ch_streams and not filtered:
+                    # Writing an empty list leaves the channel with nothing to
+                    # play, and nothing here can put the streams back. A channel
+                    # whose streams have all struck out keeps them and is
+                    # reported instead, so the operator decides. [69]
+                    kept_intact.append(ch["id"])
+                    logger.info(
+                        "[%s] Kept %d struck stream(s) on channel %s (%s): removing "
+                        "them would leave it with none",
+                        self.task_id, len(ch_streams), ch["id"], ch.get("name"),
+                    )
+                    continue
                 if len(filtered) < len(ch_streams):
                     removed_here = len(ch_streams) - len(filtered)
                     try:
@@ -172,6 +185,8 @@ class StruckStreamCleanupTask(TaskScheduler):
             }
             if errors:
                 details["errors"] = errors[:20]
+            if kept_intact:
+                details["channels_kept_intact"] = kept_intact[:50]
 
             if self._cancel_requested:
                 return TaskResult(

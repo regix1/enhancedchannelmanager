@@ -99,6 +99,44 @@ class TestStruckStreamCleanupTask:
         assert s20.consecutive_failures == 0
 
     @pytest.mark.asyncio
+    async def test_keeps_a_channel_whose_streams_have_all_struck_out(self, test_session):
+        """A channel is never left with nothing to play."""
+        from models import StreamStats
+
+        test_session.add(StreamStats(stream_id=10, stream_name="s10", probe_status="failed", consecutive_failures=3))
+        test_session.add(StreamStats(stream_id=20, stream_name="s20", probe_status="failed", consecutive_failures=4))
+        test_session.commit()
+
+        task = self._make_task()
+
+        mock_settings = MagicMock()
+        mock_settings.strike_threshold = 3
+
+        mock_client = AsyncMock()
+        mock_client.get_channels = AsyncMock(return_value={
+            "results": [
+                # Every stream struck: removing them would empty the channel.
+                {"id": 1, "name": "ALL STRUCK", "streams": [10, 20]},
+                # One survivor: the struck stream still goes.
+                {"id": 2, "name": "ONE LEFT", "streams": [10, 99]},
+                # Already empty: nothing to do and nothing to report.
+                {"id": 3, "name": "EMPTY", "streams": []},
+            ],
+            "count": 3,
+        })
+        mock_client.update_channel = AsyncMock()
+
+        with patch("tasks.struck_stream_cleanup.get_settings", return_value=mock_settings), \
+             patch("tasks.struck_stream_cleanup.get_session", return_value=test_session), \
+             patch("tasks.struck_stream_cleanup.get_client", return_value=mock_client):
+            result = await task.execute()
+
+        assert result.success is True
+        mock_client.update_channel.assert_called_once_with(2, {"streams": [99]})
+        assert result.details["channels_kept_intact"] == [1]
+        assert result.success_count == 1
+
+    @pytest.mark.asyncio
     async def test_handles_api_error(self, test_session):
         """Client error during channel update returns failure details."""
         from models import StreamStats
@@ -187,7 +225,9 @@ class TestStruckStreamCleanupTask:
 
         page1 = {
             "results": [
-                {"id": 1, "name": "CH1", "streams": [10]},
+                # CH1 carries a survivor so the removal still happens here; a
+                # channel with nothing but struck streams is kept whole. [69]
+                {"id": 1, "name": "CH1", "streams": [10, 60]},
                 {"id": 2, "name": "CH2", "streams": [40]},
             ],
             "count": 3,
@@ -215,7 +255,7 @@ class TestStruckStreamCleanupTask:
         mock_client.get_channels.assert_any_call(page=2, page_size=100)
         # Struck stream 10 removed from CH1 (page 1) and CH3 (page 2); CH2 untouched.
         assert mock_client.update_channel.call_count == 2
-        mock_client.update_channel.assert_any_call(1, {"streams": []})
+        mock_client.update_channel.assert_any_call(1, {"streams": [60]})
         mock_client.update_channel.assert_any_call(3, {"streams": [50]})
         assert result.success_count == 2
 
