@@ -170,6 +170,32 @@ async def find_dead_streams(
     return dead
 
 
+def stale_streams_to_detach(
+    unit_stream_ids: set[int],
+    attached: list[int],
+    stale_stream_ids: set[int],
+    working_stream_ids: set[int],
+) -> list[int]:
+    """Which of one event's delisted streams may leave a channel.
+
+    Empty unless that event has a stream on the channel with a passing
+    probe. A delisted stream that still plays is the only thing serving the
+    event until something has proved it can take over.
+
+    Scoped to the event's own streams, because two events can derive the
+    same channel name and share a channel, and an operator can leave a third
+    party's stream on it. Without the scope one event's passing probe would
+    take away another's only working stream.
+
+    The run detaches exactly this list and the preview reports its length,
+    so the rule lives here rather than in either of them. [75]
+    """
+    on_channel = unit_stream_ids & set(attached)
+    if not on_channel & working_stream_ids:
+        return []
+    return sorted(on_channel & stale_stream_ids)
+
+
 async def find_working_streams(stream_ids) -> set[int]:
     """Return the subset of ``stream_ids`` whose last probe passed.
 

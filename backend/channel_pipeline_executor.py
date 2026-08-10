@@ -4898,6 +4898,7 @@ class ActionExecutor:
         from services.event_sync_stream_health import (
             find_dead_streams,
             find_working_streams,
+            stale_streams_to_detach,
         )
 
         target_group_id = config["promote_target_group_id"]
@@ -5293,42 +5294,35 @@ class ActionExecutor:
                 ]
                 unit_stream_ids = unit_stream_ids_by_key.get(
                     unit.event_key, set())
-                if unit_stream_ids.intersection(
-                    attached
-                ).intersection(working_stream_ids):
-                    # Only this event's own delisted streams. Two events can
-                    # derive the same channel name and share the channel, and
-                    # an operator can leave another event's stream on it, so
-                    # iterating every stale id attached here would let one
-                    # event's passing probe take away another's only stream.
-                    for stale_id in sorted(
-                        unit_stream_ids & set(attached) & set(stale_rows)
-                    ):
-                        stale_row = stale_rows[stale_id]
-                        remove_result = await self._execute_remove_from_channel(
-                            Action(type="remove_from_channel", params={}),
-                            StreamContext(
-                                stream_id=stale_id,
-                                stream_name=stale_row.stream.name,
-                                channel_id=channel_id,
-                            ),
-                            exec_ctx,
-                        )
-                        exec_ctx.add_result(remove_result)
-                        if remove_result.success and not remove_result.skipped:
-                            promo["stale_streams_removed"] += 1
-                        promo["promote_entries"].append({
-                            "type": "event_sync_promote_detach",
-                            "description": remove_result.description,
-                            "success": remove_result.success,
-                            "skipped": remove_result.skipped,
-                            "entity_id": channel_id,
-                            "entity_name": unit.channel_name,
-                            "error": remove_result.error,
-                            "match": _provenance(
-                                stale_row, unit, channel_id,
-                                unit.channel_name),
-                        })
+                for stale_id in stale_streams_to_detach(
+                    unit_stream_ids, attached, set(stale_rows),
+                    working_stream_ids,
+                ):
+                    stale_row = stale_rows[stale_id]
+                    remove_result = await self._execute_remove_from_channel(
+                        Action(type="remove_from_channel", params={}),
+                        StreamContext(
+                            stream_id=stale_id,
+                            stream_name=stale_row.stream.name,
+                            channel_id=channel_id,
+                        ),
+                        exec_ctx,
+                    )
+                    exec_ctx.add_result(remove_result)
+                    if remove_result.success and not remove_result.skipped:
+                        promo["stale_streams_removed"] += 1
+                    promo["promote_entries"].append({
+                        "type": "event_sync_promote_detach",
+                        "description": remove_result.description,
+                        "success": remove_result.success,
+                        "skipped": remove_result.skipped,
+                        "entity_id": channel_id,
+                        "entity_name": unit.channel_name,
+                        "error": remove_result.error,
+                        "match": _provenance(
+                            stale_row, unit, channel_id,
+                            unit.channel_name),
+                    })
 
             if channel_id is not None:
                 promo["channel_ids"].append(channel_id)

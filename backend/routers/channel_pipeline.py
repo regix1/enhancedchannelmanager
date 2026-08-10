@@ -3361,6 +3361,10 @@ async def preview_event_sync(
             config, resolution.resolved, existing_name_to_id, now=now,
         )
 
+        # Stays 0 when the health gate is off, which is also when the run
+        # detaches nothing. [75]
+        stale_streams_removed = 0
+
         if config.get("skip_dead_streams"):
             # Health the preview can read WITHOUT writing: a probe stores a
             # row, and this endpoint promises to store nothing, so the
@@ -3412,6 +3416,47 @@ async def preview_event_sync(
                 plan = build_promotion_plan(
                     config, resolution.resolved, existing_name_to_id,
                     now=now, dead_stream_ids=dead,
+                )
+
+            # What the run would DETACH. Removing a stream from a live
+            # channel is the one destructive thing this feature does, and
+            # without this the operator cannot see it coming. Same rule the
+            # run applies, from the same helper, so the two cannot drift. [75]
+            from services.event_sync_stream_health import (
+                find_working_streams, stale_streams_to_detach,
+            )
+
+            stale_ids = {
+                row.stream.stream_id
+                for row in resolution.resolved
+                if row.stream.is_stale and row.stream.stream_id is not None
+            }
+            streams_by_channel = {
+                ch["id"]: [
+                    s["id"] if isinstance(s, dict) else s
+                    for s in ch.get("streams", [])
+                ]
+                for ch in target_channels
+            }
+            working = await find_working_streams([
+                row.stream.stream_id
+                for unit in plan.units for row in unit.rows
+                if row.stream.stream_id is not None
+            ])
+            for unit in plan.units:
+                if unit.existing_channel_id is None:
+                    continue
+                unit_ids = {
+                    row.stream.stream_id for row in unit.rows
+                    if row.stream.stream_id is not None
+                }
+                stale_streams_removed += len(
+                    stale_streams_to_detach(
+                        unit_ids,
+                        streams_by_channel.get(unit.existing_channel_id, []),
+                        stale_ids,
+                        working,
+                    )
                 )
 
         units_out = []
@@ -3524,6 +3569,7 @@ async def preview_event_sync(
             "skipped_dateless": plan.skipped_dateless,
             "dead_streams_skipped": plan.dead_streams_skipped,
             "skipped_all_dead": plan.skipped_all_dead,
+            "stale_streams_removed": stale_streams_removed,
             "units": units_out,
         }
         # Annotate the unmatched rows in place — the operator reads the

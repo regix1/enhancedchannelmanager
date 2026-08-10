@@ -1049,6 +1049,10 @@ class TestPromotionPreview:
         assert promo["would_promote"] == 0
         assert promo["skipped_all_dead"] == 1
         assert promo["dead_streams_skipped"] == 1
+        # Detaching a stream from a live channel is the one destructive
+        # thing a run does, so the operator sees the number before it
+        # happens rather than only in the run summary. [75]
+        assert promo["stale_streams_removed"] == 0
         row = next(r for r in data["unmatched_streams"]
                    if r["stream_id"] == 301)
         assert row["promote_stream_dead"] is True

@@ -147,6 +147,51 @@ class TestVerdictFromStoredHealth:
         assert lookup.call_count == 0
 
 
+class TestStaleStreamsToDetach:
+    """The rule the run applies and the preview reports, in one place. [75]"""
+
+    def test_nothing_goes_without_a_working_stream_on_the_channel(self):
+        from services.event_sync_stream_health import stale_streams_to_detach
+        assert stale_streams_to_detach(
+            unit_stream_ids={1, 2},
+            attached=[1, 2],
+            stale_stream_ids={1},
+            working_stream_ids=set(),
+        ) == []
+
+    def test_the_delisted_stream_goes_once_something_works(self):
+        from services.event_sync_stream_health import stale_streams_to_detach
+        assert stale_streams_to_detach(
+            unit_stream_ids={1, 2},
+            attached=[1, 2],
+            stale_stream_ids={1},
+            working_stream_ids={2},
+        ) == [1]
+
+    def test_another_events_stream_is_never_taken(self):
+        """Two events can derive the same channel name and share a channel.
+        Stream 9 is delisted and attached, but it belongs to a different
+        event, so this event's passing probe must not remove it."""
+        from services.event_sync_stream_health import stale_streams_to_detach
+        assert stale_streams_to_detach(
+            unit_stream_ids={1, 2},
+            attached=[1, 2, 9],
+            stale_stream_ids={1, 9},
+            working_stream_ids={2},
+        ) == [1]
+
+    def test_a_working_stream_on_the_channel_but_not_this_event_is_not_evidence(self):
+        """Stream 8 works and is attached, but it is not this event's, so it
+        proves nothing about whether this event can lose its delisted one."""
+        from services.event_sync_stream_health import stale_streams_to_detach
+        assert stale_streams_to_detach(
+            unit_stream_ids={1},
+            attached=[1, 8],
+            stale_stream_ids={1},
+            working_stream_ids={8},
+        ) == []
+
+
 class TestDelistedStreams:
     """Dispatcharr's own ``is_stale`` flag: the provider has stopped listing
     the stream. This provider re-issues every event under a new id on each
