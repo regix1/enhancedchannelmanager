@@ -63,6 +63,14 @@ inputs (dry-run parity by construction — the same argument as
   has a channel is NEVER un-promoted for being far away — that would
   delete and recreate the same channel every day. This is the deliberate
   opposite of ``skip_past_events`` above, which does divert adopt units.
+* **A DATELESS event is never promoted.** A listing carrying a time and no
+  date names a recurring slot rather than one broadcast, so the channel it
+  would create would carry a different event every day with nothing to say
+  which. Such units are diverted before every other filter, so they never
+  spend cap budget, and like the health filter this retires nothing: the
+  caller keeps whatever channel such a unit already has. Attaching a
+  dateless stream to a MASTER channel is a separate question and is
+  unaffected — that is what ``assume_current_date`` governs.
 
 **Which dispositions are promotable (pinned semantics, AC-11):**
 
@@ -120,6 +128,7 @@ __all__ = [
     "PromotionPlan",
     "PromotionUnit",
     "build_promotion_plan",
+    "event_has_started",
     "event_is_early",
     "event_is_past",
     "promoted_channel_name",
@@ -250,6 +259,31 @@ def event_is_early(
     return parsed.start - timedelta(hours=lead_hours) > now
 
 
+def event_has_started(parsed: ParsedEvent, now: datetime) -> bool:
+    """Is this event's parsed start already behind us?
+
+    The health gate asks this before it lets a probe verdict count against a
+    stream: a stream for an event that has not begun may fail simply because
+    there is nothing to stream yet, and rejecting it would stop the channel
+    ever being created. A stream the provider has DELISTED is dead either
+    way — that is Dispatcharr's own statement, not a probe's. [7]
+
+    Refuses the same two cases as :func:`event_is_past` and
+    :func:`event_is_early`, and for the same reason: an event with no parsed
+    start, or one whose date was fabricated from "now" rather than read off
+    the provider string, cannot be judged started any more than it can be
+    judged finished. Both answer ``False``, which is the safe direction —
+    no probe verdict counts.
+
+    ``now`` must be tz-aware (``parsed.start`` always is).
+    """
+    if parsed.start is None:
+        return False
+    if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:
+        return False
+    return parsed.start <= now
+
+
 def promoted_channel_name(parsed: ParsedEvent) -> str | None:
     """Deterministic promoted-channel name for one complete parsed identity.
 
@@ -299,7 +333,16 @@ class PromotionUnit:
 
     ``rows`` are the resolver's ResolvedStream objects (kept whole so the
     executor can thread provenance without re-deriving anything), in
-    deterministic (provider_id, stream_id) order. ``action`` is the planned
+    deterministic (provider_id, stream_id) order within each folded key and
+    with the surviving key's own rows first. ``rows[0]`` is therefore the
+    row this unit's identity was read from, and its parsed start is the
+    unit's start, so a caller asking whether the event has begun may read it
+    there. That holds for the plan as this function builds it. A caller that
+    replans with ``dead_stream_ids`` gets units whose dead rows have been
+    dropped, and the first row is one of them when the stream it names is
+    dead, so the start must be read off the plan the caller made BEFORE its
+    health check, which is also the plan that decides which events have
+    started. [72] ``action`` is the planned
     realization against the CALLER-SUPPLIED existing-name map:
     ``create`` (no channel with the derived name exists in the target
     group) or ``attach_existing`` (adopt + attach only). ``existing_channel_id``
@@ -336,6 +379,16 @@ class PromotionPlan:
     They come back on their own once the window opens, and no unit that
     already has a channel is ever in here.
 
+    ``skipped_dateless_units`` are units whose date was fabricated from
+    "now" rather than read off the provider string. A name carrying a clock
+    time and no date says nothing about WHICH day's event it is, so it is
+    never turned into a channel. Dropped whatever their action and before
+    every other filter, so a dateless unit never spends cap budget either.
+    Like the all-dead bucket this is not a retirement signal: the caller
+    keeps any channel such a unit already has in the managed set, because
+    a stream the operator promoted yesterday must not disappear on the
+    strength of a name the parser cannot date. [30]
+
     ``all_dead_units`` are units every one of whose streams failed the
     health check, and ``dead_streams_skipped`` counts the individual
     streams that failed. Both are counted among the units that survived
@@ -353,6 +406,7 @@ class PromotionPlan:
     target_group_id: int | None
     skipped_past_units: tuple[PromotionUnit, ...] = ()
     skipped_early_units: tuple[PromotionUnit, ...] = ()
+    skipped_dateless_units: tuple[PromotionUnit, ...] = ()
     all_dead_units: tuple[PromotionUnit, ...] = ()
     dead_streams_skipped: int = 0
 
@@ -390,6 +444,10 @@ class PromotionPlan:
     @property
     def skipped_early(self) -> int:
         return len(self.skipped_early_units)
+
+    @property
+    def skipped_dateless(self) -> int:
+        return len(self.skipped_dateless_units)
 
     @property
     def skipped_all_dead(self) -> int:
@@ -559,6 +617,12 @@ def build_promotion_plan(
             caller because it reads the database and talks to the provider,
             and this module stays pure.
 
+    A DATELESS unit is dropped first of all, whatever its action: its date
+    was fabricated from "now", so the name identifies a recurring slot
+    rather than one broadcast, and a channel named after it would carry a
+    different event every day. The caller keeps any channel such a unit
+    already has, so this filter creates nothing and retires nothing. [30]
+
     ``skip_past_events`` is applied BEFORE the cap so finished events cannot
     spend create budget that a live event needs, and to units of EITHER
     action. Dropping an adopt unit is how a finished event's channel leaves
@@ -636,6 +700,7 @@ def build_promotion_plan(
     capped_units: list[PromotionUnit] = []
     skipped_past_units: list[PromotionUnit] = []
     skipped_early_units: list[PromotionUnit] = []
+    skipped_dateless_units: list[PromotionUnit] = []
     all_dead_units: list[PromotionUnit] = []
     dead_streams_skipped = 0
     creates = 0
@@ -646,9 +711,13 @@ def build_promotion_plan(
         # key's own lowest-sorting row. After a fold the rest of the list
         # carries a different start, so reading the identity off whatever
         # sorts first would name the channel after a listing the key does
-        # not belong to.
+        # not belong to. The fold already returns each list in that order,
+        # so the rows are kept exactly as it left them: re-sorting here
+        # would push a folded-in listing whose start is up to
+        # MAX_CLUSTER_WINDOW_MINUTES away into element zero, and every
+        # caller that reads a unit's start off ``rows[0]`` would then be
+        # reading a different instant than this ``parsed``. [52]
         parsed = clustered[0].result.parsed
-        rows = sorted(clustered, key=_row_sort_key)
         name = promoted_channel_name(parsed)
         if name is None:  # pragma: no cover — key is None first
             continue
@@ -662,10 +731,16 @@ def build_promotion_plan(
             event_key=key,
             channel_name=name,
             dateless=parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES,
-            rows=tuple(rows),
+            rows=tuple(clustered),
             action=action,
             existing_channel_id=existing_id,
         )
+        if unit.dateless:
+            # Runs before every other filter: an event nobody can date is
+            # not a candidate for a channel at all, so it should not spend
+            # cap budget on its way to being dropped. [30]
+            skipped_dateless_units.append(unit)
+            continue
         if (
             skip_past
             and now is not None
@@ -720,6 +795,7 @@ def build_promotion_plan(
         target_group_id=target_group_id,
         skipped_past_units=tuple(skipped_past_units),
         skipped_early_units=tuple(skipped_early_units),
+        skipped_dateless_units=tuple(skipped_dateless_units),
         all_dead_units=tuple(all_dead_units),
         dead_streams_skipped=dead_streams_skipped,
     )

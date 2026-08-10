@@ -5,21 +5,46 @@ that lists an event it cannot actually serve used to get a channel out of it
 just the same. This module answers the one question that stops that: of the
 streams a plan is about to turn into channels, which ones are dead?
 
-One helper, two call sites — ``channel_pipeline_executor`` for a live run and
+Two call sites — ``channel_pipeline_executor`` for a live run and
 ``routers.channel_pipeline`` for the preview — so the verdict an operator
 reads in the preview is computed by the same code the run obeys.
 
-**It reads health, it does not define it.** A stream counts as dead when
+:func:`find_working_streams` answers the opposite question, and the two are
+not each other's complement. "Not dead" is the bar for ATTACHING a stream,
+because refusing an unprobed candidate would create no channels at all. A
+passing probe is the bar for DETACHING one, because a channel that is
+playing must not lose the stream serving it on anything weaker than proof
+that something else works. [51]
 
-* it has already struck out (``consecutive_failures`` at or past the
-  configured ``strike_threshold``) — the same signal auto-creation's
-  ``skip_struck_streams`` uses, so ECM has one idea of a broken stream, not
-  two; or
-* this call probed it just now and the probe did not succeed.
+**It reads health, it does not define it.** The rule is one sentence: a
+stream is dead when the provider has stopped listing it, and probe-derived
+signals only count once the event has started.
 
-A single old failure is NOT dead. Streams fail transiently all the time, and
-the strike threshold is exactly the setting an operator already tuned to say
-how much failure is too much.
+* **Provider-stale** — Dispatcharr's M3U refresh no longer finds the stream
+  in the source playlist. Dead ALWAYS, whatever its probe history says and
+  however new the event is. This is the provider's own statement rather
+  than a verdict of ours, and a delisted stream is delisted whether or not
+  it has aired. It is also the signal that matters: this provider re-issues
+  every event under a new stream id on each refresh, so the superseded id
+  keeps the ``success`` verdict it earned while it still worked.
+* **A stored failed or timed-out probe**, and **a struck-out stream**
+  (``consecutive_failures`` at or past the configured ``strike_threshold``,
+  the same signal auto-creation's ``skip_struck_streams`` uses) — dead only
+  once the event's start time has gone by.
+* **Never probed, or not probed recently** — never dead. About sixty of
+  some thirty-seven thousand streams have ever been probed, so treating an
+  absent verdict as a failure would reject essentially every candidate and
+  no channel would ever be created.
+
+**Why a probe verdict is ignored before the event starts:** a stream for an
+event that has not begun may fail simply because there is nothing to stream
+yet. Rejecting it would stop the channel being created at all, which is the
+opposite of what an operator wants from a health check. Staleness carries
+the whole load for a future event, and it is enough. [4][7][8]
+
+**"The event has started" is the caller's answer**, taken from the same
+parsed start ``skip_past_events`` and ``promote_lead_hours`` already read,
+so there is exactly one clock on this path and the tests can pin it.
 
 **Probing is for live runs only.** A probe writes a ``StreamStats`` row, and
 the preview endpoint promises zero writes, so the preview reads whatever
@@ -39,12 +64,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_HEALTH_PROBES_PER_RUN",
     "find_dead_streams",
+    "find_working_streams",
 ]
 
 # How many never-probed candidate streams one run may probe. Probing runs
@@ -66,6 +93,8 @@ async def find_dead_streams(
     *,
     client=None,
     probe_missing: bool = False,
+    stale_stream_ids: set[int] | None = None,
+    event_start_by_stream: dict[int, datetime] | None = None,
 ) -> set[int]:
     """Return the subset of ``stream_ids`` that has no working stream.
 
@@ -78,9 +107,86 @@ async def find_dead_streams(
         probe_missing: Probe the candidates that have no health record yet.
             True for a live run, False for the preview and for a dry run,
             because a probe writes a row.
+        stale_stream_ids: Ids the provider has stopped listing, read off the
+            ``is_stale`` flag the caller's own stream fetch already carried.
+            Every candidate in here is dead, and none of them is probed —
+            dialling a stream the playlist no longer has is exactly the
+            wasted work this saves.
+        event_start_by_stream: When the event began, for the candidates
+            whose event HAS begun. ONLY these can be marked dead by a probe
+            verdict, stored or fresh. A candidate left out is one whose
+            event is still ahead, and a stream that has nothing to serve yet
+            is not a broken stream. The instant matters as well as the
+            membership: a stored verdict recorded before that start was
+            taken while the event still had nothing to serve, and nothing
+            re-probes a stream that already has a record, so counting it
+            would make a pre-kickoff failure permanent. [59]
 
-    Never raises. An empty set means "no stream was shown to be dead",
-    which is also what every failure path returns.
+    Never raises. Every failure path returns the streams the provider
+    already disowned and nothing else, because a database that will not
+    answer is not evidence that an operator's event has no working stream.
+    """
+    ids = sorted({sid for sid in stream_ids if sid is not None})
+    if not ids:
+        return set()
+
+    delisted = stale_stream_ids or set()
+    stale = {sid for sid in ids if sid in delisted}
+
+    try:
+        stats = await _load_stats(ids)
+    except Exception as e:
+        logger.warning(
+            "[EVENT-SYNC] stream health lookup failed (%s) — only the "
+            "stream(s) the provider no longer lists are treated as dead "
+            "this run", e,
+        )
+        return stale
+
+    threshold = _strike_threshold()
+    started = event_start_by_stream or {}
+    dead = set(stale)
+    dead |= {
+        sid for sid in ids
+        if sid in started
+        and (
+            _is_struck(stats.get(sid), threshold)
+            or _probe_failed(stats.get(sid), started[sid])
+        )
+    }
+
+    if probe_missing and client is not None:
+        # A stale stream is left out: the provider has already answered
+        # the question a probe would ask.
+        unprobed = [
+            sid for sid in ids if sid not in stats and sid not in stale
+        ]
+        if unprobed:
+            fresh_failures = await _probe_and_collect_failures(
+                client, unprobed
+            )
+            dead |= fresh_failures & set(started)
+
+    return dead
+
+
+async def find_working_streams(stream_ids) -> set[int]:
+    """Return the subset of ``stream_ids`` whose last probe passed.
+
+    Deliberately NOT the complement of :func:`find_dead_streams`. "Not
+    dead" covers a stream nobody has ever probed and, before its event
+    starts, one that is failing right now — neither of which is evidence
+    that anything plays. A stored ``success`` verdict is, and that is the
+    only thing a caller may act on when it is about to take a stream away
+    from a channel that is currently serving an event.
+
+    A live run's own probes write their rows before this reads, so a
+    candidate probed to success moments earlier in the same run answers
+    here. The preview and a dry run probe nothing, so they see whatever
+    verdicts already existed.
+
+    Never raises. Every failure path returns the empty set, which reads as
+    "nothing is proven to work" and leaves every channel exactly as it is.
     """
     ids = sorted({sid for sid in stream_ids if sid is not None})
     if not ids:
@@ -90,23 +196,16 @@ async def find_dead_streams(
         stats = await _load_stats(ids)
     except Exception as e:
         logger.warning(
-            "[EVENT-SYNC] stream health lookup failed (%s) — no stream "
-            "treated as dead this run", e,
+            "[EVENT-SYNC] stream health lookup failed (%s) — no stream is "
+            "treated as proven working this run, so nothing that is "
+            "currently playing is taken off a channel", e,
         )
         return set()
 
-    threshold = _strike_threshold()
-    dead = {
+    return {
         sid for sid in ids
-        if _is_struck(stats.get(sid), threshold)
+        if (stats.get(sid) or {}).get("probe_status") == "success"
     }
-
-    if probe_missing and client is not None:
-        unprobed = [sid for sid in ids if sid not in stats]
-        if unprobed:
-            dead |= await _probe_and_collect_failures(client, unprobed)
-
-    return dead
 
 
 async def _load_stats(stream_ids: list[int]) -> dict[int, dict]:
@@ -120,17 +219,24 @@ async def _load_stats(stream_ids: list[int]) -> dict[int, dict]:
 
 
 def _strike_threshold() -> int:
-    """How many consecutive failures make a stream struck out, or 0 = off."""
+    """How many consecutive failures make a stream struck out, or 0 = off.
+
+    A stored ``0`` is the operator switching the struck-out check off. An
+    unreadable setting is not the same statement, so it falls back to the
+    shipped default instead of returning ``0`` and turning the check off on
+    the operator's behalf without saying so. [10]
+    """
     try:
         from config import get_settings
 
         return int(get_settings().strike_threshold or 0)
     except Exception as e:
         logger.warning(
-            "[EVENT-SYNC] strike threshold unreadable (%s) — falling back "
-            "to the fresh probe verdict alone", e,
+            "[EVENT-SYNC] strike threshold unreadable (%s) — using the "
+            "shipped default of 3, because returning 0 here would switch "
+            "the struck-out check off silently", e,
         )
-        return 0
+        return 3
 
 
 def _is_struck(stat: dict | None, threshold: int) -> bool:
@@ -138,6 +244,32 @@ def _is_struck(stat: dict | None, threshold: int) -> bool:
     if stat is None or threshold <= 0:
         return False
     return int(stat.get("consecutive_failures") or 0) >= threshold
+
+
+def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
+    """Did this stream's stored probe verdict say it did not answer?
+
+    The sibling of :func:`_is_struck`, asking the other half of the stored
+    row: one failure recorded as ``failed`` or ``timeout`` counts even
+    though the strike counter has not reached its threshold. [6]
+
+    It counts only when the probe itself happened at or after the event
+    started. A stream dialled while its event was still ahead had nothing
+    to serve, and the record it left is never refreshed, so an earlier
+    verdict would decide the event forever. A row with no timestamp cannot
+    be shown to be a live-event verdict and does not count either. [59]
+    """
+    if stat is None:
+        return False
+    if stat.get("probe_status") not in _FAILED_PROBE_STATUSES:
+        return False
+    # The health table keeps naive UTC and serializes it with a Z.
+    raw = stat.get("last_probed")
+    if not raw:
+        return False
+    probed_at = datetime.fromisoformat(
+        raw.rstrip("Z")).replace(tzinfo=timezone.utc)
+    return probed_at >= started_at
 
 
 async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]:

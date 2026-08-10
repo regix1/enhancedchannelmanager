@@ -8,6 +8,7 @@ potential rollback.
 import contextlib
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 import re
 
@@ -209,7 +210,13 @@ class ExecutionContext:
                 })
 
         if result.modified:
-            if result.entity_type == "channel":
+            # Keyed on the action rather than the entity: a removal is
+            # recorded against the CHANNEL so rollback can restore its stream
+            # list, and it is still a stream leaving a channel rather than a
+            # channel property update.
+            if result.action_type == "remove_from_channel":
+                self.streams_removed += 1
+            elif result.entity_type == "channel":
                 # merge_stream results (action_type "merge_stream") count as
                 # stream merges, not channel property updates.  All other
                 # channel modifications (assign_logo, assign_tvg_id,
@@ -226,8 +233,6 @@ class ExecutionContext:
                         self.merged_channel_ids.add(result.entity_id)
                 else:
                     self.channels_updated += 1
-            elif result.entity_type == "stream" and result.action_type == "remove_from_channel":
-                self.streams_removed += 1
             # y3m6o.1 Finding 6 (0152): a non-rollbackable modification (e.g.
             # assign_channel_profile — profile membership with no reversible
             # previous_state) is still COUNTED as an update but is NOT recorded
@@ -3559,13 +3564,19 @@ class ActionExecutor:
         filtered_streams = [s for s in current_streams if s != stream_ctx.stream_id]
 
         if exec_ctx.dry_run:
+            # Update the cached channel so a later dry-run removal on the
+            # same channel sees the stream already gone, exactly as
+            # _add_stream_to_channel does for a merge. Without it a second
+            # unit sharing this channel reports removing the same stream a
+            # second time.
+            channel["streams"] = filtered_streams
             return ActionResult(
                 success=True,
                 action_type=action.type,
                 description=f"Would remove stream from channel '{channel_name}'",
-                entity_type="stream",
-                entity_id=stream_ctx.stream_id,
-                entity_name=stream_ctx.stream_name,
+                entity_type="channel",
+                entity_id=channel_id,
+                entity_name=channel_name,
                 modified=True
             )
 
@@ -3574,13 +3585,16 @@ class ActionExecutor:
             await self.client.update_channel(channel_id, {"streams": filtered_streams})
             channel["streams"] = filtered_streams
 
+            # Recorded against the CHANNEL: rollback restores a channel from
+            # the stream list held here, so a removal filed under the stream
+            # is one rollback silently does not reverse.
             return ActionResult(
                 success=True,
                 action_type=action.type,
                 description=f"Removed stream from channel '{channel_name}'",
-                entity_type="stream",
-                entity_id=stream_ctx.stream_id,
-                entity_name=stream_ctx.stream_name,
+                entity_type="channel",
+                entity_id=channel_id,
+                entity_name=channel_name,
                 modified=True,
                 previous_state=previous_state
             )
@@ -4809,6 +4823,10 @@ class ActionExecutor:
           has a channel keeps it however far away it is, because
           un-promoting it would delete and recreate the same channel every
           day until the window opened.
+        * **Dateless events**: an event whose name carries a time but no
+          date is never promoted (counted as ``skipped_dateless``). Like
+          the health filter this retires nothing — a channel an earlier
+          run already made for such an event keeps its place.
         * **Stream health**: with ``skip_dead_streams`` on, the streams
           this run is about to turn into channels are health-checked and
           the failures leave their unit's attach list
@@ -4820,7 +4838,27 @@ class ActionExecutor:
           The check runs LAST, on the plan's post-cap units only: probing
           dials the provider, so it sees the handful of streams that
           survived the past filter, the lead window and the cap rather
-          than every parsed candidate.
+          than every parsed candidate. Two inputs come from here: the
+          provider's own ``is_stale`` flag, carried off the fetch the run
+          already made, and which events have already started, since a
+          probe failure before kickoff can just mean there is nothing to
+          serve yet.
+        * **Delisted streams leave a channel that got a working
+          replacement**: this provider re-lists each event under a new id
+          on every refresh, so an adopted channel otherwise keeps every id
+          it has ever been given. A stale id is removed through the
+          standard ``remove_from_channel`` execution, which records the
+          channel's previous stream list for rollback and mutates nothing
+          on a dry run, and ONLY where it belongs to the same unit as a
+          stream on that channel whose probe PASSED
+          (``stale_streams_removed``). Another event sharing the channel
+          keeps its own streams: its evidence is its own.
+          Attaching needs a stream that is not dead; detaching needs one
+          that is proven to work, which is a higher bar on purpose. Before
+          kickoff a replacement often fails its probe because there is
+          nothing to serve yet, and the delisted stream is usually the only
+          thing still serving the event, so where nothing has a passing
+          verdict the channel keeps BOTH streams and keeps playing.
 
         Returns the promotion summary the engine folds into the rule's
         event_sync summary and uses to register the managed set
@@ -4833,12 +4871,18 @@ class ActionExecutor:
         # path already keeps a local map under this name, built over the
         # MASTER group with no prefix strip.
         from channel_number_prefix import channel_name_to_id
-        from services.event_sync_promote import build_promotion_plan
+        from services.event_sync_promote import (
+            build_promotion_plan,
+            event_has_started,
+        )
         from services.event_sync_review import (
             PROVIDER_ID_UNKNOWN,
             stream_name_hash,
         )
-        from services.event_sync_stream_health import find_dead_streams
+        from services.event_sync_stream_health import (
+            find_dead_streams,
+            find_working_streams,
+        )
 
         target_group_id = config["promote_target_group_id"]
 
@@ -4854,10 +4898,19 @@ class ActionExecutor:
             self._channel_number_separator,
         )
 
+        # One instant for the whole promotion: the planner's past filter and
+        # lead window, and the health gate's "has this event begun" set, all
+        # read it. Two wall-clock reads a few milliseconds apart disagree
+        # about every event whose start falls between them. [53]
+        now = datetime.now(timezone.utc)
+
         plan = build_promotion_plan(
-            config, resolution.resolved, existing_name_to_id
+            config, resolution.resolved, existing_name_to_id, now=now,
         )
 
+        stale_rows: dict = {}
+        working_stream_ids: set = set()
+        unit_stream_ids_by_key: dict = {}
         if config.get("skip_dead_streams"):
             # Plan first, then check ONLY the streams that plan is about to
             # turn into channels. plan.units is what is left after the past
@@ -4867,6 +4920,41 @@ class ActionExecutor:
             # runs before it. The planner is pure, so replanning with the
             # verdict costs nothing and keeps the health filter in the one
             # place the preview reads it from too.
+            #
+            # Read off the fetch this run already performed rather than
+            # scanning the provider's whole playlist again. The whole row is
+            # kept so a detach can name the stream it dropped and journal
+            # the same provenance an attach does. [12]
+            stale_rows = {
+                row.stream.stream_id: row
+                for row in resolution.resolved
+                if row.stream.is_stale and row.stream.stream_id is not None
+            }
+            # Which streams belong to which event, read BEFORE the health
+            # replan. A delisted stream is always dead, so the replan takes
+            # every one of them out of its unit and afterwards no unit still
+            # lists the stale stream it is supposed to be able to drop. The
+            # replan keeps each unit's event key, so that is what this is
+            # keyed on. [55]
+            unit_stream_ids_by_key = {
+                unit.event_key: {
+                    row.stream.stream_id for row in unit.rows
+                    if row.stream.stream_id is not None
+                }
+                for unit in plan.units
+            }
+            # A probe verdict only counts against a stream once its event
+            # has begun; before that a failure can just mean there is
+            # nothing to serve yet. The unit's own parsed start answers it,
+            # the same instant skip_past_events and promote_lead_hours
+            # read. [7]
+            event_start_by_stream = {
+                row.stream.stream_id: unit.rows[0].result.parsed.start
+                for unit in plan.units
+                if event_has_started(unit.rows[0].result.parsed, now)
+                for row in unit.rows
+                if row.stream.stream_id is not None
+            }
             dead = await find_dead_streams(
                 [
                     row.stream.stream_id
@@ -4874,12 +4962,24 @@ class ActionExecutor:
                 ],
                 client=self.client,
                 probe_missing=not exec_ctx.dry_run,
+                stale_stream_ids=set(stale_rows),
+                event_start_by_stream=event_start_by_stream,
             )
             if dead:
                 plan = build_promotion_plan(
                     config, resolution.resolved, existing_name_to_id,
-                    dead_stream_ids=dead,
+                    now=now, dead_stream_ids=dead,
                 )
+            # Read AFTER the health gate, so a candidate this run just
+            # probed to success is already in it. This is the only thing
+            # the detach below is allowed to act on: "not dead" lets a
+            # never-probed stream and a pre-kickoff failure through, and
+            # neither is a reason to take away the stream a channel is
+            # currently playing. [51]
+            working_stream_ids = await find_working_streams([
+                row.stream.stream_id
+                for unit in plan.units for row in unit.rows
+            ])
 
         promo = {
             "target_group_id": target_group_id,
@@ -4902,8 +5002,10 @@ class ActionExecutor:
             "skipped_past": plan.skipped_past,
             "skipped_past_adopted": plan.skipped_past_adopted,
             "skipped_early": plan.skipped_early,
+            "skipped_dateless": plan.skipped_dateless,
             "dead_streams_skipped": plan.dead_streams_skipped,
             "skipped_all_dead": plan.skipped_all_dead,
+            "stale_streams_removed": 0,
             "channel_ids": [],
             "promote_entries": [],
         }
@@ -4923,6 +5025,15 @@ class ActionExecutor:
                 "event(s) that are further ahead than the lead window — "
                 "each one promotes on its own once the window opens",
                 rule_name, plan.skipped_early,
+            )
+
+        if plan.skipped_dateless:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': %d event(s) carry a time but no "
+                "date, so nothing can say which day they belong to — no "
+                "channel is created for them, and any channel they already "
+                "have keeps its place",
+                rule_name, plan.skipped_dateless,
             )
 
         if plan.dead_streams_skipped or plan.skipped_all_dead:
@@ -4974,8 +5085,13 @@ class ActionExecutor:
         # A failing stream is a reason not to CREATE a channel, never a
         # reason to lose one. Every all-dead unit that already has a channel
         # holds its place in the managed set, so Pass 4 leaves it alone and
-        # a provider outage cannot take an operator's channels with it.
+        # a provider outage cannot take an operator's channels with it. [38]
         for unit in plan.all_dead_units:
+            _keep_existing_channel(unit)
+
+        # Same posture for an event nobody can date: it is not promotable,
+        # but a channel an earlier run already made for it stays. [30]
+        for unit in plan.skipped_dateless_units:
             _keep_existing_channel(unit)
 
         for unit in plan.units:
@@ -5144,8 +5260,70 @@ class ActionExecutor:
                         row, unit, channel_id, unit.channel_name),
                 })
 
+            # This provider re-lists every event under a NEW stream id on
+            # each refresh, so a channel adopted run after run collects ids
+            # the playlist no longer carries. Drop those, but only once
+            # THIS channel carries a stream of this unit whose probe
+            # PASSED. A delisted stream is very often the only one still
+            # serving the event, and before kickoff a replacement can fail
+            # its probe simply because there is nothing to serve yet, so
+            # anything short of a passing verdict would trade a channel
+            # that plays for one that does not. Where nothing qualifies the
+            # channel keeps both streams and keeps playing. [35][36][37][51]
+            if stale_rows and channel is not None:
+                attached = [
+                    s["id"] if isinstance(s, dict) else s
+                    for s in channel.get("streams", [])
+                ]
+                unit_stream_ids = unit_stream_ids_by_key.get(
+                    unit.event_key, set())
+                if unit_stream_ids.intersection(
+                    attached
+                ).intersection(working_stream_ids):
+                    # Only this event's own delisted streams. Two events can
+                    # derive the same channel name and share the channel, and
+                    # an operator can leave another event's stream on it, so
+                    # iterating every stale id attached here would let one
+                    # event's passing probe take away another's only stream.
+                    for stale_id in sorted(
+                        unit_stream_ids & set(attached) & set(stale_rows)
+                    ):
+                        stale_row = stale_rows[stale_id]
+                        remove_result = await self._execute_remove_from_channel(
+                            Action(type="remove_from_channel", params={}),
+                            StreamContext(
+                                stream_id=stale_id,
+                                stream_name=stale_row.stream.name,
+                                channel_id=channel_id,
+                            ),
+                            exec_ctx,
+                        )
+                        exec_ctx.add_result(remove_result)
+                        if remove_result.success and not remove_result.skipped:
+                            promo["stale_streams_removed"] += 1
+                        promo["promote_entries"].append({
+                            "type": "event_sync_promote_detach",
+                            "description": remove_result.description,
+                            "success": remove_result.success,
+                            "skipped": remove_result.skipped,
+                            "entity_id": channel_id,
+                            "entity_name": unit.channel_name,
+                            "error": remove_result.error,
+                            "match": _provenance(
+                                stale_row, unit, channel_id,
+                                unit.channel_name),
+                        })
+
             if channel_id is not None:
                 promo["channel_ids"].append(channel_id)
+
+        if promo["stale_streams_removed"]:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': dropped %d stream(s) the provider "
+                "no longer lists from promoted channels that just received "
+                "a working replacement",
+                rule_name, promo["stale_streams_removed"],
+            )
 
         if plan.capped:
             logger.warning(

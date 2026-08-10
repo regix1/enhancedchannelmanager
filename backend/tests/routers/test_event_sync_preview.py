@@ -989,6 +989,7 @@ class TestPromotionPreview:
         )
         promo = resp.json()["promotion"]
         assert promo["skipped_early"] == 0
+        assert promo["skipped_dateless"] == 0
         assert promo["dead_streams_skipped"] == 0
         assert promo["skipped_all_dead"] == 0
         assert "promote_skipped_early" not in resp.json()["unmatched_streams"][0]
@@ -1004,7 +1005,9 @@ class TestPromotionPreview:
             datetime(2026, 7, 1, 12, 0, 0)
         )
         client = _mock_client()
-        with patch("services.event_sync_promote.datetime") as promote_clock:
+        # The preview reads its instant once and hands it to the planner,
+        # so pinning the endpoint's clock pins the lead window too. [53]
+        with patch("routers.channel_pipeline.datetime") as promote_clock:
             promote_clock.now.return_value = far_ahead
             resp = await _preview(
                 async_client, client,
@@ -1050,6 +1053,82 @@ class TestPromotionPreview:
                    if r["stream_id"] == 301)
         assert row["promote_stream_dead"] is True
         assert row["promote_skipped_all_dead"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_delisted_stream_is_dead_in_the_preview_too(
+        self, async_client
+    ):
+        """Preview and run must agree on staleness. Both read Dispatcharr's
+        own ``is_stale`` flag off the fetch they already made, so the only
+        thing they can differ on is a probe, which the preview never does.
+        The stored verdict here says the stream worked, which is exactly
+        the shape that used to sail through."""
+        streams = {
+            "Fubo Events": SECONDARY_STREAMS["Fubo Events"],
+            "DAZN Events": [
+                {"id": 301,
+                 "name": "DAZN 05: Fury vs. Usyk @ 11 Jul 11:00 PM ET",
+                 "m3u_account": 2, "is_stale": True},
+                {"id": 302, "name": "DAZN 09: NO EVENT", "m3u_account": 2},
+            ],
+        }
+        client = _mock_client(secondary_streams=streams)
+
+        def _stats_for(stream_ids):
+            return {
+                sid: {"stream_id": sid, "probe_status": "success",
+                      "consecutive_failures": 0}
+                for sid in stream_ids
+            }
+
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_for), \
+             patch("stream_prober.ensure_prober") as ensure_prober:
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    skip_dead_streams=True)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        assert ensure_prober.call_count == 0
+        promo = data["promotion"]
+        assert promo["would_promote"] == 0
+        assert promo["dead_streams_skipped"] == 1
+        assert promo["skipped_all_dead"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["promote_stream_dead"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_dateless_event_says_so_on_the_row(self, async_client):
+        """The row must carry its own reason. Without one the panel falls
+        through to "incomplete parsed identity", which tells the operator
+        the parse failed when what is actually missing is a date."""
+        streams = {
+            "Fubo Events": SECONDARY_STREAMS["Fubo Events"],
+            "DAZN Events": [
+                {"id": 301, "name": "DAZN 07: FURY vs HALL 6PM",
+                 "m3u_account": 2},
+            ],
+        }
+        client = _mock_client(secondary_streams=streams)
+        resp = await _preview(
+            async_client, client,
+            {"event_sync_config": self._promote_config(
+                assume_current_date=True)},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        promo = data["promotion"]
+        assert promo["would_promote"] == 0
+        assert promo["skipped_dateless"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["would_promote"] is False
+        assert row["promote_skipped_dateless"] is True
 
     @pytest.mark.asyncio
     async def test_the_health_check_is_not_run_when_the_rule_is_off(

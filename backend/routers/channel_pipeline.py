@@ -10,7 +10,7 @@ import logging
 import tarfile
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional
 
 import httpx
@@ -2694,6 +2694,11 @@ async def _fetch_and_resolve_event_sync(
 
     from fastapi.concurrency import run_in_threadpool
 
+    # The run's own cap, not the preview's general one: both paths build
+    # their stale set out of what this fetch returned, so a stream inside one
+    # cap and outside the other would be delisted for one and unknown to the
+    # other, and the preview would show a detach the run does not make. [64]
+    from channel_pipeline_engine import EVENT_SYNC_MAX_SECONDARY_STREAMS
     from services import event_sync_staleness
     from services.event_sync_resolver import (
         SecondaryStream,
@@ -2829,9 +2834,15 @@ async def _fetch_and_resolve_event_sync(
                                 stale_lookup, account_id, gname, s["name"],
                             )
                         ),
+                        # Dispatcharr's own "I no longer list this stream"
+                        # flag, carried off the fetch the preview already
+                        # performs so preview and run read the same
+                        # staleness. [11][15]
+                        is_stale=s.get("is_stale"),
                     ))
-                if len(secondary_streams) >= _PREVIEW_MAX_STREAMS:
-                    secondary_streams = secondary_streams[:_PREVIEW_MAX_STREAMS]
+                if len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
+                    secondary_streams = secondary_streams[
+                        :EVENT_SYNC_MAX_SECONDARY_STREAMS]
                     truncated = True
                     break
                 if not isinstance(resp, dict) or not resp.get("next"):
@@ -2874,9 +2885,13 @@ async def _fetch_and_resolve_event_sync(
                                     s["name"],
                                 )
                             ),
+                            # Same provider-listing flag for the master-group
+                            # self-attach source. [11]
+                            is_stale=s.get("is_stale"),
                         ))
-                    if len(secondary_streams) >= _PREVIEW_MAX_STREAMS:
-                        secondary_streams = secondary_streams[:_PREVIEW_MAX_STREAMS]
+                    if len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
+                        secondary_streams = secondary_streams[
+                            :EVENT_SYNC_MAX_SECONDARY_STREAMS]
                         truncated = True
                         break
                     if not isinstance(resp, dict) or not resp.get("next"):
@@ -3336,8 +3351,14 @@ async def preview_event_sync(
             target_channels, number_separator
         )
 
+        # One instant for the whole preview, for the same reason the run
+        # keeps one: the planner's past filter and lead window and the
+        # health gate's started-event set must agree about every event whose
+        # start falls between two wall-clock reads. [53]
+        now = datetime.now(timezone.utc)
+
         plan = build_promotion_plan(
-            config, resolution.resolved, existing_name_to_id
+            config, resolution.resolved, existing_name_to_id, now=now,
         )
 
         if config.get("skip_dead_streams"):
@@ -3347,12 +3368,31 @@ async def preview_event_sync(
             # is the one that goes and asks the provider. On a rule whose
             # streams have never been probed the preview therefore shows
             # none dead and the run may still drop some.
+            from services.event_sync_promote import event_has_started
             from services.event_sync_stream_health import find_dead_streams
 
-            dead = await find_dead_streams([
-                row.stream.stream_id
-                for unit in plan.units for row in unit.rows
-            ])
+            dead = await find_dead_streams(
+                [
+                    row.stream.stream_id
+                    for unit in plan.units for row in unit.rows
+                ],
+                # Both read off the same fetch and the same parsed start the
+                # run uses, so preview and run reach the same verdict for
+                # every stream except the ones a live run probes. [15]
+                stale_stream_ids={
+                    row.stream.stream_id
+                    for row in resolution.resolved
+                    if row.stream.is_stale
+                    and row.stream.stream_id is not None
+                },
+                event_start_by_stream={
+                    row.stream.stream_id: unit.rows[0].result.parsed.start
+                    for unit in plan.units
+                    if event_has_started(unit.rows[0].result.parsed, now)
+                    for row in unit.rows
+                    if row.stream.stream_id is not None
+                },
+            )
             if dead:
                 # Annotate the losing rows from the pre-health plan, which
                 # is the last place they still appear — the replan below
@@ -3371,7 +3411,7 @@ async def preview_event_sync(
                             }
                 plan = build_promotion_plan(
                     config, resolution.resolved, existing_name_to_id,
-                    dead_stream_ids=dead,
+                    now=now, dead_stream_ids=dead,
                 )
 
         units_out = []
@@ -3442,6 +3482,19 @@ async def preview_event_sync(
                     "promote_channel_name": unit.channel_name,
                     "promote_skipped_early": True,
                 }
+        # Dateless drops: the parse succeeded, so the row must not fall
+        # through to the preview's "incomplete parsed identity" default.
+        # What is missing is a date, and saying that is the difference
+        # between a rule the operator can fix and one they think is broken.
+        for unit in plan.skipped_dateless_units:
+            for row in unit.rows:
+                promote_annotations[(row.stream.group_id,
+                                     row.stream.stream_id)] = {
+                    "would_promote": False,
+                    "promote_action": None,
+                    "promote_channel_name": unit.channel_name,
+                    "promote_skipped_dateless": True,
+                }
         # Every stream of an all-dead unit is dead by definition, so the
         # row carries both flags and the operator sees which event lost
         # its channel and why.
@@ -3468,6 +3521,7 @@ async def preview_event_sync(
             "skipped_past": plan.skipped_past,
             "skipped_past_adopted": plan.skipped_past_adopted,
             "skipped_early": plan.skipped_early,
+            "skipped_dateless": plan.skipped_dateless,
             "dead_streams_skipped": plan.dead_streams_skipped,
             "skipped_all_dead": plan.skipped_all_dead,
             "units": units_out,
@@ -3493,7 +3547,8 @@ async def preview_event_sync(
         "excluded_by_operator=%d preflight_ok=%s truncated=%s "
         "stale_suspect=%d freshness_unknown=%d snapshot_covered=%d "
         "would_promote=%s skipped_past=%s skipped_past_adopted=%s "
-        "skipped_early=%s dead_streams_skipped=%s skipped_all_dead=%s",
+        "skipped_early=%s skipped_dateless=%s dead_streams_skipped=%s "
+        "skipped_all_dead=%s",
         master_group_id, secondary_group_ids, len(master_channels),
         len(resolution.resolved), counts[DISPOSITION_WOULD_ATTACH],
         counts[DISPOSITION_AMBIGUOUS], counts[DISPOSITION_UNMATCHED],
@@ -3504,6 +3559,7 @@ async def preview_event_sync(
         promotion_out["skipped_past"] if promotion_out else "off",
         promotion_out["skipped_past_adopted"] if promotion_out else "off",
         promotion_out["skipped_early"] if promotion_out else "off",
+        promotion_out["skipped_dateless"] if promotion_out else "off",
         promotion_out["dead_streams_skipped"] if promotion_out else "off",
         promotion_out["skipped_all_dead"] if promotion_out else "off",
     )

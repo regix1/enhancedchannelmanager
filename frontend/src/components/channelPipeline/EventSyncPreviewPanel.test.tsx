@@ -862,6 +862,106 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     ).toBeNull();
   });
 
+  it('says how many streams were left alone for carrying no date', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_dateless = 4;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    const dateless = screen.getByTestId('event-sync-promote-skipped-dateless');
+    expect(dateless.textContent).toMatch(
+      /4 streams were left alone because their names carry no date/
+    );
+    expect(dateless.textContent).toMatch(/no channels were created for them/);
+  });
+
+  it('does not blame the parse when the plan is empty because of dates', () => {
+    // Those streams parsed a title and a time. Telling the operator no
+    // stream has a complete parsed identity sends them to the title and
+    // time patterns, and the real answer is one line above.
+    const preview = promotedPreview();
+    preview.promotion!.units = [];
+    preview.promotion!.skipped_dateless = 3;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-dateless')
+    ).toBeTruthy();
+    expect(screen.queryByText(/Nothing to promote/)).toBeNull();
+  });
+
+  it('says the parse found nothing when no stream was held back for a date', () => {
+    const preview = promotedPreview();
+    preview.promotion!.units = [];
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/Nothing to promote\. No unmatched stream/)
+    ).toBeTruthy();
+  });
+
+  it('uses the singular for a single dateless count', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_dateless = 1;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-dateless').textContent
+    ).toMatch(/1 stream was left alone because its name carries no date/);
+  });
+
+  it('stays silent about dateless streams when the count is missing or zero', () => {
+    // A backend that still promotes dateless streams omits the count
+    // entirely; a newer one sends 0 when every stream carried a date.
+    // Neither may render a block.
+    const absent = promotedPreview();
+    expect(absent.promotion!.skipped_dateless).toBeUndefined();
+    const zero = promotedPreview();
+    zero.promotion!.skipped_dateless = 0;
+    render(
+      <EventSyncPreviewPanel
+        preview={absent}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    render(
+      <EventSyncPreviewPanel
+        preview={zero}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.queryAllByTestId('event-sync-promote-skipped-dateless')
+    ).toHaveLength(0);
+  });
+
   it('marks the skipped row whose channel the rule is about to release', () => {
     const preview = promotedPreview();
     preview.promotion!.skipped_past = 2;
@@ -945,6 +1045,56 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     ).toBeInTheDocument();
     // Both rows now carry a health reason, so nothing may fall through.
     expect(screen.queryByText(/incomplete parsed identity/)).toBeNull();
+  });
+
+  it('names the missing date on a dateless row instead of blaming the parse', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_dateless = 1;
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_skipped_dateless = true;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/no event day to build a channel around/)
+    ).toBeInTheDocument();
+    // The dateless row parsed its title fine, so only the fixture's
+    // genuinely identity-less second row may say otherwise. Two would mean
+    // the dateless row fell through to the fallback.
+    expect(screen.getAllByText(/incomplete parsed identity/)).toHaveLength(1);
+  });
+
+  it('reads as dateless when the row also carries a health flag', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_dateless = 1;
+    preview.promotion!.dead_streams_skipped = 1;
+    // A stream with no date never reaches the plan, so the missing date is
+    // what the operator has to be told, not the health verdict.
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_skipped_dateless = true;
+    preview.unmatched_streams[0].promote_stream_dead = true;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/no event day to build a channel around/)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Dropped because this stream failed its health check/)
+    ).toBeNull();
+    expect(screen.getAllByText(/incomplete parsed identity/)).toHaveLength(1);
   });
 
   it('still says incomplete parsed identity when no annotation explains the row', () => {

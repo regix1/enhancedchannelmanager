@@ -410,7 +410,7 @@ backward compatibility; the rule editor now reads and writes the nested shape.
 | `skip_past_events` | no (default **false**) | When true, an event whose parsed start time has **already gone by** (plus `past_event_grace_hours`) gets no new channel, **and any channel this rule already promoted for it stops being managed**, which hands that channel to the rule's `orphan_action` (delete by default). Providers routinely leave finished events in the playlist forever, so without this every one of them keeps minting a channel nobody can watch and nothing ever cleans them up. Events with no genuinely parsed date (`assume_current_date` synthesized it) are never filtered. Absent means the filter does not exist for the rule. See [Skipping events that already finished](#skipping-events-that-already-finished). |
 | `past_event_grace_hours` | no (default 4) | How long after its start time an event still counts as current for `skip_past_events` (0–72; filled only when the filter is on). Provider names carry a start time and never a duration, so this is what keeps a broadcast in progress from being skipped and its channel removed mid-event. |
 | `promote_lead_hours` | no (absent = **no lead limit**) | How far ahead of its start time an event may get a channel (1–720). An event further away than this waits; an event that already **has** a channel keeps it however far away it is, so this only ever stops a create. Never default-filled. See [Not promoting an event that is still days away](#not-promoting-an-event-that-is-still-days-away). |
-| `skip_dead_streams` | no (default **false**) | When true, the run checks the health of the streams it is about to turn into channels and leaves the failures out. An event whose streams all fail gets no channel. It **never deletes** a channel that already exists. See [Not promoting a stream that does not play](#not-promoting-a-stream-that-does-not-play). |
+| `skip_dead_streams` | no (default **false**) | When true, the run leaves out any stream the provider has stopped listing, plus any stream that failed a probe once its event has started. An event whose streams are all dead gets no channel. It **never deletes** a channel that already exists, and it drops a delisted stream from a channel only after attaching a working one. See [Not promoting a stream that does not play](#not-promoting-a-stream-that-does-not-play). |
 
 ### Why validation is strict
 
@@ -1579,7 +1579,9 @@ Two things it deliberately does **not** do:
 * **It never touches dateless events.** When `assume_current_date`
   synthesized the date, the date was fabricated from "now" rather than
   read off the provider name. Past-versus-future is meaningless for those,
-  and the answer would flip every midnight, so they always promote.
+  and the answer would flip every midnight, so this filter never judges
+  them. They are dropped earlier for a different reason — see
+  [Dateless events are never promoted](#dateless-events-are-never-promoted).
 * **It does not spend cap budget.** Filtering happens before
   `max_promote_per_run`, so a playlist full of finished events cannot
   starve the live ones of create slots.
@@ -1647,11 +1649,28 @@ opposite of `skip_past_events`: un-promoting a far-off event would delete
 its channel tonight and recreate it tomorrow, every day until the window
 opened.
 
-Like the past-event filter, it never touches a dateless listing, and it
+Like the past-event filter, it never judges a dateless listing, and it
 runs before `max_promote_per_run` so a playlist full of next month's shows
 cannot starve tonight's events of create slots. Held-back events are
 counted as `promotion.skipped_early` and each held row is marked
 `promote_skipped_early: true`.
+
+### Dateless events are never promoted
+
+A listing that carries a time but no date names a recurring slot, not one
+broadcast. `FURY vs HALL 6PM` is the same string tonight, tomorrow and next
+week, so a channel promoted from it would carry a different event every day
+and there would be no way to tell which.
+
+Promotion therefore drops those events before any other filter. Nothing is
+created for them, they never spend cap budget, and the count reaches both
+the preview and the run summary as `promotion.skipped_dateless`, with each
+row marked `promote_skipped_dateless: true`. A channel an earlier run
+already created for such an event is kept, not retired.
+
+This applies only to promotion. Dateless listings still **attach** to
+master channels as before when `assume_current_date` is on, which is what
+that setting is for.
 
 ### Not promoting a stream that does not play
 
@@ -1699,16 +1718,57 @@ every stream keeps whatever channel it already has, and orphan cleanup
 does not touch it. A provider having a bad hour cannot take your channels
 with it.
 
-What counts as dead:
+What counts as dead, in one sentence: **a stream is dead when the provider
+has stopped listing it, and a probe result only counts once the event has
+started.**
 
-* a stream that has struck out, meaning its consecutive probe failures have
-  reached the **Strike threshold** setting (default 3), which is the same
-  signal auto-creation's "skip struck streams" uses; or
-* a stream this run probed and could not reach.
+| Signal | Dead? |
+|---|---|
+| The provider no longer lists the stream (Dispatcharr flags it stale) | **Always.** Whatever its probe history says, and however far off the event is. |
+| Its stored probe result is a failure or a timeout | **Only once the event's start time has gone by.** |
+| It has struck out, meaning consecutive probe failures reached the **Strike threshold** setting (default 3) | **Only once the event's start time has gone by.** |
+| It has never been probed | **Never.** |
+| It has not been probed recently | **Never.** |
 
-A single old failure is not enough. Streams fail transiently, and the
-strike threshold is the setting you already tuned to say how much failure
-is too much.
+Two of those need the reasoning spelled out, because both are easy to get
+backwards:
+
+* **The listing is the signal that matters.** Some providers re-issue every
+  event under a new stream id on each playlist refresh. The old id keeps
+  whatever health record it earned while it still worked, so it reads as a
+  healthy stream forever even though the provider has moved on. On one live
+  instance that was 6 of the 12 streams attached to promoted channels, and
+  4 channels had nothing else behind them.
+* **A probe result before the event starts means nothing.** A stream for a
+  game that has not begun may fail simply because there is nothing to serve
+  yet. On one live instance every listed replacement for events a week or
+  more away probed as failed; treating that as dead would have refused
+  every upcoming event and created no channels at all. The listing carries
+  the whole load until kickoff, and it is enough.
+
+A never-probed stream is never dead either. ECM has probed about 65 of some
+37,000 streams on a real instance, so an absent result has to mean nothing.
+
+**Swapping a delisted stream out.** Once a promoted channel carries a
+stream for that event whose probe **passed**, the run removes from that
+channel any stream the provider has stopped listing. The order matters and
+is the whole point: the delisted stream goes only **after** a stream that
+is proven to play is in place.
+
+The two bars are deliberately different. Attaching a stream asks only that
+it is not dead, because refusing every unprobed candidate would create no
+channels at all. Detaching asks for positive evidence, because a stream
+that is merely "not dead" may be one nobody has ever probed, or one that is
+failing right now for the ordinary reason that its event has not started
+and there is nothing to serve yet. On one live instance four channels each
+held a delisted stream that passed its probe beside a listed replacement
+that failed, days before kickoff; swapping on "not dead" would have taken
+four channels that played and left them on streams that did not.
+
+So where nothing has a passing verdict, the channel keeps **both** streams
+and keeps playing. The removals are counted on the run summary, they go
+through the same rollback-safe path a `remove_from_channel` rule action
+uses, and a dry run removes nothing and reports what it would have done.
 
 Two limits worth knowing:
 

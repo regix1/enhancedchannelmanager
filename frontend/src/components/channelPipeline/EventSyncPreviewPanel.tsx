@@ -151,12 +151,33 @@ function skippedAllDeadText(count: number): string {
 }
 
 /**
+ * Streams whose name carries no date. There is no event day to build a
+ * channel around, so nothing is created for them, and they only come back if
+ * the provider renames the stream.
+ */
+function skippedDatelessText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 stream was left alone because its name carries no date, so no ' +
+      'channel was created for it.'
+    );
+  }
+  return (
+    `${count} streams were left alone because their names carry no date, ` +
+    'so no channels were created for them.'
+  );
+}
+
+/**
  * Why one unmatched row is or is not in the promotion plan, for its cell in
  * the unmatched table.
  *
  * The order matters. A row whose event lost every stream carries both health
  * flags, so the all-dead reading has to win over the single-stream one or the
  * operator reads "one stream is bad" about an event that has no streams left.
+ * The dateless reading sits above both health readings for the same kind of
+ * reason: a stream with no date never reaches the plan at all, so naming a
+ * health verdict on it would send the operator after the wrong thing.
  * The final fallback is only reached by a row with no promotion annotation at
  * all, which is what an incomplete parsed identity looks like. Every other
  * reason has to be named above it, or a perfectly parsed row gets told its
@@ -180,6 +201,9 @@ function promotionRowReason(row: EventSyncUnmatchedStream): string {
   }
   if (row.promote_skipped_early) {
     return 'Deferred (further ahead than the lead window), so it gets its channel on a later run';
+  }
+  if (row.promote_skipped_dateless) {
+    return 'Skipped because this stream name carries no date, so there is no event day to build a channel around';
   }
   if (row.promote_skipped_all_dead) {
     return 'Skipped because every stream for this event failed its health check, so there was nothing to attach';
@@ -644,10 +668,10 @@ export function EventSyncPreviewPanel({
                   </span>
                 </div>
               )}
-              {/* The three counts below ride along only on a backend that
-                  has the lead window and the stream health check. A missing
-                  count reads as 0, so an older backend simply renders
-                  nothing here. */}
+              {/* The four counts below ride along only on a backend that has
+                  the lead window, the stream health check and the dateless
+                  divert. A missing count reads as 0, so an older backend
+                  simply renders nothing here. */}
               {(preview.promotion.skipped_early ?? 0) > 0 && (
                 <p
                   className="form-hint"
@@ -680,11 +704,25 @@ export function EventSyncPreviewPanel({
                   </span>
                 </div>
               )}
-              {preview.promotion.units.length === 0 ? (
-                <p className="form-hint">
-                  Nothing to promote — no unmatched stream has a complete
-                  parsed identity.
+              {(preview.promotion.skipped_dateless ?? 0) > 0 && (
+                <p
+                  className="form-hint"
+                  data-testid="event-sync-promote-skipped-dateless"
+                >
+                  {skippedDatelessText(preview.promotion.skipped_dateless ?? 0)}
                 </p>
+              )}
+              {preview.promotion.units.length === 0 ? (
+                // The dateless hint above already says why those streams
+                // were left alone, and their identity parsed fine apart
+                // from the date, so repeating the parse as the reason sends
+                // the operator to the wrong patterns. [66]
+                (preview.promotion.skipped_dateless ?? 0) === 0 && (
+                  <p className="form-hint">
+                    Nothing to promote. No unmatched stream has a complete
+                    parsed identity.
+                  </p>
+                )
               ) : (
                 <div className="event-sync-table-wrap">
                   <table>

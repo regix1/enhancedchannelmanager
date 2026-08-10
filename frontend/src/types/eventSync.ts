@@ -394,6 +394,11 @@ export interface EventSyncUnmatchedStream {
    * `promote_skipped_past`, it re-surfaces on a later run. Absent on a
    * backend without the lead window. */
   promote_skipped_early?: boolean;
+  /** True when the stream name carries no date, so there is no event day to
+   * build a channel around and the stream is left alone. It comes back on a
+   * later run only if the provider renames the stream. Absent on a backend
+   * that still promotes dateless streams. */
+  promote_skipped_dateless?: boolean;
   /** True when this stream failed its health check. On its own it means the
    * event still promotes on the streams that passed; alongside
    * `promote_skipped_all_dead` it means nothing was left to attach. Absent
@@ -468,6 +473,11 @@ export interface EventSyncPromotionPreview {
    * new channel; it never retires one that already exists. Absent on a
    * backend without the health check. */
   skipped_all_dead?: number;
+  /** How many streams were left alone because their names carry no date, so
+   * there is no event day to build a channel around. Optional and read with
+   * a 0 fallback for the same reason as the three counts above: a backend
+   * that still promotes dateless streams omits it. */
+  skipped_dateless?: number;
   units: EventSyncPromotionUnit[];
 }
 

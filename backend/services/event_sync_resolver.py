@@ -202,6 +202,15 @@ class SecondaryStream:
     group not captured / capped list). Fail-open: only ``True`` can ever
     demote, and only via the stale-dateless rail in :func:`_resolve_stream`
     when ``assume_current_date`` was load-bearing for the match.
+
+    ``is_stale`` is Dispatcharr's own per-stream flag, carried straight off
+    the fetch the caller already performed: ``True`` when its M3U refresh
+    no longer found this stream in the source playlist, so the provider has
+    stopped listing it and will eventually delete it. A DIFFERENT question
+    from ``name_seen_before_today`` above, which asks whether a NAME
+    predates today. ``None`` when the fetch did not carry the flag. The
+    promotion health gate treats ``True`` as dead — the provider's own
+    statement, not a verdict of ours. [11]
     """
 
     name: str
@@ -210,6 +219,7 @@ class SecondaryStream:
     provider: str | None = None
     provider_id: int | None = None
     name_seen_before_today: bool | None = None
+    is_stale: bool | None = None
 
 
 @dataclass(frozen=True)

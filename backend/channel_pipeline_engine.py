@@ -3196,6 +3196,11 @@ class ChannelPipelineEngine:
                                 stale_lookup, account_id, gname, s["name"],
                             )
                         ),
+                        # Dispatcharr already told us whether it still lists
+                        # this stream; carrying the flag off this fetch is
+                        # what keeps the health gate from re-scanning the
+                        # whole playlist for it. [11][12]
+                        is_stale=s.get("is_stale"),
                     ))
                 if len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
                     secondary_streams = secondary_streams[
@@ -3257,6 +3262,9 @@ class ChannelPipelineEngine:
                                     s["name"],
                                 )
                             ),
+                            # Same provider-listing flag for the master-group
+                            # self-attach source. [11]
+                            is_stale=s.get("is_stale"),
                         ))
                     if len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
                         secondary_streams = secondary_streams[
@@ -4199,10 +4207,20 @@ class ChannelPipelineEngine:
                         f"{promo['skipped_early']} event(s) still too far "
                         f"ahead to promote"
                     )
+                if promo.get("skipped_dateless"):
+                    extras.append(
+                        f"{promo['skipped_dateless']} event(s) skipped with "
+                        f"no date to place them on"
+                    )
                 if promo.get("dead_streams_skipped"):
                     extras.append(
                         f"{promo['dead_streams_skipped']} stream(s) dropped "
                         f"as dead"
+                    )
+                if promo.get("stale_streams_removed"):
+                    extras.append(
+                        f"{promo['stale_streams_removed']} delisted stream(s) "
+                        f"removed from promoted channel(s)"
                     )
                 if promo.get("skipped_all_dead"):
                     extras.append(

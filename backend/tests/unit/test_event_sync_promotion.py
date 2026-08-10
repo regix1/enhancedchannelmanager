@@ -13,9 +13,10 @@ end to end against the stateful fixture Dispatcharr:
 * **AC-3 idempotence** — an immediate re-run creates zero channels and
   attaches zero duplicates; same-run cross-provider streams sharing an
   event key share ONE channel.
-* **AC-4 dateless identity (t6bin parity)** — a synthesized-date parse
-  promotes to a channel with NO date in name/identity; the re-run after
-  simulated midnight adopts the same channel.
+* **Dateless streams never promote** — a synthesized-date parse names a
+  recurring slot rather than one broadcast, so it is diverted out of the
+  plan whatever its action, counted as ``skipped_dateless``, and any
+  channel it already has is kept rather than retired.
 * **AC-5 reconciliation lifecycle** — stream gone from the playlist →
   next run's Pass 4 deletes the promoted channel per orphan_action;
   masters are provably never in the managed set; first-run-populate
@@ -70,6 +71,7 @@ from services.event_sync_promote import (
     PromotionPlan,
     PromotionUnit,
     build_promotion_plan,
+    event_has_started,
     event_is_early,
     event_is_past,
     promoted_channel_name,
@@ -362,9 +364,9 @@ class TestPromotedChannelName:
         assert "11" not in name and "Jul" not in name
 
     def test_dateless_name_and_key_stable_across_midnight(self):
-        """AC-4 half 2 (t6bin parity at the identity layer): the same
-        dateless slot parsed on two different days derives the SAME key
-        and the SAME name — so the re-run adopts, never duplicates."""
+        """The identity layer is unchanged by the promotion rule: the same
+        dateless slot parsed on two different days derives the SAME key and
+        the SAME name, so nothing downstream can mint a duplicate."""
         day1 = _parsed(
             "Fury vs Hall", EASTERN.localize(datetime(2026, 7, 11, 18, 0)),
             matched_pattern="dateless-title-time-ampm",
@@ -375,14 +377,18 @@ class TestPromotedChannelName:
         )
         assert master_event_key(day1) == master_event_key(day2)
         assert promoted_channel_name(day1) == promoted_channel_name(day2)
-        # And the plan adopts when the day-1 channel exists.
+        # The plan recognizes the day-1 channel as this unit's own, then
+        # diverts the unit because nothing can date it.
         rows = [_resolved("FURY vs HALL 6PM", DISPOSITION_UNMATCHED, day2)]
         plan = build_promotion_plan(
             _promote_config(),
             rows,
             {promoted_channel_name(day1).lower(): 902},
         )
-        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units == ()
+        assert plan.skipped_dateless_units[0].action \
+            == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.skipped_dateless_units[0].existing_channel_id == 902
 
 
 class TestSkipPastEvents:
@@ -451,10 +457,11 @@ class TestSkipPastEvents:
         assert plan.would_create == 1
         assert plan.skipped_past == 0
 
-    def test_dateless_event_is_never_filtered(self):
+    def test_the_past_filter_never_judges_a_dateless_event(self):
         """The date on a synthesized parse was fabricated from "now", so
         past-vs-future says nothing about the event and the verdict would
-        flip at midnight. Even a start that reads as long gone survives."""
+        flip at midnight. Even a start that reads as long gone is never
+        called finished; it leaves the plan as dateless instead."""
         parsed = _parsed(
             "Fury vs Hall", self.FINISHED,
             matched_pattern="dateless-title-time-ampm",
@@ -463,8 +470,9 @@ class TestSkipPastEvents:
         plan = build_promotion_plan(
             self._skip_config(), rows, {}, now=FROZEN_NOW
         )
-        assert plan.would_create == 1
         assert plan.skipped_past == 0
+        assert plan.skipped_dateless == 1
+        assert plan.would_create == 0
 
     def test_finished_event_releases_its_existing_channel(self):
         """An adopt unit for a finished event is dropped too, so its
@@ -548,7 +556,9 @@ class TestSkipPastEvents:
     def test_dateless_event_keeps_its_existing_channel(self):
         """The synthesized-date guard on the destructive path: the date
         came from "now", so a past-vs-future verdict would flip at
-        midnight and delete a channel that is still wanted."""
+        midnight and delete a channel that is still wanted. The dateless
+        bucket carries the channel id, which is what the executor holds in
+        the managed set."""
         parsed = _parsed(
             "Fury vs Hall", self.FINISHED,
             matched_pattern="dateless-title-time-ampm",
@@ -560,7 +570,8 @@ class TestSkipPastEvents:
         )
         assert plan.skipped_past == 0
         assert plan.skipped_past_adopted == 0
-        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.skipped_dateless == 1
+        assert plan.skipped_dateless_units[0].existing_channel_id == 903
 
     def test_channel_of_an_event_still_on_air_is_kept(self):
         """The grace window on the destructive path: the broadcast started
@@ -688,8 +699,46 @@ class TestClusteringAcrossProviderClocks:
         assert len(plan.units) == 1
         assert plan.units[0].channel_name == promoted_channel_name(early)
         assert plan.units[0].event_key == master_event_key(early)
-        # Attach order is still by provider and stream id.
-        assert [r.stream.stream_id for r in plan.units[0].rows] == [1, 999]
+        # The surviving key's own rows come first and the folded-in ones
+        # follow, each group by provider and stream id. Element zero is
+        # therefore the row the unit was named after, which is what lets a
+        # caller read the unit's start off rows[0]. [52]
+        assert [r.stream.stream_id for r in plan.units[0].rows] == [999, 1]
+
+    def test_a_folded_unit_reads_its_start_off_the_row_it_was_named_after(
+        self
+    ):
+        """Two listings of one event forty minutes apart with the run
+        happening between them. The health gate reads the unit's start off
+        ``rows[0]`` to decide whether the event has begun, so that row has
+        to be the one the unit's identity came from. Sorting the whole
+        folded list by provider and stream id used to put the later listing
+        first, and a single run then answered "has this started" one way
+        for the channel name and the other way for the probe verdicts. [52]
+        """
+        early = _parsed("Knoxville Raceway", self.RACE)
+        late = _parsed("Knoxville Raceway", self._minutes_later(40))
+        rows = [
+            # The later listing sorts first by (provider_id, stream_id).
+            _resolved("later listing", DISPOSITION_UNMATCHED, late,
+                      provider_id=1, stream_id=1),
+            _resolved("earlier listing", DISPOSITION_UNMATCHED, early,
+                      provider_id=9, stream_id=999),
+        ]
+        between = self._minutes_later(20)
+
+        plan = build_promotion_plan(
+            _promote_config(time_window_minutes=60), rows, {}, now=between,
+        )
+
+        assert len(plan.units) == 1
+        unit = plan.units[0]
+        assert unit.channel_name == promoted_channel_name(early)
+        assert unit.rows[0].result.parsed.start == early.start
+        # The two listings genuinely straddle the run's instant, so reading
+        # the wrong one flips the verdict rather than merely shifting it.
+        assert event_has_started(unit.rows[0].result.parsed, between) is True
+        assert event_has_started(late, between) is False
 
     def test_an_existing_channel_outranks_the_earliest_start(self):
         """A provider dropping its earlier listing must not rename the
@@ -776,7 +825,8 @@ class TestClusteringAcrossProviderClocks:
     def test_dateless_slots_never_fold(self):
         """A dateless start was fabricated from "now", so its clock says
         nothing about which event it is and folding on it would join two
-        unrelated recurring slots."""
+        unrelated recurring slots. Neither is promoted, but they stay two
+        separate units on the way out."""
         rows = [
             _resolved("slot a", DISPOSITION_UNMATCHED,
                       _parsed("Ppv Event", self.RACE,
@@ -788,7 +838,8 @@ class TestClusteringAcrossProviderClocks:
                       stream_id=2),
         ]
         plan = build_promotion_plan(_promote_config(), rows, {})
-        assert len(plan.units) == 2
+        assert plan.units == ()
+        assert plan.skipped_dateless == 2
 
     def test_enforce_time_window_off_still_keeps_the_days_apart(self):
         """``enforce_time_window`` governs whether a clock mismatch may
@@ -958,9 +1009,10 @@ class TestPromoteLeadHours:
         assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
         assert plan.units[0].existing_channel_id == 920
 
-    def test_dateless_event_is_never_held_back(self):
+    def test_the_lead_window_never_judges_a_dateless_event(self):
         """The date was fabricated from "now", so an early-vs-late verdict
-        on it says nothing about the event."""
+        on it says nothing about the event. It leaves the plan as dateless
+        rather than as held back."""
         rows = [
             _resolved("slot", DISPOSITION_UNMATCHED,
                       _parsed("Ppv Event", self.FAR,
@@ -970,12 +1022,14 @@ class TestPromoteLeadHours:
             self._lead_config(), rows, {}, now=FROZEN_NOW
         )
         assert plan.skipped_early == 0
-        assert plan.would_create == 1
+        assert plan.skipped_dateless == 1
+        assert plan.would_create == 0
 
     def test_event_with_no_parsed_start_is_never_early(self):
         parsed = ParsedEvent(raw_name="no time here", title="Fury vs. Usyk",
                              start=None, teams=None, matched_pattern=None)
         assert event_is_early(parsed, 24, FROZEN_NOW) is False
+
 
     def test_early_events_do_not_spend_cap_budget(self):
         """Held-back events must not starve tonight's events of create
@@ -1017,6 +1071,42 @@ class TestPromoteLeadHours:
             plan = build_promotion_plan(_promote_config(), rows, {})
             assert fake_clock.now.call_count == 0
         assert plan.would_create == 1
+
+
+class TestEventHasStarted:
+    """The question the health gate asks before a probe verdict counts.
+
+    A stream for an event that has not begun may fail simply because there
+    is nothing to stream yet, so a failure before kickoff is no evidence at
+    all. Only a delisted stream is dead either way.
+    """
+
+    BEFORE = EASTERN.localize(datetime(2026, 7, 11, 20, 0))
+    AFTER = EASTERN.localize(datetime(2026, 7, 12, 2, 0))
+
+    def test_a_start_already_behind_us_has_started(self):
+        parsed = _parsed("Fury vs. Usyk", START)
+        assert event_has_started(parsed, self.AFTER) is True
+
+    def test_a_start_still_ahead_has_not_started(self):
+        parsed = _parsed("Fury vs. Usyk", START)
+        assert event_has_started(parsed, self.BEFORE) is False
+
+    def test_the_exact_start_instant_counts_as_started(self):
+        parsed = _parsed("Fury vs. Usyk", START)
+        assert event_has_started(parsed, START) is True
+
+    def test_an_event_with_no_parsed_start_never_starts(self):
+        parsed = ParsedEvent(raw_name="no time here", title="Fury vs. Usyk",
+                             start=None, teams=None, matched_pattern=None)
+        assert event_has_started(parsed, self.AFTER) is False
+
+    def test_a_dateless_event_never_starts(self):
+        """Its date came from "now", so "has it begun" is unanswerable and
+        the safe answer is the one where no probe verdict counts."""
+        parsed = _parsed("Ppv Event", START,
+                         matched_pattern="dateless-title-time-ampm")
+        assert event_has_started(parsed, self.AFTER) is False
 
 
 class TestDeadStreamsAreNotPromoted:
@@ -1646,7 +1736,13 @@ class TestPromotionExecution:
 
 
 class TestDatelessPromotion:
-    """AC-4 integration: dateless promote + midnight re-run adoption."""
+    """A stream carrying a time but no date never becomes a channel.
+
+    The name identifies a recurring slot rather than one broadcast, so the
+    channel it would promote to would carry a different event every day and
+    the operator has no way to tell which. The count reaches the run
+    summary so the rows are explained rather than silently missing.
+    """
 
     def _dateless_state(self):
         return FakeDispatcharrState(
@@ -1661,7 +1757,7 @@ class TestDatelessPromotion:
             ]},
         )
 
-    def test_dateless_promotes_without_date_and_readopts_after_midnight(
+    def test_a_dateless_stream_never_becomes_a_channel(
         self, db_session_factory
     ):
         _add_rule(db_session_factory, _promote_config(
@@ -1673,24 +1769,342 @@ class TestDatelessPromotion:
 
         first, _ = _manual_run(client, db_session_factory, now=FROZEN_NOW)
         promo1 = first["event_sync"][0]["promotion"]
-        assert promo1["promoted_created"] == 1
-        created_id = promo1["channel_ids"][0]
-        name = state.channels[created_id]["name"]
-        # No date component — identity/name never carry a synthesized date.
-        assert name == "Fury Vs Hall @ 06:00 PM"
+        assert promo1["promoted_created"] == 0
+        assert promo1["skipped_dateless"] == 1
+        assert promo1["channel_ids"] == []
+        client.create_channel.assert_not_awaited()
 
-        # Simulated midnight: same playlist, next day.
+        # A re-run after simulated midnight still creates nothing, so the
+        # rule cannot mint one channel per day for the same slot.
         second, _ = _manual_run(
             client, db_session_factory, now=FROZEN_NOW + timedelta(days=1)
         )
         promo2 = second["event_sync"][0]["promotion"]
         assert promo2["promoted_created"] == 0
-        assert promo2["promoted_adopted"] == 1
-        assert promo2["already_attached"] == 1
-        assert client.create_channel.await_count == 1
+        assert promo2["skipped_dateless"] == 1
+        assert client.create_channel.await_count == 0
         client.delete_channel.assert_not_awaited()
-        # Still exactly one promoted channel, same id.
-        assert created_id in state.channels
+
+
+class TestDelistedStreamSwap:
+    """A promoted channel pinned to a stream the provider stopped listing.
+
+    Measured shape from the live instance: the provider re-lists each event
+    under a new id on every refresh, so a channel adopted run after run
+    keeps the superseded id. The replacement is listed but probes failed,
+    because its event is still days away and there is nothing to serve yet.
+    Swapping unconditionally would take a channel that plays and leave it
+    with a stream that does not, so the delisted stream is dropped only once
+    a stream on that channel has a PASSING probe. Attaching asks only that a
+    stream is not dead; detaching asks for proof that something works, and
+    the gap between those two bars is exactly this class. [51]
+    """
+
+    STALE_ID = 7301
+    REPLACEMENT_ID = 7302
+    OTHER_EVENT_STALE_ID = 7401
+
+    def _swap_state(self) -> FakeDispatcharrState:
+        state = _promote_state()
+        state.channels[850] = {
+            "id": 850, "name": FURY_CHANNEL_NAME,
+            "channel_group_id": PROMOTE_GROUP_ID,
+            "auto_created": True, "streams": [self.STALE_ID],
+        }
+        state.secondary_streams[SECONDARY_B_NAME] = [
+            {"id": self.STALE_ID, "name": STREAM_FURY, "m3u_account": 2,
+             "is_stale": True},
+            {"id": self.REPLACEMENT_ID, "name": STREAM_FURY_ALT,
+             "m3u_account": 2},
+        ]
+        return state
+
+    def _run_at(self, client, session_factory, now, dry_run=False,
+                replacement_status="failed", probed_at=None):
+        """A run whose promotion clock is pinned, with the replacement
+        carrying a stored health record.
+
+        ``failed`` is the live instance's own shape: probed twice, failed
+        twice, one short of the strike threshold. ``success`` is the shape
+        of a replacement that has been proven to play, which is the only
+        thing that lets the delisted stream go.
+
+        ``probed_at`` is when that record was written, defaulting to the run
+        instant. The health table stores it as naive UTC.
+        """
+        stats = {self.REPLACEMENT_ID: {
+            "stream_id": self.REPLACEMENT_ID,
+            "probe_status": replacement_status,
+            "consecutive_failures": 2 if replacement_status == "failed" else 0,
+            "last_probed": (probed_at or now).astimezone(
+                pytz.utc).replace(tzinfo=None).isoformat() + "Z",
+        }}
+
+        def _stats_for(stream_ids):
+            return {sid: stats[sid] for sid in stream_ids if sid in stats}
+
+        with patch("channel_pipeline_executor.datetime") as promote_clock, \
+             patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_for):
+            promote_clock.now.return_value = now
+            return _manual_run(client, session_factory, dry_run=dry_run)
+
+    def test_the_delisted_stream_goes_once_a_passing_replacement_arrives(
+        self, db_session_factory
+    ):
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        # The replacement has been probed and it answered, so there is
+        # positive evidence that this channel keeps playing without the
+        # stream the provider dropped.
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW,
+            replacement_status="success",
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["dead_streams_skipped"] == 1
+        assert promo["stale_streams_removed"] == 1
+        assert state.stream_ids_of(850) == [self.REPLACEMENT_ID]
+        assert 850 in promo["channel_ids"]
+
+    def test_the_delisted_stream_stays_when_the_replacement_only_probes_failed(
+        self, db_session_factory
+    ):
+        """The shape of the four live channels, and the reason the bar for
+        detaching is a passing probe rather than "not dead".
+
+        The event starts at 11 PM and the run is at noon, so the
+        replacement's failed probe does not count against it and it is
+        attached. It is still not EVIDENCE of anything, so the delisted
+        stream that currently plays stays where it is and the channel ends
+        the run carrying both. [51]
+        """
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(client, db_session_factory, FROZEN_NOW)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["stale_streams_removed"] == 0
+        assert state.stream_ids_of(850) == [
+            self.STALE_ID, self.REPLACEMENT_ID,
+        ]
+        assert 850 in promo["channel_ids"]
+
+    def test_the_delisted_stream_stays_when_nobody_has_probed_the_replacement(
+        self, db_session_factory
+    ):
+        """Never probed is not evidence either. A dry run probes nothing,
+        so the replacement reaches the detach check with no verdict at all
+        and the channel keeps both streams. [51]"""
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        with patch("channel_pipeline_executor.datetime") as promote_clock, \
+             patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   lambda stream_ids: {}):
+            promote_clock.now.return_value = FROZEN_NOW
+            result, _ = _manual_run(client, db_session_factory, dry_run=True)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["stale_streams_removed"] == 0
+        assert state.update_channel_calls == []
+
+    def test_the_delisted_stream_stays_when_nothing_else_is_playable(
+        self, db_session_factory
+    ):
+        """The case that would break four live channels if the swap were
+        unconditional: once the event is on air the replacement's failed
+        probe does count, so there is nothing to attach and the delisted
+        stream is the only thing still serving the event."""
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW + timedelta(days=1)
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["skipped_all_dead"] == 1
+        assert promo["stale_streams_removed"] == 0
+        assert state.stream_ids_of(850) == [self.STALE_ID]
+        # The channel stays in the managed set, so Pass 4 leaves it alone.
+        assert 850 in promo["channel_ids"]
+
+    def test_a_failure_recorded_before_kickoff_never_turns_fatal(
+        self, db_session_factory
+    ):
+        """A stream probed while its event was still hours away failed
+        because there was nothing to serve yet. Nothing re-probes a stream
+        that already has a record, so counting that verdict once the event
+        starts would make it permanent and leave the event with no
+        channel. [59]
+        """
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW + timedelta(days=1),
+            probed_at=FROZEN_NOW,
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["skipped_all_dead"] == 0
+        assert state.stream_ids_of(850) == [
+            self.STALE_ID, self.REPLACEMENT_ID,
+        ]
+
+    def test_an_event_whose_only_stream_is_delisted_creates_nothing(
+        self, db_session_factory
+    ):
+        """No replacement is listed at all, so the event has nothing behind
+        it. No channel is created, and the one it already has is kept:
+        health blocks creates and attaches, it never retires."""
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        state.secondary_streams[SECONDARY_B_NAME] = [
+            {"id": self.STALE_ID, "name": STREAM_FURY, "m3u_account": 2,
+             "is_stale": True},
+        ]
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(client, db_session_factory, FROZEN_NOW)
+
+        promo = result["event_sync"][0]["promotion"]
+        # The same two numbers the preview reports for this shape, in
+        # tests/routers/test_event_sync_preview.py — a delisted stream with
+        # a stored success verdict and no replacement. Preview and run read
+        # staleness off the same fetch and cannot differ on it.
+        assert promo["dead_streams_skipped"] == 1
+        assert promo["skipped_all_dead"] == 1
+        assert promo["promoted_created"] == 0
+        assert promo["stale_streams_removed"] == 0
+        assert state.stream_ids_of(850) == [self.STALE_ID]
+        assert 850 in promo["channel_ids"]
+
+    def test_a_dry_run_removes_nothing_and_reports_what_it_would_do(
+        self, db_session_factory
+    ):
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW, dry_run=True,
+            replacement_status="success",
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["stale_streams_removed"] == 1
+        assert state.stream_ids_of(850) == [self.STALE_ID]
+        assert state.update_channel_calls == []
+        would_remove = [
+            r for r in result["dry_run_results"]
+            if str(r["action"]).startswith("Would remove")
+        ]
+        assert len(would_remove) == 1
+        assert would_remove[0]["stream_id"] == self.STALE_ID
+
+    def test_only_this_event_s_delisted_stream_goes(self, db_session_factory):
+        """A channel can carry a delisted stream from a different event, and
+        the proof that THIS event has something working says nothing about
+        that one. The channel keeps it. [55]
+        """
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        state.channels[850]["streams"] = [
+            self.STALE_ID, self.OTHER_EVENT_STALE_ID,
+        ]
+        state.secondary_streams[SECONDARY_B_NAME].append(
+            {"id": self.OTHER_EVENT_STALE_ID, "name": STREAM_TYSON,
+             "m3u_account": 2, "is_stale": True},
+        )
+
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW,
+            replacement_status="success",
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["stale_streams_removed"] == 1
+        assert state.stream_ids_of(850) == [
+            self.OTHER_EVENT_STALE_ID, self.REPLACEMENT_ID,
+        ]
+
+    def test_the_detach_records_the_channel_it_can_be_restored_from(
+        self, db_session_factory
+    ):
+        """Rollback restores a channel from the stream list recorded against
+        it, so a detach that records anything else is not reversed. [58]
+        """
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        self._run_at(
+            client, db_session_factory, FROZEN_NOW,
+            replacement_status="success",
+        )
+
+        from models import ChannelPipelineExecution
+
+        session = db_session_factory()
+        try:
+            execution = (
+                session.query(ChannelPipelineExecution)
+                .order_by(ChannelPipelineExecution.id.desc())
+                .first()
+            )
+            modified = execution.get_modified_entities()
+        finally:
+            session.close()
+
+        # The list as it stood after the attach and before the detach is the
+        # one only the detach can have recorded.
+        detached = [
+            e for e in modified
+            if e["type"] == "channel" and e["id"] == 850
+            and (e.get("previous") or {}).get("streams") == [
+                self.STALE_ID, self.REPLACEMENT_ID,
+            ]
+        ]
+        assert len(detached) == 1
 
 
 class TestReconciliationLifecycle:
@@ -1781,9 +2195,12 @@ class TestReconciliationLifecycle:
 
     def _run_at(self, client, session_factory, moment):
         """One manual run with BOTH clocks pinned to ``moment``: the
-        resolver's, which dates the parse, and the planner's, which
-        decides whether the event has finished."""
-        with patch("services.event_sync_promote.datetime") as promote_clock:
+        resolver's, which dates the parse, and the executor's, which is
+        the ONE clock the promotion reads. The planner takes its instant
+        from the executor rather than reading the wall clock itself, so
+        pinning the executor pins the past filter and the lead window
+        too. [53]"""
+        with patch("channel_pipeline_executor.datetime") as promote_clock:
             promote_clock.now.return_value = moment
             return _manual_run(client, session_factory, now=moment)
 

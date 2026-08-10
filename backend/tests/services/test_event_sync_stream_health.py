@@ -4,7 +4,12 @@ The rails that matter here are all about what the check REFUSES to do. It
 reports a stream dead only on evidence, it probes only on a live run, and
 every failure of its own machinery reads as "nothing is dead" so an outage
 in ECM can never look like an outage at the provider.
+
+The evidence itself is one rule: a stream is dead when the provider has
+stopped listing it, and a probe verdict counts only once the event has
+started. Everything in here is a case of that.
 """
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,14 +17,24 @@ import pytest
 from services.event_sync_stream_health import (
     MAX_HEALTH_PROBES_PER_RUN,
     find_dead_streams,
+    find_working_streams,
 )
 
 
-def _stat(stream_id, *, failures=0, status="success"):
+# When the events in these tests began, and when a stored verdict was
+# recorded unless a test says otherwise. A probe taken after kickoff is the
+# ordinary case; one taken before it is the case in
+# test_a_failure_recorded_before_kickoff_stays_out_of_the_verdict.
+_KICKOFF = datetime(2026, 7, 11, 23, 0, 0, tzinfo=timezone.utc)
+
+
+def _stat(stream_id, *, failures=0, status="success", probed_at=None):
     return {
         "stream_id": stream_id,
         "probe_status": status,
         "consecutive_failures": failures,
+        "last_probed": (probed_at or _KICKOFF).replace(
+            tzinfo=None).isoformat() + "Z",
     }
 
 
@@ -41,30 +56,88 @@ class TestVerdictFromStoredHealth:
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
              patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams([7, 8]) == {7}
+            assert await find_dead_streams(
+                [7, 8], event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7}
 
-    async def test_one_old_failure_is_not_dead(self):
-        """Streams fail transiently. The strike threshold is the setting an
-        operator already tuned to say how much failure is too much, so a
-        single failure below it is not evidence."""
+    async def test_a_stored_failure_after_the_event_started_is_dead(self):
+        """One recorded failure is below the strike threshold, and once the
+        event is on air that is still a stream that did not answer."""
         stats = {7: _stat(7, failures=1, status="failed")}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
              patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams([7]) == set()
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
 
-    async def test_a_stream_with_no_health_record_is_not_dead(self):
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams([7, 8]) == set()
-
-    async def test_the_strike_rule_switched_off_reports_nothing(self):
+    async def test_a_stored_failure_before_the_event_starts_is_not_dead(self):
+        """The criterion that keeps upcoming events working: a stream for an
+        event that has not begun may fail simply because there is nothing to
+        stream yet."""
         stats = {7: _stat(7, failures=99, status="failed")}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams([7], event_start_by_stream={}) \
+                == set()
+
+    async def test_a_failure_recorded_before_kickoff_stays_out_of_the_verdict(
+        self
+    ):
+        """The same failure as the test above, still stored an hour later
+        when the event is on air. It was recorded while the stream had
+        nothing to serve, and a stream that already has a record is never
+        probed again, so counting it now would decide the event on evidence
+        nothing will ever refresh. [59]
+        """
+        stats = {7: _stat(7, failures=1, status="failed",
+                          probed_at=_KICKOFF - timedelta(hours=1))}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_stream_with_no_health_record_is_not_dead(self):
+        """Nothing has looked at this stream. Roughly sixty of thirty-seven
+        thousand streams have ever been probed, so an absent verdict has to
+        mean nothing, even for an event already on air."""
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7, 8], event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == set()
+
+    async def test_the_strike_rule_switched_off_reports_nothing(self):
+        stats = {7: _stat(7, failures=99, status="success")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
              patch("config.get_settings", return_value=_settings(0)):
-            assert await find_dead_streams([7]) == set()
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_an_unreadable_strike_threshold_keeps_the_check_on(self):
+        """A settings error is not the operator switching the struck-out
+        check off, so it must not read as a threshold of 0."""
+        stats = {7: _stat(7, failures=99, status="success")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", side_effect=RuntimeError("boom")):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_stream_nobody_probed_recently_is_not_dead(self):
+        """"Not probed recently" says only that ECM has not looked, so it
+        must never reach this gate. The guard exists because there is a
+        second endpoint that merges that signal into its stale list, and
+        reading the gate off THAT one would block essentially every
+        candidate."""
+        stat = _stat(7, status="success")
+        stat["last_probed"] = "2020-01-01T00:00:00Z"
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({7: stat})), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
 
     async def test_no_candidates_asks_nothing(self):
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids") \
@@ -74,20 +147,80 @@ class TestVerdictFromStoredHealth:
         assert lookup.call_count == 0
 
 
+class TestDelistedStreams:
+    """Dispatcharr's own ``is_stale`` flag: the provider has stopped listing
+    the stream. This provider re-issues every event under a new id on each
+    refresh, so the superseded id keeps the ``success`` verdict it earned
+    while it still worked, and only the listing says otherwise."""
+
+    def _probing_client(self):
+        client = MagicMock()
+        client.get_streams_by_ids = AsyncMock(
+            return_value=[{"id": 7, "url": "http://x/7", "name": "seven"}])
+        return client
+
+    def _prober(self):
+        prober = MagicMock()
+        prober.max_concurrent_probes = 4
+        prober.probe_stream = AsyncMock(
+            return_value={"probe_status": "success"})
+        return prober
+
+    async def test_a_delisted_stream_is_dead_despite_a_success_record(self):
+        stats = {7: _stat(7, status="success"), 8: _stat(8)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7, 8], stale_stream_ids={7}) == {7}
+
+    async def test_a_delisted_stream_is_dead_before_its_event_starts(self):
+        """Staleness carries the whole load for an event still ahead: a
+        delisted stream is delisted whether or not it has aired."""
+        stats = {7: _stat(7, status="success")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], stale_stream_ids={7}, event_start_by_stream={}) == {7}
+
+    async def test_a_delisted_stream_is_never_probed(self):
+        client = self._probing_client()
+        prober = self._prober()
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7], client=client, probe_missing=True,
+                stale_stream_ids={7}) == {7}
+        assert prober.probe_stream.call_count == 0
+        assert client.get_streams_by_ids.call_count == 0
+
+    async def test_a_listed_stream_with_a_success_record_is_not_dead(self):
+        stats = {7: _stat(7, status="success")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], stale_stream_ids=set(), event_start_by_stream={7: _KICKOFF}) == set()
+
+
 class TestFailOpen:
-    """Every failure of the check's own machinery reads as "nothing dead"."""
+    """A failure of the check's own machinery reads as "nothing dead". The
+    one thing that survives it is the provider's own statement that a stream
+    is no longer listed, which needed no lookup to begin with."""
 
     async def test_an_unreadable_health_table_reports_nothing(self):
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    side_effect=RuntimeError("no database")):
             assert await find_dead_streams([7, 8]) == set()
 
-    async def test_an_unreadable_strike_threshold_reports_nothing(self):
-        stats = {7: _stat(7, failures=99, status="failed")}
+    async def test_an_unreadable_health_table_still_reports_delisted(self):
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", side_effect=RuntimeError("boom")):
-            assert await find_dead_streams([7]) == set()
+                   side_effect=RuntimeError("no database")):
+            assert await find_dead_streams(
+                [7, 8], stale_stream_ids={8}) == {8}
 
     async def test_no_prober_reports_nothing(self):
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
@@ -95,7 +228,8 @@ class TestFailOpen:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=None):
             assert await find_dead_streams(
-                [7], client=MagicMock(), probe_missing=True) == set()
+                [7], client=MagicMock(), probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == set()
 
     async def test_a_url_lookup_failure_reports_nothing(self):
         client = MagicMock()
@@ -108,7 +242,8 @@ class TestFailOpen:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7], client=client, probe_missing=True) == set()
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == set()
 
     async def test_a_probe_that_raises_leaves_the_stream_working(self):
         client = MagicMock()
@@ -122,7 +257,8 @@ class TestFailOpen:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7], client=client, probe_missing=True) == set()
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == set()
 
 
 class TestProbing:
@@ -152,7 +288,22 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7, 8], client=client, probe_missing=True) == {7}
+                [7, 8], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7}
+
+    async def test_a_probe_failure_before_the_event_starts_is_not_dead(self):
+        """The measured case that made this rule necessary: every listed
+        replacement for an event days away probes failed, and rejecting
+        them would stop the channel ever being created."""
+        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
+        prober = self._prober({7: "failed"})
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={}) == set()
 
     async def test_a_timeout_counts_as_not_answering(self):
         client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
@@ -162,7 +313,8 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7], client=client, probe_missing=True) == {7}
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == {7}
 
     async def test_probe_missing_off_never_probes(self):
         """The preview and every dry run take this path: a probe writes a
@@ -197,7 +349,8 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7], client=client, probe_missing=True) == set()
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == set()
         assert prober.probe_stream.call_count == 0
 
     async def test_probing_is_capped_per_run(self):
@@ -228,7 +381,49 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             assert await find_dead_streams(
-                [7, 8], client=client, probe_missing=True) == {7, 8}
+                [7, 8], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7, 8}
+
+
+class TestProvenWorking:
+    """The other half of the gate, and deliberately not its complement.
+
+    "Not dead" is what a stream needs to be ATTACHED, because refusing an
+    unprobed candidate would create no channels at all. Taking a stream
+    off a channel that is currently serving an event needs more than the
+    absence of bad news, so only a passing verdict counts here. [51]
+    """
+
+    async def test_only_a_passing_verdict_counts_as_working(self):
+        stats = {7: _stat(7), 8: _stat(8, failures=1, status="failed")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)):
+            assert await find_working_streams([7, 8]) == {7}
+
+    async def test_a_stream_nobody_probed_is_not_working(self):
+        """The gap between the two questions: this stream is not dead, and
+        it is not proven to work either."""
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})):
+            assert await find_working_streams([7]) == set()
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams([7], event_start_by_stream={7: _KICKOFF}) \
+                == set()
+
+    async def test_a_timed_out_probe_is_not_working(self):
+        stats = {7: _stat(7, status="timeout"), 8: _stat(8, status="pending")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)):
+            assert await find_working_streams([7, 8]) == set()
+
+    async def test_an_unreadable_health_table_proves_nothing_working(self):
+        """Fail CLOSED here, unlike the dead check. Nothing is proven to
+        work, so nothing is taken off a channel."""
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   side_effect=RuntimeError("db is gone")):
+            assert await find_working_streams([7, 8]) == set()
 
 
 @pytest.mark.parametrize("probe_missing", [True, False])
