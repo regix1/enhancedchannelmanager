@@ -65,9 +65,28 @@ Standing defaults (these OVERRIDE the global "worktree-isolate every write agent
 
 Frontend tooling in a worktree (writable `.vite-temp`) is fixed in `scripts/worktree-bootstrap.sh`; full caveats in `docs/shipping.md` → "Worktree quirks".
 
-## Sizing Vocabulary — No Calendar Estimates
+## Sizing Vocabulary — Measured Durations Only, Never Invented Ones
 
 Size work as **Small / Medium / Large / Epic — needs decomposition** (per `~/.claude/skills/grooming/SKILL.md`). Do NOT give the PO calendar estimates in hours/days/weeks/months. Calendar estimates invite commitment theater and are almost always wrong.
+
+The reason they are wrong is worth knowing, because it tells you what IS allowed: the model's sense of
+"how long a feature takes" comes from training data measuring **human teams** shipping features, so it
+says "three months" about work that finishes in a day. The unit is wrong, not the estimate.
+
+**So there is exactly one way to answer a duration question: quote a measured range, or say you don't
+have one.** Completed swarm runs are recorded to `~/.claude/swarm-runs.jsonl`, and the answer comes
+from `node ~/.claude/skills/swarm/scripts/predict-run.mjs --size <S|M|L|Epic>`:
+
+- **5+ comparable runs** → report the range of ACTIVE minutes with the sample size, e.g. "7 comparable
+  runs: 18 to 74 minutes of active work, median 31, and 4 of the 7 needed a fix round." Report the
+  range and the count, never a single number.
+- **Fewer than 5** → the size class alone, and say the history is still building. The script refuses
+  to give a range there; that refusal is the point.
+- **Never** convert either figure into hours, days, weeks or months for a person, and never quote
+  wall-clock as "how long it takes" — the first measured run logged 797 minutes wall against 52
+  minutes active, because wall-clock counts every minute the run sat waiting on the PO.
+
+Full rules, the recorded fields, and how a run gets recorded: `~/.claude/skills/swarm/reference/run-timing.md`.
 
 Exception — governance cadence rules from ADRs (e.g., ADR-005's monthly-then-quarterly audit cadence) are project-defined constraints and can be quoted verbatim. Do not multiply them out into wall-time estimates. Quote the rule; let the PO do the arithmetic if they want it.
 
