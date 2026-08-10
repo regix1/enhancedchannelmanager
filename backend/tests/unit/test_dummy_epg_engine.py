@@ -836,6 +836,33 @@ def test_variant_duration_overrides_profile_duration():
     assert prog_stop - prog_start == timedelta(minutes=300)
 
 
+def test_the_guide_id_survives_a_channel_being_renumbered():
+    """Channel numbers are handed out from 1 again on every rebuild, so
+    keying the guide on one makes a rebuilt channel inherit the programmes
+    of whatever event previously held that number. The id follows the
+    channel, which is never reissued. [78]
+    """
+    name, _start = _event_name_today()
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_template": "{title}",
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "enabled": True,
+        "channel_assignments": [{"channel_id": 4242}],
+    }
+
+    def _channel_id_for(number: int) -> str:
+        xml = generate_xmltv([profile], {4242: {
+            "name": name, "channel_number": number, "streams": []}})
+        return ET.fromstring(xml).find("channel").get("id")
+
+    assert _channel_id_for(1) == _channel_id_for(7)
+    assert "4242" in _channel_id_for(1)
+
+
 def test_the_upcoming_block_starts_on_the_event_s_own_day():
     """An event days away must not produce one programme days long.
 

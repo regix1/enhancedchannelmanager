@@ -741,7 +741,12 @@ def generate_xmltv(
             if tvg_id_override:
                 tvg_id = tvg_id_override
             else:
-                tvg_id_template = profile.get("tvg_id_template", "ecm-{channel_number}")
+                # Keyed on the channel id, which is never reissued, rather
+                # than the channel number, which is handed out from 1 again
+                # every time channels are rebuilt. A recycled id makes the
+                # guide client attach the previous holder's programmes to
+                # whatever event now carries that number. [78]
+                tvg_id_template = profile.get("tvg_id_template", "ecm-{channel_id}")
                 tvg_id_groups = {
                     "channel_id": str(ch_id),
                     "channel_number": str(int(ch_number)) if ch_number is not None else str(ch_id),

@@ -710,7 +710,7 @@ def register(mcp: FastMCP):
         categories: str | None = None,
         channel_logo_url_template: str | None = None,
         program_poster_url_template: str | None = None,
-        tvg_id_template: str = "ecm-{channel_number}",
+        tvg_id_template: str = "ecm-{channel_id}",
         include_date_tag: bool = False,
         include_live_tag: bool = False,
         include_new_tag: bool = False,

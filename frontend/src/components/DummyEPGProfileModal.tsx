@@ -168,7 +168,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const [outputTimezone, setOutputTimezone] = useState('');
   const [programDuration, setProgramDuration] = useState(180);
   const [categories, setCategories] = useState('');
-  const [tvgIdTemplate, setTvgIdTemplate] = useState('ecm-{channel_number}');
+  const [tvgIdTemplate, setTvgIdTemplate] = useState('ecm-{channel_id}');
   const [includeDateTag, setIncludeDateTag] = useState(false);
   const [includeLiveTag, setIncludeLiveTag] = useState(false);
   const [includeNewTag, setIncludeNewTag] = useState(false);
@@ -262,7 +262,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setOutputTimezone(profile.output_timezone || '');
         setProgramDuration(profile.program_duration || 180);
         setCategories(profile.categories || '');
-        setTvgIdTemplate(profile.tvg_id_template || 'ecm-{channel_number}');
+        setTvgIdTemplate(profile.tvg_id_template || 'ecm-{channel_id}');
         setIncludeDateTag(profile.include_date_tag || false);
         setIncludeLiveTag(profile.include_live_tag || false);
         setIncludeNewTag(profile.include_new_tag || false);
@@ -271,7 +271,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setUpcomingEndedOpen(Boolean(profile.upcoming_title_template || profile.upcoming_description_template || profile.ended_title_template || profile.ended_description_template));
         setFallbackOpen(Boolean(profile.fallback_title_template || profile.fallback_description_template));
         setEpgTagsOpen(Boolean(profile.include_date_tag || profile.include_live_tag || profile.include_new_tag));
-        setAdvancedOpen(Boolean(profile.tvg_id_template && profile.tvg_id_template !== 'ecm-{channel_number}'));
+        setAdvancedOpen(Boolean(profile.tvg_id_template && profile.tvg_id_template !== 'ecm-{channel_id}'));
       } else if (importData) {
         // Import mode: pre-fill from Dispatcharr source data
         const d = importData;
@@ -306,7 +306,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setOutputTimezone(d.output_timezone || '');
         setProgramDuration(d.program_duration || 180);
         setCategories(d.categories || '');
-        setTvgIdTemplate(d.tvg_id_template || 'ecm-{channel_number}');
+        setTvgIdTemplate(d.tvg_id_template || 'ecm-{channel_id}');
         setIncludeDateTag(d.include_date_tag || false);
         setIncludeLiveTag(d.include_live_tag || false);
         setIncludeNewTag(d.include_new_tag || false);
@@ -336,7 +336,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setOutputTimezone('');
         setProgramDuration(180);
         setCategories('');
-        setTvgIdTemplate('ecm-{channel_number}');
+        setTvgIdTemplate('ecm-{channel_id}');
         setIncludeDateTag(false);
         setIncludeLiveTag(false);
         setIncludeNewTag(false);
@@ -507,7 +507,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         categories: categories.trim() || undefined,
         channel_logo_url_template: v0.channel_logo_url_template?.trim() || undefined,
         program_poster_url_template: v0.program_poster_url_template?.trim() || undefined,
-        tvg_id_template: tvgIdTemplate.trim() || 'ecm-{channel_number}',
+        tvg_id_template: tvgIdTemplate.trim() || 'ecm-{channel_id}',
         include_date_tag: includeDateTag,
         include_live_tag: includeLiveTag,
         include_new_tag: includeNewTag,
@@ -1174,7 +1174,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     type="text"
                     value={tvgIdTemplate}
                     onChange={(e) => setTvgIdTemplate(e.target.value)}
-                    placeholder="ecm-{channel_number}"
+                    placeholder="ecm-{channel_id}"
                   />
                   <p className="form-hint">Template for tvg-id in XMLTV output. Use &#123;channel_number&#125; for the channel number. This must match the tvg-id used in Dispatcharr for channel matching.</p>
                 </div>

@@ -64,7 +64,7 @@ class TestCreateDummyEpgProfile:
         assert body["stream_index"] == 1
         assert body["event_timezone"] == "US/Eastern"
         assert body["program_duration"] == 180
-        assert body["tvg_id_template"] == "ecm-{channel_number}"
+        assert body["tvg_id_template"] == "ecm-{channel_id}"
         for absent in ("title_pattern", "substitution_pairs", "pattern_variants", "channel_group_ids"):
             assert absent not in body, f"{absent} should be omitted when not given"
         assert "id=10" in _text(result)

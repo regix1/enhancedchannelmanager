@@ -2872,7 +2872,7 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 categories=item.get("categories"),
                 channel_logo_url_template=item.get("channel_logo_url_template"),
                 program_poster_url_template=item.get("program_poster_url_template"),
-                tvg_id_template=item.get("tvg_id_template", "ecm-{channel_number}"),
+                tvg_id_template=item.get("tvg_id_template", "ecm-{channel_id}"),
                 include_date_tag=item.get("include_date_tag", False),
                 include_live_tag=item.get("include_live_tag", False),
                 include_new_tag=item.get("include_new_tag", False),

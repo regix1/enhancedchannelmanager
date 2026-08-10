@@ -2719,7 +2719,7 @@ class DummyEPGProfile(Base):
     categories = Column(String(500), nullable=True)  # comma-separated
     channel_logo_url_template = Column(String(500), nullable=True)
     program_poster_url_template = Column(String(500), nullable=True)
-    tvg_id_template = Column(String(255), default="ecm-{channel_number}", nullable=False)
+    tvg_id_template = Column(String(255), default="ecm-{channel_id}", nullable=False)
 
     # EPG tags
     include_date_tag = Column(Boolean, default=False, nullable=False)

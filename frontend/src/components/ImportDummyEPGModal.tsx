@@ -38,7 +38,7 @@ function mapSourceToProfile(source: EPGSource): Partial<DummyEPGProfile> {
     program_poster_url_template: cp.program_poster_url ?? null,
     // ECM-only defaults
     substitution_pairs: [],
-    tvg_id_template: 'ecm-{channel_number}',
+    tvg_id_template: 'ecm-{channel_id}',
     pattern_variants: [],
     // Tags
     include_date_tag: cp.include_date_tag ?? false,

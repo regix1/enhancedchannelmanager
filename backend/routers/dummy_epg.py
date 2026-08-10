@@ -86,7 +86,7 @@ class ProfileCreateRequest(BaseModel):
     categories: Optional[str] = None
     channel_logo_url_template: Optional[str] = None
     program_poster_url_template: Optional[str] = None
-    tvg_id_template: str = "ecm-{channel_number}"
+    tvg_id_template: str = "ecm-{channel_id}"
     include_date_tag: bool = False
     include_live_tag: bool = False
     include_new_tag: bool = False
