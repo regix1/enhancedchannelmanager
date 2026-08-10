@@ -604,8 +604,16 @@ def generate_channel_xml(
         has_time = "hour" in groups
 
         if has_time:
-            # Upcoming filler: midnight to event start
-            if start_dt > today_midnight:
+            # Upcoming filler: from midnight of the EVENT'S OWN day up to the
+            # start. Running it from today's midnight instead made an event two
+            # weeks out a single programme two weeks long, which a guide client
+            # correctly shows as the thing airing right now. The channel simply
+            # carries nothing until the day it plays. [77]
+            event_midnight = max(
+                today_midnight,
+                start_dt.replace(hour=0, minute=0, second=0, microsecond=0),
+            )
+            if start_dt > event_midnight:
                 upcoming_title = _render(
                     get_template("upcoming_title_template"), template_groups
                 )
@@ -613,7 +621,7 @@ def generate_channel_xml(
                     get_template("upcoming_description_template"), template_groups
                 )
                 programmes.append(_make_programme(
-                    today_midnight, start_dt, channel_id_str,
+                    event_midnight, start_dt, channel_id_str,
                     upcoming_title or title,
                     upcoming_desc or description,
                     categories, poster_url,

@@ -836,6 +836,41 @@ def test_variant_duration_overrides_profile_duration():
     assert prog_stop - prog_start == timedelta(minutes=300)
 
 
+def test_the_upcoming_block_starts_on_the_event_s_own_day():
+    """An event days away must not produce one programme days long.
+
+    The filler used to run from today's midnight to the start, so an event
+    two weeks out became a single 13-day programme and a guide client showed
+    it as the thing airing right now. It now begins at midnight of the day
+    the event plays, and the channel simply carries nothing before that. [77]
+    """
+    tz = pytz.timezone(_EVENT_TZ)
+    now = datetime.now(tz)
+    start = tz.localize(datetime(now.year, now.month, now.day, 20, 0, 0)) + timedelta(days=6)
+    name = f"Big Game {start:%m/%d/%Y} 20:00"
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_template": "{title}",
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+    }
+
+    # The lead-in is the block that ends exactly when the event begins. This
+    # profile sets no upcoming_title_template, so it carries the plain title
+    # and cannot be picked out by name.
+    upcoming = [
+        p for p in _programmes_for(profile, name)
+        if _programme_window(p)[1] == start
+    ]
+    assert len(upcoming) == 1
+    up_start, _up_stop = _programme_window(upcoming[0])
+    # Same calendar day as the event, not the day the guide was built.
+    assert up_start.astimezone(tz).date() == start.date()
+    assert start - up_start < timedelta(days=1)
+
+
 def test_a_name_matching_no_variant_falls_back_to_the_profile_patterns():
     """A variant list holds special cases and does not switch the profile's
     own patterns off.
