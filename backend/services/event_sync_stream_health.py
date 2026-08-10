@@ -339,12 +339,16 @@ async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]
     if not urls:
         return set()
 
+    await prober.refresh_account_probe_limits()
+
     dead: set[int] = set()
     failures_lock = asyncio.Lock()
-    semaphore = asyncio.Semaphore(max(1, prober.max_concurrent_probes))
 
-    async def _probe_one(stream_id: int, url: str, name: str) -> None:
-        async with semaphore:
+    async def _probe_one(stream_id: int, url: str, name: str, m3u_account) -> None:
+        # Per provider, not global: a line that allows one connection answers
+        # every probe past the first with a failure, and this function records
+        # those as dead streams. [76]
+        async with prober.semaphore_for_account(m3u_account):
             try:
                 result = await prober.probe_stream(stream_id, url, name)
             except Exception as e:
@@ -359,7 +363,8 @@ async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]
                     dead.add(stream_id)
 
     await asyncio.gather(*[
-        _probe_one(sid, url, name) for sid, (url, name) in urls.items()
+        _probe_one(sid, url, name, account)
+        for sid, (url, name, account) in urls.items()
     ])
     logger.info(
         "[EVENT-SYNC] promotion health check probed %d candidate stream(s), "
@@ -392,5 +397,9 @@ async def _probe_urls(client, stream_ids: list[int]) -> dict[int, tuple]:
             url = stream.get("url")
             if stream_id is None or not url:
                 continue
-            urls[stream_id] = (url, stream.get("name") or f"Stream {stream_id}")
+            urls[stream_id] = (
+                url,
+                stream.get("name") or f"Stream {stream_id}",
+                stream.get("m3u_account"),
+            )
     return urls

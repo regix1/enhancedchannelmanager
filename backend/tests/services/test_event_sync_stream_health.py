@@ -9,6 +9,7 @@ The evidence itself is one rule: a stream is dead when the provider has
 stopped listing it, and a probe verdict counts only once the event has
 started. Everything in here is a case of that.
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -209,6 +210,10 @@ class TestDelistedStreams:
         prober.max_concurrent_probes = 4
         prober.probe_stream = AsyncMock(
             return_value={"probe_status": "success"})
+        # Probing is bounded per provider, so the health check asks the prober
+        # for that account's gate and refreshes the ceilings first. [76]
+        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
+        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
         return prober
 
     async def test_a_delisted_stream_is_dead_despite_a_success_record(self):
@@ -297,6 +302,8 @@ class TestFailOpen:
         prober = MagicMock()
         prober.max_concurrent_probes = 4
         prober.probe_stream = AsyncMock(side_effect=RuntimeError("ffprobe"))
+        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
+        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning({})), \
              patch("config.get_settings", return_value=_settings(3)), \
@@ -320,6 +327,10 @@ class TestProbing:
             return {"probe_status": statuses[stream_id]}
 
         prober.probe_stream = AsyncMock(side_effect=_probe)
+        # Probing is bounded per provider now, so the health check refreshes
+        # the ceilings and asks for that account's gate. [76]
+        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
+        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
         return prober
 
     async def test_a_stream_that_does_not_answer_is_dead(self):

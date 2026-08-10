@@ -449,6 +449,12 @@ class StreamProber:
         self.bitrate_sample_duration = bitrate_sample_duration
         self.parallel_probing_enabled = parallel_probing_enabled
         self.max_concurrent_probes = max(1, min(16, max_concurrent_probes))  # Clamp to 1-16
+        # Per-provider ceiling, lower than the global one. A line that allows
+        # one connection returns a failure for every probe past the first, and
+        # those land in StreamStats as if the stream were broken. Populated by
+        # services.probe_limits; empty means every account uses the global. [76]
+        self.account_probe_limits: dict[int, int] = {}
+        self._account_semaphores: dict[int | None, asyncio.Semaphore] = {}
         self.profile_distribution_strategy = profile_distribution_strategy
         self.skip_recently_probed_hours = skip_recently_probed_hours
         self.refresh_m3us_before_probe = refresh_m3us_before_probe
@@ -526,6 +532,42 @@ class StreamProber:
         except Exception as e:
             logger.error("[STREAM-PROBE] Failed to load probe history from %s: %s", PROBE_HISTORY_FILE, e)
             self._probe_history = []
+
+    async def refresh_account_probe_limits(self) -> None:
+        """Re-read each provider's connection ceiling before a probe run.
+
+        Cheap: one call per account, and Xtream Codes answers in well under a
+        second. Run it per probe run rather than once at startup so an
+        operator who fixes a limit does not have to restart anything. [76]
+        """
+        from config import get_settings
+        from services.probe_limits import account_probe_limits
+
+        overrides = getattr(get_settings(), "probe_concurrency_by_account", {}) or {}
+        self.account_probe_limits = await account_probe_limits(self.client, overrides)
+        # The old semaphores were built from the previous ceilings.
+        self._account_semaphores.clear()
+
+    def semaphore_for_account(self, m3u_account) -> asyncio.Semaphore:
+        """Concurrency gate for one provider, at most the global limit.
+
+        Takes whatever shape the stream carries in ``m3u_account`` — an id, a
+        nested object, or nothing — so callers do not each repeat the
+        unwrapping.
+
+        One semaphore per account, reused for the life of the prober, so
+        streams from different providers do not queue behind each other while
+        each provider still sees no more connections than it allows. An
+        account with no recorded limit gets the global one, which is the
+        behaviour every account had before per-provider limits existed. [76]
+        """
+        account_id = self._extract_m3u_account_id(m3u_account)
+        if account_id not in self._account_semaphores:
+            limit = self.account_probe_limits.get(account_id, self.max_concurrent_probes)
+            self._account_semaphores[account_id] = asyncio.Semaphore(
+                max(1, min(self.max_concurrent_probes, limit))
+            )
+        return self._account_semaphores[account_id]
 
     def update_probing_settings(self, parallel_probing_enabled: bool, max_concurrent_probes: int,
                                 profile_distribution_strategy: str = "fill_first") -> None:
@@ -2432,10 +2474,14 @@ class StreamProber:
                 logger.info("[STREAM-PROBE] Starting parallel probe of %s streams (filtered from %s total)", len(streams_to_probe), len(all_streams))
                 logger.info("[STREAM-PROBE] Rate limit settings: max_concurrent_probes=%s", self.max_concurrent_probes)
 
-                # Global concurrency limit - max simultaneous probes regardless of M3U account
-                # This prevents system resource exhaustion when probing many streams
-                global_probe_semaphore = asyncio.Semaphore(self.max_concurrent_probes)
-                logger.info("[STREAM-PROBE] Semaphore created with limit=%s", self.max_concurrent_probes)
+                # Concurrency is bounded per provider rather than globally, so
+                # a line never sees more connections than it allows while
+                # other providers still probe in parallel. Each account's
+                # ceiling is at most max_concurrent_probes.
+                await self.refresh_account_probe_limits()
+                logger.info("[STREAM-PROBE] Per-account probe ceilings: %s (global cap %s)",
+                            self.account_probe_limits or "none published",
+                            self.max_concurrent_probes)
 
                 # Track our own probe connections per M3U (separate from Dispatcharr's active connections)
                 # This lets us know how many streams WE are currently probing per M3U
@@ -2476,8 +2522,10 @@ class StreamProber:
                                      "no profile (direct URL), url=%s",
                                      stream_id, stream_name, stream_url)
 
-                    # Acquire global semaphore to limit total concurrent probes
-                    async with global_probe_semaphore:
+                    # Per provider, not global: a line answers every probe past
+                    # its own connection limit with a failure, and those are
+                    # recorded as broken streams. [76]
+                    async with self.semaphore_for_account(stream.get("m3u_account")):
                         # Track concurrent probe count
                         async with active_probe_count_lock:
                             active_probe_count[0] += 1
@@ -3017,8 +3065,7 @@ class StreamProber:
 
             await self._create_probe_notification(len(stream_ids), send_alerts=start_send_alerts)
 
-            # Bound concurrency with the same global semaphore probe-all uses.
-            semaphore = asyncio.Semaphore(self.max_concurrent_probes)
+            await self.refresh_account_probe_limits()
             results_lock = asyncio.Lock()
 
             async def _probe_one(stream: dict):
@@ -3026,8 +3073,10 @@ class StreamProber:
                 stream_id = stream["id"]
                 stream_name = stream.get("name", f"Stream {stream_id}")
                 stream_url = stream.get("url", "")
-                m3u_account_id = self._extract_m3u_account_id(stream.get("m3u_account"))
-                async with semaphore:
+                # Gate per provider, not globally: probing a one-connection
+                # line wider than it allows turns working streams into
+                # recorded failures. [76]
+                async with self.semaphore_for_account(stream.get("m3u_account")):
                     if self._probe_cancelled:
                         return
                     self._probe_progress_current_stream = stream_name

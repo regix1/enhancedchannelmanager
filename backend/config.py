@@ -210,6 +210,11 @@ class DispatcharrSettings(BaseModel):
     parallel_probing_enabled: bool = True
     # Max simultaneous probes when parallel probing is enabled (1-16)
     max_concurrent_probes: int = 8
+    # Per-provider ceiling, keyed by M3U account id as a string. Xtream Codes
+    # accounts report their own limit and need no entry here; a plain M3U URL
+    # reports nothing, so this is the only way to tell ECM about one. An
+    # account with no entry and nothing published uses max_concurrent_probes.
+    probe_concurrency_by_account: dict[str, int] = {}
     # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     profile_distribution_strategy: str = "fill_first"
     # Skip streams that were successfully probed within the last N hours (0 = always probe)
