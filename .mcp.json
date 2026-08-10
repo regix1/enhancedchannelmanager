@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "ecm": {
-      "type": "http",
-      "url": "http://localhost:6101/mcp?api_key=${ECM_MCP_API_KEY}"
-    }
-  }
-}

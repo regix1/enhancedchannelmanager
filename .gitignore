@@ -65,3 +65,6 @@ test-results/
 test-results-visual/
 playwright-report/
 frontend/test-results/
+
+# Local MCP server config: carries the ECM host and can carry an API key
+.mcp.json
