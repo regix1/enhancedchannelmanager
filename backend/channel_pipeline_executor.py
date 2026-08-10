@@ -3581,6 +3581,22 @@ class ActionExecutor:
             )
 
         try:
+            # The cached channel was read when the run started, and this writes
+            # the whole stream list back, so anything added since would be
+            # dropped. Re-read and filter that instead.
+            fresh = await self.client.get_channel(channel_id)
+            current_streams = [s["id"] if isinstance(s, dict) else s
+                               for s in fresh.get("streams", [])]
+            if stream_ctx.stream_id not in current_streams:
+                channel["streams"] = current_streams
+                return ActionResult(
+                    success=True,
+                    action_type=action.type,
+                    description=f"Stream already gone from channel '{channel_name}', skipped",
+                    skipped=True
+                )
+            filtered_streams = [s for s in current_streams if s != stream_ctx.stream_id]
+
             previous_state = {"streams": current_streams.copy()}
             await self.client.update_channel(channel_id, {"streams": filtered_streams})
             channel["streams"] = filtered_streams

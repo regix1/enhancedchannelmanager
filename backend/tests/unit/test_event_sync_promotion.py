@@ -1873,6 +1873,45 @@ class TestDelistedStreamSwap:
         assert state.stream_ids_of(850) == [self.REPLACEMENT_ID]
         assert 850 in promo["channel_ids"]
 
+    def test_a_stream_added_during_the_run_survives_the_detach(
+        self, db_session_factory
+    ):
+        """The run's channel cache is built once, at the start, and the
+        detach writes a whole stream list back. Filtering the cached list
+        would drop anything added in between, so the channel is re-read
+        first and that list is filtered instead. [70]
+        """
+        concurrent_id = 7501
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        client = make_promote_client(state)
+
+        # Something outside this run puts a stream on the channel after the
+        # cache was built, so only a fresh read can see it.
+        cached_get_channel = client.get_channel
+
+        async def _get_channel_after_a_late_addition(channel_id):
+            if channel_id == 850:
+                streams = state.channels[850]["streams"]
+                if concurrent_id not in streams:
+                    streams.append(concurrent_id)
+            return await cached_get_channel(channel_id)
+
+        client.get_channel = _get_channel_after_a_late_addition
+
+        result, _ = self._run_at(
+            client, db_session_factory, FROZEN_NOW,
+            replacement_status="success",
+        )
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["stale_streams_removed"] == 1
+        assert self.STALE_ID not in state.stream_ids_of(850)
+        assert concurrent_id in state.stream_ids_of(850)
+
     def test_the_delisted_stream_stays_when_the_replacement_only_probes_failed(
         self, db_session_factory
     ):
