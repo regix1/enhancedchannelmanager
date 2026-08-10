@@ -393,6 +393,32 @@ def extract_groups_from_variants(
     return None, None
 
 
+def _extract_event_groups(name: str, source: dict) -> tuple[dict | None, dict | None]:
+    """Read an event's parts from a name, preferring a matching variant.
+
+    ``source`` is the stored profile on the generation path and the request
+    config on the preview path; both carry the same pattern keys.
+
+    A variant list holds special cases, not a replacement for the profile's
+    own patterns. A name matching none of them still has a title and a time
+    to read, and returning nothing here would drop it to a full-day block
+    with no start. [74]
+    """
+    variants = source.get("pattern_variants", [])
+    groups: dict | None = None
+    matched_variant: dict | None = None
+    if variants:
+        groups, matched_variant = extract_groups_from_variants(name, variants)
+    if groups is None:
+        groups = extract_groups(
+            name,
+            source.get("title_pattern"),
+            source.get("time_pattern"),
+            source.get("date_pattern"),
+        )
+    return groups, matched_variant
+
+
 def _resolve_variant_template(variant: dict | None, profile: dict, field: str) -> str:
     """Get template from variant (if set), else fall back to profile-level."""
     if variant:
@@ -502,16 +528,7 @@ def generate_channel_xml(
     substituted_name, _steps = apply_substitutions(source_name, sub_pairs)
 
     # Extract groups — variant-aware
-    pattern_variants = profile.get("pattern_variants", [])
-    matched_variant = None
-
-    if pattern_variants:
-        groups, matched_variant = extract_groups_from_variants(substituted_name, pattern_variants)
-    else:
-        title_pattern = profile.get("title_pattern")
-        time_pattern = profile.get("time_pattern")
-        date_pattern = profile.get("date_pattern")
-        groups = extract_groups(substituted_name, title_pattern, time_pattern, date_pattern)
+    groups, matched_variant = _extract_event_groups(substituted_name, profile)
 
     # Profile config
     event_timezone = profile.get("event_timezone", "US/Eastern")
@@ -766,16 +783,7 @@ def preview_pipeline(
     substituted_name, substitution_steps = apply_substitutions(sample_name, sub_pairs)
 
     # Variant-aware matching
-    pattern_variants = config.get("pattern_variants", [])
-    matched_variant = None
-
-    if pattern_variants:
-        groups, matched_variant = extract_groups_from_variants(substituted_name, pattern_variants)
-    else:
-        title_pattern = config.get("title_pattern")
-        time_pattern = config.get("time_pattern")
-        date_pattern = config.get("date_pattern")
-        groups = extract_groups(substituted_name, title_pattern, time_pattern, date_pattern)
+    groups, matched_variant = _extract_event_groups(substituted_name, config)
 
     matched = groups is not None
     time_variables = None

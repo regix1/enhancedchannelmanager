@@ -836,6 +836,36 @@ def test_variant_duration_overrides_profile_duration():
     assert prog_stop - prog_start == timedelta(minutes=300)
 
 
+def test_a_name_matching_no_variant_falls_back_to_the_profile_patterns():
+    """A variant list holds special cases and does not switch the profile's
+    own patterns off.
+
+    Without the fallback an unmatched name yields no groups at all, loses its
+    start, and ships as a full-day block with no event in it. [74]
+    """
+    name, start = _event_name_today()
+    profile = {
+        **_variant_profile(180, [{
+            "name": "hockey only",
+            "title_pattern": r"^(?P<title>.*Hockey.*?)\s",
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 60,
+        }]),
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+    }
+
+    main = [
+        p for p in _programmes_for(profile, name)
+        if _programme_window(p)[0] == start
+    ]
+    assert len(main) == 1
+    prog_start, prog_stop = _programme_window(main[0])
+    assert prog_stop - prog_start == timedelta(minutes=180)
+
+
 def test_preview_uses_variant_duration():
     """The preview path resolves the duration through the variant as well."""
     name, _start = _event_name_today()

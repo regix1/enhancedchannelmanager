@@ -161,6 +161,23 @@ What each stored value resolves to, with a profile default of 180:
 | `0` | 0, honoured rather than read as unset |
 | `"240"` | 240, a numeric string is read as a number |
 
+### A name matching no variant
+
+Variants are tried in order and the first whose patterns match wins. A name that
+matches none of them falls back to the **profile's own** `title_pattern`,
+`time_pattern` and `date_pattern`, and to the profile's `program_duration`.
+
+This matters because a variant list is a set of special cases, not a replacement
+for the profile. Without the fallback, adding a single variant to a working
+profile would leave every channel that variant does not match with no parsed
+start at all, and each one would render as a single full-day block instead of
+its event.
+
+A variant should therefore carry the profile's `time_pattern` and `date_pattern`
+unless it genuinely needs different ones. `extract_groups_from_variants` passes
+all three of a variant's patterns to the extractor, so a variant that sets only
+`title_pattern` loses the event's start time even when it matches.
+
 The floor is 0 rather than 1 because the engine honours a stored 0. Values
 outside 0 to 1440 are rejected with HTTP 422 by `PatternVariantModel` in
 `backend/routers/dummy_epg.py` on create, update and preview. The YAML import
