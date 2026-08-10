@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from cache import get_cache
@@ -54,6 +54,11 @@ class PatternVariantModel(BaseModel):
     ended_description_template: Optional[str] = None
     fallback_title_template: Optional[str] = None
     fallback_description_template: Optional[str] = None
+    # Omitted means the profile's own program_duration applies, so a variant
+    # that never sets it keeps today's behaviour. The floor is 0 rather than
+    # 1 because the engine honours a stored 0 instead of reading it as
+    # "unset". [25]
+    program_duration: Optional[int] = Field(default=None, ge=0, le=1440)
 
 
 class ProfileCreateRequest(BaseModel):
@@ -75,7 +80,9 @@ class ProfileCreateRequest(BaseModel):
     fallback_description_template: Optional[str] = None
     event_timezone: str = "US/Eastern"
     output_timezone: Optional[str] = None
-    program_duration: int = 180
+    # Same range as the variant field below it: a negative duration ends the
+    # programme before it starts and overlaps the two fillers around it. [62]
+    program_duration: int = Field(default=180, ge=0, le=1440)
     categories: Optional[str] = None
     channel_logo_url_template: Optional[str] = None
     program_poster_url_template: Optional[str] = None
@@ -107,7 +114,7 @@ class ProfileUpdateRequest(BaseModel):
     fallback_description_template: Optional[str] = None
     event_timezone: Optional[str] = None
     output_timezone: Optional[str] = None
-    program_duration: Optional[int] = None
+    program_duration: Optional[int] = Field(default=None, ge=0, le=1440)
     categories: Optional[str] = None
     channel_logo_url_template: Optional[str] = None
     program_poster_url_template: Optional[str] = None

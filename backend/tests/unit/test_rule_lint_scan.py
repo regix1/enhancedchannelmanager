@@ -215,6 +215,37 @@ def _seed_dummy_epg_profile_benign_b1g(session) -> DummyEPGProfile:
     return profile
 
 
+def _seed_dummy_epg_profile_with_variants(
+    session, name: str, variants: list
+) -> DummyEPGProfile:
+    """Profile whose only lintable content is its ``pattern_variants``.
+    The top-level pattern is benign so any finding comes from a variant."""
+    profile = DummyEPGProfile(
+        name=name,
+        enabled=True,
+        name_source="channel",
+        stream_index=1,
+        title_pattern=r"(?<team1>.+?) vs (?<team2>.+)",
+        event_timezone="US/Eastern",
+        program_duration=180,
+        tvg_id_template="ecm-{channel_number}",
+        pattern_variants=json.dumps(variants),
+    )
+    session.add(profile)
+    session.commit()
+    session.refresh(profile)
+    return profile
+
+
+def _benign_variant(name: str, **extra) -> dict:
+    variant = {
+        "name": name,
+        "title_pattern": r"(?<team1>.+?) vs (?<team2>.+)",
+    }
+    variant.update(extra)
+    return variant
+
+
 # =========================================================================
 # Tests.
 # =========================================================================
@@ -273,6 +304,97 @@ class TestRunScanWritesFindings:
         """The spike's critical regression: B1G title_pattern must NOT be
         flagged by the scan, because regexploit would have (0 FP target)."""
         _seed_dummy_epg_profile_benign_b1g(test_session)
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert findings == []
+
+    def test_flags_variant_duration_outside_the_allowed_range(self, test_session):
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball too long",
+            [_benign_variant("Baseball", program_duration=5000)],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert len(findings) == 1
+        assert findings[0].code == "VARIANT_DURATION_OUT_OF_RANGE"
+        assert findings[0].field == "pattern_variants[0].program_duration"
+
+    def test_flags_a_negative_variant_duration(self, test_session):
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball negative",
+            [_benign_variant("Baseball", program_duration=-30)],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert len(findings) == 1
+        assert findings[0].code == "VARIANT_DURATION_OUT_OF_RANGE"
+
+    def test_flags_a_variant_duration_it_cannot_read_as_a_number(self, test_session):
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball as words",
+            [_benign_variant("Baseball", program_duration="long")],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert len(findings) == 1
+        assert findings[0].code == "VARIANT_DURATION_OUT_OF_RANGE"
+
+    def test_accepts_a_numeric_string_duration(self, test_session):
+        """The engine reads a numeric string as a number, so flagging it would
+        report a value that works."""
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball as text",
+            [_benign_variant("Baseball", program_duration="240")],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert findings == []
+
+    def test_accepts_a_variant_duration_of_zero(self, test_session):
+        """Zero is a value the engine honours, not a stand-in for unset."""
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball zero",
+            [_benign_variant("Baseball", program_duration=0)],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert findings == []
+
+    def test_accepts_a_variant_duration_inside_the_range(self, test_session):
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball 240",
+            [_benign_variant("Baseball", program_duration=240)],
+        )
+        run_scan(test_session)
+        findings = test_session.query(RuleLintFinding).filter(
+            RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG
+        ).all()
+        assert findings == []
+
+    def test_accepts_a_variant_that_sets_no_duration(self, test_session):
+        _seed_dummy_epg_profile_with_variants(
+            test_session,
+            "Baseball default",
+            [_benign_variant("Baseball")],
+        )
         run_scan(test_session)
         findings = test_session.query(RuleLintFinding).filter(
             RuleLintFinding.rule_type == RULE_TYPE_DUMMY_EPG

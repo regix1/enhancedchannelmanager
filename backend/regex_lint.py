@@ -97,6 +97,14 @@ ViolationCode = Literal[
     # executor's ``$N`` → ``\N`` conversion, never a group reference).
     # Save-time path (enhancedchannelmanager-2uwi3).
     "REGEX_GROUP_REF_OUT_OF_RANGE",
+    # Not a regex finding. Raised by the dummy EPG profile scan in
+    # :mod:`tasks.rule_lint_scan` when a ``program_duration`` cannot be read
+    # as a number, or falls outside the 0 to 1440 minutes the profile
+    # endpoints accept. The reported field says whether it is a pattern
+    # variant's or the profile's own. Stored profiles can carry either
+    # because the YAML import and the backup restore write both without the
+    # pydantic models that guard create and update.
+    "VARIANT_DURATION_OUT_OF_RANGE",
     # Advisory codes (bd-0gntx) — surfaced via the analyze endpoint
     # only, never from the strict :func:`lint_pattern` save-time path.
     "REGEX_TRIVIALLY_MATCHES_ALL",

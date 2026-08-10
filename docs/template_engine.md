@@ -133,6 +133,54 @@ Lookup pipes additionally carry `{source: <table>, matched: bool}`. The trace
 preserves order, so rendering the `output` strings concatenated from each
 step reproduces the final output exactly.
 
+## Per-variant program duration
+
+A profile carries one `program_duration` in minutes, and every event it renders
+gets that length. A pattern variant can set its own `program_duration` to
+override it, so a profile whose default is 180 can still give baseball 240
+minutes by putting the longer value on the variant that matches baseball
+channels.
+
+| Where | Key | Type | Meaning |
+|-|-|-|-|
+| Profile | `program_duration` | integer, required, default 180 | Length of every event the profile renders |
+| Pattern variant | `program_duration` | integer 0 to 1440, optional | Length of every event this variant matches |
+
+The variant key is optional and **absent means "use the profile value"**, so a
+profile written before this key existed keeps rendering exactly as it did. The
+profile editor leaves the variant's Program Duration field blank in that case;
+clearing the field removes the key again rather than writing a number back.
+
+What each stored value resolves to, with a profile default of 180:
+
+| Stored on the variant | Resolves to |
+|-|-|
+| key absent | 180 |
+| `null` | 180, the same as absent |
+| `300` | 300 |
+| `0` | 0, honoured rather than read as unset |
+| `"240"` | 240, a numeric string is read as a number |
+
+The floor is 0 rather than 1 because the engine honours a stored 0. Values
+outside 0 to 1440 are rejected with HTTP 422 by `PatternVariantModel` in
+`backend/routers/dummy_epg.py` on create, update and preview. The YAML import
+path stores variants without that model, so
+`backend/tasks/rule_lint_scan.py` re-checks stored profiles and reports a
+duration it cannot read, or one outside the range, as a lint finding in the UI.
+
+## Ended templates no longer reach the generated guide
+
+`ended_title_template` and `ended_description_template` exist at both profile
+level and variant level, and both are still stored, validated and rendered in
+the **profile preview**. They no longer appear in the generated guide.
+
+An event that runs past its scheduled length now keeps its own title and its
+live tag until the next programme, instead of being replaced by a block titled
+from `ended_title_template`. That block was the reason a running game read as
+finished in Emby. Nothing was removed, so a profile that sets these templates
+still round-trips unchanged, but the text only shows up in the preview. The
+profile editor says so under both pairs of fields.
+
 ## Related files
 
 - `backend/template_engine.py`, `backend/tests/unit/test_template_engine.py`

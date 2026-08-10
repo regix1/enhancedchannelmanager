@@ -16,6 +16,13 @@ import { VariantTabs } from './patternBuilder/VariantTabs';
 import './ModalBase.css';
 import './DummyEPGProfileModal.css';
 
+// The guide no longer ends an event at its scheduled stop time, so the ended
+// templates only reach the preview. Shown under both the profile-level pair
+// and the per-variant overrides so an operator cannot type into a field that
+// looks like it changes the guide.
+const ENDED_TEMPLATE_HINT =
+  'These show in the preview but no longer in the generated guide. An event that runs past its scheduled length now keeps its own title until the next programme.';
+
 const TIMEZONES = [
   { value: '', label: '-- None --' },
   { value: 'US/Eastern', label: 'US/Eastern (ET)' },
@@ -56,6 +63,7 @@ function makeEmptyVariant(name: string = 'Default'): PatternVariant {
     ended_description_template: null,
     fallback_title_template: null,
     fallback_description_template: null,
+    program_duration: null,
   };
 }
 
@@ -77,6 +85,7 @@ function migrateToVariant(profile: DummyEPGProfile): PatternVariant {
     ended_description_template: null,
     fallback_title_template: null,
     fallback_description_template: null,
+    program_duration: null,
   };
 }
 
@@ -456,6 +465,20 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setError(`Variant "${v.name}" has an invalid Date Pattern regex`);
         return;
       }
+      // The min and max on the input are checked by the browser only for
+      // the variant currently on screen, and the save sends them all, so a
+      // value typed into a variant the operator then switched away from
+      // reaches the API and 422s the whole profile with nothing pointing at
+      // the field that caused it. [67]
+      if (
+        v.program_duration != null
+        && (v.program_duration < 0 || v.program_duration > 1440)
+      ) {
+        setError(
+          `Variant "${v.name}" needs a Program Duration between 0 and 1440 minutes`
+        );
+        return;
+      }
     }
 
     await execute(async () => {
@@ -799,6 +822,21 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 placeholder="https://example.com/posters/{team1_normalize}-vs-{team2_normalize}.jpg"
               />
             </div>
+            <div className="modal-form-group">
+              <label htmlFor="depVariantProgramDuration">Program Duration (minutes, Optional)</label>
+              <input
+                id="depVariantProgramDuration"
+                type="number"
+                min="0"
+                max="1440"
+                value={activeVariant.program_duration ?? ''}
+                onChange={(e) => updateActiveVariant({
+                  program_duration: e.target.value === '' ? null : parseInt(e.target.value, 10),
+                })}
+                placeholder="Use profile default"
+              />
+              <p className="form-hint">How long an event on this variant runs. Blank uses the profile duration.</p>
+            </div>
 
             {/* Per-Variant Template Overrides (optional — collapse by default) */}
             <CollapsibleSection
@@ -845,6 +883,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     placeholder="Use profile default"
                     rows={2}
                   />
+                  <p className="form-hint">{ENDED_TEMPLATE_HINT}</p>
                 </div>
                 <div className="modal-form-group">
                   <label>Fallback Title Override</label>
@@ -916,6 +955,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     placeholder="The {league} match between {team1} and {team2} ran from {starttime} to {endtime}."
                     rows={2}
                   />
+                  <p className="form-hint">{ENDED_TEMPLATE_HINT}</p>
                 </div>
               </div>
             </CollapsibleSection>

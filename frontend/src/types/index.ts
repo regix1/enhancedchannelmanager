@@ -1838,6 +1838,11 @@ export interface PatternVariant {
   ended_description_template: string | null;
   fallback_title_template: string | null;
   fallback_description_template: string | null;
+  // Mirrors PatternVariantModel.program_duration in
+  // backend/routers/dummy_epg.py. Null or absent means the profile's own
+  // program_duration applies, and every variant stored before the field
+  // existed comes back with the key absent rather than null.
+  program_duration?: number | null;
 }
 
 // Dummy EPG profile configuration

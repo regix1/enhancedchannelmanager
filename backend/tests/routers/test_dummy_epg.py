@@ -129,6 +129,80 @@ class TestCreateProfile:
         assert data["substitution_pairs"][0]["find"] == "HD"
 
     @pytest.mark.asyncio
+    async def test_stores_a_per_variant_program_duration(self, async_client):
+        """A variant may carry its own duration so one sport can run longer
+        than the profile default."""
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Per Variant Duration",
+                "program_duration": 180,
+                "pattern_variants": [
+                    {
+                        "name": "Baseball",
+                        "title_pattern": r"(?P<title>.+)",
+                        "program_duration": 240,
+                    },
+                ],
+            })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["program_duration"] == 180
+        assert data["pattern_variants"][0]["program_duration"] == 240
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_per_variant_duration_outside_the_range(self, async_client):
+        """5000 minutes is past the 1440 ceiling the profile field uses."""
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Too Long",
+                "pattern_variants": [
+                    {
+                        "name": "Baseball",
+                        "title_pattern": r"(?P<title>.+)",
+                        "program_duration": 5000,
+                    },
+                ],
+            })
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_per_variant_duration_of_zero(self, async_client):
+        """Zero is a value the engine honours, so the floor is 0 not 1."""
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Zero Duration",
+                "pattern_variants": [
+                    {
+                        "name": "Baseball",
+                        "title_pattern": r"(?P<title>.+)",
+                        "program_duration": 0,
+                    },
+                ],
+            })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["pattern_variants"][0]["program_duration"] == 0
+
+    @pytest.mark.asyncio
+    async def test_leaves_a_variant_duration_unset_when_not_given(self, async_client):
+        """Absent means the profile's own duration applies."""
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Profile Duration Only",
+                "program_duration": 180,
+                "pattern_variants": [
+                    {"name": "Baseball", "title_pattern": r"(?P<title>.+)"},
+                ],
+            })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["pattern_variants"][0]["program_duration"] is None
+
+    @pytest.mark.asyncio
     async def test_creates_profile_with_channel_group_ids(self, async_client):
         """Creates a profile with channel_group_ids."""
         with patch("routers.dummy_epg.cache"):

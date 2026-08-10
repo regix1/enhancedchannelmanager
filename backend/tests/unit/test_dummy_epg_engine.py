@@ -2,6 +2,9 @@
 Unit tests for the Dummy EPG generation engine.
 """
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+
+import pytz
 
 from dummy_epg_engine import (
     _js_to_python_named_groups,
@@ -765,6 +768,298 @@ def test_generate_xmltv_empty_profiles():
     assert root.tag == "tv"
     assert len(root.findall("channel")) == 0
     assert len(root.findall("programme")) == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-variant programme duration, and the block after the predicted end
+# ---------------------------------------------------------------------------
+
+_EVENT_TZ = "America/New_York"
+_TITLE_PATTERN = r"^(?P<title>.+?) \d{2}/\d{2}/\d{4}"
+_TIME_PATTERN = r"(?P<hour>\d{2}):(?P<minute>\d{2})$"
+_DATE_PATTERN = r"(?P<month>\d{2})/(?P<day>\d{2})/(?P<year>\d{4})"
+
+
+def _event_name_today() -> tuple[str, datetime]:
+    """Build a sample name for an 8pm event today in the event timezone, plus its start."""
+    tz = pytz.timezone(_EVENT_TZ)
+    now = datetime.now(tz)
+    start = tz.localize(datetime(now.year, now.month, now.day, 20, 0, 0))
+    return f"Big Game {start:%m/%d/%Y} 20:00", start
+
+
+def _variant_profile(program_duration: int, variants: list[dict]) -> dict:
+    """Profile using pattern variants, with a profile-level duration to fall back on."""
+    return {
+        "program_duration": program_duration,
+        "event_timezone": _EVENT_TZ,
+        "title_template": "{title}",
+        "pattern_variants": variants,
+    }
+
+
+def _programmes_for(profile: dict, channel_name: str) -> list[ET.Element]:
+    """Generate one channel's programmes through the public entry point."""
+    profiles = [{**profile, "enabled": True, "channel_assignments": [{"channel_id": 1}]}]
+    channel_data = {1: {"name": channel_name, "channel_number": 100, "streams": []}}
+    root = ET.fromstring(generate_xmltv(profiles, channel_data))
+    return root.findall("programme")
+
+
+def _programme_window(prog: ET.Element) -> tuple[datetime, datetime]:
+    """Parse a programme's start/stop attributes back into datetimes."""
+    fmt = "%Y%m%d%H%M%S %z"
+    return (
+        datetime.strptime(prog.get("start"), fmt),
+        datetime.strptime(prog.get("stop"), fmt),
+    )
+
+
+def test_variant_duration_overrides_profile_duration():
+    """The matched variant's program_duration sets the programme length."""
+    name, start = _event_name_today()
+    profile = _variant_profile(180, [
+        {
+            "name": "baseball",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 300,
+        },
+    ])
+    main = [
+        p for p in _programmes_for(profile, name)
+        if _programme_window(p)[0] == start
+    ]
+    assert len(main) == 1
+    prog_start, prog_stop = _programme_window(main[0])
+    assert prog_stop - prog_start == timedelta(minutes=300)
+
+
+def test_preview_uses_variant_duration():
+    """The preview path resolves the duration through the variant as well."""
+    name, _start = _event_name_today()
+    config = _variant_profile(180, [
+        {
+            "name": "baseball",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 300,
+        },
+    ])
+    result = preview_pipeline(config, name)
+    assert result["time_variables"]["starttime24"] == "20:00"
+    assert result["time_variables"]["endtime24"] == "01:00"
+
+
+def test_variant_duration_zero_is_not_treated_as_absent():
+    """A variant duration of 0 is honoured instead of falling back to the profile."""
+    name, _start = _event_name_today()
+    config = _variant_profile(180, [
+        {
+            "name": "instant",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 0,
+        },
+    ])
+    result = preview_pipeline(config, name)
+    assert result["time_variables"]["endtime24"] == "20:00"
+
+
+def test_a_variant_duration_that_is_not_a_number_uses_the_profile_value():
+    """The YAML import and the backup restore both write pattern_variants
+    into the profile's JSON column without validating them against
+    PatternVariantModel, so a stored duration is not always a number.
+    Nothing between the resolver and generate_xmltv catches an exception,
+    so raising here would empty the guide for every profile rather than
+    for the one variant that carries the bad value. It falls back to the
+    profile's own duration, which is what the lint scan tells the operator
+    an unreadable value does. [54]
+    """
+    name, _start = _event_name_today()
+    config = _variant_profile(180, [
+        {
+            "name": "baseball",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": "three hours",
+        },
+    ])
+
+    result = preview_pipeline(config, name)
+
+    assert result["time_variables"]["endtime24"] == "23:00"
+
+
+def test_a_profile_duration_that_is_not_a_number_uses_the_shipped_default():
+    """The profile-level value reaches the same two unvalidated write paths
+    the variant value does, and it is what every variant without its own
+    duration falls back to, so an unreadable one empties the guide for every
+    profile rather than for one channel. [56]
+    """
+    name, _start = _event_name_today()
+    config = _variant_profile("three hours", [
+        {
+            "name": "baseball",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+        },
+    ])
+
+    result = preview_pipeline(config, name)
+
+    assert result["time_variables"]["endtime24"] == "23:00"
+
+
+def test_a_duration_past_the_allowed_range_is_held_at_the_ceiling():
+    """int() accepts a number timedelta cannot add to a date, and the
+    OverflowError that follows is neither a TypeError nor a ValueError, so
+    the conversion guard never sees it. The ceiling is the one the API
+    already enforces. [57]
+    """
+    name, start = _event_name_today()
+    profile = _variant_profile(180, [
+        {
+            "name": "baseball",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 10000000000,
+        },
+    ])
+
+    main = [
+        p for p in _programmes_for(profile, name)
+        if _programme_window(p)[0] == start
+    ]
+
+    assert len(main) == 1
+    prog_start, prog_stop = _programme_window(main[0])
+    assert prog_stop - prog_start == timedelta(minutes=1440)
+
+
+def test_a_zero_length_event_emits_no_zero_length_programme():
+    """A duration of 0 says the event has no fixed length, not that it
+    lasts no time. A programme whose stop equals its start is dropped or
+    rejected by the consumers that read this guide. [60]
+    """
+    name, _start = _event_name_today()
+    profile = _variant_profile(180, [
+        {
+            "name": "instant",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 0,
+        },
+    ])
+
+    programmes = _programmes_for(profile, name)
+
+    assert programmes
+    assert all(
+        _programme_window(p)[0] != _programme_window(p)[1]
+        for p in programmes
+    )
+
+
+def test_variant_without_duration_uses_profile_duration():
+    """A channel matching a variant that sets no duration keeps the profile value."""
+    name, start = _event_name_today()
+    profile = _variant_profile(240, [
+        {
+            "name": "hockey",
+            "title_pattern": r"^(?P<title>Hockey Night) \d{2}/\d{2}/\d{4}",
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+            "program_duration": 300,
+        },
+        {
+            "name": "generic",
+            "title_pattern": _TITLE_PATTERN,
+            "time_pattern": _TIME_PATTERN,
+            "date_pattern": _DATE_PATTERN,
+        },
+    ])
+    main = [
+        p for p in _programmes_for(profile, name)
+        if _programme_window(p)[0] == start
+    ]
+    assert len(main) == 1
+    prog_start, prog_stop = _programme_window(main[0])
+    assert prog_stop - prog_start == timedelta(minutes=240)
+
+
+def test_programme_after_predicted_end_stays_on_air():
+    """Past the predicted end the guide keeps the event title and the live tag."""
+    name, start = _event_name_today()
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "title_template": "{title}",
+        "ended_title_template": "Ended: {title}",
+        "include_live_tag": True,
+    }
+    end = start + timedelta(minutes=180)
+    programmes = _programmes_for(profile, name)
+    after = [p for p in programmes if _programme_window(p)[0] == end]
+    assert len(after) == 1
+    assert after[0].find("title").text == "Big Game"
+    assert after[0].find("live") is not None
+    assert not any(p.find("title").text.startswith("Ended:") for p in programmes)
+
+
+def test_only_the_event_itself_is_marked_new():
+    """The block past the predicted end is the same broadcast continuing.
+    Marking it new as well puts two new markers on adjacent programmes with
+    one title, which a recorder reads as a second showing. [71]
+    """
+    name, start = _event_name_today()
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "title_template": "{title}",
+        "include_live_tag": True,
+        "include_new_tag": True,
+    }
+
+    programmes = _programmes_for(profile, name)
+
+    marked_new = [p for p in programmes if p.find("new") is not None]
+    assert len(marked_new) == 1
+    assert _programme_window(marked_new[0])[0] == start
+
+
+def test_guide_covers_the_whole_day_without_a_gap():
+    """Programmes run midnight to midnight with no gap around the event."""
+    name, _start = _event_name_today()
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "title_template": "{title}",
+    }
+    windows = [_programme_window(p) for p in _programmes_for(profile, name)]
+    tz = pytz.timezone(_EVENT_TZ)
+    now = datetime.now(tz)
+    today_midnight = tz.localize(datetime(now.year, now.month, now.day, 0, 0, 0))
+    assert windows[0][0] == today_midnight
+    assert windows[-1][1] == today_midnight + timedelta(days=1)
+    for (_, prev_stop), (next_start, _) in zip(windows, windows[1:]):
+        assert prev_stop == next_start
 
 
 # ---------------------------------------------------------------------------

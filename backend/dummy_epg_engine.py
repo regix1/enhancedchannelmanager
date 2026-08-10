@@ -402,6 +402,62 @@ def _resolve_variant_template(variant: dict | None, profile: dict, field: str) -
     return profile.get(field, "") or ""
 
 
+def _resolve_variant_duration(variant: dict | None, profile: dict) -> int:
+    """Get programme length in minutes from the variant, else fall back to profile-level.
+
+    A variant may legitimately set 0, so absence is tested rather than truthiness.
+
+    The stored value is not always a number, and it is not always one
+    ``timedelta`` can add to a date. Three write paths put a duration into
+    the profile without validating it against the API's own models: the YAML
+    import (routers.dummy_epg._apply_profile_fields), the backup restore
+    (routers.backup), and the profile-level field itself, which the create
+    and update models leave unbounded. Nothing between here and
+    generate_xmltv catches an exception, so one unreadable entry would empty
+    the guide for every profile and every channel rather than for the one
+    variant that carries it. Both values therefore pass the same conversion,
+    and the result is held inside the range the variant model already
+    enforces, which is what the startup lint scan tells the operator to
+    do. [54][56][57]
+    """
+    fallback = _duration_minutes(
+        profile.get("program_duration", 180), 180, profile.get("name"),
+    )
+    if variant:
+        val = variant.get("program_duration")
+        if val is not None:
+            return _duration_minutes(val, fallback, variant.get("name"))
+    return fallback
+
+
+def _duration_minutes(value, fallback: int, owner: str | None) -> int:
+    """One stored duration as a usable number of minutes.
+
+    ``fallback`` is what an absent value would have given: the profile's own
+    duration for a variant, and the shipped default for the profile itself.
+    The 0 to 1440 range is the one PatternVariantModel already enforces on
+    the write path that does get validated.
+    """
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[DUMMY-EPG] %r carries a program_duration that is not a number "
+            "(%r), using %s minute(s) instead",
+            owner, value, fallback,
+        )
+        return fallback
+    if not 0 <= minutes <= 1440:
+        held = min(max(minutes, 0), 1440)
+        logger.warning(
+            "[DUMMY-EPG] %r carries a program_duration of %s minute(s), "
+            "outside 0 to 1440, using %s instead",
+            owner, minutes, held,
+        )
+        return held
+    return minutes
+
+
 def generate_channel_xml(
     channel_id: int,
     channel_name: str,
@@ -460,7 +516,7 @@ def generate_channel_xml(
     # Profile config
     event_timezone = profile.get("event_timezone", "US/Eastern")
     output_timezone = profile.get("output_timezone")
-    program_duration = profile.get("program_duration", 180)
+    program_duration = _resolve_variant_duration(matched_variant, profile)
     categories_str = profile.get("categories", "")
     categories = [c.strip() for c in categories_str.split(",") if c.strip()] if categories_str else []
     include_date_tag = profile.get("include_date_tag", False)
@@ -494,11 +550,7 @@ def generate_channel_xml(
     # Helper to resolve templates: matched variant overrides profile-level for core templates;
     # upcoming/ended/fallback inherit from profile unless variant overrides them
     def get_template(field: str) -> str:
-        if matched_variant:
-            val = matched_variant.get(field)
-            if val:
-                return val
-        return profile.get(field, "") or ""
+        return _resolve_variant_template(matched_variant, profile, field)
 
     # All template rendering inside this function binds the same lookups dict.
     def _render(template: str, groups: dict) -> str:
@@ -551,28 +603,31 @@ def generate_channel_xml(
                     include_date_tag, False, False,
                 ))
 
-            # Main event
-            programmes.append(_make_programme(
-                start_dt, end_dt, channel_id_str,
-                title, description,
-                categories, poster_url,
-                include_date_tag, include_live_tag, include_new_tag,
-            ))
+            # Main event. A duration of 0 says the event has no fixed
+            # length, not that it lasts no time, so there is no window to
+            # emit: an element whose stop equals its start is dropped or
+            # rejected by the consumers that read this guide, and the block
+            # below covers the rest of the day either way. [60]
+            if end_dt > start_dt:
+                programmes.append(_make_programme(
+                    start_dt, end_dt, channel_id_str,
+                    title, description,
+                    categories, poster_url,
+                    include_date_tag, include_live_tag, include_new_tag,
+                ))
 
-            # Ended filler: event end to next midnight
+            # Predicted end to next midnight. An event that runs past its
+            # predicted length is still on air, so this block keeps the event's
+            # own title and live tag rather than declaring it over. It never
+            # carries the new tag: this is the same broadcast continuing, and
+            # a second new marker on an adjacent programme of the same title
+            # reads to a recorder as a second showing to record. [71]
             if end_dt < tomorrow_midnight:
-                ended_title = _render(
-                    get_template("ended_title_template"), template_groups
-                )
-                ended_desc = _render(
-                    get_template("ended_description_template"), template_groups
-                )
                 programmes.append(_make_programme(
                     end_dt, tomorrow_midnight, channel_id_str,
-                    ended_title or title,
-                    ended_desc or description,
+                    title, description,
                     categories, poster_url,
-                    include_date_tag, False, False,
+                    include_date_tag, include_live_tag, False,
                 ))
         else:
             # No time extracted -- single 24-hour programme
@@ -744,16 +799,12 @@ def preview_pipeline(
 
     # Helper to resolve template: variant overrides profile
     def get_template(field: str) -> str:
-        if matched_variant:
-            val = matched_variant.get(field)
-            if val:
-                return val
-        return config.get(field, "") or ""
+        return _resolve_variant_template(matched_variant, config, field)
 
     if matched:
         event_timezone = config.get("event_timezone", "US/Eastern")
         output_timezone = config.get("output_timezone")
-        program_duration = config.get("program_duration", 180)
+        program_duration = _resolve_variant_duration(matched_variant, config)
 
         time_vars = compute_event_times(
             groups, event_timezone, output_timezone, program_duration

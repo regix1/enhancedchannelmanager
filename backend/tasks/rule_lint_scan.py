@@ -112,11 +112,24 @@ def _scan_dummy_epg_profile(profile: Any) -> list[LintViolation]:
       - ``find`` on substitution pairs with ``is_regex: True``.
       - Pattern fields inside each ``pattern_variants`` entry
         (``title_pattern`` / ``time_pattern`` / ``date_pattern``).
+      - ``program_duration``, both the profile's own and the one inside
+        each ``pattern_variants`` entry. The YAML import and the backup
+        restore store both verbatim without the pydantic models that guard
+        the create and update endpoints, so an unusable duration can only
+        be caught here. The profile-level value is the one every variant
+        without its own duration falls back to.
     """
     violations: list[LintViolation] = []
     violations.extend(lint_pattern(profile.title_pattern, field="title_pattern"))
     violations.extend(lint_pattern(profile.time_pattern, field="time_pattern"))
     violations.extend(lint_pattern(profile.date_pattern, field="date_pattern"))
+    violations.extend(
+        _lint_duration(
+            profile.program_duration,
+            field="program_duration",
+            advice="Remove it to use the shipped default of 180.",
+        )
+    )
 
     pairs = _safe_json_loads(profile.substitution_pairs)
     if isinstance(pairs, list):
@@ -147,8 +160,47 @@ def _scan_dummy_epg_profile(profile: Any) -> list[LintViolation]:
                     field=f"pattern_variants[{idx}].date_pattern",
                 )
             )
+            violations.extend(
+                _lint_duration(
+                    variant.get("program_duration"),
+                    field=f"pattern_variants[{idx}].program_duration",
+                    advice="Remove it to use the profile's own duration.",
+                )
+            )
 
     return violations
+
+
+def _lint_duration(
+    duration: Any, *, field: str, advice: str
+) -> list[LintViolation]:
+    """Report one stored ``program_duration`` the engine cannot use as given.
+
+    The engine reads a numeric string as a number and holds an out-of-range
+    value at the nearest end of the range, so only a value it cannot read at
+    all, or one outside the range the API accepts, is worth reporting.
+    ``advice`` names what an absent value would have given instead, which
+    differs between a variant and the profile that carries it.
+    """
+    if duration is None:
+        return []
+    try:
+        minutes = int(duration)
+    except (TypeError, ValueError):
+        minutes = None
+    if minutes is not None and 0 <= minutes <= 1440:
+        return []
+    return [
+        LintViolation(
+            code="VARIANT_DURATION_OUT_OF_RANGE",
+            message=(
+                "Program duration must be a number of minutes "
+                f"from 0 to 1440. {advice}"
+            ),
+            field=field,
+            detail={"value": duration},
+        )
+    ]
 
 
 def _write_findings(
