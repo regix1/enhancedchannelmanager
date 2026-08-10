@@ -140,6 +140,16 @@ async def update_channel_group(group_id: int, data: dict):
         logger.info("[GROUPS] Updated channel group id=%s in %.1fms", group_id, elapsed_ms)
         return result
     except Exception as e:
+        # Dispatcharr's group name is unique, so renaming a group to a name
+        # another group already holds comes back as a 400 naming the field, and
+        # a group deleted since the list was loaded comes back as a 404. Both
+        # arrive as httpx.HTTPStatusError from update_channel_group's
+        # raise_for_status(). Surface them the way delete does instead of
+        # masking every one as a generic 500 the operator cannot act on.
+        mapped = upstream_http_exception(e)
+        if mapped is not None:
+            logger.warning("[GROUPS] Update channel group %s rejected by Dispatcharr: %s", group_id, e)
+            raise mapped
         logger.exception("[GROUPS] Failed to update channel group id=%s", group_id)
         raise HTTPException(status_code=500, detail="Internal server error")
 

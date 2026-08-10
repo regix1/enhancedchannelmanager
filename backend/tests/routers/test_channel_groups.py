@@ -161,6 +161,86 @@ class TestUpdateChannelGroup:
         assert response.status_code == 200
         mock_client.update_channel_group.assert_called_once_with(1, {"name": "Updated"})
 
+    @pytest.mark.asyncio
+    async def test_duplicate_name_surfaces_400_not_500(self, async_client):
+        """Renaming a group to a name another group already holds maps to 400
+        with the upstream detail, not an opaque 500.
+
+        Dispatcharr's ChannelGroup.name is unique, so its serializer rejects the
+        PATCH and update_channel_group raises httpx.HTTPStatusError via
+        raise_for_status().
+        """
+        mock_client = AsyncMock()
+        request = httpx.Request("PATCH", "http://disp/api/channels/groups/1/")
+        upstream = httpx.Response(
+            400, request=request,
+            text='{"name": ["channel group with this name already exists."]}',
+        )
+        mock_client.update_channel_group.side_effect = httpx.HTTPStatusError(
+            "400 Client Error", request=request, response=upstream
+        )
+
+        with patch("routers.channel_groups.get_client", return_value=mock_client):
+            response = await async_client.patch("/api/channel-groups/1", json={
+                "name": "Live Events",
+            })
+
+        assert response.status_code == 400
+        assert "already exists" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_missing_group_surfaces_404_not_500(self, async_client):
+        """A group deleted since the operator loaded the list maps to 404."""
+        mock_client = AsyncMock()
+        request = httpx.Request("PATCH", "http://disp/api/channels/groups/99/")
+        upstream = httpx.Response(
+            404, request=request, text='{"detail": "Not found."}',
+        )
+        mock_client.update_channel_group.side_effect = httpx.HTTPStatusError(
+            "404 Client Error", request=request, response=upstream
+        )
+
+        with patch("routers.channel_groups.get_client", return_value=mock_client):
+            response = await async_client.patch("/api/channel-groups/99", json={
+                "name": "Renamed",
+            })
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_genuine_server_error_still_500(self, async_client):
+        """A non-upstream error on update stays a 500."""
+        mock_client = AsyncMock()
+        mock_client.update_channel_group.side_effect = RuntimeError("boom")
+
+        with patch("routers.channel_groups.get_client", return_value=mock_client):
+            response = await async_client.patch("/api/channel-groups/1", json={
+                "name": "Renamed",
+            })
+
+        assert response.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_sends_name_verbatim(self, async_client):
+        """The name goes upstream exactly as typed — no trimming, no case folding.
+
+        Uniqueness belongs to Dispatcharr: its serializer strips surrounding
+        whitespace before the unique check (so "Sports " collides with "Sports")
+        while the index itself is case-sensitive (so "sports" does not). ECM
+        keeps that comparison upstream rather than pre-checking names here, which
+        would drift from whatever Dispatcharr actually enforces.
+        """
+        mock_client = AsyncMock()
+        mock_client.update_channel_group.return_value = {"id": 1, "name": "sports"}
+
+        with patch("routers.channel_groups.get_client", return_value=mock_client):
+            response = await async_client.patch("/api/channel-groups/1", json={
+                "name": "sports ",
+            })
+
+        assert response.status_code == 200
+        mock_client.update_channel_group.assert_called_once_with(1, {"name": "sports "})
+
 
 class TestDeleteChannelGroup:
     """Tests for DELETE /api/channel-groups/{group_id}."""
