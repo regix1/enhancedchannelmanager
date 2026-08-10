@@ -2242,14 +2242,20 @@ export function EventSyncRuleEditor({
                           disabled={isLoading}
                           data-testid="event-sync-skip-past-events"
                         />
-                        <span>Skip events that have already finished</span>
+                        <span>
+                          Skip events that have already finished, and remove
+                          their channels
+                        </span>
                       </label>
                       <span className="form-hint">
                         Most providers leave a finished event in the playlist
                         for days, so without this each one keeps getting its
-                        own channel. Channels already promoted are never
-                        deleted by this setting, and events whose date had to
-                        be assumed are never skipped.
+                        own channel. A channel this rule already promoted for
+                        a finished event stops being managed by the rule, so
+                        the rule&apos;s orphan cleanup setting decides what
+                        happens to it, and orphan cleanup deletes channels by
+                        default. Events whose date had to be assumed are never
+                        skipped.
                       </span>
                     </div>
                   )}
@@ -2269,9 +2275,10 @@ export function EventSyncRuleEditor({
                         data-testid="event-sync-past-event-grace"
                       />
                       <span className="form-hint">
-                        A provider name gives a start time, never a duration —
-                        this is what keeps an event that is still on air from
-                        being dropped mid-broadcast (default{' '}
+                        A provider name gives a start time, never a duration.
+                        This window is what keeps an event that is still on
+                        air from being skipped and its channel removed
+                        mid-broadcast (default{' '}
                         {DEFAULT_PAST_EVENT_GRACE_HOURS}, max{' '}
                         {MAX_PAST_EVENT_GRACE_HOURS}).
                       </span>

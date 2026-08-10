@@ -328,6 +328,49 @@ class TestPromotionRendering:
         assert "'DAZN 05: Fury vs. Usyk @ 11 Jul 11:00 PM ET' [DaznProvider]" in text
 
     @pytest.mark.asyncio
+    async def test_skipped_finished_events_and_their_removals_are_shown(self):
+        """An operator previewing through MCP has to see the channels a
+        run would remove, not just the ones it would add. [54]"""
+        mcp = _make_mcp_and_register()
+        client = AsyncMock()
+        promotion = self._promotion_block()
+        promotion["skipped_past"] = 7
+        promotion["skipped_past_adopted"] = 3
+        client.call_endpoint.return_value = _preview_response(
+            promotion=promotion,
+        )
+        text = await _call_tool(
+            mcp, client,
+            {"event_sync_config": {"master_group_id": 10,
+                                   "secondary_group_ids": [20, 30],
+                                   "promote_unmatched": True,
+                                   "promote_target_group_id": 40}},
+        )
+        assert "7 event(s) skipped because they had already finished" in text
+        assert "3 existing channel(s) will be REMOVED" in text
+        assert "orphan cleanup" in text
+
+    @pytest.mark.asyncio
+    async def test_no_removal_warning_without_finished_events(self):
+        mcp = _make_mcp_and_register()
+        client = AsyncMock()
+        promotion = self._promotion_block()
+        promotion["skipped_past"] = 0
+        promotion["skipped_past_adopted"] = 0
+        client.call_endpoint.return_value = _preview_response(
+            promotion=promotion,
+        )
+        text = await _call_tool(
+            mcp, client,
+            {"event_sync_config": {"master_group_id": 10,
+                                   "secondary_group_ids": [20, 30],
+                                   "promote_unmatched": True,
+                                   "promote_target_group_id": 40}},
+        )
+        assert "will be REMOVED" not in text
+        assert "already finished" not in text
+
+    @pytest.mark.asyncio
     async def test_no_promotion_block_renders_nothing(self):
         mcp = _make_mcp_and_register()
         client = AsyncMock()

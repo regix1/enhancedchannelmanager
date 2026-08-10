@@ -4177,6 +4177,16 @@ class ChannelPipelineEngine:
                     extras.append(
                         f"{promo['skipped_past']} finished event(s) skipped"
                     )
+                if promo.get("skipped_past_adopted"):
+                    extras.append(
+                        f"{promo['skipped_past_adopted']} promoted channel(s) "
+                        f"left the managed set"
+                    )
+                if promo.get("failed_units"):
+                    extras.append(
+                        f"{promo['failed_units']} promotion unit(s) got no "
+                        f"channel"
+                    )
             if summary["capped"]:
                 extras.append(
                     f"capped at {summary['cap']}, "
@@ -4238,7 +4248,13 @@ class ChannelPipelineEngine:
             attach_failures = summary.get("attach_errors", 0)
             promo = summary.get("promotion")
             if promo is not None:
-                attach_failures += promo.get("attach_errors", 0)
+                # A promotion unit that got no channel is a failure of the
+                # same run, counted on its own key since it is a unit and
+                # not a stream. [49]
+                attach_failures += (
+                    promo.get("attach_errors", 0)
+                    + promo.get("failed_units", 0)
+                )
             if attach_failures:
                 self._record_failed_phase(
                     results, phase="event_sync_attach",
@@ -5151,13 +5167,15 @@ class ChannelPipelineEngine:
                     # reconcile — their managed set contains ONLY the
                     # ECM-promoted channels in promote_target_group_id (the
                     # attach phase registers nothing else; the register site
-                    # re-asserts it). Lifecycle is reconciliation-driven by
-                    # PO decision: a promoted channel is current iff its
-                    # justifying unmatched stream was observed in the
-                    # provider playlist THIS run — no wall-clock arithmetic,
-                    # no timestamps, no run counters anywhere below. The
-                    # target group id is kept as a LAST-RESORT ownership
-                    # rail on the delete loop.
+                    # re-asserts it). Lifecycle is reconciliation-driven: a
+                    # promoted channel is current iff the promotion planner
+                    # kept its unit this run, which needs its justifying
+                    # unmatched stream in the provider playlist and, when
+                    # the rule set skip_past_events, an event that has not
+                    # finished. The clock lives entirely in that planner —
+                    # no wall-clock arithmetic, no timestamps, no run
+                    # counters anywhere below. The target group id is kept
+                    # as a LAST-RESORT ownership rail on the delete loop.
                     event_sync_promote_group_id = cfg.get(
                         "promote_target_group_id"
                     )

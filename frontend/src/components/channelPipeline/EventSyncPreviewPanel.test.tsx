@@ -522,6 +522,7 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
         capped: false,
         cap_overage: 0,
         skipped_past: 0,
+        skipped_past_adopted: 0,
         units: [
           {
             channel_name: 'Provider B Exclusive Fight @ Jul 11 09:00 PM',
@@ -662,6 +663,100 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     ).toMatch(/115 events skipped because they had already finished/);
   });
 
+  it('counts the channels that get removed separately from the skipped total', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_past = 115;
+    preview.promotion!.skipped_past_adopted = 5;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    // The skipped total and the destructive subset read as two separate
+    // statements, because only the second one loses a channel.
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-past').textContent
+    ).toMatch(/115 events skipped because they had already finished/);
+    const removed = screen.getByTestId(
+      'event-sync-promote-skipped-past-adopted'
+    );
+    expect(removed.textContent).toMatch(
+      /5 of those events already have channels/
+    );
+    expect(removed.textContent).toMatch(/orphan cleanup/i);
+    expect(removed).toHaveAttribute('role', 'alert');
+  });
+
+  it('says one channel in the singular when a single event is affected', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_past = 1;
+    preview.promotion!.skipped_past_adopted = 1;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-past-adopted').textContent
+    ).toMatch(/1 of those events already has a channel/);
+  });
+
+  it('stays silent about removals when no skipped event has a channel', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_past = 115;
+    preview.promotion!.skipped_past_adopted = 0;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-skipped-past')
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTestId('event-sync-promote-skipped-past-adopted')
+    ).toBeNull();
+  });
+
+  it('marks the skipped row whose channel the rule is about to release', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_past = 2;
+    preview.promotion!.skipped_past_adopted = 1;
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_skipped_past = true;
+    preview.unmatched_streams[0].promote_skipped_past_adopted = true;
+    preview.unmatched_streams[1].would_promote = false;
+    preview.unmatched_streams[1].promote_skipped_past = true;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    // The row that already has a channel says so; the one that does not
+    // keeps the plain wording, because nothing is lost when it is skipped.
+    expect(
+      screen.getByText(
+        /Skipped — event already finished, and this rule stops managing its channel/
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Skipped — event already finished$/)
+    ).toBeInTheDocument();
+  });
+
   it('says nothing about skipped events when none were skipped', () => {
     render(
       <EventSyncPreviewPanel
@@ -672,5 +767,8 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
       />
     );
     expect(screen.queryByTestId('event-sync-promote-skipped-past')).toBeNull();
+    expect(
+      screen.queryByTestId('event-sync-promote-skipped-past-adopted')
+    ).toBeNull();
   });
 });

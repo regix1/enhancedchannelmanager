@@ -158,11 +158,12 @@ export interface EventSyncConfig {
   max_promote_per_run?: number;
   /**
    * When true, an event whose parsed start time has already gone by (plus
-   * `past_event_grace_hours`) is not promoted to a NEW channel. Providers
-   * leave finished events in the playlist for days. Blocks creates only —
-   * an already-promoted channel is never deleted by this, and events whose
-   * date was synthesized (`assume_current_date`) are never filtered.
-   * Absent means the filter is off.
+   * `past_event_grace_hours`) is not promoted, and a channel already
+   * promoted for it leaves the set this rule manages, so the rule's orphan
+   * cleanup applies to that channel. Providers leave finished events in the
+   * playlist for days. Events whose date was synthesized
+   * (`assume_current_date`) are never filtered. Absent means the filter is
+   * off.
    */
   skip_past_events?: boolean;
   /**
@@ -367,6 +368,10 @@ export interface EventSyncUnmatchedStream {
   /** True when `skip_past_events` dropped this event because it already
    * finished. Unlike `promote_capped` it does not re-surface next run. */
   promote_skipped_past?: boolean;
+  /** True when the dropped event already has a channel, so the channel
+   * leaves the set this rule manages and the rule's orphan cleanup decides
+   * its fate. Only ever set alongside `promote_skipped_past`. */
+  promote_skipped_past_adopted?: boolean;
 }
 
 /** bead ti939.4.1: one stream inside a promotion unit. */
@@ -402,8 +407,15 @@ export interface EventSyncPromotionPreview {
   capped: boolean;
   cap_overage: number;
   /** How many events `skip_past_events` dropped because they had already
-   * finished. 0 when the filter is off. */
+   * finished. 0 when the filter is off. Both counts always ride along
+   * when this block is present, so neither needs a reader-side default:
+   * the backend that renders the block is the one shipped beside this
+   * frontend. */
   skipped_past: number;
+  /** How many of those dropped events already have a channel. Each one
+   * leaves the set this rule manages, so the rule's orphan cleanup decides
+   * what happens to the channel. Always a subset of `skipped_past`. */
+  skipped_past_adopted: number;
   units: EventSyncPromotionUnit[];
 }
 

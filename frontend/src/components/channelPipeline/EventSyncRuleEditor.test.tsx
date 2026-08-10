@@ -1973,6 +1973,30 @@ describe('EventSyncRuleEditor', () => {
       expect(config).not.toHaveProperty('past_event_grace_hours');
     });
 
+    it('says on the past-event toggle that channels are removed too', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      const toggle = screen.getByTestId('event-sync-skip-past-events');
+      const toggleGroup = toggle.closest('.form-group')!;
+      // The label alone has to carry the destructive half, because that is
+      // the only text an operator reads before ticking the box.
+      expect(toggleGroup.textContent).toMatch(/remove their channels/i);
+      expect(toggleGroup.textContent).toMatch(/orphan cleanup/i);
+      expect(toggleGroup.textContent).not.toMatch(/never deleted/i);
+
+      await user.click(toggle);
+      const grace = await screen.findByTestId('event-sync-past-event-grace');
+      expect(grace.closest('.form-group')!.textContent).toMatch(
+        /its channel removed/i
+      );
+    });
+
     it('emits the past-event filter with its grace once the box is ticked', async () => {
       const user = userEvent.setup();
       seedPromoGroup();

@@ -19,17 +19,23 @@ inputs (dry-run parity by construction — the same argument as
 * **Lifecycle: reconciliation-driven deletion.** A promoted channel is
   current iff its justifying unmatched stream is observed present in the
   provider playlist THIS run; Pass 4 orphan reconciliation deletes (per the
-  rule's ``orphan_action``, default delete) when it drops out. NO wall-clock
-  arithmetic, NO parsed or synthesized timestamps in any delete decision,
-  NO K-run counters.
-* **``skip_past_events`` blocks CREATES ONLY.** The opt-in past-event filter
-  is the single place a clock enters this module, and it may only ever
-  remove a unit whose action is ``create``. A unit that adopts an existing
-  promoted channel always stays in the plan: the caller registers the
-  plan's channels as the run's managed set, so dropping an adopt unit would
-  make Pass 4 see the channel as an orphan and delete it — a
-  timestamp-driven delete, which the invariant above forbids. The clock is
-  read only when the rule opted in, and ``now`` is injectable.
+  rule's ``orphan_action``, default delete) when it drops out. Stream
+  presence is the ONLY lifecycle signal unless the rule opts into
+  ``skip_past_events``; there are no K-run counters either way.
+* **``skip_past_events`` also ENDS a promoted channel's life.** The opt-in
+  past-event filter is the single place a clock enters this module, and it
+  diverts a finished event's unit out of the plan whatever that unit's
+  action is. A ``create`` simply never happens. An ``attach_existing``
+  leaves its channel out of the run's managed set, so Pass 4 then applies
+  the rule's own ``orphan_action`` to it — delete by default, kept
+  untouched under ``none``. That IS a delete driven by a clock, and it is
+  deliberate: a finished event's channel is unwatchable, and providers
+  leave the stream in the playlist indefinitely, so stream presence alone
+  would never retire it. Three things keep it safe — the filter is opt-in
+  per rule, :func:`event_is_past` refuses to judge an event with no parsed
+  start or a synthesized date, and ``past_event_grace_hours`` keeps a
+  broadcast still on air from being dropped mid-event. The clock is read
+  only when the rule opted in, and ``now`` is injectable.
 * **Clustering: exact-event-key only.** Same-run unmatched streams (any
   provider) sharing a :func:`services.event_sync_review.master_event_key`
   form ONE promotion unit. NO fuzzy clustering; promoted channels do NOT
@@ -229,9 +235,13 @@ class PromotionPlan:
     create-units beyond the per-run cap — NOT realized this run (runs are
     idempotent: the remainder re-surfaces next run, mirroring the attach
     cap's posture). ``cap`` echoes the effective cap.
-    ``skipped_past_units`` are create-units ``skip_past_events`` dropped
-    because the event already finished; unlike capped units they are not
-    deferred — they will not come back unless the provider re-dates them.
+    ``skipped_past_units`` are the units ``skip_past_events`` dropped
+    because the event already finished, of EITHER action; unlike capped
+    units they are not deferred — they will not come back unless the
+    provider re-dates them. The ``attach_existing`` ones
+    (:attr:`skipped_past_adopted`) each leave a real channel out of the
+    run's managed set, which hands it to Pass 4's ``orphan_action``, so
+    that count is the destructive half and is surfaced on its own.
     """
 
     units: tuple[PromotionUnit, ...]
@@ -251,6 +261,25 @@ class PromotionPlan:
     @property
     def skipped_past(self) -> int:
         return len(self.skipped_past_units)
+
+    @property
+    def skipped_past_adopted(self) -> int:
+        """How many skipped units already have a channel in the group.
+
+        Every one of them drops out of the run's managed set, so Pass 4
+        acts on it with the rule's ``orphan_action``. Operator-visible
+        before the run, because this is the destructive number.
+
+        Counted by channel id rather than by action: a unit reads as
+        ``attach_existing`` when an EARLIER unit in the same run planned
+        the same channel name, and that unit has no channel anywhere.
+        Counting it would warn the operator about losing a channel that
+        nothing is about to lose. [45]
+        """
+        return sum(
+            1 for u in self.skipped_past_units
+            if u.existing_channel_id is not None
+        )
 
     @property
     def would_create(self) -> int:
@@ -295,16 +324,25 @@ def build_promotion_plan(
             channels CURRENTLY in the promotion target group. Drives the
             create-vs-adopt decision. The caller supplies it from the same
             channel data its execution path resolves against, so plan and
-            execution agree.
+            execution agree, and the caller owns the keying: a channel
+            stored with the ``"<number> <sep> "`` prefix
+            ``include_channel_number_in_name`` writes has to appear under
+            its unprefixed spelling too, because a missed match plans a
+            create for a channel that already exists.
+            ``channel_number_prefix.channel_name_to_id`` builds exactly
+            that map, and only the caller can see whether the settings
+            write a prefix at all.
         now: tz-aware anchor for ``skip_past_events``. Defaults to the
             current UTC time, and is read ONLY when the rule turned that
             flag on — a config without it never touches a clock. Injectable
             so tests are deterministic.
 
     ``skip_past_events`` is applied BEFORE the cap so finished events cannot
-    spend create budget that a live event needs, and only to create-units
-    (see the module docstring: dropping an adopt unit would hand Pass 4 a
-    delete it must never make from a timestamp).
+    spend create budget that a live event needs, and to units of EITHER
+    action. Dropping an adopt unit is how a finished event's channel leaves
+    the run's managed set and reaches Pass 4's ``orphan_action`` — see the
+    module docstring for why that clock-driven delete is deliberate and
+    what guards it.
 
     Determinism: units are ordered by event key (byte order), so cap
     trimming selects the same units on preview and run for identical
@@ -360,14 +398,17 @@ def build_promotion_plan(
             action=action,
             existing_channel_id=existing_id,
         )
+        if (
+            skip_past
+            and now is not None
+            and event_is_past(parsed, grace_hours, now)
+        ):
+            # Either action. A create never happens; an adopt leaves its
+            # channel out of the managed set the caller registers, which
+            # is what hands it to Pass 4's orphan_action. [20]
+            skipped_past_units.append(unit)
+            continue
         if action == PROMOTE_ACTION_CREATE:
-            if (
-                skip_past
-                and now is not None
-                and event_is_past(parsed, grace_hours, now)
-            ):
-                skipped_past_units.append(unit)
-                continue
             if cap and creates >= cap:
                 capped_units.append(unit)
                 continue

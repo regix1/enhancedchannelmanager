@@ -405,10 +405,10 @@ backward compatibility; the rule editor now reads and writes the nested shape.
 | `demote_stale_dateless` | no (default **true**) | bead jqwfq: guard for `assume_current_date`. When true (the default), a would-attach whose **dateless** stream name was **already present in the provider's previous-day M3U snapshot** is routed to the [review queue](#the-review-queue-ambiguous-matches-become-questions) (reason `stale_dateless_stream_name`) instead of auto-attached — a name left over from yesterday must not attach to today's master. Positive snapshot membership is the only demoting signal (missing/capped snapshots **fail open** and never demote); dated names are never touched; a prior review-queue **accept** of the pairing outranks the guard. Set **false** only for recurring daily events whose names legitimately repeat every day. Inert unless `assume_current_date` is on. See [Reviewing ambiguous matches](#reviewing-ambiguous-matches-phase-2-review-queue). |
 | `parse_master_from_stream` | no (default **false**) | When true, each master channel's event identity (title + time) is read from its **first attached stream's name** instead of the channel name — so master channels can be named freely. A master with no attached stream is skipped. See [The master channels' date+time must be in their NAMES](#the-master-channels-datetime-must-be-in-their-names). |
 | `promote_unmatched` | no (default **false**) | bead ti939.4.1: opt-in promotion of **unmatched secondary-only events** to ECM-managed channels — the ONE sanctioned exception to "ECM never creates channels". Absent means the feature is completely invisible (no preview keys, no Pass 4 participation). **With this on, ECM CREATES and DELETES channels** in `promote_target_group_id`. See [Promoting unmatched events](#promoting-unmatched-events-phase-3-opt-in). |
-| `promote_target_group_id` | when promoting | The **dedicated ECM-owned channel group** promoted event channels live in. Required when `promote_unmatched` is true. The master group (Dispatcharr-owned) and every secondary group are refused — ownership rails. Treat this group as ECM's: channels in it appear and disappear with the provider playlist. |
+| `promote_target_group_id` | when promoting | The **dedicated ECM-owned channel group** promoted event channels live in. Required when `promote_unmatched` is true. The master group (Dispatcharr-owned) and every secondary group are refused — ownership rails. Treat this group as ECM's: channels in it appear and disappear with the provider playlist, and with `skip_past_events` on they also disappear once the event has finished. |
 | `max_promote_per_run` | no (default 25) | Per-run cap on **new** promoted channels (1–200; filled on promotion-enabled configs). On overage the run stops creating, warns, and records the overage. Adopting an existing promoted channel (idempotent re-runs) never consumes the cap. |
-| `skip_past_events` | no (default **false**) | When true, an event whose parsed start time has **already gone by** (plus `past_event_grace_hours`) is not promoted to a **new** channel. Providers routinely leave finished events in the playlist forever, so without this every one of them keeps minting a channel nobody can watch. Only **creates** are blocked: a channel already promoted is never deleted by this setting, and events with no genuinely parsed date (`assume_current_date` synthesized it) are never filtered. Absent means the filter does not exist for the rule. See [Skipping events that already finished](#skipping-events-that-already-finished). |
-| `past_event_grace_hours` | no (default 4) | How long after its start time an event still counts as current for `skip_past_events` (0–72; filled only when the filter is on). Provider names carry a start time and never a duration, so this is what keeps a broadcast in progress from being dropped mid-event. |
+| `skip_past_events` | no (default **false**) | When true, an event whose parsed start time has **already gone by** (plus `past_event_grace_hours`) gets no new channel, **and any channel this rule already promoted for it stops being managed**, which hands that channel to the rule's `orphan_action` (delete by default). Providers routinely leave finished events in the playlist forever, so without this every one of them keeps minting a channel nobody can watch and nothing ever cleans them up. Events with no genuinely parsed date (`assume_current_date` synthesized it) are never filtered. Absent means the filter does not exist for the rule. See [Skipping events that already finished](#skipping-events-that-already-finished). |
+| `past_event_grace_hours` | no (default 4) | How long after its start time an event still counts as current for `skip_past_events` (0–72; filled only when the filter is on). Provider names carry a start time and never a duration, so this is what keeps a broadcast in progress from being skipped and its channel removed mid-event. |
 
 ### Why validation is strict
 
@@ -1466,12 +1466,18 @@ its own **ECM-managed channel** in the rule's dedicated
 event attached to it.
 
 **Honest ownership statement — read before enabling:** ECM will **create
-AND delete channels** in the target group. A promoted channel exists only
+AND delete channels** in the target group. A promoted channel is kept
 while a justifying stream is still observed in the provider playlist on
 the current run; the run after the event leaves the playlist, Pass 4
 orphan reconciliation removes the channel per the rule's `orphan_action`
-(default: delete). Treat the target group as ECM-owned scratch space — do
-not hand-build channels there, and expect its contents to churn with the
+(default: delete). **With `skip_past_events` on there is a second way a
+channel is removed:** the first run after the event's start time plus
+`past_event_grace_hours` has gone by drops the event, so its channel
+stops being managed and the same Pass 4 removes it — even though the
+stream is still sitting in the playlist. That is the point of the
+setting, because providers routinely leave finished events listed
+forever. Treat the target group as ECM-owned scratch space — do not
+hand-build channels there, and expect its contents to churn with the
 providers' event schedules.
 
 ### How promotion decides (all preview-visible)
@@ -1504,12 +1510,15 @@ providers' event schedules.
   the target group; found → adopt and attach (already-attached streams
   are no-ops), not found → create. An immediate re-run creates nothing
   and attaches nothing new.
-* **Lifecycle is reconciliation, never clocks:** the delete decision is
-  purely "was the justifying stream observed this run?" — no wall-clock
-  arithmetic, no parsed/synthesized timestamps, no run counters. A rule
-  that could not observe (stream fetch failed, config invalid) does NOT
-  reconcile that run, so a transient provider error can never mass-delete
-  promoted channels.
+* **Lifecycle is reconciliation:** the delete decision is "did this run's
+  promotion plan still keep this channel?", which by default means "was
+  the justifying stream observed this run?" and nothing else. No run
+  counters, and no clock at all unless the rule turned on
+  [`skip_past_events`](#skipping-events-that-already-finished), which is
+  the one setting that also retires a channel on the event's own start
+  time. A rule that could not observe (stream fetch failed, config
+  invalid) does NOT reconcile that run, so a transient provider error can
+  never mass-delete promoted channels.
 * **Self-healing when the master catches up:** if the event later appears
   in the master group, its streams attach to the master channel (normal
   attach path) and the promoted duplicate — no longer justified — is
@@ -1540,18 +1549,26 @@ creating a channel for each one. One field run produced **184 promoted
 channels, 115 of them for events that had already happened.**
 
 `skip_past_events: true` stops that. An event counts as past once
-`start + past_event_grace_hours < now`, and a past event is simply not
-created.
+`start + past_event_grace_hours < now`. A past event is not created, and if
+this rule already promoted a channel for it, that channel stops being one of
+the rule's managed channels.
 
-Three things it deliberately does **not** do:
+**Turning this on can remove channels.** Once a finished event's channel
+leaves the managed set, the rule's own **orphan cleanup** setting decides
+what happens to it, exactly as it does for a channel whose stream left the
+playlist: `delete` (the default) and `delete_and_cleanup_groups` remove it,
+`move_uncategorized` moves it out of the group, and `none` leaves it alone
+and skips reconciliation for the rule. So this is the one place where
+a clock, rather than the provider playlist, ends a promoted channel's life.
+That is the point of the setting: a finished event's channel is unwatchable,
+and the provider keeps its stream listed forever, so nothing else would ever
+retire it. Three things keep it from being a surprise. It is off unless you
+turn it on, per rule. The preview tells you the number before you run
+anything (`promotion.skipped_past_adopted`, shown as "N of those events
+already have channels"). And the two rules below still hold.
 
-* **It never deletes.** The filter can only block a `create`. A promoted
-  channel that already exists stays in the plan and stays adopted, so the
-  lifecycle rule above still holds: a promoted channel disappears when its
-  stream leaves the playlist, never because a clock said so. Dropping an
-  adopted channel from the plan would hand Pass 4 an orphan to delete, and
-  that would be a timestamp-driven delete — exactly what the design
-  forbids.
+Two things it deliberately does **not** do:
+
 * **It never touches dateless events.** When `assume_current_date`
   synthesized the date, the date was fabricated from "now" rather than
   read off the provider name. Past-versus-future is meaningless for those,
@@ -1561,9 +1578,11 @@ Three things it deliberately does **not** do:
   starve the live ones of create slots.
 
 `past_event_grace_hours` (default 4, range 0–72) exists because a provider
-name gives a start time and never a duration. With the default, an event
-that started three hours ago is still treated as current and keeps its
-channel; at 0, an event is past the moment its start time passes.
+name gives a start time and never a duration. It is what stops a broadcast
+that is still on air from being skipped and having its channel taken away
+mid-event. With the default, an event that started three hours ago is still
+treated as current and keeps its channel; at 0, an event is past the moment
+its start time passes.
 
 ### Preview parity
 
@@ -1577,10 +1596,14 @@ parse failures. A preview (and a pipeline dry-run) creates nothing.
 
 Because the filter lives in that shared helper, preview and run agree on
 it automatically. The preview reports `promotion.skipped_past` (how many
-events were dropped as already finished) and marks each dropped row with
-`promote_skipped_past: true`, so "why did this event not get a channel?"
-is answerable without reading logs. The live run reports the same count as
-`skipped_past` on its promotion summary.
+events were dropped as already finished) and, of those,
+`promotion.skipped_past_adopted` (how many already have a channel, and will
+therefore leave the managed set for orphan cleanup to act on). Each dropped
+row is marked `promote_skipped_past: true`, with
+`promote_skipped_past_adopted: true` on the ones that already have a
+channel, so "why did this event not get a channel?" and "which channels am
+I about to lose?" are both answerable without reading logs. The live run
+reports the same two counts on its promotion summary.
 
 ## Testing & pre-release verification
 

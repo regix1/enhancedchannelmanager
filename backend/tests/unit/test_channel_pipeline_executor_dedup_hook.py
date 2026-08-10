@@ -21,6 +21,7 @@ import pytest
 import database
 from channel_pipeline_evaluator import StreamContext
 from channel_pipeline_executor import ActionExecutor, ExecutionContext
+from channel_pipeline_schema import Action
 from models import PendingMerge
 
 
@@ -109,6 +110,48 @@ class TestM3URefreshTriggeredEnqueue:
         assert rows[0].candidate_channel_id == "100"
         assert rows[0].status == "pending"
         assert rows[0].trigger_context == "m3u_refresh"
+
+    def test_enqueued_skip_result_carries_no_channel_id(
+        self, test_session, _bind_session_local
+    ):
+        # The precondition every caller of _execute_create_channel has to
+        # cope with: the enqueue result names the channel it deferred but
+        # has no channel of its own, so a caller that needs an id to attach
+        # streams to must treat this as "no channel", never substitute one.
+        existing = [
+            {
+                "id": 100,
+                "name": "ESPN",
+                "channel_group_id": 42,
+                "streams": [],
+            }
+        ]
+        executor = _make_executor(
+            triggered_by="m3u_refresh", existing_channels=existing
+        )
+
+        stream_ctx = StreamContext(
+            stream_id=201,
+            stream_name="ESPN HD",
+            m3u_account_id=1,
+            m3u_account_name="Provider A",
+            group_name="Sports",
+        )
+        action = {
+            "type": "create_channel",
+            "name_template": "{stream_name}",
+            "group_id": 42,
+        }
+        exec_ctx = ExecutionContext()
+
+        result = _run(executor.execute(action, stream_ctx, exec_ctx))
+
+        assert result.success is True
+        assert result.skipped is True
+        assert result.entity_type == "channel"
+        assert result.entity_name == "ESPN HD"
+        # The whole point: no channel id came back.
+        assert result.entity_id is None
 
     def test_no_candidate_falls_through_to_normal_create(
         self, test_session, _bind_session_local
@@ -352,3 +395,78 @@ class TestDryRunBypass:
         assert result.success is True
         assert test_session.query(PendingMerge).count() == 0
         assert exec_ctx.pending_merges_added == 0
+
+
+class TestPendingMergeOptOut:
+    """``enqueue_pending_merge=False`` keeps a caller off the queue.
+
+    Event Sync promotion opts out: it resolves create-vs-adopt from the
+    event's own name and start time, so a fuzzy same-group match there is a
+    different event rather than a duplicate channel. The caller also needs a
+    channel id back, which an enqueue result never carries.
+    """
+
+    def _create(self, executor, exec_ctx, **kwargs):
+        action = Action(type="create_channel", params={
+            "name_template": "ESPN HD",
+            "if_exists": "skip",
+            "group_id": 42,
+            "channel_number": "auto",
+        })
+        stream_ctx = StreamContext(
+            stream_id=201,
+            stream_name="ESPN HD",
+            m3u_account_id=1,
+            m3u_account_name="Provider A",
+            group_name="Sports",
+        )
+        return _run(executor._execute_create_channel(
+            action, stream_ctx, exec_ctx, template_ctx={}, **kwargs))
+
+    def test_opted_out_create_skips_the_queue_and_returns_a_channel_id(
+        self, test_session, _bind_session_local
+    ):
+        existing = [
+            {
+                "id": 100,
+                "name": "ESPN",
+                "channel_group_id": 42,
+                "streams": [],
+            }
+        ]
+        executor = _make_executor(
+            triggered_by="m3u_refresh", existing_channels=existing
+        )
+        exec_ctx = ExecutionContext()
+
+        result = self._create(executor, exec_ctx, enqueue_pending_merge=False)
+
+        assert result.success is True
+        assert result.created is True
+        assert result.entity_id == 999
+        executor.client.create_channel.assert_called_once()
+        assert test_session.query(PendingMerge).count() == 0
+        assert exec_ctx.pending_merges_added == 0
+
+    def test_default_still_enqueues_for_every_other_caller(
+        self, test_session, _bind_session_local
+    ):
+        existing = [
+            {
+                "id": 100,
+                "name": "ESPN",
+                "channel_group_id": 42,
+                "streams": [],
+            }
+        ]
+        executor = _make_executor(
+            triggered_by="m3u_refresh", existing_channels=existing
+        )
+        exec_ctx = ExecutionContext()
+
+        result = self._create(executor, exec_ctx)
+
+        assert result.skipped is True
+        assert result.entity_id is None
+        executor.client.create_channel.assert_not_called()
+        assert test_session.query(PendingMerge).count() == 1

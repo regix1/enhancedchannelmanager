@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -54,13 +55,21 @@ from sqlalchemy.pool import StaticPool
 
 import database
 from channel_pipeline_engine import ChannelPipelineEngine
-from models import ChannelPipelineRule
+from channel_pipeline_executor import ActionExecutor, ActionResult
+from models import ChannelPipelineRule, PendingMerge
 from services.event_sync_matcher import ParsedEvent, StreamMatchResult
+from channel_number_prefix import (
+    channel_name_to_id,
+    strip_channel_number_prefix,
+)
 from services.event_sync_promote import (
     DEFAULT_MAX_PROMOTE_PER_RUN,
     PROMOTE_ACTION_ATTACH_EXISTING,
     PROMOTE_ACTION_CREATE,
+    PromotionPlan,
+    PromotionUnit,
     build_promotion_plan,
+    event_is_past,
     promoted_channel_name,
 )
 from services.event_sync_resolver import (
@@ -235,6 +244,77 @@ class TestPromotionPlan:
         assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
         assert plan.units[0].existing_channel_id == 900
 
+    @pytest.mark.parametrize("separator", ["|", "-", ":"])
+    def test_number_prefixed_existing_channel_is_still_adopted(
+        self, separator
+    ):
+        """Dispatcharr stores the channel with the number prefix
+        include_channel_number_in_name writes, and the plan derives the
+        name without one. Miss that and the run creates a second channel
+        for an event it already has — and with skip_past_events on, the
+        first one loses its place in the managed set. The map the caller
+        hands the planner is the one the run builds, so this covers the
+        keying and the plan together."""
+        parsed = _parsed("Fury vs. Usyk", START)
+        rows = [_resolved(STREAM_FURY, DISPOSITION_UNMATCHED, parsed,
+                          stream_id=301)]
+        name = promoted_channel_name(parsed)
+        stored = [{"id": 900, "name": f"500 {separator} {name}"}]
+        plan = build_promotion_plan(
+            _promote_config(), rows, channel_name_to_id(stored, separator),
+        )
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert plan.units[0].existing_channel_id == 900
+
+    @pytest.mark.parametrize("separator", ["|", "-", ":"])
+    def test_every_channel_number_separator_is_stripped(self, separator):
+        """The no-argument form of the helper, which is what REWRITING a
+        prefix uses: the prefix already on a name may have been written
+        under a different setting than the one in force now."""
+        assert strip_channel_number_prefix(
+            f"500 {separator} USA Network"
+        ) == "USA Network"
+
+    def test_decimal_channel_number_is_stripped(self):
+        assert strip_channel_number_prefix("4000.1 | USA Network") \
+            == "USA Network"
+
+    def test_name_without_a_prefix_comes_back_unchanged(self):
+        """Including names that merely start with digits, and one that is
+        nothing but a prefix (stripping that to empty would key the map on
+        an empty string)."""
+        assert strip_channel_number_prefix("USA Network") == "USA Network"
+        assert strip_channel_number_prefix("500 Miles Of Racing") \
+            == "500 Miles Of Racing"
+        assert strip_channel_number_prefix("500 - ") == "500 - "
+
+    def test_a_numeric_title_keeps_its_whole_name(self):
+        """The map strips only the separator the settings write, and
+        strips nothing at all when they write no prefix. A channel
+        genuinely named "2024 - Olympics Opening" therefore keeps its
+        whole name, instead of also answering to a spelling no channel
+        has. [48]"""
+        stored = [{"id": 900, "name": "2024 - Olympics Opening"}]
+        assert channel_name_to_id(stored, None) == {
+            "2024 - olympics opening": 900,
+        }
+        assert channel_name_to_id(stored, "|") == {
+            "2024 - olympics opening": 900,
+        }
+        # With "-" configured the leading number IS the prefix shape ECM
+        # writes, so both spellings key the channel.
+        assert channel_name_to_id(stored, "-") == {
+            "2024 - olympics opening": 900,
+            "olympics opening": 900,
+        }
+
+    def test_lowest_id_wins_a_shared_key(self):
+        stored = [
+            {"id": 900, "name": "12 - Fury Vs Usyk"},
+            {"id": 700, "name": "Fury Vs Usyk"},
+        ]
+        assert channel_name_to_id(stored, "-")["fury vs usyk"] == 700
+
     def test_cap_applies_to_creations_only_and_is_deterministic(self):
         cfg = _promote_config(max_promote_per_run=1)
         rows = [
@@ -304,12 +384,15 @@ class TestPromotedChannelName:
 
 
 class TestSkipPastEvents:
-    """``skip_past_events``: finished events must not become channels.
+    """``skip_past_events``: a finished event stops being managed.
 
     Providers leave a live event in the M3U long after it ends, so without
     this filter every finished game keeps minting a channel nobody can
-    watch. The filter blocks CREATES only — see the module docstring for
-    why an adopt unit can never be dropped on a clock.
+    watch, and the one it already has never goes away. The filter drops
+    the unit whatever its action is: nothing is created, and an event that
+    already has a channel leaves the run's managed set, which hands that
+    channel to Pass 4's ``orphan_action``. The guards below are what make
+    a clock-driven delete safe — see the module docstring.
     """
 
     # FROZEN_NOW is 2026-07-11 12:00 ET. With the 4-hour default grace:
@@ -381,19 +464,115 @@ class TestSkipPastEvents:
         assert plan.would_create == 1
         assert plan.skipped_past == 0
 
-    def test_existing_promoted_channel_is_never_dropped_on_a_clock(self):
-        """The delete rail: an adopt unit dropped from the plan would leave
-        its channel out of the run's managed set, and Pass 4 would delete
-        it — a timestamp-driven delete the feature must never make."""
+    def test_finished_event_releases_its_existing_channel(self):
+        """An adopt unit for a finished event is dropped too, so its
+        channel is absent from the run's managed set and Pass 4 applies
+        the rule's own orphan_action to it. skipped_past_adopted is the
+        count of exactly those, because that is the destructive half."""
         parsed = _parsed("Fury vs. Usyk", self.FINISHED)
         rows = [_resolved("old", DISPOSITION_UNMATCHED, parsed)]
         name = promoted_channel_name(parsed)
         plan = build_promotion_plan(
             self._skip_config(), rows, {name.lower(): 900}, now=FROZEN_NOW
         )
+        assert plan.units == ()
+        assert plan.skipped_past == 1
+        assert plan.skipped_past_adopted == 1
+        dropped = plan.skipped_past_units[0]
+        assert dropped.action == PROMOTE_ACTION_ATTACH_EXISTING
+        assert dropped.existing_channel_id == 900
+
+    def test_skipped_past_adopted_counts_only_the_ones_with_a_channel(self):
+        """A finished event nobody promoted yet costs nothing to skip; one
+        that already has a channel is about to lose it. The two are
+        counted apart so the operator sees the second number on its own."""
+        never_promoted = _parsed("Alpha Event", self.FINISHED)
+        already_promoted = _parsed("Beta Event", self.FINISHED)
+        rows = [
+            _resolved("a", DISPOSITION_UNMATCHED, never_promoted, stream_id=1),
+            _resolved("b", DISPOSITION_UNMATCHED, already_promoted,
+                      stream_id=2),
+        ]
+        plan = build_promotion_plan(
+            self._skip_config(), rows,
+            {promoted_channel_name(already_promoted).lower(): 901},
+            now=FROZEN_NOW,
+        )
+        assert plan.skipped_past == 2
+        assert plan.skipped_past_adopted == 1
+
+    def test_a_skipped_unit_with_no_channel_is_never_counted(self):
+        """The count is how many channels the run is about to release, so
+        it reads the channel id, not the action. A unit carries
+        attach_existing whenever an earlier unit planned the same channel
+        name, and such a unit may have no channel at all; counting it
+        would warn the operator about a loss that cannot happen. [45]"""
+        parsed = _parsed("Fury vs. Usyk", self.FINISHED)
+        rows = (_resolved("a", DISPOSITION_UNMATCHED, parsed),)
+        name = promoted_channel_name(parsed)
+        plan = PromotionPlan(
+            units=(),
+            capped_units=(),
+            cap=DEFAULT_MAX_PROMOTE_PER_RUN,
+            target_group_id=40,
+            skipped_past_units=(
+                PromotionUnit(
+                    event_key="fury vs. usyk|a", channel_name=name,
+                    dateless=False, rows=rows,
+                    action=PROMOTE_ACTION_ATTACH_EXISTING,
+                    existing_channel_id=None,
+                ),
+                PromotionUnit(
+                    event_key="fury vs. usyk|b", channel_name=name,
+                    dateless=False, rows=rows,
+                    action=PROMOTE_ACTION_ATTACH_EXISTING,
+                    existing_channel_id=904,
+                ),
+            ),
+        )
+        assert plan.skipped_past == 2
+        assert plan.skipped_past_adopted == 1
+
+    def test_event_with_no_parsed_start_is_never_past(self):
+        """The first guard, at the source: with no start there is nothing
+        to compare, so the event is never treated as finished however long
+        the grace window is."""
+        parsed = ParsedEvent(
+            raw_name="no time here", title="Fury vs. Usyk", start=None,
+            teams=None, matched_pattern=None,
+        )
+        assert event_is_past(parsed, 0, FROZEN_NOW) is False
+
+    def test_dateless_event_keeps_its_existing_channel(self):
+        """The synthesized-date guard on the destructive path: the date
+        came from "now", so a past-vs-future verdict would flip at
+        midnight and delete a channel that is still wanted."""
+        parsed = _parsed(
+            "Fury vs Hall", self.FINISHED,
+            matched_pattern="dateless-title-time-ampm",
+        )
+        rows = [_resolved("FURY vs HALL 8PM", DISPOSITION_UNMATCHED, parsed)]
+        plan = build_promotion_plan(
+            self._skip_config(), rows,
+            {promoted_channel_name(parsed).lower(): 903}, now=FROZEN_NOW,
+        )
         assert plan.skipped_past == 0
+        assert plan.skipped_past_adopted == 0
         assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
-        assert plan.units[0].existing_channel_id == 900
+
+    def test_channel_of_an_event_still_on_air_is_kept(self):
+        """The grace window on the destructive path: the broadcast started
+        two hours ago and has no parsed duration, so its channel must
+        survive the run rather than vanish mid-event."""
+        parsed = _parsed("Mercury vs. Aces", self.IN_PROGRESS)
+        rows = [_resolved("live", DISPOSITION_UNMATCHED, parsed)]
+        plan = build_promotion_plan(
+            self._skip_config(), rows,
+            {promoted_channel_name(parsed).lower(): 904}, now=FROZEN_NOW,
+        )
+        assert plan.skipped_past == 0
+        assert plan.skipped_past_adopted == 0
+        assert plan.units[0].existing_channel_id == 904
 
     def test_past_events_do_not_spend_cap_budget(self):
         """Filtering runs before the cap, so a playlist full of finished
@@ -661,6 +840,49 @@ class TestIdempotence:
                 if e.get("action_type") == "merge_stream"] == []
         assert second["channels_created"] == 0
 
+    def _numbered_name_run(self, client, session_factory):
+        """One run with include_channel_number_in_name on and the default
+        "-" separator, so the channel is STORED as "<number> - <name>"
+        while the plan keeps deriving the unprefixed name."""
+        from config import DispatcharrSettings
+
+        with patch(
+            "channel_pipeline_engine.get_settings",
+            return_value=DispatcharrSettings(
+                include_channel_number_in_name=True,
+                channel_number_separator="-",
+            ),
+        ):
+            return _manual_run(client, session_factory)
+
+    def test_rerun_adopts_the_channel_it_stored_under_a_number_prefix(
+        self, db_session_factory
+    ):
+        """The re-run has to find the channel by the name it derives, not
+        by the name Dispatcharr stored. Miss it and the run creates a
+        duplicate, the first channel drops out of the managed set, and
+        Pass 4 deletes it while the event is still ahead. [44]"""
+        rule_id = _add_rule(db_session_factory, _promote_config())
+        state = _promote_state()
+        client = make_promote_client(state)
+
+        first, _ = self._numbered_name_run(client, db_session_factory)
+        promo1 = first["event_sync"][0]["promotion"]
+        assert promo1["promoted_created"] == 1
+        created_id = promo1["channel_ids"][0]
+        assert state.channels[created_id]["name"].endswith(
+            f"- {FURY_CHANNEL_NAME}"
+        )
+
+        second, _ = self._numbered_name_run(client, db_session_factory)
+        promo2 = second["event_sync"][0]["promotion"]
+        assert promo2["promoted_adopted"] == 1
+        assert promo2["promoted_created"] == 0
+        assert promo2["channel_ids"] == [created_id]
+        assert client.create_channel.await_count == 1
+        assert state.deleted_channel_ids == []
+        assert _managed_ids(db_session_factory, rule_id) == [created_id]
+
     def test_cross_provider_streams_share_one_channel(
         self, db_session_factory
     ):
@@ -680,6 +902,196 @@ class TestIdempotence:
         assert client.create_channel.await_count == 1
         created_id = promo["channel_ids"][0]
         assert sorted(state.stream_ids_of(created_id)) == [7002, 7301]
+
+
+TYSON_CHANNEL_NAME = "Tyson Vs. Paul @ Jul 11 09:00 PM"
+PRIOR_TYSON_CHANNEL = "Tyson Vs. Paul @ Jul 10 09:00 PM"
+
+
+class TestPromotionExecution:
+    """Each unit gets its OWN channel, or that unit alone fails.
+
+    Every other executor-level promotion test runs under
+    ``triggered_by="manual"``. The unattended trigger is ``m3u_refresh``,
+    which is also the trigger that arms the bulk-M3U dedup hook, so these
+    run under that one. The hook scores raw stream names with
+    ``token_set_ratio`` and has no notion of time, so in a group full of
+    event channels it reads tomorrow's fixture as today's channel:
+    ``PRIOR_TYSON_CHANNEL`` scores 0.95 against ``STREAM_TYSON``, well over
+    the 0.80 default threshold.
+    """
+
+    def _two_event_state(self):
+        """Two unmatched events, plus a channel promoted by an earlier run
+        whose name is the same fixture on the previous day."""
+        state = _promote_state()
+        state.channels[800] = {
+            "id": 800, "name": PRIOR_TYSON_CHANNEL,
+            "channel_group_id": PROMOTE_GROUP_ID,
+            "auto_created": True, "streams": [],
+        }
+        state.secondary_streams[SECONDARY_B_NAME].append(
+            {"id": 7501, "name": STREAM_TYSON, "m3u_account": 2},
+        )
+        return state
+
+    def _refresh_run(self, client, session_factory, monkeypatch):
+        """A run under the ONE unattended trigger an event_sync rule can
+        take, which is also the trigger that arms the dedup hook."""
+        from config import DispatcharrSettings
+
+        monkeypatch.setattr(database, "_SessionLocal", session_factory)
+        monkeypatch.setattr(
+            "config.get_settings",
+            lambda: DispatcharrSettings(dedup_threshold=0.80),
+        )
+        engine = ChannelPipelineEngine(client)
+        with patch("channel_pipeline_engine.get_session",
+                   side_effect=session_factory), \
+             patch("journal.log_entries"), \
+             patch("services.event_sync_resolver.datetime") as mock_dt:
+            mock_dt.now.return_value = FROZEN_NOW
+            return _run(engine.run_pipeline(dry_run=False,
+                                            triggered_by="m3u_refresh"))
+
+    def _pending_merge_count(self, session_factory) -> int:
+        session = session_factory()
+        try:
+            return session.query(PendingMerge).count()
+        finally:
+            session.close()
+
+    def test_streams_never_land_on_another_units_channel(
+        self, db_session_factory, monkeypatch
+    ):
+        # The premise the whole test rests on: without the opt-out the
+        # hook WOULD fire on this pair. Assert it here, or a change to the
+        # scorer or to either name leaves every assertion below passing
+        # while nothing exercises the opt-out any more. [52]
+        from services.dedup_matcher import find_candidate
+
+        armed = find_candidate(
+            STREAM_TYSON, [(800, PRIOR_TYSON_CHANNEL)], 0.80
+        )
+        assert armed is not None
+        assert armed.confidence >= 0.80
+
+        _add_rule(db_session_factory, _promote_config(auto_run=True))
+        state = self._two_event_state()
+        client = make_promote_client(state)
+
+        result = self._refresh_run(client, db_session_factory, monkeypatch)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["units"] == 2
+        assert promo["promoted_created"] == 2
+        assert promo["attach_errors"] == 0
+        assert len(set(promo["channel_ids"])) == 2
+
+        by_name = {c["name"]: c for c in state.channels.values()}
+        fury_id = by_name[FURY_CHANNEL_NAME]["id"]
+        tyson_id = by_name[TYSON_CHANNEL_NAME]["id"]
+        assert fury_id != tyson_id
+        # Each event's stream is on its own channel and nowhere else.
+        assert state.stream_ids_of(fury_id) == [7301]
+        assert state.stream_ids_of(tyson_id) == [7501]
+        # The near-duplicate channel from the earlier run is left alone.
+        assert state.stream_ids_of(800) == []
+        # Promotion decides create-vs-adopt itself; it never defers a
+        # channel to the operator merge queue.
+        assert self._pending_merge_count(db_session_factory) == 0
+
+    def test_create_without_a_channel_id_fails_only_its_own_unit(
+        self, db_session_factory, monkeypatch, caplog
+    ):
+        _add_rule(db_session_factory, _promote_config(auto_run=True))
+        state = self._two_event_state()
+        client = make_promote_client(state)
+        real_create = ActionExecutor._execute_create_channel
+
+        async def _no_channel_for_tyson(self, action, stream_ctx, exec_ctx,
+                                        template_ctx, **kwargs):
+            if action.params.get("name_template") == TYSON_CHANNEL_NAME:
+                return ActionResult(
+                    success=True, action_type="create_channel",
+                    description="channel creation deferred",
+                    entity_type="channel", entity_name=TYSON_CHANNEL_NAME,
+                    skipped=True,
+                )
+            return await real_create(self, action, stream_ctx, exec_ctx,
+                                     template_ctx, **kwargs)
+
+        monkeypatch.setattr(ActionExecutor, "_execute_create_channel",
+                            _no_channel_for_tyson)
+        with caplog.at_level(logging.WARNING,
+                             logger="channel_pipeline_executor"):
+            result = self._refresh_run(client, db_session_factory, monkeypatch)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["units"] == 2
+        assert promo["promoted_created"] == 1
+        assert promo["promoted_adopted"] == 0
+        # A whole unit failed, which is one failed unit and not one failed
+        # stream attach — the two are counted apart. [49]
+        assert promo["failed_units"] == 1
+        assert promo["attach_errors"] == 0
+
+        by_name = {c["name"]: c for c in state.channels.values()}
+        assert TYSON_CHANNEL_NAME not in by_name
+        fury_id = by_name[FURY_CHANNEL_NAME]["id"]
+        # The failed unit contributed nothing: not the previous unit's
+        # channel, not the near-duplicate from the earlier run, and no id
+        # in the managed set.
+        assert state.stream_ids_of(fury_id) == [7301]
+        assert state.stream_ids_of(800) == []
+        assert promo["channel_ids"] == [fury_id]
+        assert any(
+            "produced no channel id" in r.getMessage()
+            and "Event Rule" in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
+
+    def test_unresolvable_channel_logs_before_counting_the_error(
+        self, db_session_factory, monkeypatch, caplog
+    ):
+        _add_rule(db_session_factory, _promote_config(auto_run=True))
+        state = self._two_event_state()
+        client = make_promote_client(state)
+        real_create = ActionExecutor._execute_create_channel
+        unknown_id = 424242
+
+        async def _adopt_unknown_id(self, action, stream_ctx, exec_ctx,
+                                    template_ctx, **kwargs):
+            if action.params.get("name_template") == TYSON_CHANNEL_NAME:
+                return ActionResult(
+                    success=True, action_type="create_channel",
+                    description="adopted", entity_type="channel",
+                    entity_id=unknown_id, entity_name=TYSON_CHANNEL_NAME,
+                    skipped=True,
+                )
+            return await real_create(self, action, stream_ctx, exec_ctx,
+                                     template_ctx, **kwargs)
+
+        monkeypatch.setattr(ActionExecutor, "_execute_create_channel",
+                            _adopt_unknown_id)
+        with caplog.at_level(logging.WARNING,
+                             logger="channel_pipeline_executor"):
+            result = self._refresh_run(client, db_session_factory, monkeypatch)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["promoted_adopted"] == 1
+        assert promo["attach_errors"] == 1
+        # The channel id is real, so it stays in the managed set — dropping
+        # it would make Pass 4 read the channel as an orphan.
+        assert unknown_id in promo["channel_ids"]
+        fury_id = {c["name"]: c for c in state.channels.values()}[
+            FURY_CHANNEL_NAME]["id"]
+        assert state.stream_ids_of(fury_id) == [7301]
+        assert any(
+            "not in this run's channel index" in r.getMessage()
+            and "Event Rule" in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        )
 
 
 class TestDatelessPromotion:
@@ -762,6 +1174,145 @@ class TestReconciliationLifecycle:
         # (no create_channel action → no starting number). Verified, not
         # built.
         client.assign_channel_numbers.assert_not_called()
+
+    def test_a_failed_create_does_not_retire_the_channel_it_already_had(
+        self, db_session_factory, monkeypatch
+    ):
+        """Pass 4 cannot tell a channel the planner retired from one whose
+        unit hit a transient error on the way to it, so the unit hands its
+        known channel back instead of letting the run look like a
+        retirement. [46]"""
+        rule_id = _add_rule(db_session_factory, _promote_config())
+        state = _promote_state()
+        client = make_promote_client(state)
+
+        first, _ = _manual_run(client, db_session_factory)
+        created_id = first["event_sync"][0]["promotion"]["channel_ids"][0]
+        assert _managed_ids(db_session_factory, rule_id) == [created_id]
+
+        async def _create_fails(self, action, stream_ctx, exec_ctx,
+                                template_ctx, **kwargs):
+            return ActionResult(
+                success=False, action_type="create_channel",
+                description="upstream refused the create",
+                entity_type="channel",
+                entity_name=action.params.get("name_template"),
+                error="503 from Dispatcharr",
+            )
+
+        monkeypatch.setattr(ActionExecutor, "_execute_create_channel",
+                            _create_fails)
+        second, _ = _manual_run(client, db_session_factory)
+
+        promo = second["event_sync"][0]["promotion"]
+        assert promo["failed_units"] == 1
+        assert promo["promoted_created"] == 0
+        assert promo["channel_ids"] == [created_id]
+        assert state.deleted_channel_ids == []
+        assert created_id in state.channels
+        assert _managed_ids(db_session_factory, rule_id) == [created_id]
+
+    def _rule_that_skips_finished(self, session_factory, orphan_action):
+        """A promotion rule with skip_past_events on and the cleanup
+        setting under test. orphan_action lives on the rule row, not in
+        event_sync_config, so it is set after the row exists."""
+        rule_id = _add_rule(
+            session_factory, _promote_config(skip_past_events=True)
+        )
+        session = session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, rule_id)
+            rule.orphan_action = orphan_action
+            session.commit()
+        finally:
+            session.close()
+        return rule_id
+
+    def _run_at(self, client, session_factory, moment):
+        """One manual run with BOTH clocks pinned to ``moment``: the
+        resolver's, which dates the parse, and the planner's, which
+        decides whether the event has finished."""
+        with patch("services.event_sync_promote.datetime") as promote_clock:
+            promote_clock.now.return_value = moment
+            return _manual_run(client, session_factory, now=moment)
+
+    def _promote_then_finish(self, client, session_factory, rule_id):
+        """Run once while the event is still ahead, then again a day
+        later with the same playlist, so the only thing that changed is
+        the clock. Returns (created channel id, second run result)."""
+        first, _ = self._run_at(client, session_factory, FROZEN_NOW)
+        promo = first["event_sync"][0]["promotion"]
+        assert promo["skipped_past"] == 0
+        created_id = promo["channel_ids"][0]
+        assert _managed_ids(session_factory, rule_id) == [created_id]
+
+        second, _ = self._run_at(
+            client, session_factory, FROZEN_NOW + timedelta(days=1)
+        )
+        promo2 = second["event_sync"][0]["promotion"]
+        # The event has an existing channel and has finished, so its unit
+        # is dropped and the channel never reaches the managed set.
+        assert promo2["skipped_past"] == 1
+        assert promo2["skipped_past_adopted"] == 1
+        assert promo2["channel_ids"] == []
+        return created_id, second
+
+    def test_finished_event_channel_is_deleted_by_orphan_cleanup(
+        self, db_session_factory
+    ):
+        """The whole mechanism end to end: nothing in the promotion path
+        deletes anything, the channel just stops being managed, and Pass 4
+        removes it with the rule's own orphan_action."""
+        rule_id = self._rule_that_skips_finished(db_session_factory, "delete")
+        state = _promote_state()
+        client = make_promote_client(state)
+
+        created_id, second = self._promote_then_finish(
+            client, db_session_factory, rule_id
+        )
+        assert state.deleted_channel_ids == [created_id]
+        assert second["channels_removed"] == 1
+        assert _managed_ids(db_session_factory, rule_id) == []
+        # The Dispatcharr-owned master is untouched, as always.
+        assert 100 in state.channels
+
+    def test_finished_event_channel_is_moved_when_the_rule_moves_orphans(
+        self, db_session_factory
+    ):
+        rule_id = self._rule_that_skips_finished(
+            db_session_factory, "move_uncategorized"
+        )
+        state = _promote_state()
+        client = make_promote_client(state)
+
+        created_id, second = self._promote_then_finish(
+            client, db_session_factory, rule_id
+        )
+        assert state.deleted_channel_ids == []
+        assert state.channels[created_id]["channel_group_id"] is None
+        assert second["channels_moved"] == 1
+        assert second["channels_removed"] == 0
+
+    def test_finished_event_channel_survives_when_orphan_cleanup_is_off(
+        self, db_session_factory
+    ):
+        """The operator's opt-out still wins: orphan_action 'none' skips
+        reconciliation for the rule, so the filter costs the channel
+        nothing."""
+        rule_id = self._rule_that_skips_finished(db_session_factory, "none")
+        state = _promote_state()
+        client = make_promote_client(state)
+
+        created_id, second = self._promote_then_finish(
+            client, db_session_factory, rule_id
+        )
+        assert state.deleted_channel_ids == []
+        assert second["channels_removed"] == 0
+        assert second["channels_moved"] == 0
+        assert created_id in state.channels
+        assert state.channels[created_id]["channel_group_id"] \
+            == PROMOTE_GROUP_ID
+        assert _managed_ids(db_session_factory, rule_id) == [created_id]
 
     def test_fetch_failure_makes_no_delete_observation(
         self, db_session_factory

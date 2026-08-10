@@ -1457,9 +1457,10 @@ def validate_event_sync_config(config: Any) -> list[str]:
             "skip_past_events", skip_past_events,
             "a boolean (default false) — true stops events whose start time "
             "has already gone by (plus past_event_grace_hours) from being "
-            "promoted to new channels; events with no genuinely parsed date "
-            "are never filtered, and channels already promoted are never "
-            "deleted by this setting (omit the key to keep the filter off)",
+            "promoted, and takes any channel this rule already promoted for "
+            "one out of the set it manages, so the rule's orphan_action "
+            "decides that channel's fate; events with no genuinely parsed "
+            "date are never filtered (omit the key to keep the filter off)",
         ))
         skip_past_events = False
 

@@ -1152,6 +1152,89 @@ class TestMergeStreamsExactDefaultMatch:
         assert client.update_channel.call_args[0][0] == 50
 
 
+class TestMergeStreamsNumberedChannelLookup:
+    """A channel stored with a "<number> - " prefix has to stay findable by
+    its unprefixed name. The normalized-name and core-name indexes stripped
+    only the older "<number> | " spelling, so with
+    include_channel_number_in_name on and the default "-" separator a
+    merge_streams auto lookup missed the channel and the stream was left
+    unattached.
+    """
+
+    def _make_engine(self, mapping):
+        """Fake normalization engine that maps names via ``mapping``."""
+        engine = MagicMock()
+
+        def _normalize(name, *args, **kwargs):
+            result = MagicMock()
+            result.normalized = mapping.get(name, name)
+            result.transformations = []
+            return result
+
+        engine.normalize.side_effect = _normalize
+        engine.extract_core_name.side_effect = lambda n: mapping.get(n, n)
+        engine.extract_call_sign.return_value = None
+        return engine
+
+    def _build(self):
+        from config import DispatcharrSettings
+
+        client = MagicMock()
+        client.update_channel = AsyncMock(return_value={})
+        existing = [{"id": 60, "name": "500 - USA Network Raw", "streams": [],
+                     "channel_group_id": 3, "auto_created": True}]
+        # The engine drops the "Raw" tag but knows nothing about the
+        # channel-number prefix, so the stored name normalizes to a key that
+        # still carries the number.
+        mapping = {
+            "500 - USA Network Raw": "500 - USA Network",
+            "USA Network Raw": "USA Network",
+            "USA Network HD": "USA Network",
+        }
+        executor = ActionExecutor(
+            client,
+            existing_channels=existing,
+            normalization_engine=self._make_engine(mapping),
+            settings=DispatcharrSettings(
+                include_channel_number_in_name=True,
+                channel_number_separator="-",
+            ),
+        )
+        return client, executor
+
+    def test_merge_streams_finds_the_dash_prefixed_channel(self):
+        """A 'USA Network HD' stream merges into '500 - USA Network Raw':
+        the auto lookup searches for 'USA Network' and the normalized-name
+        index has to hold that spelling."""
+        client, executor = self._build()
+        stream_ctx = StreamContext(
+            stream_id=91,
+            stream_name="USA Network HD",
+            m3u_account_id=1,
+            m3u_account_name="Provider",
+            group_name="Entertainment",
+            tvg_id=None,
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute({"type": "merge_streams", "target": "auto"},
+                             stream_ctx, ExecutionContext(),
+                             normalization_group_ids=[1])
+        )
+
+        assert result.success is True
+        assert result.skipped is False
+        client.update_channel.assert_called()
+        assert client.update_channel.call_args[0][0] == 60
+
+    def test_core_name_index_keeps_both_spellings(self):
+        """The core-name index gains the unprefixed key without losing the
+        prefixed one an instance already resolves through."""
+        _, executor = self._build()
+        assert executor._core_name_to_channel["usa network"]["id"] == 60
+        assert executor._core_name_to_channel["500 - usa network"]["id"] == 60
+
+
 class TestActionExecutorPropertyActions:
     """Tests for property assignment actions."""
 

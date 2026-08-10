@@ -13,6 +13,7 @@ import re
 
 import safe_regex
 import journal
+from channel_number_prefix import strip_channel_number_prefix
 from epg_matching import detect_region
 from match_fold import fold_match_key
 from channel_pipeline_schema import Action, ActionType, TemplateVariables
@@ -442,11 +443,54 @@ class ActionExecutor:
         self._merge_streams_added_by_channel: dict[int, set[int]] = {}
         self._merge_prune_enabled_channels: set[int] = set()
 
+        # The separator _apply_channel_number_in_name writes into channel
+        # names, or None when include_channel_number_in_name is off and no
+        # name carries a prefix ECM put there.
+        self._channel_number_separator: Optional[str] = None
+        if self._settings and getattr(
+                self._settings, 'include_channel_number_in_name', False):
+            self._channel_number_separator = getattr(
+                self._settings, 'channel_number_separator', '-') or '-'
+
         # Pre-populate base-name mapping for existing channels with "NUMBER | " prefixes
         _num_prefix = re.compile(r'^\d+\s*\|\s*')
+
+        def _base_names(stored_name: str) -> list[str]:
+            """Every spelling of ``stored_name`` with a channel-number
+            prefix taken off: the long-standing pipe form, plus the form
+            the settings actually write. Without the second one a channel
+            stored as "12 - Fury Vs Usyk" cannot be found by the name a
+            rule derives, so the rule creates a duplicate and the original
+            drops out of the rule's managed set. [44]
+            """
+            names = []
+            stripped = _num_prefix.sub('', stored_name)
+            if stripped != stored_name:
+                names.append(stripped)
+            if self._channel_number_separator:
+                stripped = strip_channel_number_prefix(
+                    stored_name, self._channel_number_separator)
+                if stripped != stored_name and stripped not in names:
+                    names.append(stripped)
+            return names
+
+        def _index_names(stored_name: str) -> list[str]:
+            """Every spelling the normalized-name and core-name indexes are
+            built from: the pipe-stripped form they have always keyed on
+            (the stored name itself when it carries no pipe prefix), plus
+            whatever the configured separator strips off. Keying both means
+            a channel stored as "500 - USA Network Raw" is still reachable
+            under the name a rule derives, and no name that resolves today
+            stops resolving.
+            """
+            names = [_num_prefix.sub('', stored_name)]
+            for name in _base_names(stored_name):
+                if name not in names:
+                    names.append(name)
+            return names
+
         for c in self.existing_channels:
-            stripped = _num_prefix.sub('', c["name"])
-            if stripped != c["name"]:
+            for stripped in _base_names(c["name"]):
                 self._base_name_to_channel.setdefault(stripped.lower(), c)
                 self._add_candidate(self._base_name_candidates, stripped.lower(), c)
 
@@ -459,10 +503,9 @@ class ActionExecutor:
         # First-seen wins on key collisions, matching the other lookup maps.
         self._fold_key_to_channel: dict[str, dict] = {}
         for c in self.existing_channels:
-            stripped = _num_prefix.sub('', c["name"])
             self._fold_key_to_channel.setdefault(fold_match_key(c["name"]), c)
             self._add_candidate(self._fold_key_candidates, fold_match_key(c["name"]), c)
-            if stripped != c["name"]:
+            for stripped in _base_names(c["name"]):
                 self._fold_key_to_channel.setdefault(fold_match_key(stripped), c)
                 self._add_candidate(self._fold_key_candidates, fold_match_key(stripped), c)
 
@@ -471,18 +514,18 @@ class ActionExecutor:
         self._normalized_name_to_channel: dict[str, dict] = {}
         if self._normalization_engine:
             for c in self.existing_channels:
-                stripped = _num_prefix.sub('', c["name"])
-                try:
-                    result = self._normalization_engine.normalize(stripped)
-                    if result.normalized and result.normalized.lower() != stripped.lower():
-                        self._normalized_name_to_channel.setdefault(
-                            result.normalized.lower(), c
-                        )
-                        self._add_candidate(
-                            self._normalized_name_candidates,
-                            result.normalized.lower(), c)
-                except Exception as e:
-                    logger.warning("[AUTO-CREATE-EXEC] Normalization failed for channel '%s': %s", c.get("name", ""), e)
+                for stripped in _index_names(c["name"]):
+                    try:
+                        result = self._normalization_engine.normalize(stripped)
+                        if result.normalized and result.normalized.lower() != stripped.lower():
+                            self._normalized_name_to_channel.setdefault(
+                                result.normalized.lower(), c
+                            )
+                            self._add_candidate(
+                                self._normalized_name_candidates,
+                                result.normalized.lower(), c)
+                    except Exception as e:
+                        logger.warning("[AUTO-CREATE-EXEC] Normalization failed for channel '%s': %s", c.get("name", ""), e)
 
         # Pre-populate core-name mapping so merge_streams can fall back
         # to tag-group-based stripping (country prefix + quality suffix)
@@ -490,14 +533,14 @@ class ActionExecutor:
         self._core_name_to_channel: dict[str, dict] = {}
         if self._normalization_engine:
             for c in self.existing_channels:
-                stripped = _num_prefix.sub('', c["name"])
-                try:
-                    core = self._normalization_engine.extract_core_name(stripped)
-                    if core:
-                        self._core_name_to_channel.setdefault(core.lower(), c)
-                        self._add_candidate(self._core_name_candidates, core.lower(), c)
-                except Exception as e:
-                    logger.warning("[AUTO-CREATE-EXEC] Core name extraction failed for channel '%s': %s", c.get("name", ""), e)
+                for stripped in _index_names(c["name"]):
+                    try:
+                        core = self._normalization_engine.extract_core_name(stripped)
+                        if core:
+                            self._core_name_to_channel.setdefault(core.lower(), c)
+                            self._add_candidate(self._core_name_candidates, core.lower(), c)
+                    except Exception as e:
+                        logger.warning("[AUTO-CREATE-EXEC] Core name extraction failed for channel '%s': %s", c.get("name", ""), e)
 
         # Index deparenthesized variants of core names so that
         # "Bravo (East)" also matches channel "Bravo East" and vice versa.
@@ -1049,7 +1092,8 @@ class ActionExecutor:
                                        match_scope_target_group: bool = True,
                                        rule_scope_group_id: int = None,
                                        allow_manual_channel_merge: bool = False,
-                                       fold_match_key: bool = False) -> ActionResult:
+                                       fold_match_key: bool = False,
+                                       enqueue_pending_merge: bool = True) -> ActionResult:
         """Execute create_channel action."""
         params = action.params
         name_template = params.get("name_template", "{stream_name}")
@@ -1290,20 +1334,29 @@ class ActionExecutor:
         # the entire engine batch via the outer ``run_pipeline``
         # handler. Falling through to ``create_channel`` preserves
         # pre-BD-F behavior per stream and keeps batch progress intact.
-        try:
-            dedup_skip = await self._maybe_enqueue_pending_merge(
-                stream_ctx=stream_ctx,
-                channel_name=channel_name,
-                group_id=group_id,
-                exec_ctx=exec_ctx,
-            )
-        except Exception:
-            logger.warning(
-                "[DEDUP] Hook failed for stream=%s group_id=%s; falling through "
-                "to channel creation (pre-BD-F behavior)",
-                channel_name, group_id, exc_info=True,
-            )
-            dedup_skip = None
+        # ``enqueue_pending_merge=False`` opts a caller out of the queue.
+        # Event Sync promotion does: it decides create-vs-adopt from the
+        # event's own name and start time, so a fuzzy same-group match there
+        # is a DIFFERENT event (tomorrow's fixture against today's channel),
+        # not a duplicate channel. Queueing one would defer a merge the
+        # operator should never accept AND hand the caller back a result
+        # carrying no channel of its own. [8]
+        dedup_skip = None
+        if enqueue_pending_merge:
+            try:
+                dedup_skip = await self._maybe_enqueue_pending_merge(
+                    stream_ctx=stream_ctx,
+                    channel_name=channel_name,
+                    group_id=group_id,
+                    exec_ctx=exec_ctx,
+                )
+            except Exception:
+                logger.warning(
+                    "[DEDUP] Hook failed for stream=%s group_id=%s; falling through "
+                    "to channel creation (pre-BD-F behavior)",
+                    channel_name, group_id, exc_info=True,
+                )
+                dedup_skip = None
         if dedup_skip is not None:
             # Carry the accumulated context (normalization notes, wy6l5
             # manual-block reason, …) onto the dedup-skip result so the
@@ -3864,8 +3917,12 @@ class ActionExecutor:
         separator = getattr(self._settings, 'channel_number_separator', '-') or '-'
         number_str = str(int(channel_number) if channel_number == int(channel_number) else channel_number)
 
-        # Strip any existing number prefix (e.g., "4000 | USA Network" -> "USA Network")
-        stripped = re.sub(r'^\d+(?:\.\d+)?\s*[|\-:]\s*', '', channel_name).strip()
+        # Strip any existing number prefix (e.g., "4000 | USA Network" ->
+        # "USA Network"). Any separator, not just the configured one: the
+        # prefix already on the name may have been written before the
+        # setting changed. Shared with the lookups that have to undo this
+        # write, so the pair cannot drift. [50]
+        stripped = strip_channel_number_prefix(channel_name).strip()
         if not stripped:
             stripped = channel_name
 
@@ -4725,6 +4782,11 @@ class ActionExecutor:
           runs (Dispatcharr does not persist ECM's in-run auto_created
           marker), and adopting it by name IS the idempotence mechanism —
           the promotion target group is documented ECM-owned space.
+          That lookup, not the plan's ``action``, is what decides create
+          versus adopt, so its index and the plan's map have to strip the
+          same channel-number prefix or the two disagree and the run
+          creates a duplicate. Both take the separator from
+          ``self._channel_number_separator``. [44]
         * **Attach** every unit stream via :meth:`_add_stream_to_channel`
           with provenance ``kind="event_sync_promote"`` (content fingerprint
           + names; IDs display-only) under journal category ``event_sync``.
@@ -4734,10 +4796,13 @@ class ActionExecutor:
           are counted (the engine surfaces the warning). Adoption never
           consumes cap budget.
         * **Past events**: with ``skip_past_events`` on, the plan has
-          already dropped finished events from the create list (counted as
-          ``skipped_past``). Nothing here deletes on a timestamp — a
-          promoted channel still lives or dies by whether its stream is in
-          the playlist.
+          already dropped every finished event's unit (counted as
+          ``skipped_past``, of which ``skipped_past_adopted`` already have
+          a channel). Nothing here deletes anything: a dropped adopt unit
+          simply never reaches ``channel_ids``, so the channel is absent
+          from the managed set this method returns and Pass 4 applies the
+          rule's own ``orphan_action`` to it. Subtraction is the whole
+          mechanism — there is deliberately no delete call on this path.
 
         Returns the promotion summary the engine folds into the rule's
         event_sync summary and uses to register the managed set
@@ -4746,6 +4811,10 @@ class ActionExecutor:
         master-group channel is unreachable by construction; the engine
         re-asserts this invariant when registering).
         """
+        # Imported here rather than at module level: the master-attach
+        # path already keeps a local map under this name, built over the
+        # MASTER group with no prefix strip.
+        from channel_number_prefix import channel_name_to_id
         from services.event_sync_promote import build_promotion_plan
         from services.event_sync_review import (
             PROVIDER_ID_UNKNOWN,
@@ -4756,18 +4825,15 @@ class ActionExecutor:
 
         # Existing-name map for the plan's create-vs-adopt decision — the
         # SAME channel universe the create action's scoped lookup resolves
-        # against (self.existing_channels feeds both).
-        existing_name_to_id: dict[str, int] = {}
-        for ch in self.existing_channels:
-            if ch.get("channel_group_id") != target_group_id:
-                continue
-            name, cid = ch.get("name"), ch.get("id")
-            if not name or cid is None:
-                continue
-            lowered = name.lower()
-            if lowered not in existing_name_to_id \
-                    or cid < existing_name_to_id[lowered]:
-                existing_name_to_id[lowered] = cid
+        # against (self.existing_channels feeds both, and both strip the
+        # prefix this run's settings write). [16]
+        existing_name_to_id = channel_name_to_id(
+            (
+                ch for ch in self.existing_channels
+                if ch.get("channel_group_id") == target_group_id
+            ),
+            self._channel_number_separator,
+        )
 
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id
@@ -4780,11 +4846,19 @@ class ActionExecutor:
             "promoted_adopted": 0,
             "streams_attached": 0,
             "already_attached": 0,
+            # Two different things, counted apart so a summary number is
+            # never ambiguous: attach_errors counts STREAMS that failed to
+            # attach, failed_units counts promotion UNITS that produced no
+            # channel at all. One failed unit used to read as N attach
+            # errors, which is the number an operator reaches for when a
+            # channel goes missing. [49]
             "attach_errors": 0,
+            "failed_units": 0,
             "cap": plan.cap,
             "capped": plan.capped,
             "cap_overage": plan.cap_overage,
             "skipped_past": plan.skipped_past,
+            "skipped_past_adopted": plan.skipped_past_adopted,
             "channel_ids": [],
             "promote_entries": [],
         }
@@ -4793,8 +4867,9 @@ class ActionExecutor:
             logger.info(
                 "[EVENT-SYNC] Rule '%s': skip_past_events dropped %d event(s) "
                 "whose start time has already gone by — no channel created "
-                "for them (already promoted channels are untouched)",
-                rule_name, plan.skipped_past,
+                "for them, and %d already-promoted channel(s) leave the "
+                "managed set for orphan cleanup to act on",
+                rule_name, plan.skipped_past, plan.skipped_past_adopted,
             )
 
         def _provenance(row, unit, channel_id, channel_name) -> dict:
@@ -4821,6 +4896,19 @@ class ActionExecutor:
                 "disposition": row.disposition,
             }
 
+        def _keep_existing_channel(unit) -> None:
+            """Hold a failed unit's already-existing channel in the run's
+            managed set.
+
+            Pass 4 removes whatever the rule managed last run and does not
+            claim this run, and it cannot tell "the planner retired this
+            channel" from "one unit hit a 500 on the way to it". Without
+            this, a transient create failure deletes a channel for an
+            event that is still ahead and puts nothing back. [46]
+            """
+            if unit.existing_channel_id is not None:
+                promo["channel_ids"].append(unit.existing_channel_id)
+
         for unit in plan.units:
             first = unit.rows[0]
             create_action = Action(type="create_channel", params={
@@ -4840,6 +4928,7 @@ class ActionExecutor:
                 rule_target_group_id=target_group_id,
                 match_scope_target_group=True,
                 allow_manual_channel_merge=True,
+                enqueue_pending_merge=False,
             )
             exec_ctx.add_result(result)
             if not result.success:
@@ -4849,7 +4938,8 @@ class ActionExecutor:
                     rule_name, unit.event_key, unit.channel_name,
                     result.error,
                 )
-                promo["attach_errors"] += 1
+                promo["failed_units"] += 1
+                _keep_existing_channel(unit)
                 promo["promote_entries"].append({
                     "type": "event_sync_promote",
                     "description": (
@@ -4865,10 +4955,34 @@ class ActionExecutor:
                 })
                 continue
 
-            channel_id = (
-                result.entity_id if result.entity_id is not None
-                else exec_ctx.current_channel_id
-            )
+            channel_id = result.entity_id
+            if channel_id is None:
+                # A dry-run create reports its simulated channel through the
+                # executor's in-run name index rather than on the result, so
+                # resolve it by the name this call just created.
+                created_channel = self._find_channel_by_name(
+                    unit.channel_name, scope_group_id=target_group_id,
+                    exact_only=True, block_manual=False,
+                )
+                channel_id = (
+                    created_channel.get("id") if created_channel else None
+                )
+            if channel_id is None:
+                # No channel of this unit's own. Taking an id from anywhere
+                # else would attach THIS event's streams to ANOTHER event's
+                # channel, so this unit alone fails and the rest of the run
+                # carries on. Its streams go nowhere this run, but a
+                # channel the planner already found for the event keeps
+                # its place in the managed set. [8]
+                promo["failed_units"] += 1
+                _keep_existing_channel(unit)
+                logger.warning(
+                    "[EVENT-SYNC] Rule '%s': promotion of event %r produced no "
+                    "channel id for '%s' — %d stream(s) NOT attached",
+                    rule_name, unit.event_key, unit.channel_name,
+                    len(unit.rows),
+                )
+                continue
             channel = self._channel_by_id.get(channel_id)
             attach_rows = list(unit.rows)
             if result.created:
@@ -4915,10 +5029,21 @@ class ActionExecutor:
 
             # Attach the (remaining) unit streams — idempotent by
             # construction, exactly like the master attach path.
+            if channel is None and attach_rows:
+                # The id is real (the channel was just created or adopted) but
+                # this run's channel index has no record of it, so there is
+                # nothing to attach to. It still joins the managed set below,
+                # because the channel does exist. [9]
+                logger.warning(
+                    "[EVENT-SYNC] Rule '%s': channel id=%s for event %r ('%s') "
+                    "is not in this run's channel index — %d stream(s) NOT "
+                    "attached",
+                    rule_name, channel_id, unit.event_key, unit.channel_name,
+                    len(attach_rows),
+                )
+                promo["attach_errors"] += len(attach_rows)
+                attach_rows = []
             for row in attach_rows:
-                if channel is None:
-                    promo["attach_errors"] += 1
-                    continue
                 row_ctx = StreamContext(
                     stream_id=row.stream.stream_id,
                     stream_name=row.stream.name,

@@ -73,6 +73,28 @@ function formatStart(iso: string | null): string {
   return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString(getDateLocale());
 }
 
+/**
+ * The skipped-event count that is destructive. A finished event with no
+ * channel is simply not created; a finished event that already has one loses
+ * it, so the two numbers are written out as separate sentences rather than
+ * folded into one total.
+ */
+function skippedPastAdoptedText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 of those events already has a channel. This rule stops managing ' +
+      "that channel when it runs, and the rule's orphan cleanup setting " +
+      'decides what happens to it. Orphan cleanup deletes channels by default.'
+    );
+  }
+  return (
+    `${count} of those events already have channels. This rule stops ` +
+    "managing those channels when it runs, and the rule's orphan cleanup " +
+    'setting decides what happens to them. Orphan cleanup deletes channels ' +
+    'by default.'
+  );
+}
+
 function summaryLine(summary: EventSyncPreviewResponse['summary']): string {
   let line =
     `${summary.would_attach} would attach, ` +
@@ -472,7 +494,9 @@ export function EventSyncPreviewPanel({
                               : row.promote_capped
                                 ? 'Deferred (per-run cap)'
                                 : row.promote_skipped_past
-                                  ? 'Skipped — event already finished'
+                                  ? row.promote_skipped_past_adopted
+                                    ? 'Skipped — event already finished, and this rule stops managing its channel'
+                                    : 'Skipped — event already finished'
                                   : 'No — incomplete parsed identity'}
                           </td>
                         )}
@@ -498,7 +522,8 @@ export function EventSyncPreviewPanel({
                 {preview.promotion.would_attach_existing} adopting an
                 existing promoted channel) with every listed stream
                 attached. ECM deletes a promoted channel when its stream
-                leaves the provider playlist.
+                leaves the provider playlist, and when its event has
+                finished if the rule skips finished events.
               </p>
               {preview.promotion.capped && (
                 <div className="warning-message" role="alert">
@@ -511,7 +536,7 @@ export function EventSyncPreviewPanel({
                   </span>
                 </div>
               )}
-              {(preview.promotion.skipped_past ?? 0) > 0 && (
+              {preview.promotion.skipped_past > 0 && (
                 <p
                   className="form-hint"
                   data-testid="event-sync-promote-skipped-past"
@@ -519,9 +544,24 @@ export function EventSyncPreviewPanel({
                   {preview.promotion.skipped_past} event
                   {preview.promotion.skipped_past === 1 ? '' : 's'} skipped
                   because they had already finished. Turn off &quot;Skip
-                  events that have already finished&quot; on the rule, or
-                  raise the grace hours, if you expected them here.
+                  events that have already finished, and remove their
+                  channels&quot; on the rule, or raise the grace hours, if
+                  you expected them here.
                 </p>
+              )}
+              {preview.promotion.skipped_past_adopted > 0 && (
+                <div
+                  className="warning-message"
+                  role="alert"
+                  data-testid="event-sync-promote-skipped-past-adopted"
+                >
+                  <span className="material-icons">warning</span>
+                  <span>
+                    {skippedPastAdoptedText(
+                      preview.promotion.skipped_past_adopted
+                    )}
+                  </span>
+                </div>
               )}
               {preview.promotion.units.length === 0 ? (
                 <p className="form-hint">

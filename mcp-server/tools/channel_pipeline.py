@@ -1738,6 +1738,22 @@ def register(mcp: FastMCP):
                         f"— {promo.get('cap_overage')} unit(s) deferred "
                         f"to the next run."
                     )
+                if promo.get("skipped_past"):
+                    lines.append(
+                        f"  NOTE: {promo['skipped_past']} event(s) skipped "
+                        f"because they had already finished, so no channel "
+                        f"is created for them."
+                    )
+                if promo.get("skipped_past_adopted"):
+                    lines.append(
+                        f"  WARNING: {promo['skipped_past_adopted']} "
+                        f"existing channel(s) will be REMOVED. Those "
+                        f"events already have promoted channels, and "
+                        f"skipping a finished event takes its channel out "
+                        f"of the rule's managed set, so orphan cleanup "
+                        f"acts on it (delete, unless the rule's orphan "
+                        f"action says otherwise)."
+                    )
                 for unit in promo.get("units", []):
                     streams = unit.get("streams", [])
                     lines.append(

@@ -3286,6 +3286,8 @@ async def preview_event_sync(
     promotion_out: dict | None = None
     promote_annotations: dict[tuple, dict] = {}
     if config.get("promote_unmatched"):
+        from channel_number_prefix import channel_name_to_id
+        from config import get_settings
         from services.event_sync_promote import build_promotion_plan
 
         promote_target_group_id = config["promote_target_group_id"]
@@ -3320,15 +3322,19 @@ async def preview_event_sync(
             )
             target_channels = []
 
-        existing_name_to_id: dict[str, int] = {}
-        for ch in target_channels:
-            cname, cid = ch.get("name"), ch.get("id")
-            if not cname or cid is None:
-                continue
-            lowered = cname.lower()
-            if lowered not in existing_name_to_id \
-                    or cid < existing_name_to_id[lowered]:
-                existing_name_to_id[lowered] = cid
+        # Same two spellings the run's own map keys, so the preview cannot
+        # show a create the run would plan as an adopt. [16]
+        preview_settings = get_settings()
+        number_separator = None
+        if getattr(
+            preview_settings, "include_channel_number_in_name", False
+        ):
+            number_separator = getattr(
+                preview_settings, "channel_number_separator", "-"
+            ) or "-"
+        existing_name_to_id = channel_name_to_id(
+            target_channels, number_separator
+        )
 
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id
@@ -3379,6 +3385,15 @@ async def preview_event_sync(
                     "promote_action": None,
                     "promote_channel_name": unit.channel_name,
                     "promote_skipped_past": True,
+                    # This event already has a channel, so skipping it
+                    # takes that channel out of the managed set and hands
+                    # it to the rule's orphan cleanup. Keyed on the id,
+                    # not the action: a unit can read as attach_existing
+                    # because an earlier unit in the same run planned the
+                    # same name, with no channel anywhere. [45]
+                    "promote_skipped_past_adopted": (
+                        unit.existing_channel_id is not None
+                    ),
                 }
         promotion_out = {
             "enabled": True,
@@ -3391,6 +3406,7 @@ async def preview_event_sync(
             "capped": plan.capped,
             "cap_overage": plan.cap_overage,
             "skipped_past": plan.skipped_past,
+            "skipped_past_adopted": plan.skipped_past_adopted,
             "units": units_out,
         }
         # Annotate the unmatched rows in place — the operator reads the
@@ -3413,7 +3429,7 @@ async def preview_event_sync(
         "streams=%d would_attach=%d ambiguous=%d unmatched=%d parse_failed=%d "
         "excluded_by_operator=%d preflight_ok=%s truncated=%s "
         "stale_suspect=%d freshness_unknown=%d snapshot_covered=%d "
-        "would_promote=%s skipped_past=%s",
+        "would_promote=%s skipped_past=%s skipped_past_adopted=%s",
         master_group_id, secondary_group_ids, len(master_channels),
         len(resolution.resolved), counts[DISPOSITION_WOULD_ATTACH],
         counts[DISPOSITION_AMBIGUOUS], counts[DISPOSITION_UNMATCHED],
@@ -3422,6 +3438,7 @@ async def preview_event_sync(
         stale_suspect_streams, freshness_unknown_streams, snapshot_covered,
         promotion_out["would_promote"] if promotion_out else "off",
         promotion_out["skipped_past"] if promotion_out else "off",
+        promotion_out["skipped_past_adopted"] if promotion_out else "off",
     )
 
     return {
