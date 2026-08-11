@@ -1,0 +1,57 @@
+.banner-league-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+/* Pattern column is widest: it holds a regex, the league holds a short code. */
+.banner-league-row {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.banner-league-row input[type="text"] {
+  width: 100%;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-lg);
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.875rem;
+}
+
+.banner-league-row input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.banner-league-head {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.banner-league-empty {
+  margin: 0.75rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.banner-league-add {
+  margin-top: 0.75rem;
+}
+
+@media (max-width: 640px) {
+  .banner-league-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .banner-league-head {
+    display: none;
+  }
+}

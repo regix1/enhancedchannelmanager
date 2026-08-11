@@ -2,12 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import * as api from '../../services/api';
 import * as channelPipelineApi from '../../services/channelPipelineApi';
 import { useNotifications } from '../../contexts/NotificationContext';
-import type { Theme, ProbeHistoryEntry, SortCriterion, SortEnabledMap, FailedStreamCategory, GracenoteConflictMode, StreamPreviewMode } from '../../services/api';
+import type { Theme, ProbeHistoryEntry, SortCriterion, SortEnabledMap, FailedStreamCategory, GracenoteConflictMode, StreamPreviewMode, SportsBannerLeagueRule } from '../../services/api';
 import { NormalizationEngineSection } from '../settings/NormalizationEngineSection';
 import { TagEngineSection } from '../settings/TagEngineSection';
 import { AuthSettingsSection } from '../settings/AuthSettingsSection';
 import { UserManagementSection } from '../settings/UserManagementSection';
 import { LinkedAccountsSection } from '../settings/LinkedAccountsSection';
+import { SportsBannerLeagues } from '../settings/SportsBannerLeagues';
 import { TLSSettingsSection } from '../settings/TLSSettingsSection';
 import { BackupRestoreSection } from '../settings/BackupRestoreSection';
 import { MCPSettingsSection } from '../settings/MCPSettingsSection';
@@ -362,6 +363,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   const [defaultChannelProfileIds, setDefaultChannelProfileIds] = useState<number[]>([]);
   const [epgAutoMatchThreshold, setEpgAutoMatchThreshold] = useState(80);
   const [sportsBannerBaseUrl, setSportsBannerBaseUrl] = useState('');
+  const [sportsBannerLeagues, setSportsBannerLeagues] = useState<SportsBannerLeagueRule[]>([]);
   const [customNetworkPrefixes, setCustomNetworkPrefixes] = useState<string[]>([]);
   const [customNetworkSuffixes, setCustomNetworkSuffixes] = useState<string[]>([]);
   const [normalizeOnChannelCreate, setNormalizeOnChannelCreate] = useState(false);
@@ -882,6 +884,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       setDefaultChannelProfileIds(settings.default_channel_profile_ids);
       setEpgAutoMatchThreshold(settings.epg_auto_match_threshold ?? 80);
       setSportsBannerBaseUrl(settings.sports_banner_base_url ?? '');
+      setSportsBannerLeagues(settings.sports_banner_leagues ?? []);
       setCustomNetworkPrefixes(settings.custom_network_prefixes ?? []);
       setCustomNetworkSuffixes(settings.custom_network_suffixes ?? []);
       setNormalizeOnChannelCreate(settings.normalize_on_channel_create ?? false);
@@ -1306,6 +1309,11 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         default_channel_profile_ids: defaultChannelProfileIds,
         epg_auto_match_threshold: epgAutoMatchThreshold,
         sports_banner_base_url: sportsBannerBaseUrl.trim(),
+        // Blank rows are what a half-finished "Add rule" leaves behind; the
+        // backend drops them anyway, so they never reach the stored list.
+        sports_banner_leagues: sportsBannerLeagues
+          .map((rule) => ({ match: rule.match.trim(), league: rule.league.trim() }))
+          .filter((rule) => rule.match && rule.league),
         custom_network_prefixes: customNetworkPrefixes,
         custom_network_suffixes: customNetworkSuffixes,
         normalize_on_channel_create: normalizeOnChannelCreate,
@@ -2744,6 +2752,13 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
             its two teams. Leave it empty to keep the artwork exactly as the source sends it.
           </p>
         </div>
+
+        {sportsBannerBaseUrl.trim() !== '' && (
+          <SportsBannerLeagues
+            rules={sportsBannerLeagues}
+            onChange={setSportsBannerLeagues}
+          />
+        )}
       </div>
 
       <div className="settings-section">

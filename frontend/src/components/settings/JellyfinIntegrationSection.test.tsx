@@ -139,6 +139,7 @@ const settingsBase = {
   allow_multi_provider_auto_sync: false,
   epg_auto_match_threshold: 80,
   sports_banner_base_url: '',
+  sports_banner_leagues: [],
   custom_network_prefixes: [],
   custom_network_suffixes: [],
   stats_poll_interval: 10,

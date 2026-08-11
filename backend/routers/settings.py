@@ -29,6 +29,7 @@ from cache import get_cache
 from database import get_session
 from stream_prober import StreamProber, get_prober, set_prober
 from bandwidth_tracker import BandwidthTracker, get_tracker, set_tracker
+from services.epg_artwork import compile_leagues
 from services.notification_service import create_notification_internal, update_notification_internal, delete_notifications_by_source_internal
 
 logger = logging.getLogger(__name__)
@@ -354,6 +355,9 @@ class SettingsRequest(BaseModel):
     allow_multi_provider_auto_sync: bool = False
     epg_auto_match_threshold: int = 80
     sports_banner_base_url: str = ""
+    # None is "never configured" and falls back to the built-in league rules;
+    # [] is a deliberate "no leagues". Both must survive the round trip.
+    sports_banner_leagues: list[dict] | None = None
     # bd-ugzn4 (BD-K): dedup epic operator settings. Defaults match
     # config.DispatcharrSettings so an older frontend bundle that doesn't
     # send these fields persists the current value rather than getting
@@ -492,6 +496,9 @@ class SettingsResponse(BaseModel):
     allow_multi_provider_auto_sync: bool
     epg_auto_match_threshold: int
     sports_banner_base_url: str
+    # The EFFECTIVE rules, so the editor opens on the built-in defaults
+    # instead of on an empty list the operator would have to recreate.
+    sports_banner_leagues: list[dict]
     dedup_threshold: float
     dedup_m3u_toast_suppressed: bool
     custom_network_prefixes: list[str]
@@ -726,6 +733,12 @@ async def get_current_settings():
         allow_multi_provider_auto_sync=settings.allow_multi_provider_auto_sync,
         epg_auto_match_threshold=settings.epg_auto_match_threshold,
         sports_banner_base_url=settings.sports_banner_base_url,
+        # Hand back the EFFECTIVE rules: unset means the built-ins are what is
+        # running, so that is what the editor has to open on.
+        sports_banner_leagues=[
+            {"match": pattern.pattern, "league": league}
+            for pattern, league in compile_leagues(settings.sports_banner_leagues)
+        ],
         dedup_threshold=settings.dedup_threshold,
         dedup_m3u_toast_suppressed=settings.dedup_m3u_toast_suppressed,
         custom_network_prefixes=settings.custom_network_prefixes,

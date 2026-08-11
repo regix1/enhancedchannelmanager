@@ -82,19 +82,31 @@ _MAX_MATCH = 512
 
 _PROBE_CONCURRENCY = 16
 
-# Gracenote series title -> the league segment game-thumbs knows it by. A
-# title that is not here keeps whatever artwork the feed gave it: the segment
-# has to be a real league code or game-thumbs answers 400 even with
-# ``fallback=true``, and a 400 renders as a broken image in the guide.
-MATCHUP_LEAGUES = {
-    "college football": "ncaaf",
-    "nfl football": "nfl",
-    "college basketball": "ncaab",
-    "nba basketball": "nba",
-    "wnba basketball": "wnba",
-    "mlb baseball": "mlb",
-    "nhl hockey": "nhl",
-}
+# Programme title -> the league segment game-thumbs knows it by, tried in
+# order. The title is matched on a PATTERN rather than in full because a
+# postseason airing is titled for the bowl and never for the league ("CFP
+# Semifinal at the VRBO Fiesta Bowl"), as are the archive strands ("Hardwood
+# Classics", "Super Bowl Classics"). Matching in full left those showing the
+# landscape art this module exists to get rid of.
+#
+# It stays an ALLOWLIST. A title no pattern claims keeps the artwork the feed
+# gave it, which is what stops "Divorce Court" — sub-title "No Boundaries and
+# Many Betrayals: Michelle vs. Alonzo" — from reading as a matchup and being
+# handed a football banner. Under ``fallback=true`` a wrong league still
+# renders something plausible, so a false positive here is silent.
+#
+# WNBA precedes NBA and Minor League precedes MLB so the narrower name wins.
+MATCHUP_LEAGUES = (
+    (re.compile(r"\bWNBA\b", re.I), "wnba"),
+    (re.compile(r"\bNBA\b|Hardwood Classics", re.I), "nba"),
+    (re.compile(r"\bNFL\b|Super Bowl", re.I), "nfl"),
+    (re.compile(r"\bCFL\b", re.I), "cfl"),
+    (re.compile(r"College Football|\bCFP\b", re.I), "ncaaf"),
+    (re.compile(r"College Basketball", re.I), "ncaab"),
+    (re.compile(r"Minor League Baseball", re.I), "milb"),
+    (re.compile(r"\bMLB\b", re.I), "mlb"),
+    (re.compile(r"\bNHL\b", re.I), "nhl"),
+)
 
 _PROGRAMME_END = "</programme>"
 _PROGRAMME = re.compile(r"<programme\b[^>]*>.*?</programme>", re.DOTALL)
@@ -155,18 +167,56 @@ class ArtworkCache:
             logger.warning("[EPG-ART] Could not write cache %s: %s", self.path, e)
 
 
+def compile_leagues(rules: list[dict] | None) -> tuple[tuple[re.Pattern, str], ...]:
+    """Operator league rules as ordered (pattern, league) pairs.
+
+    ``None`` means they were never configured, so the built-ins apply. An
+    empty list is a deliberate "no leagues" and is honoured as one.
+
+    A row whose pattern will not compile is dropped rather than raised: the
+    guide is served through this path, so one bad row must cost its own rule
+    and not the whole feed.
+    """
+    if rules is None:
+        return MATCHUP_LEAGUES
+    compiled = []
+    for rule in rules:
+        match = str(rule.get("match") or "").strip()
+        league = str(rule.get("league") or "").strip()
+        if not match or not league:
+            continue
+        try:
+            compiled.append((re.compile(match, re.I), league))
+        except re.error as e:
+            logger.warning("[EPG-ART] Dropping league rule %r: %s", match, e)
+    return tuple(compiled)
+
+
 def _slug(team: str) -> str:
-    """Team name as the path segment game-thumbs matches on."""
-    return re.sub(r"[^a-z0-9]+", "-", unescape(team).lower()).strip("-")
+    """Team name as the path segment game-thumbs matches on.
+
+    The qualifier an archive or tournament airing puts in front of the
+    matchup lands on the away side of the split ("2008 NBA Finals: Boston vs.
+    Los Angeles", "2025 Big Ten: Indiana at Penn St."). game-thumbs matches on
+    the team alone, so anything ahead of the last colon is dropped.
+    """
+    name = unescape(team).strip()
+    name = name.rpartition(":")[2].strip() or name
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def matchup_banner(base: str, title: str, sub_title: str) -> str | None:
+def matchup_banner(base: str, title: str, sub_title: str,
+                   leagues: tuple[tuple[re.Pattern, str], ...] = MATCHUP_LEAGUES) -> str | None:
     """game-thumbs URL for one matchup, or None when it is not a matchup.
 
     ``title`` names the league and ``sub_title`` the two teams; both arrive
     still XML-escaped, as they sit in the feed.
     """
-    league = MATCHUP_LEAGUES.get(unescape(title).strip().lower())
+    plain_title = unescape(title)
+    league = next(
+        (code for pattern, code in leagues if pattern.search(plain_title)),
+        None,
+    )
     if league is None:
         return None
     teams = _MATCHUP.match(unescape(sub_title).strip())
@@ -191,9 +241,11 @@ class ArtworkRewriter:
     answer for are recorded in ``unknown`` for the caller to probe later.
     """
 
-    def __init__(self, cache: ArtworkCache, banner_base: str = ""):
+    def __init__(self, cache: ArtworkCache, banner_base: str = "",
+                 leagues: tuple[tuple[re.Pattern, str], ...] = MATCHUP_LEAGUES):
         self.cache = cache
         self.banner_base = banner_base.rstrip("/")
+        self.leagues = leagues
         self.unknown: dict[str, tuple[str, str, str, str]] = {}
         self.rewritten = 0
         self.bannered = 0
@@ -220,7 +272,8 @@ class ArtworkRewriter:
         sub_title = _SUB_TITLE.search(prog)
         if title is None or sub_title is None:
             return prog
-        url = matchup_banner(self.banner_base, title.group(1), sub_title.group(1))
+        url = matchup_banner(self.banner_base, title.group(1), sub_title.group(1),
+                             self.leagues)
         if url is None:
             return prog
         self.bannered += 1

@@ -37,6 +37,7 @@ from concurrency import run_cpu_bound
 from services.epg_artwork import (
     ArtworkCache,
     ArtworkRewriter,
+    compile_leagues,
     probe_unknown,
     stream_rewritten,
 )
@@ -2115,8 +2116,11 @@ async def artwork_proxy(source_id: int, background: BackgroundTasks = None):
     validate_url_scheme(url, "EPG source URL")
 
     cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
+    artwork_settings = get_settings()
     rewriter = ArtworkRewriter(
-        cache, banner_base=get_settings().sports_banner_base_url
+        cache,
+        banner_base=artwork_settings.sports_banner_base_url,
+        leagues=compile_leagues(artwork_settings.sports_banner_leagues),
     )
 
     async def body():

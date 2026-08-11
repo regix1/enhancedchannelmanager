@@ -11,7 +11,9 @@ import httpx
 from services.epg_artwork import (
     ArtworkCache,
     ArtworkRewriter,
+    MATCHUP_LEAGUES,
     VERTICAL_CODES,
+    compile_leagues,
     _MAX_MATCH,
     _OUTAGE_STREAK,
     _PROBE_CONCURRENCY,
@@ -343,6 +345,88 @@ class TestMatchupBanner:
     def test_a_trailing_slash_on_the_base_is_not_doubled(self, tmp_path):
         rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT + "/")
         assert "//ncaaf" not in _run(rw, MATCHUP)
+
+
+class TestWhichProgrammesCount:
+    """Which titles are read as a matchup, and which must never be.
+
+    The title is matched on a pattern because a postseason airing is titled
+    for the bowl and an archive strand for itself, never for the league. That
+    is also what makes the guard load-bearing: 275 programmes in the live
+    guide have a matchup-shaped sub-title and 108 of them are not team sport.
+    """
+
+    def test_a_bowl_game_is_recognised_by_its_round_not_its_league(self):
+        """"CFP Semifinal at the VRBO Fiesta Bowl" never says "football"."""
+        assert matchup_banner(GT, "CFP Semifinal at the VRBO Fiesta Bowl",
+                              "Miami vs Ole Miss") == (
+            f"{GT}/ncaaf/miami/ole-miss/cover?style=4&logo=true&fallback=true")
+
+    def test_an_archive_strand_is_recognised(self):
+        assert matchup_banner(GT, "Hardwood Classics",
+                              "2008 NBA Finals: Boston vs. Los Angeles Lakers") == (
+            f"{GT}/nba/boston/los-angeles-lakers/cover"
+            "?style=4&logo=true&fallback=true")
+
+    def test_a_qualifier_before_the_matchup_is_dropped(self):
+        """The teams are what game-thumbs matches on, not the round."""
+        url = matchup_banner(GT, "Greatest Games: College Football",
+                             "2025 Big Ten: Indiana at Penn St.")
+        assert url == (f"{GT}/ncaaf/indiana/penn-st/cover"
+                       "?style=4&logo=true&fallback=true")
+
+    def test_a_courtroom_show_is_not_a_matchup(self):
+        """Divorce Court is real, airs a "X vs. Y" sub-title, and must not be
+        handed a football banner. fallback=true means a wrong league still
+        renders something plausible, so this cannot be caught downstream."""
+        assert matchup_banner(GT, "Divorce Court",
+                              "No Boundaries and Many Betrayals: Shetel vs. Alonzo") is None
+
+    def test_a_narrower_league_name_wins_over_the_one_inside_it(self):
+        """WNBA precedes NBA, Minor League precedes MLB."""
+        assert "/wnba/" in matchup_banner(GT, "WNBA Basketball", "Aces at Liberty")
+        assert "/milb/" in matchup_banner(GT, "Minor League Baseball",
+                                          "Iowa Cubs at St. Paul Saints")
+
+
+class TestLeagueRules:
+    """The rules are operator-editable, and one bad row must not cost the feed."""
+
+    def test_unset_rules_fall_back_to_the_built_ins(self):
+        assert compile_leagues(None) is MATCHUP_LEAGUES
+
+    def test_an_empty_list_is_a_deliberate_none_not_a_reset(self):
+        """Deleting every row has to mean none, or a row can never be removed."""
+        assert compile_leagues([]) == ()
+
+    def test_operator_rules_replace_the_built_ins(self, tmp_path):
+        leagues = compile_leagues([{"match": "Curling Night", "league": "curling"}])
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT, leagues=leagues)
+        out = _run(rw, MATCHUP.replace("College Football", "Curling Night"))
+        assert f"{GT}/curling/alabama/south-carolina/cover" in out
+        # the built-in College Football rule is gone
+        assert matchup_banner(GT, "College Football", "A at B", leagues) is None
+
+    def test_the_first_matching_rule_wins(self):
+        leagues = compile_leagues([
+            {"match": "Bowl", "league": "first"},
+            {"match": "Rose Bowl", "league": "second"},
+        ])
+        assert "/first/" in matchup_banner(GT, "Rose Bowl", "A at B", leagues)
+
+    def test_a_row_that_will_not_compile_is_dropped_and_the_rest_survive(self):
+        """A typo'd bracket must cost its own rule, not the whole guide."""
+        leagues = compile_leagues([
+            {"match": "Foo[", "league": "broken"},
+            {"match": "College Football", "league": "ncaaf"},
+        ])
+        assert len(leagues) == 1
+        assert "/ncaaf/" in matchup_banner(GT, "College Football", "A at B", leagues)
+
+    def test_a_row_missing_either_half_is_dropped(self):
+        assert compile_leagues([{"match": "", "league": "x"},
+                                {"match": "y", "league": ""},
+                                {"match": "  ", "league": "  "}]) == ()
 
 
 class TestProbe:

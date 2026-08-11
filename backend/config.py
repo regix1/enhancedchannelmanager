@@ -148,6 +148,11 @@ class DispatcharrSettings(BaseModel):
     # picture for every game. Empty leaves programme artwork exactly as the
     # upstream feed had it.
     sports_banner_base_url: str = ""
+    # Ordered [{"match": <title regex>, "league": <game-thumbs segment>}] rules
+    # deciding which programmes get a matchup banner. None means the operator
+    # has never set them and the built-in defaults apply; an empty list is a
+    # deliberate "none", which is why this is not just [].
+    sports_banner_leagues: list[dict] | None = None
     # Custom network prefixes to strip during bulk channel creation
     # These are merged with the built-in list (CHAMP, PPV, NFL, etc.)
     custom_network_prefixes: list[str] = []

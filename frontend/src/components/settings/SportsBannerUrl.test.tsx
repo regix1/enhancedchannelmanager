@@ -145,6 +145,7 @@ const settingsBase = {
   allow_multi_provider_auto_sync: false,
   epg_auto_match_threshold: 80,
   sports_banner_base_url: '',
+  sports_banner_leagues: [],
   custom_network_prefixes: [],
   custom_network_suffixes: [],
   stats_poll_interval: 10,
@@ -284,6 +285,13 @@ describe('Sports matchup banner URL', () => {
     expect(payload.sports_banner_base_url).toBe('http://thumbs.example:3100');
   });
 
+  it('hides the league rules until a server is configured', async () => {
+    renderOnChannelDefaults();
+
+    await screen.findByLabelText(/Sports matchup banners/i);
+    expect(screen.queryByLabelText(/Title pattern 1/i)).not.toBeInTheDocument();
+  });
+
   it('sends a blank as an empty string, not undefined', async () => {
     vi.mocked(api.getSettings).mockResolvedValue(
       makeSettings({ sports_banner_base_url: 'http://thumbs.example:3100' }));
@@ -298,5 +306,103 @@ describe('Sports matchup banner URL', () => {
     await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
     const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
     expect(payload.sports_banner_base_url).toBe('');
+  });
+});
+
+describe('Sports matchup banner league rules', () => {
+  const CONFIGURED = {
+    sports_banner_base_url: 'http://thumbs.example:3100',
+    sports_banner_leagues: [
+      { match: 'College Football|CFP', league: 'ncaaf' },
+      { match: '\\bNHL\\b', league: 'nhl' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUser = { is_admin: true, username: 'admin' };
+    vi.mocked(api.getSettings).mockResolvedValue(makeSettings(CONFIGURED));
+    vi.mocked(api.saveSettings).mockResolvedValue({ status: 'ok', configured: true, server_changed: false });
+    vi.mocked(api.getChannelProfiles).mockResolvedValue([]);
+    vi.mocked(api.listAlertMethods).mockResolvedValue([]);
+    vi.mocked(api.getM3UAccounts).mockResolvedValue([]);
+  });
+
+  it('shows the rules the settings were loaded with, in order', async () => {
+    renderOnChannelDefaults();
+
+    const first = await screen.findByLabelText(/Title pattern 1/i) as HTMLInputElement;
+    await waitFor(() => expect(first.value).toBe('College Football|CFP'));
+    expect((screen.getByLabelText(/League 1/i) as HTMLInputElement).value).toBe('ncaaf');
+    expect((screen.getByLabelText(/Title pattern 2/i) as HTMLInputElement).value).toBe('\\bNHL\\b');
+  });
+
+  it('sends an edited rule on save', async () => {
+    renderOnChannelDefaults();
+
+    const league = await screen.findByLabelText(/League 2/i) as HTMLInputElement;
+    await waitFor(() => expect(league.value).toBe('nhl'));
+    fireEvent.change(league, { target: { value: 'nhl-alt' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_leagues).toEqual([
+      { match: 'College Football|CFP', league: 'ncaaf' },
+      { match: '\\bNHL\\b', league: 'nhl-alt' },
+    ]);
+  });
+
+  it('adds a rule and sends it', async () => {
+    renderOnChannelDefaults();
+
+    await screen.findByLabelText(/Title pattern 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Add rule/i }));
+    fireEvent.change(screen.getByLabelText(/Title pattern 3/i), { target: { value: 'Leagues Cup' } });
+    fireEvent.change(screen.getByLabelText(/League 3/i), { target: { value: 'epl' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_leagues).toContainEqual({ match: 'Leagues Cup', league: 'epl' });
+  });
+
+  it('removes a rule and sends the shorter list', async () => {
+    renderOnChannelDefaults();
+
+    await screen.findByLabelText(/Title pattern 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Remove rule 1/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_leagues).toEqual([{ match: '\\bNHL\\b', league: 'nhl' }]);
+  });
+
+  it('drops a half-finished row instead of storing it', async () => {
+    // An unfilled "Add rule" must not reach the stored list.
+    renderOnChannelDefaults();
+
+    await screen.findByLabelText(/Title pattern 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Add rule/i }));
+    fireEvent.change(screen.getByLabelText(/Title pattern 3/i), { target: { value: 'Half typed' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_leagues).toHaveLength(2);
+  });
+
+  it('sends an empty list when every rule is removed, not the defaults back', async () => {
+    renderOnChannelDefaults();
+
+    await screen.findByLabelText(/Title pattern 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Remove rule 2/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Remove rule 1/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_leagues).toEqual([]);
   });
 });
