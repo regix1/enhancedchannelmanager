@@ -48,18 +48,36 @@ VERTICAL_CODES = ("v12", "v13", "v7", "v11", "v8")
 # pins the landscape geometry there (w=960&h=540); carrying it onto the
 # portrait rendition would hand the client a 16:9 crop of the portrait and
 # undo the repoint.
+_BASE = r"(?P<base>https?://[\w.-]*tmsimg\.com/assets/)"
+
 _ICON = re.compile(
-    r"(?P<base>https?://[\w.-]*tmsimg\.com/assets/)"
+    _BASE +
     r"(?P<asset>p\d+)_(?P<kind>[a-z]{1,3})_[hv]\d+_(?P<suffix>[a-z]{2})\.jpg"
     r"(?:\?[^\"'\s<>]*)?"
 )
 
+# Where a match can BEGIN, which is what a chunk boundary has to back onto.
+# The literal "http" is not that: it also occurs inside a query carrying a
+# percent-encoded URL of its own (?u=http%3A%2F%2F...), and a boundary there
+# sits INSIDE the match that query belongs to. The emitted half still matches,
+# because the query group is optional, so the URL is rewritten without its
+# query and the encoded remainder comes back glued onto it. [54]
+_ICON_START = re.compile(_BASE)
+
 # Longest text _ICON can span. A chunk boundary inside a URL would otherwise
-# hide it from both this pass and the next, so this much tail is held back
-# until more text arrives.
+# hide it from both this pass and the next, so the tail is backed onto the
+# start of any match reaching this far, holding at most twice this much.
 _MAX_MATCH = 512
 
 _PROBE_CONCURRENCY = 16
+
+# Consecutive assets the CDN answered for on NO code before a run stops
+# probing. Every one of those already failed on all five codes, so a run of
+# them is the host being down rather than assets being unusual, and the ones
+# behind them cost five timeouts each for answers the next refresh has to
+# fetch anyway. A single answer resets it, so a few unlucky assets partway
+# through a healthy run do not end it. [55]
+_OUTAGE_STREAK = 3
 
 
 class ArtworkCache:
@@ -141,8 +159,19 @@ class ArtworkRewriter:
         # half, so the match was gone from both — the icon passed through
         # untouched with nothing to show why. Backing up to the last URL start
         # near the end keeps any partial match whole in the tail.
-        cut = buf.rfind("http", max(0, len(buf) - _MAX_MATCH))
-        if cut <= 0:
+        #
+        # The window reaches back two _MAX_MATCH, not one: a URL that began
+        # earlier still spans the boundary, and its start sits outside the
+        # last _MAX_MATCH by construction. One search over that window is
+        # enough, because the last start in it is also the last start in any
+        # suffix of it. [52]
+        cut = -1
+        for start in _ICON_START.finditer(buf, max(0, len(buf) - 2 * _MAX_MATCH)):
+            cut = start.start()
+        if cut < 0:
+            # No icon can begin within reach, so none can be spanning the
+            # boundary: one that began before the window ends before this
+            # offset, since _MAX_MATCH bounds how far a match reaches.
             cut = len(buf) - _MAX_MATCH
         self._tail = buf[cut:]
         return _ICON.sub(self._sub, buf[:cut])
@@ -186,7 +215,13 @@ async def stream_rewritten(url: str, cache: ArtworkCache, rewriter: ArtworkRewri
 
 async def _probe(client: httpx.AsyncClient, base: str, asset: str,
                  kind: str, suffix: str) -> str | None:
-    """First vertical code whose rendition exists for this asset, else None."""
+    """First vertical code whose rendition exists for this asset, else None.
+
+    Raises the last transport error when NOT ONE code answered, so the caller
+    can tell an unreachable CDN from an asset that has no portrait. [35]
+    """
+    last_error: httpx.HTTPError | None = None
+    answered = 0
     for code in VERTICAL_CODES:
         url = f"{base}{asset}_{kind}_{code}_{suffix}.jpg"
         try:
@@ -195,8 +230,14 @@ async def _probe(client: httpx.AsyncClient, base: str, asset: str,
                 r = await client.get(url, follow_redirects=True)
             if r.status_code == 200:
                 return code
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            # A timeout on one code says nothing about the rest, and the None
+            # this would return gets cached as a real "no portrait" forever.
+            last_error = e
+            continue
+        answered += 1
+    if not answered:
+        raise last_error
     return None
 
 
@@ -210,17 +251,37 @@ async def probe_unknown(cache: ArtworkCache,
     if not unknown:
         return 0
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+    unreachable = 0
     async with httpx.AsyncClient(timeout=10.0) as client:
-        async def one(key: str) -> None:
+        async def one(key: str) -> bool:
+            """False when the CDN answered for no code at all."""
+            nonlocal unreachable
             base, asset, kind, suffix = unknown[key]
             async with sem:
-                cache.put(key, await _probe(client, base, asset, kind, suffix))
+                # Read while holding a slot, not before it: every asset is
+                # scheduled at once, so a check outside the semaphore would
+                # run on all of them before the first probe had answered.
+                if unreachable >= _OUTAGE_STREAK:
+                    return False
+                try:
+                    code = await _probe(client, base, asset, kind, suffix)
+                except httpx.HTTPError:
+                    # An outage lasting this probe window would otherwise
+                    # record every asset it touched as having no portrait,
+                    # kept forever. Leave the key out and re-probe next
+                    # refresh.
+                    unreachable += 1
+                    return False
+                unreachable = 0
+            cache.put(key, code)
+            return True
 
-        await asyncio.gather(*(one(k) for k in unknown))
+        probed = await asyncio.gather(*(one(k) for k in unknown))
     cache.save()
     resolved = sum(1 for k in unknown if cache.get(k)[1])
     logger.info(
-        "[EPG-ART] Probed %s new assets, %s have a portrait rendition",
-        len(unknown), resolved,
+        "[EPG-ART] Probed %s new assets, %s have a portrait rendition, "
+        "%s unreachable and left for the next refresh",
+        len(unknown), resolved, probed.count(False),
     )
     return resolved

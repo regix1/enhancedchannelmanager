@@ -6,11 +6,31 @@ only a rendition confirmed to exist is emitted, anything unresolved keeps the
 landscape URL it had, and a match split across a chunk boundary is still
 found — the rewrite streams, so boundaries land mid-URL routinely.
 """
-from services.epg_artwork import ArtworkCache, ArtworkRewriter
+import httpx
+
+from services.epg_artwork import (
+    ArtworkCache,
+    ArtworkRewriter,
+    VERTICAL_CODES,
+    _MAX_MATCH,
+    _OUTAGE_STREAK,
+    _PROBE_CONCURRENCY,
+    _probe,
+    probe_unknown,
+)
 
 
 ICON = "http://dtil.tmsimg.com/assets/p30177490_b_h8_ab.jpg?w=960&h=540"
 XML = f'<programme><title>CIA</title><icon src="{ICON}" /></programme>'
+
+BARE = "http://dtil.tmsimg.com/assets/p30177490_b_h8_ab.jpg"
+PORTRAIT = "http://dtil.tmsimg.com/assets/p30177490_b_v12_ab.jpg"
+SEED = {"p30177490_b_ab": "v12"}
+
+# Bound at import, before any test can patch it. A test that streams twice
+# would otherwise build its second stub on top of the first, and the first
+# one's transport would win and replay the wrong body.
+UPSTREAM_CLIENT = httpx.AsyncClient
 
 
 def _cache(tmp_path, seed=None):
@@ -29,6 +49,32 @@ def _run(rewriter, text, chunk=None):
         out.append(rewriter.feed(text[i:i + chunk]))
     out.append(rewriter.finish())
     return "".join(out)
+
+
+async def _streamed(monkeypatch, rewriter, body):
+    """Push text through the real streaming path against a stub upstream.
+
+    Driving feed() by hand is a narrower path than production: the streaming
+    caller feeds the decoder's flush before finish(), and that extra call
+    re-cuts a tail the previous call had already backed onto a URL start.
+    """
+    from services import epg_artwork
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode("utf-8"))
+
+    class _Stub(UPSTREAM_CLIENT):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_respond)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(epg_artwork.httpx, "AsyncClient", _Stub)
+    chunks = [
+        chunk async for chunk in epg_artwork.stream_rewritten(
+            "http://feed/guide.xml", rewriter.cache, rewriter,
+        )
+    ]
+    return b"".join(chunks).decode("utf-8")
 
 
 class TestRewrite:
@@ -109,6 +155,208 @@ class TestChunkBoundaries:
                    body, chunk=11)
         assert out.count("<filler/>") == 20
         assert out.count("p30177490_b_v12_ab.jpg") == 20
+
+
+class TestWideGapsBetweenIcons:
+    """A URL is only safe if its "http" is inside the window the cut searches.
+
+    An icon far enough back from the end of the accumulated buffer has its
+    "http" outside that window by construction, so the backup search finds
+    nothing and the cut lands inside the URL. Icons placed close together
+    hide this completely: any nearby "http" rescues the cut. These inputs put
+    one icon on its own with more than _MAX_MATCH of icon-free text after it.
+    """
+
+    async def test_a_url_straddling_the_fallback_cut_is_still_repointed(
+            self, tmp_path, monkeypatch):
+        """The gap is what matters, not the chunk size. Here the URL ends 470
+        characters before the buffer end, so nothing in the searched window
+        starts a match and the fixed-offset cut splits it."""
+        body = "a" * 380 + BARE + "b" * 470
+        rw = ArtworkRewriter(_cache(tmp_path, SEED))
+
+        out = await _streamed(monkeypatch, rw, body)
+
+        assert out == "a" * 380 + PORTRAIT + "b" * 470
+        assert rw.rewritten == 1
+
+    async def test_a_cut_inside_the_query_does_not_orphan_it(
+            self, tmp_path, monkeypatch):
+        """The query group is optional, so a cut inside it still leaves a
+        COMPLETE match in the emitted half. That half rewrites and drops the
+        query, and the leftover comes back glued to the rewritten URL, which
+        is the broken image the module promises can never happen."""
+        query_url = f"{BARE}?w=960&amp;h=540"
+        for offset in range(51, 67):
+            # The closing quote ends the query, as it does in the feed. Sized
+            # so the fixed-offset cut lands on that offset within the URL.
+            after = '" ' + "b" * (offset + _MAX_MATCH - len(query_url) - 2)
+            rw = ArtworkRewriter(_cache(tmp_path, SEED))
+
+            out = await _streamed(monkeypatch, rw, "a" * 380 + query_url + after)
+
+            assert out == "a" * 380 + PORTRAIT + after, f"cut at {offset}"
+            assert "h=540" not in out, f"query fragment survived, cut at {offset}"
+
+    async def test_a_url_whose_query_carries_another_url_is_not_split(
+            self, tmp_path, monkeypatch):
+        """A query can hold a percent-encoded URL of its own, so "http"
+        occurs INSIDE a match as well as at its start. A boundary backed onto
+        that inner one leaves a complete-looking match in the emitted half,
+        which rewrites and drops the query, and the encoded remainder comes
+        back glued to the rewritten URL."""
+        query_url = f"{BARE}?u=http%3A%2F%2Fx.example%2Fa"
+        for offset in range(len(query_url) + 1):
+            # offset is where a fixed-offset cut lands inside the URL.
+            after = '" ' + "b" * (offset + _MAX_MATCH - len(query_url) - 2)
+            rw = ArtworkRewriter(_cache(tmp_path, SEED))
+
+            out = await _streamed(monkeypatch, rw, "a" * 380 + query_url + after)
+
+            assert out == "a" * 380 + PORTRAIT + after, f"cut at {offset}"
+            assert "x.example" not in out, f"query fragment survived, cut at {offset}"
+
+    def test_the_retained_tail_stays_bounded(self, tmp_path):
+        """Backing the cut onto an earlier start reaches back one more
+        _MAX_MATCH and no further, so what is held cannot grow with the feed.
+        Reads _tail because that IS the held text."""
+        body = "".join(f"{'b' * gap}{BARE}"
+                       for gap in (0, 100, 461, 462, 511, 512, 700, 1500))
+        body += "c" * 900
+
+        worst = 0
+        for size in (1, 7, 64, 511, 512, 513, 1024, 4096):
+            rw = ArtworkRewriter(_cache(tmp_path, SEED))
+            for i in range(0, len(body), size):
+                rw.feed(body[i:i + size])
+                worst = max(worst, len(rw._tail))
+            rw.finish()
+
+        assert worst <= 2 * _MAX_MATCH
+        assert worst > _MAX_MATCH, "the wider reach was never exercised"
+
+
+class TestProbe:
+    async def test_a_network_error_on_one_code_tries_the_rest(self):
+        """probe_unknown writes whatever this returns into the cache, where a
+        None is a real "no portrait" that is never probed again. Abandoning
+        the asset on one timeout records that permanently."""
+        tried = []
+
+        class _Cdn:
+            async def head(self, url: str,
+                           follow_redirects: bool = False) -> httpx.Response:
+                tried.append(url)
+                if "_v8_" in url:
+                    return httpx.Response(200)
+                raise httpx.ReadTimeout("upstream stalled")
+
+        code = await _probe(_Cdn(), "http://dtil.tmsimg.com/assets/",
+                            "p30177490", "b", "ab")
+
+        assert code == "v8"
+        assert len(tried) == len(VERTICAL_CODES)
+
+    async def test_an_asset_the_cdn_never_answered_for_stays_uncached(
+        self, tmp_path, monkeypatch
+    ):
+        """A cached None is kept forever, so writing one for an asset the CDN
+        answered for on no code at all turns an outage lasting this probe
+        window into a permanent "no portrait" on everything it touched."""
+        class _Cdn:
+            async def head(self, url: str,
+                           follow_redirects: bool = False) -> httpx.Response:
+                raise httpx.ConnectError("cdn unreachable")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> bool:
+                return False
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Cdn())
+        cache = _cache(tmp_path)
+
+        resolved = await probe_unknown(cache, {"p30177490_b_ab": (
+            "http://dtil.tmsimg.com/assets/", "p30177490", "b", "ab",
+        )})
+
+        assert resolved == 0
+        assert cache.get("p30177490_b_ab") == (False, None)
+
+    async def test_a_host_answering_nothing_ends_the_run_early(
+        self, tmp_path, monkeypatch
+    ):
+        """Every asset here already failed on all five codes, so continuing
+        spends five timeouts apiece on a host that is answering nothing, for
+        answers the next refresh has to fetch anyway."""
+        asked = []
+
+        class _Cdn:
+            async def head(self, url: str,
+                           follow_redirects: bool = False) -> httpx.Response:
+                asked.append(url)
+                raise httpx.ConnectError("cdn unreachable")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> bool:
+                return False
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Cdn())
+        cache = _cache(tmp_path)
+        unknown = {
+            f"p{i}_b_ab": ("http://dtil.tmsimg.com/assets/", f"p{i}", "b", "ab")
+            for i in range(60)
+        }
+
+        resolved = await probe_unknown(cache, unknown)
+
+        assert resolved == 0
+        # Everything already in flight when the streak completes still
+        # finishes, and nothing behind it is started.
+        assert len(asked) <= ((_PROBE_CONCURRENCY + _OUTAGE_STREAK)
+                              * len(VERTICAL_CODES))
+        assert all(cache.get(k) == (False, None) for k in unknown)
+
+    async def test_scattered_failures_do_not_end_the_run(
+        self, tmp_path, monkeypatch
+    ):
+        """A CDN that keeps answering is not an outage. Ten assets fail here,
+        spread through thirty, which is more than enough to end the run if
+        those failures were counted cumulatively instead of consecutively."""
+        asked = []
+        never_answered = {f"p{i}" for i in range(0, 30, 3)}
+
+        class _Cdn:
+            async def head(self, url: str,
+                           follow_redirects: bool = False) -> httpx.Response:
+                asked.append(url)
+                if url.split("/assets/")[1].split("_")[0] in never_answered:
+                    raise httpx.ConnectError("cdn unreachable")
+                return httpx.Response(200 if "_v12_" in url else 404)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> bool:
+                return False
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Cdn())
+        cache = _cache(tmp_path)
+        unknown = {
+            f"p{i}_b_ab": ("http://dtil.tmsimg.com/assets/", f"p{i}", "b", "ab")
+            for i in range(30)
+        }
+
+        resolved = await probe_unknown(cache, unknown)
+
+        assert resolved == 20
+        assert all(cache.get(f"{a}_b_ab") == (False, None)
+                   for a in never_answered)
+        # Twenty answered on the first code, ten walked all five.
+        assert len(asked) == 20 + 10 * len(VERTICAL_CODES)
 
 
 class TestCache:
