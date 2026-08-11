@@ -23,6 +23,15 @@ therefore serves landscape and the next one serves portrait.
 A rewrite is only emitted for a rendition that answered 200, so an asset
 with no portrait keeps its landscape URL: the failure mode is the crop that
 is showing today, never a broken image.
+
+**Sports matchups are a second job, because repointing cannot reach them.**
+Gracenote publishes no per-game art for a league: measured against the live
+feed, 39% of College Football airings carry no icon at all and the rest all
+share ONE series image, so a guide shows the same picture for every game.
+There is nothing to repoint in either case. Given a game-thumbs base URL,
+a programme whose title names a known league and whose sub-title reads
+"<away> at <home>" instead gets a banner built from those two teams. Without
+that URL the pass does not run and the feed comes through as it always did.
 """
 import asyncio
 import codecs
@@ -30,6 +39,8 @@ import json
 import logging
 import re
 import zlib
+from html import unescape
+from xml.sax.saxutils import escape
 
 import httpx
 
@@ -70,6 +81,30 @@ _ICON_START = re.compile(_BASE)
 _MAX_MATCH = 512
 
 _PROBE_CONCURRENCY = 16
+
+# Gracenote series title -> the league segment game-thumbs knows it by. A
+# title that is not here keeps whatever artwork the feed gave it: the segment
+# has to be a real league code or game-thumbs answers 400 even with
+# ``fallback=true``, and a 400 renders as a broken image in the guide.
+MATCHUP_LEAGUES = {
+    "college football": "ncaaf",
+    "nfl football": "nfl",
+    "college basketball": "ncaab",
+    "nba basketball": "nba",
+    "wnba basketball": "wnba",
+    "mlb baseball": "mlb",
+    "nhl hockey": "nhl",
+}
+
+_PROGRAMME_END = "</programme>"
+_PROGRAMME = re.compile(r"<programme\b[^>]*>.*?</programme>", re.DOTALL)
+_TITLE = re.compile(r"<title\b[^>]*>(.*?)</title>", re.DOTALL)
+_SUB_TITLE = re.compile(r"<sub-title\b[^>]*>(.*?)</sub-title>", re.DOTALL)
+_ICON_EL = re.compile(r"<icon\b[^>]*/>|<icon\b[^>]*>.*?</icon>", re.DOTALL)
+
+# Gracenote writes the visiting side first, in both the "at" and the "vs."
+# spellings, which is the order game-thumbs takes its two team segments in.
+_MATCHUP = re.compile(r"^(?P<away>.+?)\s+(?:at|vs\.?)\s+(?P<home>.+)$", re.I)
 
 # Consecutive assets the CDN answered for on NO code before a run stops
 # probing. Every one of those already failed on all five codes, so a run of
@@ -120,6 +155,33 @@ class ArtworkCache:
             logger.warning("[EPG-ART] Could not write cache %s: %s", self.path, e)
 
 
+def _slug(team: str) -> str:
+    """Team name as the path segment game-thumbs matches on."""
+    return re.sub(r"[^a-z0-9]+", "-", unescape(team).lower()).strip("-")
+
+
+def matchup_banner(base: str, title: str, sub_title: str) -> str | None:
+    """game-thumbs URL for one matchup, or None when it is not a matchup.
+
+    ``title`` names the league and ``sub_title`` the two teams; both arrive
+    still XML-escaped, as they sit in the feed.
+    """
+    league = MATCHUP_LEAGUES.get(unescape(title).strip().lower())
+    if league is None:
+        return None
+    teams = _MATCHUP.match(unescape(sub_title).strip())
+    if teams is None:
+        return None
+    away, home = _slug(teams.group("away")), _slug(teams.group("home"))
+    if not away or not home:
+        return None
+    # fallback=true is not optional: a team game-thumbs cannot resolve answers
+    # 400 with a JSON body without it, and the guide draws that as a broken
+    # image. With it, an unresolved side still yields a usable banner.
+    return (f"{base}/{league}/{away}/{home}/cover"
+            f"?style=4&logo=true&fallback=true")
+
+
 class ArtworkRewriter:
     """Repoints icons across a stream of text without holding it all.
 
@@ -129,10 +191,12 @@ class ArtworkRewriter:
     answer for are recorded in ``unknown`` for the caller to probe later.
     """
 
-    def __init__(self, cache: ArtworkCache):
+    def __init__(self, cache: ArtworkCache, banner_base: str = ""):
         self.cache = cache
+        self.banner_base = banner_base.rstrip("/")
         self.unknown: dict[str, tuple[str, str, str, str]] = {}
         self.rewritten = 0
+        self.bannered = 0
         self._tail = ""
 
     def _sub(self, m: re.Match) -> str:
@@ -149,11 +213,53 @@ class ArtworkRewriter:
         return (f"{m.group('base')}{m.group('asset')}_{m.group('kind')}"
                 f"_{code}_{m.group('suffix')}.jpg")
 
+    def _banner(self, m: re.Match) -> str:
+        """Give one programme its matchup banner, if it is a matchup."""
+        prog = m.group(0)
+        title = _TITLE.search(prog)
+        sub_title = _SUB_TITLE.search(prog)
+        if title is None or sub_title is None:
+            return prog
+        url = matchup_banner(self.banner_base, title.group(1), sub_title.group(1))
+        if url is None:
+            return prog
+        self.bannered += 1
+        # The URL carries no quote to escape, only the & joining its query.
+        icon = '<icon src="%s" />' % escape(url)
+        # Replacing in place keeps the icon where the feed had it, which is
+        # where a reader expecting XMLTV's child order looks for it. Only a
+        # programme that carried no icon needs one appended.
+        if _ICON_EL.search(prog):
+            return _ICON_EL.sub(lambda _: icon, prog, count=1)
+        return f"{prog[:-len(_PROGRAMME_END)]}{icon}{_PROGRAMME_END}"
+
+    def _render(self, text: str) -> str:
+        """Both passes, in the order that lets the banner win.
+
+        The banner goes first so a matchup's own icon is already gone by the
+        time the repoint runs; what the repoint then sees is the artwork of
+        everything that is not a matchup.
+        """
+        if self.banner_base:
+            text = _PROGRAMME.sub(self._banner, text)
+        return _ICON.sub(self._sub, text)
+
     def feed(self, text: str) -> str:
         buf = self._tail + text
         if len(buf) <= _MAX_MATCH:
             self._tail = buf
             return ""
+        if self.banner_base:
+            # Cut just past the last closed programme so the banner pass only
+            # ever sees whole ones. Nothing is lost while the header and the
+            # channel list stream by with no programme to close: that falls
+            # through to the icon boundary below, and a programme cannot have
+            # started yet for the banner pass to miss.
+            end = buf.rfind(_PROGRAMME_END)
+            if end >= 0:
+                cut = end + len(_PROGRAMME_END)
+                self._tail = buf[cut:]
+                return self._render(buf[:cut])
         # Cut where a match cannot straddle. Splitting at a fixed offset put
         # the HEAD of a URL in the emitted half and its tail in the carried
         # half, so the match was gone from both — the icon passed through
@@ -177,7 +283,7 @@ class ArtworkRewriter:
         return _ICON.sub(self._sub, buf[:cut])
 
     def finish(self) -> str:
-        out = _ICON.sub(self._sub, self._tail)
+        out = self._render(self._tail)
         self._tail = ""
         return out
 

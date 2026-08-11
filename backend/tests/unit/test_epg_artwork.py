@@ -16,6 +16,7 @@ from services.epg_artwork import (
     _OUTAGE_STREAK,
     _PROBE_CONCURRENCY,
     _probe,
+    matchup_banner,
     probe_unknown,
 )
 
@@ -26,6 +27,17 @@ XML = f'<programme><title>CIA</title><icon src="{ICON}" /></programme>'
 BARE = "http://dtil.tmsimg.com/assets/p30177490_b_h8_ab.jpg"
 PORTRAIT = "http://dtil.tmsimg.com/assets/p30177490_b_v12_ab.jpg"
 SEED = {"p30177490_b_ab": "v12"}
+
+GT = "http://thumbs.example:3100"
+MATCHUP = (
+    '<programme start="20260830190000 +0000" channel="sec.us">'
+    '<title lang="en">College Football</title>'
+    '<sub-title lang="en">Alabama at South Carolina</sub-title>'
+    '<desc lang="en">The Tide visit the Gamecocks.</desc>'
+    "</programme>"
+)
+BANNER = (f"{GT}/ncaaf/alabama/south-carolina/cover"
+          "?style=4&amp;logo=true&amp;fallback=true")
 
 # Bound at import, before any test can patch it. A test that streams twice
 # would otherwise build its second stub on top of the first, and the first
@@ -234,6 +246,103 @@ class TestWideGapsBetweenIcons:
 
         assert worst <= 2 * _MAX_MATCH
         assert worst > _MAX_MATCH, "the wider reach was never exercised"
+
+
+class TestMatchupBanner:
+    """Sports matchups get a banner built from their two teams.
+
+    Gracenote publishes no per-game art for these: every airing of a league
+    carries the SAME series image, so a guide shows one picture for every
+    game, and 39% of them carry no image at all. game-thumbs renders the
+    matchup from the two team names the sub-title already holds.
+    """
+
+    def test_a_matchup_with_no_artwork_is_given_a_banner(self, tmp_path):
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+        out = _run(rw, MATCHUP)
+        assert f'<icon src="{BANNER}" />' in out
+        assert rw.bannered == 1
+
+    def test_a_recycled_series_image_is_replaced_where_it_stood(self, tmp_path):
+        """In place, not appended: a reader that honours XMLTV's child order
+        looks for the icon where the feed put it."""
+        with_icon = MATCHUP.replace(
+            "<desc", f'<icon src="{BARE}" /><desc')
+        out = _run(ArtworkRewriter(_cache(tmp_path, SEED), banner_base=GT),
+                   with_icon)
+        assert out.index(BANNER) < out.index("<desc")
+        assert BARE not in out and PORTRAIT not in out
+        assert out.count("<icon") == 1
+
+    def test_artwork_outside_a_matchup_is_still_repointed(self, tmp_path):
+        """The banner pass must not cost the portrait repoint its job."""
+        out = _run(ArtworkRewriter(_cache(tmp_path, SEED), banner_base=GT),
+                   MATCHUP + XML)
+        assert BANNER in out
+        assert PORTRAIT in out
+
+    def test_a_league_game_thumbs_does_not_know_is_left_alone(self, tmp_path):
+        """An unreal league segment answers 400 even with fallback=true, and
+        a 400 draws as a broken image — worse than the generic art."""
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+        out = _run(rw, MATCHUP.replace("College Football", "Cycling"))
+        assert "<icon" not in out
+        assert rw.bannered == 0
+
+    def test_a_programme_with_no_matchup_is_left_alone(self, tmp_path):
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+        out = _run(rw, MATCHUP.replace(
+            "<sub-title lang=\"en\">Alabama at South Carolina</sub-title>",
+            "<sub-title lang=\"en\">Week 3 Preview</sub-title>"))
+        assert "<icon" not in out
+        assert rw.bannered == 0
+
+    def test_no_base_url_leaves_the_feed_as_it_was(self, tmp_path):
+        """The default: an operator with no game-thumbs sees today's guide."""
+        rw = ArtworkRewriter(_cache(tmp_path))
+        assert _run(rw, MATCHUP) == MATCHUP
+        assert rw.bannered == 0
+
+    def test_the_query_separator_is_escaped(self, tmp_path):
+        """A bare & in an attribute makes the feed not parse at all."""
+        out = _run(ArtworkRewriter(_cache(tmp_path), banner_base=GT), MATCHUP)
+        assert "&amp;logo=true&amp;fallback=true" in out
+        assert "?style=4&l" not in out
+
+    def test_output_is_identical_at_every_chunk_size(self, tmp_path):
+        """A programme split across chunks still gets its banner: the cut
+        lands past a closed programme, so the pass never sees half of one."""
+        body = f"<tv>{MATCHUP}{XML}{MATCHUP}</tv>"
+        whole = _run(ArtworkRewriter(_cache(tmp_path, SEED), banner_base=GT),
+                     body)
+        assert whole.count(BANNER) == 2
+        for size in (1, 7, 64, 200, 511, 512, 513, 4096):
+            assert _run(
+                ArtworkRewriter(_cache(tmp_path, SEED), banner_base=GT),
+                body, size,
+            ) == whole, f"chunk size {size} diverged"
+
+    async def test_it_survives_the_real_streaming_path(self, monkeypatch,
+                                                       tmp_path):
+        rw = ArtworkRewriter(_cache(tmp_path, SEED), banner_base=GT)
+        out = await _streamed(monkeypatch, rw, f"<tv>{MATCHUP}{XML}</tv>")
+        assert BANNER in out and PORTRAIT in out
+
+    def test_a_team_name_is_slugged_and_unescaped(self):
+        """Team names arrive XML-escaped and full of punctuation."""
+        url = matchup_banner(GT, "College Football",
+                             "Texas A&amp;M at Ohio State")
+        assert url == (f"{GT}/ncaaf/texas-a-m/ohio-state/cover"
+                       "?style=4&logo=true&fallback=true")
+
+    def test_the_vs_spelling_reads_the_same_way_round(self):
+        """Gracenote writes the visiting side first in both spellings."""
+        assert matchup_banner(GT, "NHL Hockey", "Rangers vs. Bruins") == (
+            f"{GT}/nhl/rangers/bruins/cover?style=4&logo=true&fallback=true")
+
+    def test_a_trailing_slash_on_the_base_is_not_doubled(self, tmp_path):
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT + "/")
+        assert "//ncaaf" not in _run(rw, MATCHUP)
 
 
 class TestProbe:

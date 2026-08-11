@@ -24,7 +24,7 @@ from alert_methods import send_alert
 from auth import RequireAdminIfEnabled
 from auth import get_jwt_secret_key
 from cache import get_cache
-from config import CONFIG_DIR, validate_url_scheme
+from config import CONFIG_DIR, get_settings, validate_url_scheme
 from dispatcharr_client import get_client, upstream_http_exception
 from epg_matching import (
     _epg_source_id,
@@ -2115,7 +2115,9 @@ async def artwork_proxy(source_id: int, background: BackgroundTasks = None):
     validate_url_scheme(url, "EPG source URL")
 
     cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
-    rewriter = ArtworkRewriter(cache)
+    rewriter = ArtworkRewriter(
+        cache, banner_base=get_settings().sports_banner_base_url
+    )
 
     async def body():
         try:

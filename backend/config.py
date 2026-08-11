@@ -141,6 +141,13 @@ class DispatcharrSettings(BaseModel):
     # Set to 0 to disable auto-matching (all matches need review)
     # Set to 100 to require perfect confidence for auto-match
     epg_auto_match_threshold: int = 80
+    # Base URL of a game-thumbs instance (e.g. http://host:3100). When set, the
+    # EPG artwork proxy gives a sports matchup a banner built from its two
+    # teams. Gracenote publishes no per-game art for these, only one series
+    # image reused across every airing, so the guide otherwise shows the same
+    # picture for every game. Empty leaves programme artwork exactly as the
+    # upstream feed had it.
+    sports_banner_base_url: str = ""
     # Custom network prefixes to strip during bulk channel creation
     # These are merged with the built-in list (CHAMP, PPV, NFL, etc.)
     custom_network_prefixes: list[str] = []
