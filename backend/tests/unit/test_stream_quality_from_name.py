@@ -53,6 +53,40 @@ class TestHeightFromStats:
         ) == 2160
 
 
+class TestNameSourcesReachTheSort:
+    """A channel's stream list arrives either as dicts carrying names or as
+    bare ids. Only probed streams have a name in the stats cache, so when the
+    payload is id-only the sort saw no name at all and scored every fallback
+    equal — which is how a live channel ended up SD-first with 4K last.
+    """
+
+    def _stats_for(self, current_streams, stream_items, stream_name_map):
+        """Mirror the engine's seeding step for both payload shapes."""
+        payload_names = {
+            s["id"]: s["name"]
+            for s in stream_items
+            if isinstance(s, dict) and s.get("id") and s.get("name")
+        }
+        names = {
+            sid: payload_names.get(sid) or stream_name_map.get(sid)
+            for sid in current_streams
+        }
+        return {sid: {"stream_name": n} for sid, n in names.items() if n}
+
+    def test_names_come_from_the_payload_when_it_carries_dicts(self):
+        stats = self._stats_for(
+            [1, 2],
+            [{"id": 1, "name": "ESPN SD"}, {"id": 2, "name": "ESPN 4K"}],
+            {},
+        )
+        assert _resolution_height_from_stats(stats[2]) == 2160
+
+    def test_names_come_from_the_map_when_the_payload_is_ids_only(self):
+        stats = self._stats_for([1, 2], [1, 2], {1: "ESPN SD", 2: "ESPN 4K"})
+        assert _resolution_height_from_stats(stats[1]) == 480
+        assert _resolution_height_from_stats(stats[2]) == 2160
+
+
 class TestChannelOrdering:
     def test_unprobed_streams_order_best_definition_first(self):
         """The reported case: FS1 merged 12 copies and put 4K at position 3

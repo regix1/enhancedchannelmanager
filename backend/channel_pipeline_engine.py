@@ -1621,6 +1621,7 @@ class ChannelPipelineEngine:
         stream_m3u_map: dict = None,
         custom_stream_ids: set[int] | None = None,
         catchup_stream_ids: set[int] | None = None,
+        stream_name_map: dict | None = None,
     ):
         """
         Pass 3.5: Reorder streams within channels using smart sort.
@@ -1628,9 +1629,17 @@ class ChannelPipelineEngine:
         Uses the user's stream_sort_priority, stream_sort_enabled, and
         m3u_account_priorities settings (same logic as stream_prober smart sort).
         Falls back to resolution-only if settings not available.
+
+        ``stream_name_map`` (stream_id -> name) covers the streams the channel
+        payload lists as bare ids. Names otherwise reach the sort only from the
+        stats cache, which holds probed streams alone, so a quality sort over
+        unprobed fallbacks saw no name to read a tier from and scored them all
+        equal.
         """
         if stream_m3u_map is None:
             stream_m3u_map = {}
+        if stream_name_map is None:
+            stream_name_map = {}
         if custom_stream_ids is None:
             custom_stream_ids = set()
         if catchup_stream_ids is None:
@@ -1679,16 +1688,24 @@ class ChannelPipelineEngine:
                 # to "Stream <id>", which can make sorting appear to do nothing.
                 # If the channel payload includes stream dicts with names, seed those
                 # into the per-call stats cache so name-based sorts can still reorder.
+                # Names come from the channel payload when it carries stream
+                # dicts, and from stream_name_map when it carries bare ids —
+                # Dispatcharr returns either shape, and the id-only one used to
+                # leave every name unknown.
                 stats_cache = self._stream_stats_cache
-                if any(isinstance(s, dict) and s.get("name") for s in stream_items):
+                payload_names = {
+                    s["id"]: s["name"]
+                    for s in stream_items
+                    if isinstance(s, dict) and s.get("id") and s.get("name")
+                }
+                names = {
+                    sid: payload_names.get(sid) or stream_name_map.get(sid)
+                    for sid in current_streams
+                }
+                names = {sid: n for sid, n in names.items() if n}
+                if names:
                     stats_cache = dict(self._stream_stats_cache)
-                    for s in stream_items:
-                        if not isinstance(s, dict):
-                            continue
-                        sid = s.get("id")
-                        sname = s.get("name")
-                        if not sid or not sname:
-                            continue
+                    for sid, sname in names.items():
                         existing = stats_cache.get(sid)
                         if isinstance(existing, dict):
                             if not existing.get("stream_name"):
@@ -2252,10 +2269,16 @@ class ChannelPipelineEngine:
         # and a set of operator-added custom stream IDs (Dispatcharr is_custom) for
         # the "custom_streams" Smart Sort criterion (bead ap1ud / GH #244).
         stream_m3u_map = {}
+        # Names for the quality sort's tier fallback: a channel's stream list
+        # arrives as bare ids, and only probed streams have a name in the
+        # stats cache.
+        stream_name_map: dict[int, str] = {}
         custom_stream_ids: set[int] = set()
         catchup_stream_ids: set[int] = set()
         for s in streams:
             stream_m3u_map[s.stream_id] = s.m3u_account_id
+            if s.stream_name:
+                stream_name_map[s.stream_id] = s.stream_name
             if getattr(s, "is_custom", False):
                 custom_stream_ids.add(s.stream_id)
             if getattr(s, "is_catchup", False):
@@ -2994,6 +3017,7 @@ class ChannelPipelineEngine:
                 settings=settings, stream_m3u_map=stream_m3u_map,
                 custom_stream_ids=custom_stream_ids,
                 catchup_stream_ids=catchup_stream_ids,
+                stream_name_map=stream_name_map,
             )
 
             # =================================================================
