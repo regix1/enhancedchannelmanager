@@ -1233,6 +1233,7 @@ export interface SettingsResponse {
   // Default False preserves today's locked behavior.
   allow_multi_provider_auto_sync: boolean;
   epg_auto_match_threshold: number;  // 0-100, confidence score threshold for auto-matching
+  sports_banner_base_url: string;  // game-thumbs base URL; empty leaves programme artwork as the feed had it
   custom_network_prefixes: string[];  // User-defined network prefixes to strip
   custom_network_suffixes: string[];  // User-defined network suffixes to strip
   stats_poll_interval: number;  // Seconds between stats polling (default 10)
@@ -1394,6 +1395,7 @@ export async function saveSettings(settings: {
   // bd-dgs64 (GH #591): optional - admin-only on the backend, defaults to false.
   allow_multi_provider_auto_sync?: boolean;
   epg_auto_match_threshold?: number;  // Optional - 0-100, defaults to 80
+  sports_banner_base_url?: string;  // Optional - game-thumbs base URL, defaults to '' (feature off)
   custom_network_prefixes?: string[];  // Optional - user-defined network prefixes
   custom_network_suffixes?: string[];  // Optional - user-defined network suffixes
   stats_poll_interval?: number;  // Optional - seconds between stats polling, defaults to 10

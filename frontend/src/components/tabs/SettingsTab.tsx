@@ -361,6 +361,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   const [timezonePreference, setTimezonePreference] = useState('both');
   const [defaultChannelProfileIds, setDefaultChannelProfileIds] = useState<number[]>([]);
   const [epgAutoMatchThreshold, setEpgAutoMatchThreshold] = useState(80);
+  const [sportsBannerBaseUrl, setSportsBannerBaseUrl] = useState('');
   const [customNetworkPrefixes, setCustomNetworkPrefixes] = useState<string[]>([]);
   const [customNetworkSuffixes, setCustomNetworkSuffixes] = useState<string[]>([]);
   const [normalizeOnChannelCreate, setNormalizeOnChannelCreate] = useState(false);
@@ -880,6 +881,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       setMaxChannelPipelineLogEntries(settings.max_auto_creation_log_entries ?? 500);
       setDefaultChannelProfileIds(settings.default_channel_profile_ids);
       setEpgAutoMatchThreshold(settings.epg_auto_match_threshold ?? 80);
+      setSportsBannerBaseUrl(settings.sports_banner_base_url ?? '');
       setCustomNetworkPrefixes(settings.custom_network_prefixes ?? []);
       setCustomNetworkSuffixes(settings.custom_network_suffixes ?? []);
       setNormalizeOnChannelCreate(settings.normalize_on_channel_create ?? false);
@@ -1303,6 +1305,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         date_format: dateFormat,
         default_channel_profile_ids: defaultChannelProfileIds,
         epg_auto_match_threshold: epgAutoMatchThreshold,
+        sports_banner_base_url: sportsBannerBaseUrl.trim(),
         custom_network_prefixes: customNetworkPrefixes,
         custom_network_suffixes: customNetworkSuffixes,
         normalize_on_channel_create: normalizeOnChannelCreate,
@@ -2722,6 +2725,23 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
             EPG matches with a confidence score at or above this threshold will be automatically assigned.
             Lower values match more channels automatically but may be less accurate.
             Set to 0 to require manual review for all matches.
+          </p>
+        </div>
+
+        <div className="form-group">
+          <label htmlFor="sportsBannerBaseUrl">Sports matchup banners</label>
+          <input
+            id="sportsBannerBaseUrl"
+            type="url"
+            placeholder="http://your-host:3100"
+            value={sportsBannerBaseUrl}
+            onChange={(e) => setSportsBannerBaseUrl(e.target.value)}
+          />
+          <p className="form-hint">
+            Base URL of a game-thumbs server. Guide providers publish no artwork for an
+            individual game, so every airing of a league shows the same picture or none at
+            all. With this set, the EPG artwork proxy gives each matchup a banner built from
+            its two teams. Leave it empty to keep the artwork exactly as the source sends it.
           </p>
         </div>
       </div>

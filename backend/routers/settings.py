@@ -353,6 +353,7 @@ class SettingsRequest(BaseModel):
     # guard. Admin-only (see _ADMIN_ONLY_SETTINGS_FIELDS). Default False.
     allow_multi_provider_auto_sync: bool = False
     epg_auto_match_threshold: int = 80
+    sports_banner_base_url: str = ""
     # bd-ugzn4 (BD-K): dedup epic operator settings. Defaults match
     # config.DispatcharrSettings so an older frontend bundle that doesn't
     # send these fields persists the current value rather than getting
@@ -490,6 +491,7 @@ class SettingsResponse(BaseModel):
     # bd-dgs64 (GH #591): see DispatcharrSettings.allow_multi_provider_auto_sync.
     allow_multi_provider_auto_sync: bool
     epg_auto_match_threshold: int
+    sports_banner_base_url: str
     dedup_threshold: float
     dedup_m3u_toast_suppressed: bool
     custom_network_prefixes: list[str]
@@ -723,6 +725,7 @@ async def get_current_settings():
         linked_m3u_accounts=settings.linked_m3u_accounts,
         allow_multi_provider_auto_sync=settings.allow_multi_provider_auto_sync,
         epg_auto_match_threshold=settings.epg_auto_match_threshold,
+        sports_banner_base_url=settings.sports_banner_base_url,
         dedup_threshold=settings.dedup_threshold,
         dedup_m3u_toast_suppressed=settings.dedup_m3u_toast_suppressed,
         custom_network_prefixes=settings.custom_network_prefixes,

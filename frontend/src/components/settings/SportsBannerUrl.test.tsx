@@ -1,25 +1,23 @@
 /**
- * Tests for the Channel Pipeline "Runaway Safety Cap" control (skg35).
+ * Tests for the "Sports matchup banners" game-thumbs base URL.
  *
- * Surfaces ``max_auto_created_channels_per_run`` (the GH #473 runaway-creation
- * OOM safety valve) and its sibling ``max_auto_creation_log_entries`` in the
- * Settings > Channel Pipeline page so an operator can view + adjust them instead
- * of hand-editing settings.json.
+ * Guide providers publish no artwork for an individual game: measured
+ * against the live feed, 39% of College Football airings carried no icon at
+ * all and the rest all shared ONE series image. `sports_banner_base_url`
+ * points the EPG artwork proxy at a game-thumbs server so each matchup gets
+ * a banner built from its two teams.
  *
- * Contracts under test:
- *   - The numeric inputs render on the Channel Pipeline page and populate from
- *     the loaded settings.
- *   - Helper text explains the idempotent-rerun behavior + the 0-disables
- *     semantics (so the operator knows a capped run can simply be re-run).
- *   - An admin can edit the cap and the new value is sent in the save payload.
- *   - For a NON-admin the inputs are disabled (consistent with the backend
- *     field-level admin gate, which 403s a non-admin who changes them).
+ * The field is pure wiring, which is exactly the kind that breaks silently
+ * — an empty value is also the off switch, so a load or save that drops it
+ * turns the feature off rather than erroring. These pin the round trip:
+ *   - It renders on the Channel Defaults page and populates from settings.
+ *   - An edit reaches the save payload.
+ *   - A blank stays blank in the payload instead of going undefined, which
+ *     is what keeps "off" distinguishable from "field not sent".
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
-// Mutable auth identity so a single mocked module can serve both the admin and
-// non-admin cases (vi.mock factories are hoisted + evaluated once per file).
 let mockUser: { is_admin: boolean; username: string } = { is_admin: true, username: 'admin' };
 
 vi.mock('../../services/api', () => ({
@@ -215,16 +213,16 @@ const settingsBase = {
   ssrf_outbound_mode: 'lan_friendly' as const,
 };
 
-function renderOnChannelPipeline() {
+function renderOnChannelDefaults() {
   return render(
     <SettingsTab
       onSaved={vi.fn()}
-      initialSettingsPage="channel-pipeline"
+      initialSettingsPage="channel-defaults"
     />
   );
 }
 
-describe('Channel Pipeline Runaway Safety Cap (skg35)', () => {
+describe('Sports matchup banner URL', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockUser = { is_admin: true, username: 'admin' };
@@ -235,47 +233,70 @@ describe('Channel Pipeline Runaway Safety Cap (skg35)', () => {
     vi.mocked(api.getM3UAccounts).mockResolvedValue([]);
   });
 
-  it('renders the channel-cap input populated from loaded settings', async () => {
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({ max_auto_created_channels_per_run: 750 }));
-    renderOnChannelPipeline();
+  it('shows the URL the settings were loaded with', async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      makeSettings({ sports_banner_base_url: 'http://thumbs.example:3100' }));
+    renderOnChannelDefaults();
 
-    const input = await screen.findByLabelText(/Max channels created per run/i) as HTMLInputElement;
-    expect(input.value).toBe('750');
+    // The input renders from the component's `useState('')` default, so it
+    // exists before the mocked getSettings() promise has resolved. Read the
+    // value inside waitFor so it re-polls until the loaded one lands.
+    const input = await screen.findByLabelText(/Sports matchup banners/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe('http://thumbs.example:3100'));
   });
 
-  it('explains the idempotent-rerun + 0-disables semantics in helper text', async () => {
-    renderOnChannelPipeline();
+  it('is empty when no server is configured, which is the off state', async () => {
+    renderOnChannelDefaults();
 
-    await screen.findByLabelText(/Max channels created per run/i);
-    // The idempotent-rerun hint is the operator's actual escape hatch — it must
-    // appear on the channel-cap field specifically (the one the capped-run
-    // message points them at).
-    expect(screen.getByText(/idempotent/i)).toBeInTheDocument();
-    // Both cap fields document the 0-disables sentinel, so there are two.
-    expect(screen.getAllByText(/Set to 0 to disable the cap/i)).toHaveLength(2);
+    const input = await screen.findByLabelText(/Sports matchup banners/i) as HTMLInputElement;
+    expect(input.value).toBe('');
   });
 
-  it('lets an admin raise the cap and sends the new value on save', async () => {
-    renderOnChannelPipeline();
+  it('says what an empty value does, since blank is a real choice', async () => {
+    renderOnChannelDefaults();
 
-    const input = await screen.findByLabelText(/Max channels created per run/i) as HTMLInputElement;
-    expect(input.disabled).toBe(false);
-    fireEvent.change(input, { target: { value: '5000' } });
+    await screen.findByLabelText(/Sports matchup banners/i);
+    expect(screen.getByText(/Leave it empty/i)).toBeInTheDocument();
+  });
+
+  it('sends an edited URL on save', async () => {
+    renderOnChannelDefaults();
+
+    const input = await screen.findByLabelText(/Sports matchup banners/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'http://thumbs.example:3100' } });
 
     fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
 
     await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
     const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
-    expect(payload.max_auto_created_channels_per_run).toBe(5000);
+    expect(payload.sports_banner_base_url).toBe('http://thumbs.example:3100');
   });
 
-  it('disables the cap inputs for a non-admin (backend gate would 403 a change)', async () => {
-    mockUser = { is_admin: false, username: 'viewer' };
-    renderOnChannelPipeline();
+  it('trims a pasted URL so stray whitespace cannot break every banner', async () => {
+    renderOnChannelDefaults();
 
-    const channelInput = await screen.findByLabelText(/Max channels created per run/i) as HTMLInputElement;
-    const logInput = screen.getByLabelText(/Max execution-log entries per run/i) as HTMLInputElement;
-    expect(channelInput.disabled).toBe(true);
-    expect(logInput.disabled).toBe(true);
+    const input = await screen.findByLabelText(/Sports matchup banners/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '  http://thumbs.example:3100  ' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_base_url).toBe('http://thumbs.example:3100');
+  });
+
+  it('sends a blank as an empty string, not undefined', async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      makeSettings({ sports_banner_base_url: 'http://thumbs.example:3100' }));
+    renderOnChannelDefaults();
+
+    const input = await screen.findByLabelText(/Sports matchup banners/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe('http://thumbs.example:3100'));
+    fireEvent.change(input, { target: { value: '' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+    const payload = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(payload.sports_banner_base_url).toBe('');
   });
 });
