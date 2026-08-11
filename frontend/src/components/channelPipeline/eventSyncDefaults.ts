@@ -49,6 +49,13 @@ export const MAX_PAST_EVENT_GRACE_HOURS = 72;
  */
 export const DEFAULT_PROMOTE_LEAD_HOURS = 24;
 
+/**
+ * Suggested range when an operator first asks for a promoted-channel block.
+ * High enough to sit past a normal lineup, which is the whole point: the
+ * backend default is 'auto', and auto starts at 1.
+ */
+export const DEFAULT_PROMOTE_CHANNEL_NUMBER = '900-999';
+
 /** Mirror of MIN_PROMOTE_LEAD_HOURS in backend/services/event_sync_promote.py. */
 export const MIN_PROMOTE_LEAD_HOURS = 1;
 

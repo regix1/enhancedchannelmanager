@@ -190,6 +190,14 @@ export interface EventSyncConfig {
    * recreate the same channel every day.
    */
   promote_lead_hours?: number;
+  /**
+   * Where promoted event channels are numbered: 'auto', a positive integer,
+   * or a 'min-max' range like '900-999'. Absent means 'auto', which starts
+   * at 1 and takes the lowest free numbers — that is how event channels end
+   * up interleaved with an operator's real lineup. A range parks them past
+   * it.
+   */
+  promote_channel_number?: string | number;
 }
 
 // =============================================================================

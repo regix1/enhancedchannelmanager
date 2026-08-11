@@ -5149,7 +5149,13 @@ class ActionExecutor:
                 "name_template": unit.channel_name,
                 "if_exists": "skip",
                 "group_id": target_group_id,
-                "channel_number": "auto",
+                # "auto" starts at 1, so promoted events took the lowest free
+                # numbers and interleaved themselves with an operator's real
+                # lineup. ``promote_channel_number`` takes the same values as
+                # a create_channel action's ("auto", an int, or a "min-max"
+                # range), so a range parks them past the real channels.
+                # Absent means "auto" — unchanged for every existing rule.
+                "channel_number": config.get("promote_channel_number", "auto"),
             })
             first_ctx = StreamContext(
                 stream_id=first.stream.stream_id,

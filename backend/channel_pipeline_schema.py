@@ -810,6 +810,7 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     # exception to "ECM never creates channels". Opt-in; absent keys mean
     # the feature is invisible.
     "promote_unmatched",
+    "promote_channel_number",
     "promote_target_group_id",
     "max_promote_per_run",
     # Past-event filter — keeps finished events (which providers leave in
@@ -1386,6 +1387,25 @@ def validate_event_sync_config(config: Any) -> list[str]:
             "in that group (omit the key entirely to keep promotion off)",
         ))
         promote_unmatched = False
+
+    # Where promoted channels are numbered. "auto" starts at 1, which put
+    # event channels in among an operator's real lineup; a "min-max" range
+    # parks them past it. Same grammar as a create_channel action's
+    # channel_number, because it feeds that action.
+    promote_channel_number = config.get("promote_channel_number")
+    if promote_channel_number is not None and not (
+        promote_channel_number == "auto"
+        or (isinstance(promote_channel_number, int)
+            and not isinstance(promote_channel_number, bool)
+            and promote_channel_number > 0)
+        or (isinstance(promote_channel_number, str)
+            and re.fullmatch(r"\d+-\d+", promote_channel_number))
+    ):
+        errors.append(_event_sync_error(
+            "promote_channel_number", promote_channel_number,
+            "'auto', a positive integer, or a 'min-max' range like "
+            "'900-999' — where promoted event channels are numbered",
+        ))
 
     promote_target_group_id = config.get("promote_target_group_id")
     if promote_target_group_id is not None \

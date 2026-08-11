@@ -75,6 +75,7 @@ import {
   DEFAULT_PROMOTE_LEAD_HOURS,
   MIN_PROMOTE_LEAD_HOURS,
   MAX_PROMOTE_LEAD_HOURS,
+  DEFAULT_PROMOTE_CHANNEL_NUMBER,
   EVENT_ATTACH_FLOOR,
   clampAttachThreshold,
   selectionIsBuiltinDefaults,
@@ -402,6 +403,16 @@ export function EventSyncRuleEditor({
   );
   const [promoteLeadText, setPromoteLeadText] = useState(
     String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS)
+  );
+  // Channel-number block for promoted events. Same shape as the lead-time
+  // box: an absent promote_channel_number IS the off state, and off means
+  // 'auto' — which starts at 1, so event channels land among the real
+  // lineup. Presence of the stored value is what the box reads and writes.
+  const [numberPromoted, setNumberPromoted] = useState(
+    config?.promote_channel_number != null
+  );
+  const [promoteNumberText, setPromoteNumberText] = useState(
+    String(config?.promote_channel_number ?? DEFAULT_PROMOTE_CHANNEL_NUMBER)
   );
   // Stream health check. Default OFF — the backend treats an absent key as
   // false. Checking a stream contacts the provider, so a run only pays that
@@ -794,6 +805,16 @@ export function EventSyncRuleEditor({
         )
       );
     }
+    // Same absence-is-off rule as the lead window. The backend rejects
+    // anything that is not 'auto', a positive integer, or 'min-max', so an
+    // unparseable box falls back to the default rather than saving a value
+    // that would fail validation.
+    if (numberPromoted) {
+      const entered = promoteNumberText.trim();
+      built.promote_channel_number = /^(auto|\d+|\d+-\d+)$/.test(entered)
+        ? entered
+        : DEFAULT_PROMOTE_CHANNEL_NUMBER;
+    }
     // Stream health check: same shape as the past-event filter, not the lead
     // window. `false` is expressible here, so an unticked box still has to be
     // written back whenever the stored config carries the key — that written
@@ -1041,6 +1062,9 @@ export function EventSyncRuleEditor({
       limitPromoteLead !== (config?.promote_lead_hours != null) ||
       promoteLeadText !==
         String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS) ||
+      numberPromoted !== (config?.promote_channel_number != null) ||
+      promoteNumberText !==
+        String(config?.promote_channel_number ?? DEFAULT_PROMOTE_CHANNEL_NUMBER) ||
       skipDeadStreams !== (config?.skip_dead_streams ?? false) ||
       dummyEpgProfileId !== (config?.dummy_epg_profile_id ?? null) ||
       streamSortField !== (rule?.stream_sort_field ?? '') ||
@@ -1052,7 +1076,8 @@ export function EventSyncRuleEditor({
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
     promoteTargetGroupId, skipPastEvents, pastEventGraceText,
-    limitPromoteLead, promoteLeadText, skipDeadStreams,
+    limitPromoteLead, promoteLeadText, numberPromoted, promoteNumberText,
+    skipDeadStreams,
     dummyEpgProfileId, config, rule,
     initial, customSharedMeta, streamSortField, streamSortOrder,
   ]);
@@ -2386,6 +2411,46 @@ export function EventSyncRuleEditor({
                         picked up on a later run, so nothing is lost by
                         waiting (default {DEFAULT_PROMOTE_LEAD_HOURS}, max{' '}
                         {MAX_PROMOTE_LEAD_HOURS}).
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={numberPromoted}
+                          onChange={e => setNumberPromoted(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-number-promoted"
+                        />
+                        <span>Give promoted channels their own number range</span>
+                      </label>
+                      <span className="form-hint">
+                        Off by default, so a promoted channel takes the lowest
+                        free number starting at 1 and lands in among your real
+                        channels. Turn this on to park event channels past
+                        them.
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && numberPromoted && (
+                    <div className="form-group">
+                      <label htmlFor={`${id}-promote-number`}>
+                        Number promoted channels from
+                      </label>
+                      <input
+                        id={`${id}-promote-number`}
+                        type="text"
+                        value={promoteNumberText}
+                        onChange={e => setPromoteNumberText(e.target.value)}
+                        disabled={isLoading}
+                        data-testid="event-sync-promote-channel-number"
+                      />
+                      <span className="form-hint">
+                        A range like {DEFAULT_PROMOTE_CHANNEL_NUMBER}, a single
+                        number to count up from, or auto to start at 1. Each
+                        new channel takes the first free number in the range.
                       </span>
                     </div>
                   )}

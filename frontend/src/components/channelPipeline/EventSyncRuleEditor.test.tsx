@@ -2060,6 +2060,102 @@ describe('EventSyncRuleEditor', () => {
       expect(config).not.toHaveProperty('promote_lead_hours');
     });
 
+    it('leaves promote_channel_number absent until the operator asks for a range', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      // Absent means 'auto', which is what every rule saved before this
+      // field existed already does — turning promotion on must not change
+      // their numbering.
+      expect(screen.getByTestId('event-sync-number-promoted')).not.toBeChecked();
+      expect(screen.queryByTestId('event-sync-promote-channel-number')).toBeNull();
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      const config = onSave.mock.calls[0][0].event_sync_config;
+      expect(config).not.toHaveProperty('promote_channel_number');
+    });
+
+    it('emits the promoted channel range once the box is ticked', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      await user.click(screen.getByTestId('event-sync-number-promoted'));
+      const box = await screen.findByTestId('event-sync-promote-channel-number');
+      expect(box).toHaveValue('900-999');
+      await user.clear(box);
+      await user.type(box, '500-599');
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_channel_number
+      ).toBe('500-599');
+    });
+
+    it('falls back to the default when the range is not a shape the backend takes', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      await user.click(screen.getByTestId('event-sync-number-promoted'));
+      const box = await screen.findByTestId('event-sync-promote-channel-number');
+      await user.clear(box);
+      await user.type(box, 'bottom please');
+
+      await waitFor(() =>
+        expect(screen.getByText('Target group for promoted channels')).toBeInTheDocument()
+      );
+      const promoteGroup = screen
+        .getByText('Target group for promoted channels')
+        .closest('.form-group')!;
+      await user.click(promoteGroup.querySelector('.custom-select-trigger')!);
+      await user.click(await screen.findByText('Promoted Events'));
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      // Saving the typed text would fail backend validation and lose the
+      // whole edit, so the box degrades to the offered default.
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.promote_channel_number
+      ).toBe('900-999');
+    });
+
     it('emits the lead hours once the box is ticked', async () => {
       const user = userEvent.setup();
       seedPromoGroup();
