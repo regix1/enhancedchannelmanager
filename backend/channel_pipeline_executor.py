@@ -458,8 +458,6 @@ class ActionExecutor:
                 self._settings, 'channel_number_separator', '-') or '-'
 
         # Pre-populate base-name mapping for existing channels with "NUMBER | " prefixes
-        _num_prefix = re.compile(r'^\d+\s*\|\s*')
-
         def _base_names(stored_name: str) -> list[str]:
             """Every spelling of ``stored_name`` with a channel-number
             prefix taken off: the long-standing pipe form, plus the form
@@ -469,7 +467,7 @@ class ActionExecutor:
             drops out of the rule's managed set. [44]
             """
             names = []
-            stripped = _num_prefix.sub('', stored_name)
+            stripped = strip_channel_number_prefix(stored_name, '|')
             if stripped != stored_name:
                 names.append(stripped)
             if self._channel_number_separator:
@@ -488,7 +486,7 @@ class ActionExecutor:
             under the name a rule derives, and no name that resolves today
             stops resolving.
             """
-            names = [_num_prefix.sub('', stored_name)]
+            names = [strip_channel_number_prefix(stored_name, '|')]
             for name in _base_names(stored_name):
                 if name not in names:
                     names.append(name)
@@ -1211,9 +1209,15 @@ class ActionExecutor:
             # Rename channel if normalization produces a different name than what's stored
             if normalization_group_ids and self._normalization_engine:
                 existing_name = existing["name"]
-                _num_pfx = re.match(r'^(\d+\s*\|\s*)', existing_name)
-                existing_base = _num_pfx.group(0) if _num_pfx else ""
-                existing_core = existing_name[len(existing_base):]
+                # Measure against the stripped name so the preserved prefix
+                # and the core spell it back exactly. The helper strips its
+                # own result, so a name with trailing whitespace measures
+                # short and the first character of the name is counted as
+                # part of the prefix. [49]
+                stored_name = existing_name.strip()
+                existing_core = strip_channel_number_prefix(stored_name, '|')
+                existing_base = stored_name[
+                    :len(stored_name) - len(existing_core)]
                 if existing_core.lower() != channel_name.lower():
                     new_name = existing_base + channel_name
                     if exec_ctx.dry_run:
@@ -5330,8 +5334,11 @@ class ActionExecutor:
                     s["id"] if isinstance(s, dict) else s
                     for s in channel.get("streams", [])
                 ]
-                unit_stream_ids = unit_stream_ids_by_key.get(
-                    unit.event_key, set())
+                # Indexed, not defaulted. The health replan only ever
+                # removes units, so a missing key would mean the plan
+                # changed in a way this map cannot describe, and a default
+                # of set() would detach nothing instead of saying so. [58]
+                unit_stream_ids = unit_stream_ids_by_key[unit.event_key]
                 for stale_id in stale_streams_to_detach(
                     unit_stream_ids, attached, set(stale_rows),
                     working_stream_ids,
