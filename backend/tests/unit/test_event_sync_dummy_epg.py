@@ -163,11 +163,16 @@ def _mercury_state() -> FakeDispatcharrState:
     )
 
 
-def _dummy_entry(entry_id: int, channel_name: str) -> dict:
-    """One EPG data entry as Dispatcharr serves it for the dummy source."""
+def _dummy_entry(entry_id: int, channel_id: int, channel_name: str) -> dict:
+    """One EPG data entry as Dispatcharr serves it for the dummy source.
+
+    The tvg_id carries the XMLTV channel key, which the dummy engine derives
+    from the ECM channel id ("ecm-<channel id>"), not from the EPG row id —
+    the two are different id spaces (bead l76).
+    """
     return {
         "id": entry_id,
-        "tvg_id": f"ecm-{entry_id}",
+        "tvg_id": f"ecm-{channel_id}",
         "name": channel_name,
         "epg_source": DUMMY_SOURCE_ID,
     }
@@ -239,7 +244,7 @@ class TestPass5RetryPath:
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
             initial_entries=[],
-            regenerated_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         result = _manual_run(
@@ -284,7 +289,7 @@ class TestPass5RetryPath:
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
             initial_entries=[],
-            regenerated_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         _manual_run(client, db_session_factory, regenerate, wait_refresh)
@@ -319,7 +324,7 @@ class TestDirectAssignment:
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
-            initial_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         result = _manual_run(
@@ -347,7 +352,7 @@ class TestDirectAssignment:
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
-            initial_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
             source_url="http://ecm:8000/api/dummy-epg/xmltv",
         )
 
@@ -383,7 +388,7 @@ class TestNonClobbering:
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
-            initial_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         result = _manual_run(
@@ -418,7 +423,7 @@ class TestUnattendedRuns:
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
             initial_entries=[],
-            regenerated_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         engine = ChannelPipelineEngine(client)
@@ -506,7 +511,7 @@ class TestGracefulDegradation:
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
             client,
-            initial_entries=[_dummy_entry(501, MASTER_MERCURY)],
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
         result = _manual_run(

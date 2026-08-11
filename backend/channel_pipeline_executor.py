@@ -2756,9 +2756,20 @@ class ActionExecutor:
 
         Match priority:
         1. Exact tvg_id match (channel.tvg_id == entry.tvg_id)
-        2. Exact normalized name match (channel name == entry tvg_id or name)
-        3. Prefix match (channel name starts with entry name or vice versa)
-        4. Fallback: first entry (for single-entry sources like dummy EPGs)
+        2. The channel's own dummy-guide row (entry tvg_id == "ecm-<channel id>")
+        3. Exact normalized name match (channel name == entry tvg_id or name)
+        4. Prefix match (channel name starts with entry name or vice versa)
+        5. Fallback: first entry (for single-entry sources like dummy EPGs)
+
+        Dummy-profile guide rows are keyed "ecm-<channel id>" and a channel id
+        is never reissued, so such a row belongs to exactly one channel. The
+        name tiers must never see ANOTHER channel's row: a recreated event
+        channel carries the same name as the deleted channel whose row is
+        still in the source, and the name match linked the new channel to
+        that dead row — no programmes, while the run reported it assigned
+        (bead l76). With those rows excluded, a channel whose own row does
+        not exist yet gets no match, which is what lets the caller defer to
+        Pass 5's regenerate-and-retry instead of mis-linking.
 
         Within tiers 2 and 3, candidates sort by region consistency first
         (bead vznut.4, mirroring vznut.2: a "...West" channel prefers the
@@ -2780,6 +2791,27 @@ class ActionExecutor:
                 if entry.get("tvg_id") == channel_tvg_id:
                     logger.debug("[AUTO-CREATE-EXEC] Exact tvg_id match: %s", channel_tvg_id)
                     return entry
+
+        # 2. The channel's own dummy-guide row (bead l76).
+        channel_id = channel.get("id")
+        own_dummy_tvg = f"ecm-{channel_id}" if channel_id is not None else None
+        if own_dummy_tvg:
+            for entry in source_entries:
+                if entry.get("tvg_id") == own_dummy_tvg:
+                    logger.debug(
+                        "[AUTO-CREATE-EXEC] Own dummy-guide row match: %s",
+                        own_dummy_tvg,
+                    )
+                    return entry
+            # Every remaining ecm-keyed row belongs to another channel (the
+            # loop above would have returned this channel's own). Drop them
+            # so neither the name tiers nor the single-entry fallbacks can
+            # mis-link (bead l76); no match then defers to Pass 5, which
+            # regenerates the guide with this channel's row and retries.
+            source_entries = [
+                e for e in source_entries
+                if not re.fullmatch(r"ecm-\d+", e.get("tvg_id") or "")
+            ]
 
         # Normalize channel name
         norm_channel = self._normalize_for_epg(channel_name)
