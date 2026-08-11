@@ -185,18 +185,25 @@ path stores variants without that model, so
 `backend/tasks/rule_lint_scan.py` re-checks stored profiles and reports a
 duration it cannot read, or one outside the range, as a lint finding in the UI.
 
-## Ended templates no longer reach the generated guide
+## Ended templates label the block after the predicted end (opt-in)
 
 `ended_title_template` and `ended_description_template` exist at both profile
-level and variant level, and both are still stored, validated and rendered in
-the **profile preview**. They no longer appear in the generated guide.
+level and variant level. When set, they title the block that runs from the
+event's predicted end to midnight, so an over event reads as over in the
+guide instead of looking active until midnight. When left empty, that block
+keeps the event's own title, so a broadcast running past its predicted length
+is not declared finished mid-air.
 
-An event that runs past its scheduled length now keeps its own title and its
-live tag until the next programme, instead of being replaced by a block titled
-from `ended_title_template`. That block was the reason a running game read as
-finished in Emby. Nothing was removed, so a profile that sets these templates
-still round-trips unchanged, but the text only shows up in the preview. The
-profile editor says so under both pairs of fields.
+Which way to lean is the operator's call, because the predicted end is a
+guess (event start plus `program_duration`): set the templates and a game in
+overtime reads as ended while still playing; leave them empty and a finished
+game reads as active until midnight. Either way the block never carries the
+live or new tag.
+
+Variants inherit the profile-level ended templates only when the profile
+templates' placeholders resolve; a variant whose patterns capture different
+groups (e.g. `away`/`home` instead of `title`) must declare its own ended
+templates, exactly like the upcoming pair.
 
 ## Related files
 

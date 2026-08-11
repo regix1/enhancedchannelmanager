@@ -1101,7 +1101,6 @@ def test_live_tag_stops_at_the_predicted_end():
         "time_pattern": _TIME_PATTERN,
         "date_pattern": _DATE_PATTERN,
         "title_template": "{title}",
-        "ended_title_template": "Ended: {title}",
         "include_live_tag": True,
     }
     end = start + timedelta(minutes=180)
@@ -1110,11 +1109,38 @@ def test_live_tag_stops_at_the_predicted_end():
     assert len(after) == 1
     assert after[0].find("title").text == "Big Game"
     assert after[0].find("live") is None
-    assert not any(p.find("title").text.startswith("Ended:") for p in programmes)
 
     on_air = [p for p in programmes if p.find("live") is not None]
     assert len(on_air) == 1
     assert _programme_window(on_air[0])[0] == start
+
+
+def test_ended_templates_label_the_block_after_the_predicted_end():
+    """Set ended templates take over the after-event block; the event block
+    itself keeps its own title. Empty templates keep the event title (the
+    test above), so declaring an event over is the operator's opt-in."""
+    name, start = _event_name_today()
+    profile = {
+        "program_duration": 180,
+        "event_timezone": _EVENT_TZ,
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "title_template": "{title}",
+        "ended_title_template": "Ended: {title}",
+        "ended_description_template": "{title} has finished.",
+    }
+    end = start + timedelta(minutes=180)
+    programmes = _programmes_for(profile, name)
+
+    after = [p for p in programmes if _programme_window(p)[0] == end]
+    assert len(after) == 1
+    assert after[0].find("title").text == "Ended: Big Game"
+    assert after[0].find("desc").text == "Big Game has finished."
+    assert after[0].find("live") is None
+
+    main = [p for p in programmes if _programme_window(p)[0] == start]
+    assert main[0].find("title").text == "Big Game"
 
 
 def test_only_the_event_itself_is_marked_new():

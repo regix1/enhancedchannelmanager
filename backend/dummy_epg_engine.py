@@ -641,20 +641,29 @@ def generate_channel_xml(
                     include_date_tag, include_live_tag, include_new_tag,
                 ))
 
-            # Predicted end to next midnight. An event that runs past its
-            # predicted length is still on air, so this block keeps the event's
-            # own title rather than declaring it over. It carries neither the
-            # live nor the new tag. A guide client badges every programme
-            # carrying the live tag, whether or not that programme is the one
-            # airing, so keeping it here left an event marked live for each
-            # hour between its predicted end and midnight; the badge now stops
-            # at the predicted end. A second new marker on an adjacent
-            # programme of the same title reads to a recorder as a second
-            # showing to record. [71]
+            # Predicted end to next midnight. The predicted length is a guess,
+            # so which way this block should read is the operator's call, made
+            # through the ended templates: set, they label the event over
+            # ("Ended: ..."); empty, the block keeps the event's own title so
+            # a broadcast running long is not declared finished mid-air. It
+            # carries neither the live nor the new tag. A guide client badges
+            # every programme carrying the live tag, whether or not that
+            # programme is the one airing, so keeping it here left an event
+            # marked live for each hour between its predicted end and
+            # midnight. A second new marker on an adjacent programme of the
+            # same title reads to a recorder as a second showing to
+            # record. [71]
             if end_dt < tomorrow_midnight:
+                ended_title = _render(
+                    get_template("ended_title_template"), template_groups
+                )
+                ended_desc = _render(
+                    get_template("ended_description_template"), template_groups
+                )
                 programmes.append(_make_programme(
                     end_dt, tomorrow_midnight, channel_id_str,
-                    title, description,
+                    ended_title or title,
+                    ended_desc or description,
                     categories, poster_url,
                     include_date_tag, False, False,
                 ))
