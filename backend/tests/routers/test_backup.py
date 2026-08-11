@@ -1157,6 +1157,37 @@ class TestRestoreYaml:
         assert test_session.query(FFmpegProfile).count() == 1
         assert test_session.query(DummyEPGProfile).count() == 1
         assert test_session.query(DummyEPGChannelAssignment).count() == 1
+        # The export fixture carries the old number-keyed template, which restore
+        # repoints onto the channel id.
+        assert test_session.query(DummyEPGProfile).one().tvg_id_template == "ecm-{channel_id}"
+
+    @pytest.mark.asyncio
+    async def test_restore_keeps_customized_tvg_id_template(self, async_client, test_session):
+        """A template that is not the old literal is restored unchanged."""
+        content = _make_yaml_export(database={
+            "dummy_epg_profiles": [
+                {
+                    "name": "Sports EPG",
+                    "enabled": True,
+                    "name_source": "channel",
+                    "stream_index": 1,
+                    "event_timezone": "US/Eastern",
+                    "program_duration": 180,
+                    "tvg_id_template": "house-{channel_number}",
+                    "channel_assignments": [],
+                },
+            ],
+        })
+
+        response = await async_client.post(
+            "/api/backup/restore-yaml",
+            data={"sections": json.dumps(["dummy_epg_profiles"])},
+            files={"file": ("export.yaml", content, "text/yaml")},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert test_session.query(DummyEPGProfile).one().tvg_id_template == "house-{channel_number}"
 
     @pytest.mark.asyncio
     async def test_selective_restore(self, async_client, test_session):

@@ -2849,6 +2849,14 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
         session.query(DummyEPGChannelAssignment).delete()
         session.query(DummyEPGProfile).delete()
         for item in items:
+            # A backup exported before the tvg-id default moved still carries the
+            # number-keyed literal, and channel numbers are handed out from 1 again
+            # whenever channels are rebuilt, so restoring it attaches guide rows to
+            # a number another event may now hold. The exact-literal gate matches
+            # the startup fixup, so an edited template is left alone.
+            tvg_id_template = item.get("tvg_id_template", "ecm-{channel_id}")
+            if tvg_id_template == "ecm-{channel_number}":
+                tvg_id_template = "ecm-{channel_id}"
             profile = DummyEPGProfile(
                 name=item["name"],
                 enabled=item.get("enabled", True),
@@ -2872,7 +2880,7 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 categories=item.get("categories"),
                 channel_logo_url_template=item.get("channel_logo_url_template"),
                 program_poster_url_template=item.get("program_poster_url_template"),
-                tvg_id_template=item.get("tvg_id_template", "ecm-{channel_id}"),
+                tvg_id_template=tvg_id_template,
                 include_date_tag=item.get("include_date_tag", False),
                 include_live_tag=item.get("include_live_tag", False),
                 include_new_tag=item.get("include_new_tag", False),
