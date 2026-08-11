@@ -24,7 +24,7 @@ from alert_methods import send_alert
 from auth import RequireAdminIfEnabled
 from auth import get_jwt_secret_key
 from cache import get_cache
-from config import validate_url_scheme
+from config import CONFIG_DIR, validate_url_scheme
 from dispatcharr_client import get_client, upstream_http_exception
 from epg_matching import (
     _epg_source_id,
@@ -34,6 +34,7 @@ from epg_matching import (
 )
 import journal
 from concurrency import run_cpu_bound
+from services.epg_artwork import ArtworkCache, rewrite_artwork
 from services.epg_migration import (
     PREVIEW_ISSUER,
     PreviewTokenError,
@@ -2065,6 +2066,60 @@ async def audit_epg_duplicates():
     except Exception as e:
         logger.exception("[EPG-AUDIT] Failed: %s", e)
         raise HTTPException(status_code=500, detail="EPG duplicate audit failed")
+
+
+@router.get("/artwork-proxy/{source_id}")
+async def artwork_proxy(source_id: int):
+    """Serve an EPG source's XMLTV with its programme artwork made portrait.
+
+    Point a Dispatcharr XMLTV source at this instead of the upstream URL when
+    the guide client renders programme tiles in portrait: the upstream feeds
+    reference Gracenote's landscape renditions, which such a client
+    center-crops. See services.epg_artwork for what is repointed and why an
+    unresolved asset keeps its landscape URL.
+
+    GET is auth-exempt for the same reason as the dummy EPG XMLTV (see
+    main.AUTH_EXEMPT_GET_PREFIXES): Dispatcharr's fetcher has nowhere to put
+    an ECM credential. What is readable is the upstream guide, which is
+    already public at its own URL.
+    """
+    client = get_client()
+    try:
+        source = await client.get_epg_source(source_id)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not read EPG source")
+
+    url = (source or {}).get("url")
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"EPG source {source_id} has no URL to proxy",
+        )
+    validate_url_scheme(url, "EPG source URL")
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as http:
+            upstream = await http.get(url)
+            upstream.raise_for_status()
+            content = upstream.content
+    except httpx.HTTPError as e:
+        logger.warning("[EPG-ART] Upstream fetch failed for source %s: %s", source_id, e)
+        raise HTTPException(status_code=502, detail="Upstream EPG fetch failed")
+
+    if url.endswith(".gz") or upstream.headers.get("content-encoding") == "gzip":
+        try:
+            content = gzip.decompress(content)
+        except gzip.BadGzipFile:
+            pass  # Not actually gzipped despite extension/header; use raw content
+
+    xml_text = content.decode("utf-8", errors="replace")
+    cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
+    rewritten, stats = await rewrite_artwork(xml_text, cache)
+    return Response(
+        content=rewritten,
+        media_type="application/xml",
+        headers={"X-ECM-Artwork-Repointed": str(stats["rewritten"])},
+    )
 
 
 @router.post("/channels/{channel_id}/link")

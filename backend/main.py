@@ -541,6 +541,11 @@ AUTH_EXEMPT_PATHS = {
 # is readable by anyone, so keep new dummy-epg routes outside the xmltv prefix.
 AUTH_EXEMPT_GET_PREFIXES = (
     "/api/dummy-epg/xmltv",
+    # Same trade-off, same consumer: Dispatcharr registers
+    # /api/epg/artwork-proxy/<source_id> as an XMLTV source. What it returns
+    # is an upstream guide that is already public at its own URL, with the
+    # programme artwork repointed.
+    "/api/epg/artwork-proxy",
 )
 
 from auth.settings import get_auth_settings

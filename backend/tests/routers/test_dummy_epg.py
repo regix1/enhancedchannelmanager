@@ -983,10 +983,18 @@ class TestXmltvUnauthenticatedAccess:
         assert response.status_code == 401
         assert response.json()["detail"] == "Not authenticated"
 
-    def test_exempt_prefixes_cover_only_the_xmltv_reads(self):
+    def test_exempt_prefixes_cover_only_the_guide_reads(self):
         """Structural check on the constant — catches an accidental
         widening of the prefix during a refactor.
+
+        Both entries exist for the same reason: Dispatcharr registers them as
+        XMLTV sources and its fetcher has nowhere to put an ECM bearer token.
+        The artwork proxy returns an upstream guide that is already public at
+        its own URL, with the programme artwork repointed.
         """
         from main import AUTH_EXEMPT_GET_PREFIXES
 
-        assert AUTH_EXEMPT_GET_PREFIXES == ("/api/dummy-epg/xmltv",)
+        assert AUTH_EXEMPT_GET_PREFIXES == (
+            "/api/dummy-epg/xmltv",
+            "/api/epg/artwork-proxy",
+        )
