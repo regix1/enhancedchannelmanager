@@ -1069,6 +1069,11 @@ def _run_migrations(engine) -> None:
             # orphaned by pre-fix group deletions (GH #465 - bd-miut3)
             _heal_orphaned_normalization_group_refs(conn)
 
+            # Repoint a dummy EPG tvg-id template stored before the default
+            # flipped, so the guide keys on the channel id rather than a number
+            # that gets reissued on the next rebuild
+            _migrate_dummy_epg_tvg_id_template(conn)
+
             logger.debug("[DATABASE] All migrations complete - schema is up to date")
     except Exception as e:
         logger.exception("[DATABASE] Migration failed: %s", e)
@@ -3233,6 +3238,61 @@ def _heal_task_schedules_null_next_run_at(conn) -> None:
             "class defaults rehydrated (bd-1weac)",
             healed,
         )
+
+
+def _migrate_dummy_epg_tvg_id_template(conn) -> None:
+    """Point a stored dummy EPG tvg-id template at the channel id.
+
+    The ``tvg_id_template`` code default moved from ``ecm-{channel_number}`` to
+    ``ecm-{channel_id}``, but a SQLAlchemy ``default=`` applies at INSERT only,
+    so a profile row written before that change still holds the old string and
+    ``dummy_epg_engine`` renders ``ecm-<number>`` from it. Channel numbers are
+    handed out from 1 again whenever channels are rebuilt, so a number-keyed
+    guide row attaches the previous holder's programmes to whatever event now
+    carries that number. Channel ids are never reissued.
+
+    What the rewrite leaves behind: a channel whose ``epg_data_id`` already
+    points at an ``ecm-<number>`` guide row shows no programmes until the next
+    EPG match pass moves it onto the id-keyed row.
+
+    Why not Alembic: ``_bootstrap_alembic``'s bd-5w6jz fast-path (see
+    ``_schema_matches_head``) stamps ``alembic_version`` forward to head when
+    the live schema already covers the model shape. ``tvg_id_template`` has
+    existed since the baseline, so every install carrying the old value is
+    exactly the population that fast-path skips, and a data-only Alembic
+    revision would never execute there. ``_run_migrations`` runs unconditionally
+    every startup and relies on WHERE-clause idempotency, which is the shape
+    this fix needs.
+
+    Idempotency: the exact-literal predicate is the gate. A fresh install, an
+    already-migrated install, and a profile an operator has edited to anything
+    else all match zero rows, so a customised template is left alone.
+    """
+    from sqlalchemy import text
+
+    result = conn.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='dummy_epg_profiles'"
+    ))
+    if not result.fetchone():
+        logger.debug(
+            "[DATABASE] dummy_epg_profiles table doesn't exist yet, skipping "
+            "tvg_id_template migration"
+        )
+        return
+
+    update = conn.execute(text(
+        "UPDATE dummy_epg_profiles "
+        "SET tvg_id_template = 'ecm-{channel_id}' "
+        "WHERE tvg_id_template = 'ecm-{channel_number}'"
+    ))
+    if update.rowcount > 0:
+        logger.info(
+            "[DATABASE] Repointed tvg_id_template onto the channel id for %d "
+            "dummy EPG profile(s); channels still linked to an ecm-<number> "
+            "guide row show no programmes until the next EPG match pass",
+            update.rowcount,
+        )
+        conn.commit()
 
 
 def get_session():
