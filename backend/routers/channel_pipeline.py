@@ -3397,6 +3397,19 @@ async def preview_event_sync(
                     if row.stream.stream_id is not None
                 },
             )
+            # Which streams belong to which event, read BEFORE the health
+            # replan, the same instant the run reads it. A delisted stream
+            # is always dead, so the replan takes every one of them out of
+            # its unit and afterwards no unit still lists the stale stream
+            # it is supposed to be able to drop. The replan keeps each
+            # unit's event key, so that is what this is keyed on. [1]
+            unit_stream_ids_by_key = {
+                unit.event_key: {
+                    row.stream.stream_id for row in unit.rows
+                    if row.stream.stream_id is not None
+                }
+                for unit in plan.units
+            }
             if dead:
                 # Annotate the losing rows from the pre-health plan, which
                 # is the last place they still appear — the replan below
@@ -3446,14 +3459,29 @@ async def preview_event_sync(
             for unit in plan.units:
                 if unit.existing_channel_id is None:
                     continue
-                unit_ids = {
+                # Indexed, not defaulted. The health replan only ever
+                # removes units, so a missing key would mean the plan
+                # changed in a way this map cannot describe, and a default
+                # of set() would report zero detaches instead of saying
+                # so. [58]
+                unit_ids = unit_stream_ids_by_key[unit.event_key]
+                # The channel as the RUN sees it at the detach: the attach
+                # happens first and writes the unit's streams onto the
+                # cached channel, so the run reads a list that already
+                # carries them. Reading the pre-run fetch alone reports
+                # zero on a channel that so far holds only the delisted
+                # stream, which is the shape of every first refresh. [34]
+                attached = list(
+                    streams_by_channel.get(unit.existing_channel_id, [])
+                )
+                attached.extend(
                     row.stream.stream_id for row in unit.rows
                     if row.stream.stream_id is not None
-                }
+                )
                 stale_streams_removed += len(
                     stale_streams_to_detach(
                         unit_ids,
-                        streams_by_channel.get(unit.existing_channel_id, []),
+                        attached,
                         stale_ids,
                         working,
                     )

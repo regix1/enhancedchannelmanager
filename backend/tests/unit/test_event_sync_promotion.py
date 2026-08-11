@@ -2145,6 +2145,54 @@ class TestDelistedStreamSwap:
         ]
         assert len(detached) == 1
 
+    @pytest.mark.asyncio
+    async def test_the_preview_reports_the_detach_before_the_run_does_it(
+        self, async_client
+    ):
+        """Detaching is the one destructive thing promotion does, so the
+        number the operator reads before approving a run has to be the
+        number the run then performs.
+
+        The shape is the one every first refresh produces: the channel
+        carries the delisted stream alone, and the replacement is listed
+        this run with a passing probe. The run attaches the replacement
+        first and detaches the delisted stream after, so a preview that
+        reads the channel as it stood before that attach sees nothing
+        working on it and can only ever report zero. [1][2]
+        """
+        state = self._swap_state()
+        client = make_promote_client(state)
+        stats = {self.REPLACEMENT_ID: {
+            "stream_id": self.REPLACEMENT_ID,
+            "probe_status": "success",
+            "consecutive_failures": 0,
+            "last_probed": FROZEN_NOW.astimezone(pytz.utc).replace(
+                tzinfo=None).isoformat() + "Z",
+        }}
+
+        def _stats_for(stream_ids):
+            return {sid: stats[sid] for sid in stream_ids if sid in stats}
+
+        with patch("routers.channel_pipeline.get_client",
+                   return_value=client), \
+             patch("routers.channel_pipeline.datetime") as preview_clock, \
+             patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_for):
+            preview_clock.now.return_value = FROZEN_NOW
+            resp = await async_client.post(
+                "/api/channel-pipeline/event-sync-preview",
+                json={"event_sync_config": _promote_config(
+                    skip_dead_streams=True,
+                )},
+            )
+
+        assert resp.status_code == 200
+        promo = resp.json()["promotion"]
+        assert promo["stale_streams_removed"] == 1
+        unit = next(u for u in promo["units"]
+                    if u["existing_channel_id"] == 850)
+        assert unit["action"] == PROMOTE_ACTION_ATTACH_EXISTING
+
 
 class TestReconciliationLifecycle:
     """AC-5: reconciliation-driven deletion (PO decision 1) + protections."""
