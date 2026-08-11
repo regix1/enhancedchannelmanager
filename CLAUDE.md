@@ -1,38 +1,5 @@
 # Agent Instructions
 
-## STOP — Read Beads, Then Create a Bead
-
-Before reading code, editing files, or exploring the codebase for ANY code task:
-
-1. **Read existing beads** for context on past work:
-   ```bash
-   bd list --status closed
-   bd ready
-   ```
-2. **Create a bead** for the current task:
-   ```bash
-   bd create "Brief title" --description "Why this exists and what needs to be done"
-   ```
-   The first positional arg is the **title**, not the repo. Repo is auto-routed from `.beads/`. Don't pass `enhancedchannelmanager` as the title — that's the most common foot-gun.
-
-No exceptions. No "I'll do it later." The bead comes before the first Read, Grep, or Edit.
-After the work is deployed and verified, close it: `bd close <bead-id>`
-
-## Beads Quick Reference
-
-```bash
-bd ready                      # Find available work
-bd show <id>                  # View issue details
-bd update <id> --status in_progress  # Claim work
-bd close <id>                 # Complete work
-bd list --status closed       # View closed beads for context
-bd sync                       # Sync beads data only (NOT for code commits)
-```
-
-- Beads auto-route to this repo via `.beads/`. If you ever need to override (e.g., creating a bead targeting a different rig), use `--repo enhancedchannelmanager`.
-- **NEVER chain `bd create` and `bd close`** — run them as separate commands
-- The `.git/beads-worktrees/dev` worktree is **only for beads issue tracking** (sparse checkout of `.beads/` only — no code files). Do NOT edit code there.
-
 ## Invoking Personas (project-engineer, qa-engineer, sre, etc.)
 
 Personas are skills at `~/.claude/skills/<persona>/SKILL.md`, NOT subagent types. To spawn them — especially in parallel — use the Agent tool with `subagent_type: "general-purpose"` and load the persona identity in the prompt:
@@ -51,7 +18,7 @@ For multi-persona workflows (team-plan, team-review, spike, grooming, standup, r
 
 ## Worktree & Agent Isolation (this environment)
 
-The Claude Code worktree mechanism is unreliable here. Two harness-level bugs — NOT fixable in-repo (see bd-j8osn):
+The Claude Code worktree mechanism is unreliable here. Two harness-level bugs — NOT fixable in-repo:
 
 - **cwd-trap:** a worktree-spawned agent's Bash cwd resets to the MAIN checkout between calls, while Read/Edit act on the literal absolute path given. An agent that doesn't make EVERY path worktree-absolute ends up editing `dev` directly — silently polluting the main checkout.
 - **Lock accumulation:** a finished agent's worktree stays locked and is never auto-cleaned; `git worktree remove` then needs `-f -f`.
@@ -103,7 +70,6 @@ Exception — governance cadence rules from ADRs (e.g., ADR-005's monthly-then-q
 | Runbooks | `docs/runbooks/` |
 | **Style Guide (canonical)** | `docs/style_guide.md` |
 | CSS Guidelines | `docs/css_guidelines.md` |
-| Beads (Issue Tracking) | `~/.claude/projects/<project-slug>/memory/beads.md` |
 | Dispatcharr API | `docs/dispatcharr_api.md` |
 | Discord Release Notes | `docs/discord_release_notes.md` |
 | Frontend Lint Policy | `docs/frontend_lint.md` |

@@ -117,14 +117,14 @@ Delta-zero enforcement is only workable if there's a defined path for **justifie
 
 5. **No global severity dismissals** — every dismissal is per-alert.
 
-6. **Audit cadence**: the Security Engineer reviews **three audit scopes** on the same cadence — **monthly for the first quarter after Option 4 lands**, then **quarterly thereafter**. The first-quarter cadence catches early-calibration drift before it calcifies; quarterly is the steady state. Audits are filed as beads under `enhancedchannelmanager` so the cadence itself is visible and delinquent audits are themselves a signal.
+6. **Audit cadence**: the Security Engineer reviews **three audit scopes** on the same cadence — **monthly for the first quarter after Option 4 lands**, then **quarterly thereafter**. The first-quarter cadence catches early-calibration drift before it calcifies; quarterly is the steady state. Audits are filed as GitHub issues so the cadence itself is visible and delinquent audits are themselves a signal.
 
    ### Scope A — CodeQL dismissal log (original scope)
 
    Reviews the GitHub Code Scanning dismissed-alerts list. Each audit surfaces:
    - Patterns of reflexive dismissals (same engineer, same rule, short justification).
    - Sanitizer-justified dismissals whose referenced tests have since been deleted or modified.
-   - Any unresolved risk-accepted beads (the Phase-1 substitute for "won't fix") that have aged beyond their documented review date.
+   - Any unresolved risk-accepted issues (the Phase-1 substitute for "won't fix") that have aged beyond their documented review date.
 
    Pull command:
    ```bash
@@ -144,9 +144,9 @@ Delta-zero enforcement is only workable if there's a defined path for **justifie
         --json number,title,mergedAt,mergeCommit
       ```
    2. For each release-cut PR, capture the cut SHA (the head of the release branch at merge time) and a 30-day pre-cut window.
-   3. Walk the `.beads/issues.jsonl` history (via `git log -p .beads/issues.jsonl` between the window start and the cut SHA) and flag any P1→P2-or-lower transitions whose closing line is `"priority":2` (or higher digit) where the prior line had `"priority":1`. Manual `git log -p` review is acceptable for Phase 1; if the audit becomes recurring noise, file a follow-on bead for a `scripts/bd-priority-history.sh` helper.
-   4. Cross-reference each downgrade event with the bead's owner and the release-cut PR author. **Flag** any case where the downgrader is the PO or the cut-PR author and the downgrade landed within 7 days of the cut SHA — that is the tightest signal of pre-cut gate-weakening.
-   5. File a separate bead per flagged event (per ADR-004 §Decision item 4); a clean audit closes with no follow-on beads.
+   3. Walk the priority-label history of issues touched in that window (`gh issue list --state all --search "updated:>=<window-start>" --json number` then `gh api repos/:owner/:repo/issues/<n>/timeline` for `unlabeled`/`labeled` events) and flag any P1→P2-or-lower transitions. Manual timeline review is acceptable for Phase 1; if the audit becomes recurring noise, file a follow-on issue for a helper script.
+   4. Cross-reference each downgrade event with the issue's owner and the release-cut PR author. **Flag** any case where the downgrader is the PO or the cut-PR author and the downgrade landed within 7 days of the cut SHA — that is the tightest signal of pre-cut gate-weakening.
+   5. File a separate issue per flagged event (per ADR-004 §Decision item 4); a clean audit closes with no follow-on issues.
 
    ### Scope C — `allow_force_pushes` flip-event audit (added 2026-04-24, bd-se7ay)
 
@@ -169,8 +169,8 @@ Delta-zero enforcement is only workable if there's a defined path for **justifie
    - `allow_deletions.enabled`, `block_creations.enabled`, `required_conversation_resolution.enabled` — record drift even if not currently mandated.
 
    For each flip detected:
-   1. Look for a corresponding rollback bead (search closed beads with the `rollback` or `runbook` label, or `git log` for `runbooks/` activity in the same window).
-   2. If a rollback bead exists, the flip is authorized — record the bead reference in the audit bead's comment.
+   1. Look for a corresponding rollback issue (search closed issues with the `rollback` or `runbook` label, or `git log` for `runbooks/` activity in the same window).
+   2. If a rollback issue exists, the flip is authorized — record the issue reference in the audit issue's comment.
    3. If no bead exists, file a P1 incident bead and page the PO.
 
    **Phase 2 upgrade path.** If/when the repo migrates to an org or an org-admin PAT is provisioned, the audit can switch to the live audit-log API:
@@ -284,7 +284,7 @@ If Option 1 + Option 4 prove too noisy or too slow:
 
 ## Audit History
 
-Index of completed audits under §Audit Cadence (item 6). Each entry links to the per-cycle report; the report carries the per-alert table, findings, and follow-up beads.
+Index of completed audits under §Audit Cadence (item 6). Each entry links to the per-cycle report; the report carries the per-alert table, findings, and follow-up issues.
 
 | Audit period | Cadence | Report | Key finding |
 |---|---|---|---|

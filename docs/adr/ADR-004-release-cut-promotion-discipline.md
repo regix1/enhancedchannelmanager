@@ -52,7 +52,7 @@ For each cut:
 
 | # | Gate | Enforcement | Cites |
 |---|---|---|---|
-| G1a | **Zero open P0/P1 bugs at the `dev` cut SHA** (beads board, all scopes) | Manual verification by cut-authorizer; checklist item in the release-cut PR description | `bd-vgm4l` root cause |
+| G1a | **Zero open P0/P1 bugs at the `dev` cut SHA** (GitHub Issues, all scopes) | Manual verification by cut-authorizer; checklist item in the release-cut PR description | — |
 | G1b | **Zero open HIGH/CRITICAL security findings not formally waived** (GitHub Security tab + active advisories) — distinct from G1a so a mis-triaged finding cannot slip through "the bug board is clean" | Manual verification at Phase 1 via `gh api .../code-scanning/alerts` + Security tab review; mechanical at Phase 2 | Complement to ADR-005 gate G4 |
 | G2 | `Backend Tests` green on the release branch | Branch protection required check | Existing `bd-8w33i` |
 | G3 | `Frontend Tests` green on the release branch | Branch protection required check | Existing `bd-8w33i` |
@@ -130,8 +130,7 @@ For reference — this goes into `shipping.md` on acceptance.
 
 ```bash
 # 0. Pre-flight — gate items G1a, G1b, G7 (human checks)
-bd list --status open --priority 0                # G1a: must be empty
-bd list --status open --priority 1                # G1a: must be empty (or each justified in PR)
+gh issue list --state open --label P0 --label P1   # G1a: must be empty (or each justified in PR)
 gh api repos/:owner/:repo/code-scanning/alerts --paginate \
   | jq '[.[] | select(.state=="open" and (.rule.security_severity_level=="high" or .rule.security_severity_level=="critical"))] | length'
                                                    # G1b: must be 0 (or each formally waived)
@@ -167,7 +166,7 @@ PR_URL=$(gh pr create --base main --head release/v0.17.0 \
 <paste the promoted CHANGELOG [0.17.0] block here>
 
 ### Pre-Cut Gate Checklist
-- [ ] G1a: Zero open P0/P1 bugs at cut SHA (verified via `bd list`)
+- [ ] G1a: Zero open P0/P1 bugs at cut SHA (verified via `gh issue list`)
 - [ ] G1b: Zero open HIGH/CRITICAL security findings not formally waived (GitHub Security tab)
 - [x] G2: Backend Tests green (CI will verify)
 - [x] G3: Frontend Tests green (CI will verify)

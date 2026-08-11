@@ -19,13 +19,7 @@ cd frontend && npm test && npm run build
 
 > **Deploying to the dev container** (the local edit→deploy→verify loop, separate from this PR flow): use `scripts/deploy-frontend.sh` for the frontend — it clears stale `/app/static/assets/*` before copying, which a hand-run `docker cp` skips. See CLAUDE.md → "Container-First Development".
 
-### 2. Update the Bead
-
-```bash
-bd update <id> --description "Detailed description of changes made"
-```
-
-### 3. Increment the Version
+### 2. Increment the Version
 
 The version literal is hand-edited in **three** files, and all three must move in lockstep — see [`docs/versioning.md`](versioning.md#touchpoints) → Touchpoints for the canonical list. CI enforces this via the `version-consistency` job (`scripts/check_version_consistency.py`) and fails the PR on divergence.
 
@@ -43,21 +37,15 @@ python scripts/check_version_consistency.py   # must report all 3 agree
 cd frontend && npm run build
 ```
 
-The version-bump commit lands via PR like every other change to `dev` — the branch protection rule applies regardless of how trivial the diff is. This was surfaced by `bd-i6a1m`'s tag-stone bump (commit `c479b99a`, `0.16.0-0058 → 0.16.0-0059`), which was rejected on direct push and had to merge via [PR #175](https://github.com/MotWakorb/enhancedchannelmanager/pull/175). Tag-stone bumps follow the same §6 PR flow as feature work; there is no fast-path exemption.
+The version-bump commit lands via PR like every other change to `dev` — the branch protection rule applies regardless of how trivial the diff is. This was surfaced by `bd-i6a1m`'s tag-stone bump (commit `c479b99a`, `0.16.0-0058 → 0.16.0-0059`), which was rejected on direct push and had to merge via [PR #175](https://github.com/MotWakorb/enhancedchannelmanager/pull/175). Tag-stone bumps follow the same §4 PR flow as feature work; there is no fast-path exemption.
 
-### 4. Close the Bead
-
-```bash
-bd close <id>
-```
-
-### 5. Update README.md and CHANGELOG.md if Needed
+### 3. Update README.md and CHANGELOG.md if Needed
 
 If the change adds, removes, or modifies a feature, update the documentation.
 
 Every user-facing change must also be recorded in [`CHANGELOG.md`](../CHANGELOG.md) under the `[Unreleased]` section, in the appropriate Keep-a-Changelog category (Added / Changed / Deprecated / Removed / Fixed / Security). When cutting a release, rename the `[Unreleased]` heading to the new version with the release date and start a fresh empty `[Unreleased]` section above it.
 
-### 6. Commit and Open the PR
+### 4. Commit and Open the PR
 
 `dev` branch protection requires PRs with 5 passing status checks (`enforce_admins=true` — no one bypasses, including the PO). Direct push to `dev` is rejected. Branch from current `origin/dev`, push the branch, open a PR, wait for the required checks, then merge.
 
@@ -94,10 +82,6 @@ git status  # MUST show "up to date with origin"
 ```
 
 The required check names above are pulled from `gh api /repos/MotWakorb/enhancedchannelmanager/branches/dev/protection | jq '.required_status_checks.contexts'` — if branch protection changes, update this list.
-
-### 7. File Beads for Remaining Work
-
-Create beads for anything that needs follow-up.
 
 ### Worktree quirks: npm and node_modules unavailable
 
@@ -189,13 +173,6 @@ may be in-flight agent work, not orphans.
 - NEVER stop before the PR is merged — an open PR is not a shipped change
 - NEVER say "ready to merge when you are" — YOU must drive the merge once the required checks are green
 - If a required check fails, fix the underlying issue and push to the same branch; do not bypass or skip checks
-- Always use `enhancedchannelmanager` as the repository name when creating beads
-- **NEVER chain `bd create` and `bd close` in one command** — the `bd list` output format doesn't work with shell parsing. Always run them as separate commands:
-  ```bash
-  bd create enhancedchannelmanager "Description"  # Note the ID it prints
-  bd close <id>                                    # Use the exact ID
-  ```
-- Do NOT run `bd sync` as part of code commits. `bd sync` is ONLY for syncing beads issue tracking data.
 
 ## MCP Release Verification
 
@@ -227,8 +204,7 @@ Adapted from ADR-004 §"Cut Mechanics", with the post-cut dev update (step 8) co
 
 ```bash
 # 0. Pre-flight — gate items G1a, G1b, G7 (human checks)
-bd list --status open --priority 0                # G1a: must be empty
-bd list --status open --priority 1                # G1a: must be empty (or each justified in PR)
+gh issue list --state open --label P0 --label P1   # G1a: must be empty (or each justified in PR)
 gh api repos/:owner/:repo/code-scanning/alerts --paginate \
   | jq '[.[] | select(.state=="open" and (.rule.security_severity_level=="high" or .rule.security_severity_level=="critical"))] | length'
                                                    # G1b: must be 0 (or each formally waived)
@@ -264,7 +240,7 @@ PR_URL=$(gh pr create --base main --head release/v0.17.0 \
 <paste the promoted CHANGELOG [0.17.0] block here>
 
 ### Pre-Cut Gate Checklist
-- [ ] G1a: Zero open P0/P1 bugs at cut SHA (verified via `bd list`)
+- [ ] G1a: Zero open P0/P1 bugs at cut SHA (verified via `gh issue list`)
 - [ ] G1b: Zero open HIGH/CRITICAL security findings not formally waived (GitHub Security tab)
 - [x] G2: Backend Tests green (CI will verify)
 - [x] G3: Frontend Tests green (CI will verify)
@@ -328,7 +304,7 @@ All seven items must pass before the release-cut PR can merge. Copy-paste this b
 
 | # | Gate | Enforcement | Cites |
 |---|---|---|---|
-| G1a | **Zero open P0/P1 bugs at the `dev` cut SHA** (beads board, all scopes) | Mechanical: `Release Cut Gate` workflow runs `bd list --status open --priority 0/1` on the release branch's `.beads/issues.jsonl`. PR-description "G1a Justifications" parsing is not yet automated — open P0/P1s require manual override (close them, or escalate to the cut-authorizing reviewer) | `bd-vgm4l` root cause; `bd-3d0tv` automation |
+| G1a | **Zero open P0/P1 bugs at the `dev` cut SHA** (GitHub Issues, all scopes) | Human-verified by the cut-authorizer via `gh issue list --state open --label P0 --label P1`; open P0/P1s must be closed or explicitly justified in the release-cut PR description | — |
 | G1b | **Zero open HIGH/CRITICAL security findings not formally waived** (GitHub Security tab + active advisories) — distinct from G1a so a mis-triaged finding cannot slip through "the bug board is clean" | Mechanical: `Release Cut Gate` workflow queries `code-scanning/alerts?state=open` and fails on any HIGH/CRITICAL. Dismissed-in-Security-tab alerts have `state=dismissed` and naturally pass. PR-description cross-reference (the second half of "formally waived" semantics) is human-verified | Complement to ADR-005 gate G4; `bd-3d0tv` automation |
 | G2 | `Backend Tests` green on the release branch | Branch protection required check | Existing `bd-8w33i` |
 | G3 | `Frontend Tests` green on the release branch | Branch protection required check | Existing `bd-8w33i` |

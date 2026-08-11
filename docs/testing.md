@@ -256,12 +256,11 @@ Do **not** lower the threshold in the config.
 
 ## Container Freshness Check
 
-**Before triaging any "test failure" bead that reports failures from
-`ecm-ecm-1`, verify the container is actually running current `dev`
-HEAD.** This pattern (engineer files a "tests failing on dev" bead;
-investigation reveals tests pass locally and the container is stale)
-recurred enough times — beads `5dug8`, `0gcu9`, others — that it
-deserves its own check (bd-h0wfu).
+**Before triaging any "test failure" report from `ecm-ecm-1`, verify the
+container is actually running current `dev` HEAD.** This pattern (engineer
+reports "tests failing on dev"; investigation reveals tests pass locally
+and the container is stale) recurred enough times that it deserves its own
+check.
 
 The container reports its source SHA in two places, populated from
 Docker build args at image-build time (`Dockerfile`: `ARG GIT_COMMIT`):
@@ -298,13 +297,13 @@ docker exec ecm-ecm-1 sh -c 'rm -rf /app/static/assets/*'
 docker cp dist/. ecm-ecm-1:/app/static/
 ```
 
-Re-run the failing tests. If they now pass, the bead was deploy drift,
-not a code defect — close it without filing a code bead. The
+Re-run the failing tests. If they now pass, the report was deploy drift,
+not a code defect — close it without filing a code issue. The
 container-first development workflow (per `CLAUDE.md`) means agents
 `docker cp` specific files when iterating, so the shared `ecm-ecm-1`
 container can lag origin/dev when nobody re-deploys after a merge to
 `dev`. The freshness check above is a one-line cure for the entire
-class of fake test-failure beads.
+class of fake test-failure reports.
 
 The same SHA labels also drive container-drift dashboards in Grafana —
 `max by (git_sha) (ecm_app_info)` shows the running build identity, and
@@ -362,24 +361,24 @@ broken** — repair the test or the code. Do not mark it `flaky`.
 
 **Never** use `pytest-rerunfailures`, `vitest --retry`, or equivalent as an
 automatic safety net. Retries hide flakes. They are only acceptable as a
-temporary mitigation while a bead is open.
+temporary mitigation while an issue is open.
 
 ### Marking a test as a known flake
 
-1. File a bead (`bd create enhancedchannelmanager "<test path>: flaky — <symptom>"`)
+1. File a GitHub issue (`gh issue create --title "<test path>: flaky — <symptom>"`)
    and add the `flaky` label.
 2. If the test blocks the suite, mark it with
-   `@pytest.mark.skip(reason="flaky, see bead <id>")` or
-   `test.fixme(...)` in vitest. Cite the bead ID in the reason string.
+   `@pytest.mark.skip(reason="flaky, see #<id>")` or
+   `test.fixme(...)` in vitest. Cite the issue number in the reason string.
 3. Do **not** leave `@pytest.mark.xfail` on flaky tests — xfail masks real
    regressions once the code is fixed.
 
 ### Quarterly flake sweep
 
-Every quarter (tracked via recurring beads), the QA persona (or on-call
-engineer in its absence) runs the 3-run cadence from bead `tp681`:
+Every quarter, the QA persona (or on-call engineer in its absence) runs
+the 3-run cadence:
 
-1. Pull the current `flaky`-labelled beads list.
+1. Pull the current `flaky`-labelled issue list.
 2. Execute BE (`pytest tests/ --ignore=tests/e2e -m "not slow"`) and FE
    (`npx vitest run`) three consecutive times on `dev` tip.
 3. Any test that fails in exactly one of the three runs → new `flaky`-labelled
@@ -415,8 +414,8 @@ Reviewer workflow:
    block the merge until fixed.
 
 Manual fallback (if the automation is offline): pull the list of
-`flaky`-labelled open beads with `bd list --label flaky` and apply the same
-rule.
+`flaky`-labelled open issues with `gh issue list --label flaky` and apply
+the same rule.
 
 ### Known baseline flakes (as of 2026-04-20)
 

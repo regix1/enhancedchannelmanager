@@ -115,16 +115,6 @@ After ALL components are migrated:
    git add -A && git commit -m "Remove duplicate [pattern] CSS from components"
    ```
 
-### 6. Close Bead
-
-```bash
-# Document what was changed
-bd update <id> --description "Extracted [pattern] to shared/common.css. Files modified: [list]"
-
-# Close the bead
-bd close <id>
-```
-
 ## Quick Reference Commands
 
 ```bash

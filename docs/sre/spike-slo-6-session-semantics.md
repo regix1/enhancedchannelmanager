@@ -1,7 +1,5 @@
 # Spike: Session Semantics for SLO-6 Denominator (`ecm_session_starts_total`)
 
-**Bead:** [enhancedchannelmanager-1tl01](../../.beads/) (spike)
-**Implementation bead (blocked on this):** [enhancedchannelmanager-arp3o](../../.beads/)
 **Status:** Decision recorded. Implementation may proceed.
 **Date:** 2026-04-24
 **Authors:** Claude (orchestrator), with persona consultations from SRE, Security Engineer, UX Designer.

@@ -1,12 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(bd list:*)",
-      "Bash(bd --no-db list:*)",
-      "Bash(bd --no-db show enhancedchannelmanager-rwtv)",
-      "Bash(bd --no-db create enhancedchannelmanager \"Deprioritize failed streams in smart sort and update status in Dispatcharr\")",
       "Bash(npm run build:*)",
-      "Bash(bd:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git push:*)",

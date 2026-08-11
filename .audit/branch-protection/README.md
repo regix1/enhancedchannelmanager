@@ -16,8 +16,8 @@ Each audit diffs the newest snapshot against the previous one and surfaces:
 - `enforce_admins.enabled` flips (must be `true` per ADR-005 §Decision item 4 — disabling admin bypass).
 - `required_status_checks.contexts` shortening (must include `Backend Tests`, `Frontend Tests`, `CodeQL Analysis (python)`, `CodeQL Analysis (javascript-typescript)`).
 
-A flip is "authorized" only if a corresponding rollback bead exists in `bd` (e.g.,
-`bd-vgm4l`); unauthorized flips become P1 incident beads.
+A flip is "authorized" only if a corresponding rollback issue exists on the GitHub
+issue tracker; unauthorized flips become P1 incident issues.
 
 ## How to run
 

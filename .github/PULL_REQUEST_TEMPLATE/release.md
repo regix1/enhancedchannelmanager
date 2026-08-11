@@ -14,7 +14,7 @@
 
 All seven gates must pass before this PR can merge. G1a, G1b, G5, G6, G7 are author/reviewer-verified at Phase 1; G2, G3, G4 are mechanically enforced. See `docs/shipping.md` §Pre-Cut Gate Checklist for full criteria.
 
-- [ ] **G1a**: Zero open P0/P1 bugs at the cut SHA — verified via `bd list --status open --priority 0` and `bd list --status open --priority 1` (both empty, or each open item explicitly justified below).
+- [ ] **G1a**: Zero open P0/P1 bugs at the cut SHA — verified via `gh issue list --state open --label P0 --label P1` (empty, or each open item explicitly justified below).
 - [ ] **G1b**: Zero open HIGH/CRITICAL security findings not formally waived — verified via `gh api repos/:owner/:repo/code-scanning/alerts --paginate | jq '[.[] | select(.state=="open" and (.rule.security_severity_level=="high" or .rule.security_severity_level=="critical"))] | length'` returns `0`. Any waived alert MUST cite alert number + dismissal category here per the G1b "formally waived" semantics in `docs/shipping.md`.
 - [x] **G2**: `Backend Tests` green on the release branch (CI will verify via branch protection required check).
 - [x] **G3**: `Frontend Tests` green on the release branch (CI will verify via branch protection required check).
@@ -28,7 +28,7 @@ All seven gates must pass before this PR can merge. G1a, G1b, G5, G6, G7 are aut
 <!--
   Per ADR-004, every open P0/P1 at cut SHA must be explicitly justified here.
   Format:
-      - bd-xxxxx (P1, title): reason for inclusion in this cut despite open status.
+      - #123 (P1, title): reason for inclusion in this cut despite open status.
   If the box above is checked because G1a is empty, leave this section blank.
 -->
 
