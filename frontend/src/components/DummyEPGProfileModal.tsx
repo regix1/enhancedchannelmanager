@@ -1176,7 +1176,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     onChange={(e) => setTvgIdTemplate(e.target.value)}
                     placeholder="ecm-{channel_id}"
                   />
-                  <p className="form-hint">Template for tvg-id in XMLTV output. Use &#123;channel_number&#125; for the channel number. This must match the tvg-id used in Dispatcharr for channel matching.</p>
+                  <p className="form-hint">Template for tvg-id in XMLTV output. Keep &#123;channel_id&#125; in it, and make sure it matches the tvg-id used in Dispatcharr for channel matching. Channel ids are never reused, but channel numbers start over at 1 whenever channels are rebuilt, so a template built on the number hands the previous channel's programmes to whatever event now holds that number.</p>
                 </div>
               </div>
             </CollapsibleSection>
