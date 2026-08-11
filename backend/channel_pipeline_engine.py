@@ -2864,9 +2864,13 @@ class ChannelPipelineEngine:
                 # master channels for Pass 3.5 stream reorder, and extends
                 # stream_m3u_map with provider ids for the master + secondary
                 # streams so provider_order / quality-tie-break sorts score
-                # them correctly.
+                # them correctly. stream_name_map rides the same two fetches:
+                # a run carrying only event_sync rules skips the Pass 1 stream
+                # fetch, so nothing else ever names a stream and the quality
+                # sort has no tier to read.
                 rule_channel_order_streams=rule_channel_order_streams,
                 stream_m3u_map=stream_m3u_map,
+                stream_name_map=stream_name_map,
                 # bead ti939.4.1: promotion-enabled rules register their
                 # PROMOTED channel ids here — the managed set Pass 4
                 # reconciles. Attach-only rules never write it.
@@ -3502,6 +3506,7 @@ class ChannelPipelineEngine:
         channels_touched_ids: set,
         rule_channel_order_streams: dict = None,
         stream_m3u_map: dict = None,
+        stream_name_map: dict = None,
         rule_channel_order: dict = None,
     ) -> None:
         """Execute the event_sync attach phase (bead ti939.2.1 — Phase 1B).
@@ -3545,9 +3550,13 @@ class ChannelPipelineEngine:
         contains streams attached on PRIOR runs — they stay resident in
         their secondary groups) plus one bulk ``get_streams_by_ids`` read
         for the masters' own uncovered streams, so provider_order scoring
-        sees every stream on the channel. Rules without a
-        ``stream_sort_field`` register too but Pass 3.5 no-ops them —
-        pre-feature rules keep append-only attach semantics unchanged.
+        sees every stream on the channel. ``stream_name_map`` is extended
+        from those same two reads: a quality sort reads a stream's tier off
+        its name when nothing has probed it, and on a run carrying only
+        event_sync rules these are the only stream reads that happen.
+        Rules without a ``stream_sort_field`` register too but Pass 3.5
+        no-ops them — pre-feature rules keep append-only attach semantics
+        unchanged.
 
         Unattended (watermark-triggered, ti939.3.1) calls add three gates on
         top of the manual path, each pinned by its own test:
@@ -4083,12 +4092,24 @@ class ChannelPipelineEngine:
                 # already carries provider_id for every secondary-group
                 # stream — including ones attached on PRIOR runs, which stay
                 # resident in their secondary groups.
-                if stream_m3u_map is not None:
+                # Names for the quality sort's tier fallback ride the same
+                # pass, but on their OWN map's presence: a caller that wants
+                # names and not provider ids still gets names. A mixed run
+                # already named the whole catalogue at Pass 1, so first name
+                # wins and this fetch never overwrites it. [56]
+                if stream_m3u_map is not None or stream_name_map is not None:
                     for s in secondary_streams:
-                        if s.stream_id is not None \
+                        if stream_m3u_map is not None \
+                                and s.stream_id is not None \
                                 and s.stream_id not in stream_m3u_map:
                             stream_m3u_map[s.stream_id] = s.provider_id
+                        if stream_name_map is not None \
+                                and s.stream_id is not None \
+                                and s.name \
+                                and s.stream_id not in stream_name_map:
+                            stream_name_map[s.stream_id] = s.name
 
+                if stream_m3u_map is not None:
                     # The masters' own streams (Dispatcharr-attached from the
                     # master group's provider) are NOT in the secondary fetch
                     # unless include_master_group_streams is on — resolve the
@@ -4120,6 +4141,11 @@ class ChannelPipelineEngine:
                                                 s.get("m3u_account")
                                             )
                                         )
+                                    if stream_name_map is not None \
+                                            and sid is not None \
+                                            and s.get("name") \
+                                            and sid not in stream_name_map:
+                                        stream_name_map[sid] = s["name"]
                             except Exception as e:
                                 logger.warning(
                                     "[EVENT-SYNC] Rule '%s' (id=%s): failed to "
