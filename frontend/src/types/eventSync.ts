@@ -486,6 +486,12 @@ export interface EventSyncPromotionPreview {
    * a 0 fallback for the same reason as the three counts above: a backend
    * that still promotes dateless streams omits it. */
   skipped_dateless?: number;
+  /** How many delisted streams the run would take off promoted channels that
+   * already exist. Detaching is the only destructive thing promotion does to
+   * a live channel, so the operator sees the number before approving the run.
+   * Optional and read with a 0 fallback for the same reason as the counts
+   * above: a backend without the health check omits it. */
+  stale_streams_removed?: number;
   units: EventSyncPromotionUnit[];
 }
 

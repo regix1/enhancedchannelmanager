@@ -169,6 +169,27 @@ function skippedDatelessText(count: number): string {
 }
 
 /**
+ * The only count here that describes a change to a channel that already
+ * exists. Every other number is about a channel not being created; this one
+ * is a stream leaving a channel that is live right now, so it reads as a
+ * warning and says what earned the removal.
+ */
+function staleStreamsRemovedText(count: number): string {
+  if (count === 1) {
+    return (
+      '1 stream is taken off a channel this rule already promoted, because ' +
+      'the provider no longer lists it and another stream on that channel ' +
+      'has passed its health check.'
+    );
+  }
+  return (
+    `${count} streams are taken off channels this rule already promoted, ` +
+    'because the provider no longer lists them and another stream on each ' +
+    'of those channels has passed its health check.'
+  );
+}
+
+/**
  * Why one unmatched row is or is not in the promotion plan, for its cell in
  * the unmatched table.
  *
@@ -668,7 +689,7 @@ export function EventSyncPreviewPanel({
                   </span>
                 </div>
               )}
-              {/* The four counts below ride along only on a backend that has
+              {/* The five counts below ride along only on a backend that has
                   the lead window, the stream health check and the dateless
                   divert. A missing count reads as 0, so an older backend
                   simply renders nothing here. */}
@@ -711,6 +732,20 @@ export function EventSyncPreviewPanel({
                 >
                   {skippedDatelessText(preview.promotion.skipped_dateless ?? 0)}
                 </p>
+              )}
+              {(preview.promotion.stale_streams_removed ?? 0) > 0 && (
+                <div
+                  className="warning-message"
+                  role="alert"
+                  data-testid="event-sync-promote-stale-streams-removed"
+                >
+                  <span className="material-icons">warning</span>
+                  <span>
+                    {staleStreamsRemovedText(
+                      preview.promotion.stale_streams_removed ?? 0
+                    )}
+                  </span>
+                </div>
               )}
               {preview.promotion.units.length === 0 ? (
                 // The dateless hint above already says why those streams

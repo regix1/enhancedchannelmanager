@@ -880,6 +880,72 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     expect(dateless.textContent).toMatch(/no channels were created for them/);
   });
 
+  it('warns about the delisted streams the run would take off channels', () => {
+    // The only destructive thing a promotion run does to a channel that
+    // already exists, so the operator reads the number before approving it.
+    const preview = promotedPreview();
+    preview.promotion!.stale_streams_removed = 2;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    const removed = screen.getByTestId(
+      'event-sync-promote-stale-streams-removed'
+    );
+    expect(removed.textContent).toMatch(
+      /2 streams are taken off channels this rule already promoted/
+    );
+    expect(removed.textContent).toMatch(/passed its health check/);
+    expect(removed).toHaveAttribute('role', 'alert');
+  });
+
+  it('uses the singular for one detached stream and says nothing at zero', () => {
+    const preview = promotedPreview();
+    preview.promotion!.stale_streams_removed = 1;
+    const { rerender } = render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByTestId('event-sync-promote-stale-streams-removed').textContent
+    ).toMatch(/1 stream is taken off a channel this rule already promoted/);
+
+    // Zero and absent both read as nothing to say. Absent is what a backend
+    // without the health check sends.
+    const quiet = promotedPreview();
+    quiet.promotion!.stale_streams_removed = 0;
+    rerender(
+      <EventSyncPreviewPanel
+        preview={quiet}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.queryByTestId('event-sync-promote-stale-streams-removed')
+    ).toBeNull();
+    rerender(
+      <EventSyncPreviewPanel
+        preview={promotedPreview()}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.queryByTestId('event-sync-promote-stale-streams-removed')
+    ).toBeNull();
+  });
+
   it('does not blame the parse when the plan is empty because of dates', () => {
     // Those streams parsed a title and a time. Telling the operator no
     // stream has a complete parsed identity sends them to the title and
