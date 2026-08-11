@@ -2095,6 +2095,18 @@ async def artwork_proxy(source_id: int):
             status_code=400,
             detail=f"EPG source {source_id} has no URL to proxy",
         )
+    # The upstream URL is read off the source itself, so a source pointed at
+    # its own proxy would fetch itself forever. Point this at the source that
+    # holds the real upstream URL and register the proxy as a SEPARATE source.
+    if "/api/epg/artwork-proxy" in url:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"EPG source {source_id} points at the artwork proxy, which "
+                f"would make it fetch itself. Give this source its upstream "
+                f"URL and add the proxy as a separate EPG source."
+            ),
+        )
     validate_url_scheme(url, "EPG source URL")
 
     try:

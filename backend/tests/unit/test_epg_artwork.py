@@ -102,6 +102,44 @@ async def test_a_spent_budget_leaves_the_feed_untouched_rather_than_blocking(tmp
     assert stats["rewritten"] == 0
 
 
+async def test_a_source_pointed_at_its_own_proxy_is_refused(monkeypatch):
+    """The upstream URL is read off the source itself, so a source whose URL
+    is its own proxy would fetch itself forever. Refuse with an instruction
+    instead of recursing.
+
+    Written as a coroutine, not asyncio.run: pytest.ini sets
+    asyncio_mode=auto, so pytest-asyncio owns the loop and closing one out
+    from under it breaks every async test that runs afterwards.
+    """
+    from unittest.mock import MagicMock
+
+    import pytest
+    from fastapi import HTTPException
+
+    import routers.epg as epg
+
+    client = MagicMock()
+
+    async def _source(_id):
+        return {"url": "http://ecm:6100/api/epg/artwork-proxy/4"}
+
+    client.get_epg_source = _source
+    monkeypatch.setattr(epg, "get_client", lambda: client)
+
+    with pytest.raises(HTTPException) as caught:
+        await epg.artwork_proxy(4)
+    assert caught.value.status_code == 400
+    assert "fetch itself" in caught.value.detail
+
+
+def test_the_proxy_is_exempt_from_the_request_timeout():
+    """It downloads a whole upstream XMLTV and rewrites it, which exceeded the
+    30s budget and returned 504 against a real locals feed."""
+    from main import _TIMEOUT_EXEMPT_PREFIXES
+
+    assert "/api/epg/artwork-proxy" in _TIMEOUT_EXEMPT_PREFIXES
+
+
 def test_the_cache_round_trips_through_its_file(tmp_path):
     path = tmp_path / "art.json"
     first = ArtworkCache(path)

@@ -436,6 +436,12 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/stream-preview/",   # streaming endpoints
     "/api/tasks/",             # task triggering / status
     "/api/backup/",            # backup/restore can be large
+    # Downloads a whole upstream XMLTV (a locals feed is thousands of
+    # channels) and rewrites its artwork, so it belongs with backup rather
+    # than under the 30s budget — it returned 504 on a real source. It stays
+    # bounded by its own limits: 120s on the upstream fetch and a probe
+    # budget that leaves anything unresolved for a later run.
+    "/api/epg/artwork-proxy",
     # Note: /api/auto-creation/ was previously exempt as a hotfix (bd-zv6pi)
     # for synchronous /run handlers that could exceed the 30s budget. As of
     # bd-enfsy those handlers are now 202+poll background tasks (the
