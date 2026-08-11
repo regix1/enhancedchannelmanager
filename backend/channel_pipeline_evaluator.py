@@ -177,14 +177,16 @@ class ConditionEvaluator:
         # Includes raw names, names with channel-number prefixes stripped (e.g. "106 | Name" -> "Name"),
         # and normalization-engine-processed names for maximum match coverage
         self._channel_names_by_group: dict[int, set[str]] = {}
-        channel_number_prefix = re.compile(r'^\d+\s*\|\s*')
         for gid, channels in self._channels_by_group.items():
             names: set[str] = set()
             for c in channels:
                 raw = c["name"]
                 names.add(raw.lower())
-                # Strip "123 | " channel number prefixes
-                stripped = channel_number_prefix.sub('', raw)
+                # The pipe form ECM wrote before the separator became
+                # configurable, decimals included: an ATSC sub-channel is
+                # stored "2.1 | ABC: WBAY Green Bay". Unconditional, because
+                # a name carrying it predates the current setting.
+                stripped = strip_channel_number_prefix(raw, '|')
                 if stripped != raw:
                     names.add(stripped.lower())
                 # Every spelling to key and normalize under: the pipe-stripped
