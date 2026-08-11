@@ -45,6 +45,10 @@ class StreamContext:
     is_custom: bool = False
     # Dispatcharr's denormalized catch-up capability flag (GH #652).
     is_catchup: bool = False
+    # Dispatcharr no longer saw this stream in the provider's playlist. The
+    # row survives until a cleanup pass, so a rule that does not check it
+    # merges a feed the provider has already dropped.
+    is_stale: bool = False
 
     # Quality info (from StreamStats if probed)
     resolution: Optional[str] = None  # e.g., "1920x1080"
@@ -101,6 +105,7 @@ class StreamContext:
             m3u_account_id=m3u_account_id,
             m3u_account_name=m3u_account_name,
             is_custom=bool(stream.get("is_custom")),
+            is_stale=bool(stream.get("is_stale")),
             is_catchup=bool(stream.get("is_catchup")),
             channel_id=stream.get("channel_id") or stream.get("channel"),
             channel_name=stream.get("channel_name"),
@@ -318,6 +323,17 @@ class ConditionEvaluator:
             matched = has_logo == expected
             return EvaluationResult(matched, cond_type,
                                     f"logo {'exists' if has_logo else 'missing'}")
+
+        # Stale condition. Dispatcharr keeps a stream row after the provider
+        # stops listing it, so without this a rule keeps merging a feed that
+        # is already gone — it lands on the channel as a fallback that cannot
+        # play. Negate it to mean "only streams the provider still carries".
+        elif cond_enum == ConditionType.STREAM_IS_STALE:
+            is_stale = bool(context.is_stale)
+            expected = condition.value if condition.value is not None else True
+            matched = is_stale == expected
+            return EvaluationResult(matched, cond_type,
+                                    f"stream {'is stale' if is_stale else 'is current'}")
 
         # Provider condition
         elif cond_enum == ConditionType.PROVIDER_IS:

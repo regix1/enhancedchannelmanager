@@ -47,6 +47,7 @@ from channel_pipeline_executor import (
     ExecutionContext,
 )
 from channel_pipeline_sort import sort_channels_by_name
+from stream_normalization import get_quality_tier
 
 
 logger = logging.getLogger(__name__)
@@ -6167,16 +6168,35 @@ def _sort_streams_by_m3u_account_priority(
     return sorted_ids
 
 
+# What each name-declared tier is worth when nothing has been measured.
+# Values are the nominal heights those labels stand for, so they sort against
+# a probed height on the same scale.
+_NAME_TIER_HEIGHT = {"4K": 2160, "FHD": 1080, "HD": 720, "SD": 480}
+
+
 def _resolution_height_from_stats(stats: dict | None) -> int:
-    if not stats or not stats.get("resolution"):
+    """Measured height, else the height this stream's own name claims.
+
+    Only a probed stream has a resolution, and scoring every unprobed one 0
+    left a channel's fallbacks in arbitrary order — an SD copy could sit
+    above a 4K one. Provider names carry the tier (``Fox Sports 1 4K``,
+    ``Fox Sports 1 SD``), which costs neither a probe nor a provider
+    connection to read, so it stands in until something measures the stream.
+    A measurement always wins: the name is only consulted when there is no
+    resolution to use.
+    """
+    if stats and stats.get("resolution"):
+        try:
+            parts = stats["resolution"].split("x")
+            if len(parts) == 2:
+                return int(parts[1])
+        except (ValueError, IndexError) as e:
+            logger.debug("[AUTO-CREATE-ENGINE] Suppressed resolution parse error: %s", e)
+
+    name = (stats or {}).get("stream_name") if isinstance(stats, dict) else None
+    if not name:
         return 0
-    try:
-        parts = stats["resolution"].split("x")
-        if len(parts) == 2:
-            return int(parts[1])
-    except (ValueError, IndexError) as e:
-        logger.debug("[AUTO-CREATE-ENGINE] Suppressed resolution parse error: %s", e)
-    return 0
+    return _NAME_TIER_HEIGHT.get(get_quality_tier(name), 0)
 
 
 def _sort_streams_by_resolution_height(

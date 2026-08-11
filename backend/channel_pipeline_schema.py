@@ -34,6 +34,7 @@ class ConditionType(str, Enum):
     TVG_ID_EXISTS = "tvg_id_exists"                  # Has EPG ID
     TVG_ID_MATCHES = "tvg_id_matches"                # Regex match on EPG ID
     LOGO_EXISTS = "logo_exists"                      # Has logo URL
+    STREAM_IS_STALE = "stream_is_stale"              # Provider dropped it from its playlist
     PROVIDER_IS = "provider_is"                      # From specific M3U account(s)
     QUALITY_MIN = "quality_min"                      # Minimum resolution (height)
     QUALITY_MAX = "quality_max"                      # Maximum resolution (height)
