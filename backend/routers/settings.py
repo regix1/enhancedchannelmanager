@@ -961,159 +961,103 @@ async def update_settings(
                 detail="Password is required when changing auth method, URL or username",
             )
 
-    new_settings = DispatcharrSettings(
-        url=request.url,
-        auth_method=request.auth_method,
-        username=request.username,
-        password=password,
+    requested_settings = DispatcharrSettings(**{
+        # Every field the request and the settings model share is saved as
+        # sent. Deriving that half from the two models instead of listing it
+        # here is what stops a field from being forgotten: add one to both
+        # models and it is settable, with no matching edit in this handler.
+        # The fields below are resolved above rather than taken as sent, and
+        # they are written last so they win. [57]
+        **{
+            name: getattr(request, name)
+            for name in DispatcharrSettings.model_fields
+            if name in SettingsRequest.model_fields
+            # bd-jmi1c (GH #273): the legacy api_key is folded into
+            # request_dispatcharr_key above and mirrored from the canonical key
+            # by save_settings(), so it is never read off the body here.
+            and name != "api_key"
+        },
+        "password": password,
         # bd-jmi1c (GH #273): canonical field; ``save_settings()`` mirrors
         # this value into the legacy ``api_key`` field on disk for one
         # release of back-compat with external readers.
-        dispatcharr_api_key=dispatcharr_api_key,
-        auto_rename_channel_number=request.auto_rename_channel_number,
-        include_channel_number_in_name=request.include_channel_number_in_name,
-        channel_number_separator=request.channel_number_separator,
-        remove_country_prefix=request.remove_country_prefix,
-        include_country_in_name=request.include_country_in_name,
-        country_separator=request.country_separator,
-        timezone_preference=request.timezone_preference,
-        show_stream_urls=request.show_stream_urls,
-        hide_auto_sync_groups=request.hide_auto_sync_groups,
-        hide_ungrouped_streams=request.hide_ungrouped_streams,
-        hide_epg_urls=request.hide_epg_urls,
-        hide_m3u_urls=request.hide_m3u_urls,
-        gracenote_conflict_mode=request.gracenote_conflict_mode,
-        theme=request.theme,
-        date_format=request.date_format,
-        default_channel_profile_ids=request.default_channel_profile_ids,
-        linked_m3u_accounts=request.linked_m3u_accounts,
-        allow_multi_provider_auto_sync=request.allow_multi_provider_auto_sync,
-        epg_auto_match_threshold=request.epg_auto_match_threshold,
-        dedup_threshold=request.dedup_threshold,
-        dedup_m3u_toast_suppressed=request.dedup_m3u_toast_suppressed,
-        custom_network_prefixes=request.custom_network_prefixes,
-        custom_network_suffixes=request.custom_network_suffixes,
-        stats_poll_interval=request.stats_poll_interval,
-        user_timezone=request.user_timezone,
-        backend_log_level=request.backend_log_level,
-        frontend_log_level=request.frontend_log_level,
-        vlc_open_behavior=request.vlc_open_behavior,
-        stream_probe_timeout=request.stream_probe_timeout,
-        stream_probe_schedule_time=request.stream_probe_schedule_time,
-        bitrate_sample_duration=request.bitrate_sample_duration,
-        parallel_probing_enabled=request.parallel_probing_enabled,
-        max_concurrent_probes=request.max_concurrent_probes,
-        profile_distribution_strategy=request.profile_distribution_strategy,
-        skip_recently_probed_hours=request.skip_recently_probed_hours,
-        refresh_m3us_before_probe=request.refresh_m3us_before_probe,
-        auto_reorder_after_probe=request.auto_reorder_after_probe,
-        push_stream_stats_to_dispatcharr=request.push_stream_stats_to_dispatcharr,
-        probe_retry_count=request.probe_retry_count,
-        probe_retry_delay=request.probe_retry_delay,
-        stream_fetch_page_limit=request.stream_fetch_page_limit,
-        stream_sort_priority=request.stream_sort_priority,
-        stream_sort_enabled=request.stream_sort_enabled,
-        m3u_account_priorities=request.m3u_account_priorities,
-        black_screen_detection_enabled=request.black_screen_detection_enabled,
-        black_screen_sample_duration=request.black_screen_sample_duration,
-        low_fps_threshold=request.low_fps_threshold,
-        deprioritize_failed_streams=request.deprioritize_failed_streams,
-        deprioritize_black_screen=request.deprioritize_black_screen,
-        deprioritize_low_fps=request.deprioritize_low_fps,
-        failed_stream_sort_order=request.failed_stream_sort_order,
-        strike_threshold=request.strike_threshold,
+        "dispatcharr_api_key": dispatcharr_api_key,
         # Convert normalization_settings from API format to backend format
-        disabled_builtin_tags=(
+        "disabled_builtin_tags": (
             request.normalization_settings.disabledBuiltinTags
             if request.normalization_settings else current_settings.disabled_builtin_tags
         ),
-        custom_normalization_tags=(
+        "custom_normalization_tags": (
             [{"value": tag.value, "mode": tag.mode} for tag in request.normalization_settings.customTags]
             if request.normalization_settings else current_settings.custom_normalization_tags
         ),
-        normalize_on_channel_create=request.normalize_on_channel_create,
-        # Shared SMTP settings
-        smtp_host=request.smtp_host,
-        smtp_port=request.smtp_port,
-        smtp_user=request.smtp_user,
-        smtp_password=smtp_password,
-        smtp_from_email=request.smtp_from_email,
-        smtp_from_name=request.smtp_from_name,
-        smtp_use_tls=request.smtp_use_tls,
-        smtp_use_ssl=request.smtp_use_ssl,
-        # Shared Discord settings
-        discord_webhook_url=request.discord_webhook_url,
-        # Shared Telegram settings
-        telegram_bot_token=request.telegram_bot_token,
-        telegram_chat_id=request.telegram_chat_id,
-        stream_preview_mode=request.stream_preview_mode,
-        auto_creation_excluded_terms=request.auto_creation_excluded_terms,
-        auto_creation_excluded_groups=request.auto_creation_excluded_groups,
-        auto_creation_exclude_auto_sync_groups=request.auto_creation_exclude_auto_sync_groups,
-        # GH #473 safety-valve caps (skg35). Threaded from the request so an
-        # admin can adjust them; the config validator normalizes a negative to
-        # the 0 = disabled sentinel. Admin-gated on write (see
-        # _ADMIN_ONLY_SETTINGS_FIELDS) so a non-admin / MCP key cannot change them.
-        max_auto_created_channels_per_run=request.max_auto_created_channels_per_run,
-        max_auto_creation_log_entries=request.max_auto_creation_log_entries,
+        "smtp_password": smtp_password,
         # MCP API key is preserved from current settings — see comment above
         # where mcp_api_key is captured (bd-vj8n9).
-        mcp_api_key=mcp_api_key,
-        telemetry_client_errors_enabled=request.telemetry_client_errors_enabled,
+        "mcp_api_key": mcp_api_key,
         # Emby integration (bd-8wc6q). emby_api_key uses the preserve-on-omit
         # pattern resolved above so a partial POST cannot silently clear the
         # stored key.
-        emby_enabled=request.emby_enabled,
-        emby_base_url=request.emby_base_url,
-        emby_api_key=emby_api_key,
+        "emby_api_key": emby_api_key,
         # Plex integration (bd-r5f0c.4). plex_token preserved above.
-        plex_enabled=request.plex_enabled,
-        plex_base_url=request.plex_base_url,
-        plex_token=plex_token,
+        "plex_token": plex_token,
         # Jellyfin integration (bd-r5f0c.4). jellyfin_api_key preserved above.
-        jellyfin_enabled=request.jellyfin_enabled,
-        jellyfin_base_url=request.jellyfin_base_url,
-        jellyfin_api_key=jellyfin_api_key,
+        "jellyfin_api_key": jellyfin_api_key,
         # bd-mlcla: trusted media/proxy networks (preserve-on-omit above).
-        trusted_media_networks=trusted_media_networks,
+        "trusted_media_networks": trusted_media_networks,
         # Internal bookkeeping marker (GH #484): never sent by the UI, so it MUST
         # be preserved from current settings — rebuilding the model here would
         # otherwise reset it to False and re-arm the one-time league-strip heal,
         # re-clobbering the user's require_delimiter choice on the next boot.
-        league_delimiter_heal_applied=current_settings.league_delimiter_heal_applied,
+        "league_delimiter_heal_applied": current_settings.league_delimiter_heal_applied,
         # ADR-013 (bead 312nk.2): WS channel_stats subscriber flags. Not yet
         # surfaced in the UI (operator-driven soak via settings.json), so they
         # MUST be preserved from current settings — rebuilding the model here
         # would otherwise reset an operator's opt-in back to the default OFF on
         # the next UI settings-save.
-        use_ws_channel_stats=current_settings.use_ws_channel_stats,
-        ws_suppress_poll_when_healthy=current_settings.ws_suppress_poll_when_healthy,
+        "use_ws_channel_stats": current_settings.use_ws_channel_stats,
+        "ws_suppress_poll_when_healthy": current_settings.ws_suppress_poll_when_healthy,
         # ADR-013 §D2 (bead 312nk.3): steady-state session_telemetry write
         # cadence. Like the WS flags above it is operator-driven via
         # settings.json (not surfaced in the UI), so it MUST be preserved from
         # current settings — rebuilding the model here would otherwise reset an
         # operator's tuned value back to the default on the next UI settings-save.
-        telemetry_write_interval=current_settings.telemetry_write_interval,
+        "telemetry_write_interval": current_settings.telemetry_write_interval,
         # ADR-013 §D3/§D4 (bead 312nk.4): stream->provider and user->username
         # cache TTLs. Operator-driven via settings.json (not surfaced in the
         # UI), so they MUST be preserved from current settings — rebuilding the
         # model here would otherwise reset a tuned value back to the default on
         # the next UI settings-save.
-        stream_provider_cache_ttl=current_settings.stream_provider_cache_ttl,
-        user_username_cache_ttl=current_settings.user_username_cache_ttl,
+        "stream_provider_cache_ttl": current_settings.stream_provider_cache_ttl,
+        "user_username_cache_ttl": current_settings.user_username_cache_ttl,
         # nngkg: DBAS outbound-policy mode is written ONLY through the dedicated
         # PATCH /api/settings/security endpoint (like mcp_api_key), never by the
         # general settings form. It MUST be preserved from current settings here
         # — rebuilding the model would otherwise reset an operator's public-only
         # choice back to the lan_friendly default on the next UI settings-save.
-        ssrf_outbound_mode=current_settings.ssrf_outbound_mode,
+        "ssrf_outbound_mode": current_settings.ssrf_outbound_mode,
         # ti939.4.2: the Event Sync team-alias dictionary is written ONLY
         # through the dedicated PUT /api/event-sync/team-aliases endpoint
         # (validated + journaled there), never by the general settings form.
         # It MUST be preserved from current settings here — rebuilding the
         # model would otherwise wipe the operator's dictionary on every
         # ordinary settings save.
-        event_sync_team_aliases=current_settings.event_sync_team_aliases,
+        "event_sync_team_aliases": current_settings.event_sync_team_aliases,
+    })
+    # A model field with no field of that name on the request cannot be set
+    # through this endpoint at all, so it keeps the stored value instead of the
+    # default the construction just gave it. That is the post-refresh
+    # auto-creation latch, the MCP bulk-operation caps, and the refresh and
+    # consumed timestamp pair that gates a pending auto-creation run, none of
+    # which this form asks about. Reading the split off the names the
+    # construction actually passed leaves the validation and the preserve-on-omit
+    # resolution above untouched.
+    new_settings = requested_settings.model_copy(
+        update={
+            name: getattr(current_settings, name)
+            for name in DispatcharrSettings.model_fields
+            if name not in requested_settings.model_fields_set
+        }
     )
     save_settings(new_settings)
     clear_settings_cache()
