@@ -16,8 +16,8 @@ from typing import Any, Optional
 from urllib.parse import urljoin
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from alert_methods import send_alert
@@ -34,7 +34,12 @@ from epg_matching import (
 )
 import journal
 from concurrency import run_cpu_bound
-from services.epg_artwork import ArtworkCache, rewrite_artwork
+from services.epg_artwork import (
+    ArtworkCache,
+    ArtworkRewriter,
+    probe_unknown,
+    stream_rewritten,
+)
 from services.epg_migration import (
     PREVIEW_ISSUER,
     PreviewTokenError,
@@ -2069,7 +2074,7 @@ async def audit_epg_duplicates():
 
 
 @router.get("/artwork-proxy/{source_id}")
-async def artwork_proxy(source_id: int):
+async def artwork_proxy(source_id: int, background: BackgroundTasks = None):
     """Serve an EPG source's XMLTV with its programme artwork made portrait.
 
     Point a Dispatcharr XMLTV source at this instead of the upstream URL when
@@ -2109,28 +2114,28 @@ async def artwork_proxy(source_id: int):
         )
     validate_url_scheme(url, "EPG source URL")
 
-    try:
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as http:
-            upstream = await http.get(url)
-            upstream.raise_for_status()
-            content = upstream.content
-    except httpx.HTTPError as e:
-        logger.warning("[EPG-ART] Upstream fetch failed for source %s: %s", source_id, e)
-        raise HTTPException(status_code=502, detail="Upstream EPG fetch failed")
-
-    if url.endswith(".gz") or upstream.headers.get("content-encoding") == "gzip":
-        try:
-            content = gzip.decompress(content)
-        except gzip.BadGzipFile:
-            pass  # Not actually gzipped despite extension/header; use raw content
-
-    xml_text = content.decode("utf-8", errors="replace")
     cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
-    rewritten, stats = await rewrite_artwork(xml_text, cache)
-    return Response(
-        content=rewritten,
+    rewriter = ArtworkRewriter(cache)
+
+    async def body():
+        try:
+            async for chunk in stream_rewritten(url, cache, rewriter):
+                yield chunk
+        except httpx.HTTPError as e:
+            # The status line is long gone by now, so this cannot become a
+            # 502 — truncating the body is what tells the caller the feed is
+            # not whole, and the log says why.
+            logger.warning(
+                "[EPG-ART] Upstream stream failed for source %s: %s", source_id, e
+            )
+
+    if background is not None:
+        background.add_task(probe_unknown, cache, rewriter.unknown)
+
+    return StreamingResponse(
+        body(),
         media_type="application/xml",
-        headers={"X-ECM-Artwork-Repointed": str(stats["rewritten"])},
+        background=background,
     )
 
 
