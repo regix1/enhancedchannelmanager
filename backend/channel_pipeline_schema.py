@@ -1399,7 +1399,7 @@ def validate_event_sync_config(config: Any) -> list[str]:
             and not isinstance(promote_channel_number, bool)
             and promote_channel_number > 0)
         or (isinstance(promote_channel_number, str)
-            and re.fullmatch(r"\d+-\d+", promote_channel_number))
+            and re.fullmatch(r"\d+-\d+|[1-9]\d*", promote_channel_number))
     ):
         errors.append(_event_sync_error(
             "promote_channel_number", promote_channel_number,

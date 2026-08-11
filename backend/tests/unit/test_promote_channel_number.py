@@ -32,6 +32,20 @@ class TestValidation:
         assert validate_event_sync_config(
             _config(promote_channel_number=900)) == []
 
+    def test_a_positive_integer_as_a_string_is_accepted(self):
+        """The rule editor posts the box contents verbatim, so an operator who
+        types 900 sends the string. _get_next_channel_number already parses
+        that with int(spec)."""
+        assert validate_event_sync_config(
+            _config(promote_channel_number="900")) == []
+
+    def test_a_zero_or_zero_padded_string_is_rejected(self):
+        """int("007") is 7, so a padded entry would number somewhere the
+        operator never typed."""
+        for bad in ("0", "007"):
+            errs = validate_event_sync_config(_config(promote_channel_number=bad))
+            assert any("promote_channel_number" in e for e in errs), bad
+
     def test_absent_is_accepted_so_existing_rules_are_untouched(self):
         """Every rule saved before this key existed must keep validating, and
         keep its old numbering."""
