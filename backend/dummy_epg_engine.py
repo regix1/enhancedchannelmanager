@@ -282,8 +282,12 @@ def compute_event_times(
         except pytz.exceptions.UnknownTimeZoneError as e:
             logger.warning("[DUMMY-EPG] Unknown output_timezone %s: %s", output_timezone, e)
 
-    # Format time strings
+    # Format time strings. ``starttime`` is the hour alone, so it reads an
+    # event at 17:30 as "5 PM" — right for a show on the hour, half an hour
+    # early for anything else. ``starttime12`` is the same clock as
+    # ``starttime24`` with the minutes kept.
     starttime = start_dt.strftime("%-I %p").replace("AM", "AM").replace("PM", "PM")
+    starttime12 = start_dt.strftime("%-I:%M %p")
     starttime24 = start_dt.strftime("%H:%M")
     endtime = end_dt.strftime("%-I %p").replace("AM", "AM").replace("PM", "PM")
     endtime24 = end_dt.strftime("%H:%M")
@@ -298,6 +302,7 @@ def compute_event_times(
         "start_dt": start_dt,
         "end_dt": end_dt,
         "starttime": starttime,
+        "starttime12": starttime12,
         "starttime24": starttime24,
         "endtime": endtime,
         "endtime24": endtime24,

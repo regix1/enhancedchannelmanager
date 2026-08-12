@@ -325,6 +325,24 @@ def test_compute_times_basic_24h():
     assert result["start_dt"].minute == 30
 
 
+def test_compute_times_12h_keeps_the_minutes():
+    """``starttime`` is the hour alone, so a half-past event reads half an
+    hour early. ``starttime12`` is the 12-hour clock with the minutes kept,
+    which is what a guide description needs."""
+    groups = {"hour": "17", "minute": "30"}
+    result = compute_event_times(groups, "America/Chicago")
+    assert result["starttime12"] == "5:30 PM"
+    assert result["starttime24"] == "17:30"
+    assert result["starttime"] == "5 PM"
+
+
+def test_compute_times_12h_on_the_hour_and_past_noon():
+    for hour, minute, expected in (("9", "00", "9:00 AM"), ("12", "05", "12:05 PM"),
+                                   ("00", "15", "12:15 AM"), ("23", "45", "11:45 PM")):
+        result = compute_event_times({"hour": hour, "minute": minute}, "America/Chicago")
+        assert result["starttime12"] == expected, f"{hour}:{minute}"
+
+
 def test_compute_times_am():
     """AM time correctly parsed (9 AM stays 9)."""
     groups = {"hour": "9", "minute": "00", "ampm": "AM"}
