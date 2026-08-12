@@ -214,7 +214,14 @@ def smart_sort_streams(
             elif criterion == "bitrate":
                 bitrate_value = 0
                 if stat:
-                    bitrate_value = stat.video_bitrate or stat.bitrate or 0
+                    # A sampled 0 is a stream sending nothing, which is a
+                    # reading in its own right. Only an absent sample falls
+                    # through to what ffprobe declared.
+                    measured = stat.measured_bitrate
+                    bitrate_value = (
+                        measured if measured is not None
+                        else stat.video_bitrate or stat.bitrate or 0
+                    )
                 values.append(-bitrate_value)
 
             elif criterion == "framerate":
@@ -335,8 +342,14 @@ def smart_sort_streams(
                 sort_values.append(-resolution_value)
 
             elif criterion == "bitrate":
-                # Use video_bitrate first (from probe), fallback to overall bitrate
-                bitrate_value = stat.video_bitrate or stat.bitrate or 0
+                # Prefer what was sampled off the stream, then ffprobe's video
+                # bitrate, then the overall one. A sampled 0 is a stream
+                # sending nothing, so only an absent sample falls through.
+                measured = stat.measured_bitrate
+                bitrate_value = (
+                    measured if measured is not None
+                    else stat.video_bitrate or stat.bitrate or 0
+                )
                 sort_values.append(-bitrate_value)
 
             elif criterion == "framerate":
@@ -1051,45 +1064,48 @@ class StreamProber:
                 stream_id, name, None, "failed", "No URL available"
             )
 
+        result: Optional[dict] = None
+        status = "success"
+        error_message: Optional[str] = None
         try:
             logger.debug("[STREAM-PROBE] Running ffprobe for stream %s", stream_id)
             result = await self._run_ffprobe(url)
             logger.info("[STREAM-PROBE] Stream %s ffprobe succeeded", stream_id)
-
-            # Measure actual bitrate by downloading stream data
-            logger.debug("[STREAM-PROBE] Measuring bitrate for stream %s", stream_id)
-            measured_bitrate = await self._measure_stream_bitrate(url)
-
-            # Black screen detection (opt-in). `is_black` stays None when
-            # detection is disabled OR when it returned indeterminate (timeout
-            # / no YAVG data), so _save_probe_result knows not to overwrite
-            # any prior is_black_screen value.
-            is_black: Optional[bool] = None
-            if self.black_screen_detection_enabled:
-                logger.debug("[STREAM-PROBE] Running black screen detection for stream %s", stream_id)
-                is_black = await self._detect_black_screen(url)
-
-            # Save probe result with both ffprobe metadata and measured bitrate
-            saved = self._save_probe_result(
-                stream_id, name, result, "success", None, measured_bitrate, is_black
-            )
-            # Optionally reflect stats back to Dispatcharr. Fire-and-forget semantics:
-            # any failure is logged but never fails the probe.
-            await self._push_stats_to_dispatcharr(stream_id, saved)
-            return saved
         except asyncio.TimeoutError:
             logger.warning("[STREAM-PROBE] Stream %s probe timed out after %ss", stream_id, self.probe_timeout)
-            return self._save_probe_result(
-                stream_id,
-                name,
-                None,
-                "timeout",
-                f"Probe timed out after {self.probe_timeout}s"
-            )
+            status = "timeout"
+            error_message = f"Probe timed out after {self.probe_timeout}s"
         except Exception as e:
             logger.error("[STREAM-PROBE] Stream %s probe failed: %s", stream_id, e)
             # Return generic error to client; details stay in server logs
-            return self._save_probe_result(stream_id, name, None, "failed", "Probe failed")
+            status = "failed"
+            error_message = "Probe failed"
+
+        # Measure whatever ffprobe did. ffprobe reads the container header and
+        # stops, so it says nothing about whether bytes keep arriving, and a
+        # stream it could not parse may still be carrying content. [1]
+        logger.debug("[STREAM-PROBE] Measuring bitrate for stream %s", stream_id)
+        measured_bitrate = await self._measure_stream_bitrate(url)
+
+        # Black screen detection (opt-in). `is_black` stays None when
+        # detection is disabled OR when it returned indeterminate (timeout
+        # / no YAVG data), so _save_probe_result knows not to overwrite
+        # any prior is_black_screen value. ffmpeg needs a stream ffprobe
+        # could read, so this stays on the success path.
+        is_black: Optional[bool] = None
+        if status == "success" and self.black_screen_detection_enabled:
+            logger.debug("[STREAM-PROBE] Running black screen detection for stream %s", stream_id)
+            is_black = await self._detect_black_screen(url)
+
+        # Save probe result with both ffprobe metadata and measured bitrate
+        saved = self._save_probe_result(
+            stream_id, name, result, status, error_message, measured_bitrate, is_black
+        )
+        # Optionally reflect stats back to Dispatcharr. Fire-and-forget semantics:
+        # any failure is logged but never fails the probe, and it drops anything
+        # that did not come back as a success.
+        await self._push_stats_to_dispatcharr(stream_id, saved)
+        return saved
 
     async def _run_ffprobe(self, url: str, _retry_attempt: int = 0) -> dict:
         """Run ffprobe and parse JSON output."""
@@ -1334,10 +1350,18 @@ class StreamProber:
             elif status == "success":
                 stats.is_low_fps = False
 
-            # Apply measured bitrate if available (overrides ffprobe metadata)
+            # Sampled throughput, stored apart from whatever ffprobe declared in
+            # video_bitrate so a later reader can tell a measurement from a claim. [3]
             if measured_bitrate is not None:
-                stats.video_bitrate = measured_bitrate
-                logger.debug("[STREAM-PROBE] Applied measured bitrate: %s bps", measured_bitrate)
+                stats.measured_bitrate = measured_bitrate
+                logger.debug("[STREAM-PROBE] Recorded measured bitrate: %s bps", measured_bitrate)
+            elif status != "success":
+                # ffprobe got nothing and the sampler got nothing either, so any
+                # stored number describes a stream that has since stopped
+                # answering. Drop it, or a reader that trusts the sample over the
+                # probe verdict keeps calling this stream alive forever. A
+                # success that merely failed to sample keeps its number. [34]
+                stats.measured_bitrate = None
 
             session.commit()
             result = stats.to_dict()
@@ -1390,8 +1414,16 @@ class StreamProber:
                 mapped["audio_channels"] = (
                     _channel_names.get(raw_ch, str(raw_ch)) if isinstance(raw_ch, int) else raw_ch
                 )
-            if ecm_stats.get("video_bitrate") is not None:
-                mapped["ffmpeg_output_bitrate"] = round(ecm_stats["video_bitrate"] / 1000, 1)
+            # Dispatcharr's ffmpeg_output_bitrate is a throughput number, so send
+            # the sampled one and fall back to ffprobe's declared video bitrate
+            # only where there is no sample. A sampled 0 is what a stream
+            # sending nothing reads, and Dispatcharr should be told that.
+            measured = ecm_stats.get("measured_bitrate")
+            output_bitrate = (
+                measured if measured is not None else ecm_stats.get("video_bitrate")
+            )
+            if output_bitrate is not None:
+                mapped["ffmpeg_output_bitrate"] = round(output_bitrate / 1000, 1)
             if ecm_stats.get("fps") is not None:
                 try:
                     mapped["source_fps"] = float(ecm_stats["fps"])

@@ -1252,8 +1252,10 @@ export interface SettingsResponse {
   stream_probe_timeout: number;  // Timeout in seconds for each probe
   stream_probe_schedule_time: string;  // Time of day to run probes (HH:MM, 24h format)
   bitrate_sample_duration: number;  // Duration in seconds to sample stream for bitrate (10, 20, or 30)
+  min_stream_bitrate_kbps: number;  // Sampled throughput below this marks a started event's stream dead
   parallel_probing_enabled: boolean;  // Probe streams from different M3Us simultaneously
   max_concurrent_probes: number;  // Max simultaneous probes when parallel probing is enabled (1-16)
+  probe_concurrency_by_account: Record<string, number>;  // Per-account probe ceiling (account_id -> concurrency)
   profile_distribution_strategy: string;  // How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
   skip_recently_probed_hours: number;  // Skip streams probed within last N hours (0 = always probe)
   refresh_m3us_before_probe: boolean;  // Refresh all M3U accounts before starting probe
@@ -1415,8 +1417,10 @@ export async function saveSettings(settings: {
   stream_probe_timeout?: number;  // Optional - timeout in seconds, defaults to 30
   stream_probe_schedule_time?: string;  // Optional - time of day for probes (HH:MM), defaults to "03:00"
   bitrate_sample_duration?: number;  // Optional - duration in seconds to sample stream for bitrate (10, 20, or 30), defaults to 10
+  min_stream_bitrate_kbps?: number;  // Optional - throughput floor for the dead-stream check, defaults to 2000
   parallel_probing_enabled?: boolean;  // Optional - probe streams from different M3Us simultaneously, defaults to true
   max_concurrent_probes?: number;  // Optional - max simultaneous probes when parallel probing is enabled (1-16), defaults to 8
+  probe_concurrency_by_account?: Record<string, number>;  // Optional - per-account probe ceiling, defaults to {} (no overrides)
   profile_distribution_strategy?: string;  // Optional - how to distribute probes across profiles: fill_first, round_robin, least_loaded
   skip_recently_probed_hours?: number;  // Optional - skip streams probed within last N hours, defaults to 0 (always probe)
   refresh_m3us_before_probe?: boolean;  // Optional - refresh all M3U accounts before starting probe, defaults to true

@@ -994,7 +994,8 @@ class TestPromoteLeadHours:
     def test_an_existing_channel_is_never_taken_back(self):
         """The create-only rule, stated as the thing it protects: a far-off
         event that already has a channel keeps it, so the channel is not
-        deleted tonight and recreated tomorrow."""
+        deleted tonight and recreated tomorrow. This is what the default
+        buys, and the config here does not carry the opt-in key at all."""
         parsed = _parsed("Aew All In", self.FAR)
         rows = [
             _resolved("far", DISPOSITION_UNMATCHED, parsed),
@@ -1008,6 +1009,58 @@ class TestPromoteLeadHours:
         assert len(plan.units) == 1
         assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
         assert plan.units[0].existing_channel_id == 920
+
+    def test_an_existing_channel_is_held_back_when_the_rule_opts_in(self):
+        """``apply_lead_to_existing``: the same far-off event and the same
+        existing channel, with the operator now asking for the window to
+        reach it. A provider that lists an event hours ahead and serves an
+        offline card until it starts is the case this is for."""
+        parsed = _parsed("Aew All In", self.FAR)
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED, parsed),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(apply_lead_to_existing=True), rows,
+            {promoted_channel_name(parsed).lower(): 920},
+            now=FROZEN_NOW,
+        )
+        assert plan.units == ()
+        assert plan.skipped_early == 1
+        assert (plan.skipped_early_units[0].action
+                == PROMOTE_ACTION_ATTACH_EXISTING)
+
+    @pytest.mark.parametrize("opted_in", [False, True])
+    def test_a_create_is_held_back_under_either_setting(self, opted_in):
+        """The control the two tests above need. Strip the existing-channel
+        entry and the very same event is a create, held back either way.
+        Without it a passing result proves only that the fixture never
+        reached the gate."""
+        rows = [
+            _resolved("far", DISPOSITION_UNMATCHED,
+                      _parsed("Aew All In", self.FAR)),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(apply_lead_to_existing=opted_in), rows, {},
+            now=FROZEN_NOW,
+        )
+        assert plan.units == ()
+        assert plan.skipped_early == 1
+
+    def test_the_key_only_holds_back_what_the_window_calls_early(self):
+        """What does the holding back is still the lead window, not the
+        key: with the key on, an event close to air keeps its channel."""
+        parsed = _parsed("Aew Dynamite", self.SOON)
+        rows = [
+            _resolved("soon", DISPOSITION_UNMATCHED, parsed),
+        ]
+        plan = build_promotion_plan(
+            self._lead_config(apply_lead_to_existing=True), rows,
+            {promoted_channel_name(parsed).lower(): 921},
+            now=FROZEN_NOW,
+        )
+        assert plan.skipped_early == 0
+        assert len(plan.units) == 1
+        assert plan.units[0].action == PROMOTE_ACTION_ATTACH_EXISTING
 
     def test_the_lead_window_never_judges_a_dateless_event(self):
         """The date was fabricated from "now", so an early-vs-late verdict

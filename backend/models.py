@@ -245,6 +245,7 @@ class StreamStats(Base):
     stream_type = Column(String(20), nullable=True)  # e.g., "HLS", "MPEG-TS"
     bitrate = Column(BigInteger, nullable=True)  # bits per second (overall stream)
     video_bitrate = Column(BigInteger, nullable=True)  # bits per second (video stream only)
+    measured_bitrate = Column(BigInteger, nullable=True)  # bits per second sampled off the stream, not ffprobe's claim
     probe_status = Column(String(20), nullable=False, default="pending")  # success, failed, pending, timeout
     error_message = Column(Text, nullable=True)  # Error details for failed probes
     last_probed = Column(DateTime, nullable=True)  # Last probe timestamp
@@ -273,6 +274,7 @@ class StreamStats(Base):
             "stream_type": self.stream_type,
             "bitrate": self.bitrate,
             "video_bitrate": self.video_bitrate,
+            "measured_bitrate": self.measured_bitrate,
             "probe_status": self.probe_status,
             "error_message": self.error_message,
             "last_probed": self.last_probed.isoformat() + "Z" if self.last_probed else None,

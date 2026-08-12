@@ -58,11 +58,16 @@ inputs (dry-run parity by construction — the same argument as
   a unit dropped this way keeps whatever channel it already has in the
   run's managed set, so a provider having a bad hour cannot delete an
   operator's channel.
-* **``promote_lead_hours`` gates CREATES ONLY.** An event further ahead
-  than the lead window is simply not created yet. An event that already
-  has a channel is NEVER un-promoted for being far away — that would
-  delete and recreate the same channel every day. This is the deliberate
-  opposite of ``skip_past_events`` above, which does divert adopt units.
+* **``promote_lead_hours`` gates CREATES ONLY, unless the rule turns on
+  ``apply_lead_to_existing``.** An event further ahead than the lead
+  window is simply not created yet. By default an event that already has
+  a channel is NEVER un-promoted for being far away — that would delete
+  and recreate the same channel every day, the deliberate opposite of
+  ``skip_past_events`` above, which does divert adopt units. A rule that
+  turns ``apply_lead_to_existing`` on takes that churn on purpose, to stop
+  a provider holding channels open hours before its events start: the gate
+  then diverts adopt units too, and a diverted adopt leaves its channel
+  out of the managed set the same way a finished event's does.
 * **A DATELESS event is never promoted.** A listing carrying a time and no
   date names a recurring slot rather than one broadcast, so the channel it
   would create would carry a different event every day with nothing to say
@@ -245,10 +250,13 @@ def event_is_early(
     date was fabricated from "now" rather than read off the provider string,
     cannot be judged early any more than it can be judged finished.
 
-    A ``True`` verdict only ever stops a channel from being CREATED yet. It
-    must never take an existing channel out of a run's managed set: the
+    A ``True`` verdict stops a channel from being CREATED yet. By default
+    it must not take an existing channel out of a run's managed set: the
     event would lose its channel today and get it back tomorrow, every day
-    until the lead window opens.
+    until the lead window opens. ``apply_lead_to_existing`` is the key an
+    operator turns on to accept that churn, for a provider that hands out
+    channels hours before its events start. This function does not read
+    it — the gate in :func:`build_promotion_plan` does.
 
     ``now`` must be tz-aware (``parsed.start`` always is).
     """
@@ -374,10 +382,12 @@ class PromotionPlan:
     run's managed set, which hands it to Pass 4's ``orphan_action``, so
     that count is the destructive half and is surfaced on its own.
 
-    ``skipped_early_units`` are create-units ``promote_lead_hours`` held
-    back because the event is still further ahead than the lead window.
-    They come back on their own once the window opens, and no unit that
-    already has a channel is ever in here.
+    ``skipped_early_units`` are units ``promote_lead_hours`` held back
+    because the event is still further ahead than the lead window. They
+    come back on their own once the window opens. Create-units only,
+    unless the rule turned ``apply_lead_to_existing`` on, in which case a
+    unit that already has a channel can be in here too and that channel is
+    out of the run's managed set while it waits.
 
     ``skipped_dateless_units`` are units whose date was fabricated from
     "now" rather than read off the provider string. A name carrying a clock
@@ -630,10 +640,11 @@ def build_promotion_plan(
     module docstring for why that clock-driven delete is deliberate and
     what guards it.
 
-    ``promote_lead_hours`` is applied next and to CREATE units only, so an
-    event that already has a channel keeps it however far away it is. It
-    runs before the cap for the same reason the past filter does: an event
-    a fortnight out must not spend the budget tonight's event needs.
+    ``promote_lead_hours`` is applied next, to CREATE units only unless
+    ``apply_lead_to_existing`` is on, so by default an event that already
+    has a channel keeps it however far away it is. It runs before the cap
+    for the same reason the past filter does: an event a fortnight out
+    must not spend the budget tonight's event needs.
 
     **The health filter runs dead last, after the cap**, so the caller only
     ever has to check the handful of streams this run will really turn into
@@ -667,6 +678,9 @@ def build_promotion_plan(
         "past_event_grace_hours", DEFAULT_PAST_EVENT_GRACE_HOURS
     )
     lead_hours = config.get("promote_lead_hours")
+    # Absent means false, like every other promotion key: a stored rule
+    # must not start diverting channels it kept yesterday.
+    apply_lead_to_existing = bool(config.get("apply_lead_to_existing"))
     if (skip_past or lead_hours is not None) and now is None:
         now = datetime.now(timezone.utc)
     # Clustering forgives a clock disagreement of up to the rule's own
@@ -754,11 +768,16 @@ def build_promotion_plan(
         if (
             lead_hours is not None
             and now is not None
-            and action == PROMOTE_ACTION_CREATE
+            and (apply_lead_to_existing
+                 or action == PROMOTE_ACTION_CREATE)
             and event_is_early(parsed, lead_hours, now)
         ):
-            # CREATE units only. An event that already has a channel is
-            # never taken back off the operator for being far away.
+            # CREATE units only, until a rule opts in. An event that
+            # already has a channel is not taken back off the operator for
+            # being far away, because it would lose the channel today and
+            # get it back tomorrow. A provider that lists an event hours
+            # ahead and serves an offline card until it starts is the case
+            # where an operator wants that trade anyway. [16]
             skipped_early_units.append(unit)
             continue
         if action == PROMOTE_ACTION_CREATE:

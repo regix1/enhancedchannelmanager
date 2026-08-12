@@ -130,6 +130,11 @@ export const StreamListItem = memo(function StreamListItem({
                 {formatBitrate(streamStats.video_bitrate)}
               </span>
             )}
+            {streamStats.measured_bitrate && (
+              <span className="meta-tag bitrate" title={`Measured throughput: ${formatBitrate(streamStats.measured_bitrate)}`}>
+                {formatBitrate(streamStats.measured_bitrate)}
+              </span>
+            )}
             {streamStats.video_codec && (
               <span className="meta-tag codec" title={`Video: ${streamStats.video_codec}`}>
                 {streamStats.video_codec}

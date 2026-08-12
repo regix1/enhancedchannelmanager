@@ -3554,6 +3554,13 @@ async def preview_event_sync(
                     "promote_action": None,
                     "promote_channel_name": unit.channel_name,
                     "promote_skipped_early": True,
+                    # This event already has a channel and is only being held
+                    # back, so the run keeps that channel rather than handing it
+                    # to the orphan cleanup. Saying so is the difference between
+                    # "my channel is about to vanish" and "it stays". [36]
+                    "promote_skipped_early_adopted": (
+                        unit.existing_channel_id is not None
+                    ),
                 }
         # Dateless drops: the parse succeeded, so the row must not fall
         # through to the preview's "incomplete parsed identity" default.
@@ -4468,6 +4475,7 @@ async def _build_debug_bundle() -> tuple[str, bytes]:
                     "audio_channels": stat.audio_channels,
                     "bitrate": stat.bitrate,
                     "video_bitrate": stat.video_bitrate,
+                    "measured_bitrate": stat.measured_bitrate,
                     "is_black_screen": stat.is_black_screen or False,
                     "is_low_fps": stat.is_low_fps or False,
                     "consecutive_failures": stat.consecutive_failures or 0,

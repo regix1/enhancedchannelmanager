@@ -1,0 +1,89 @@
+/* One height for the whole row so the delete button lines up with the inputs. */
+.probe-concurrency {
+  --probe-concurrency-control: 2.375rem;
+}
+
+.probe-concurrency-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  max-width: 400px;
+}
+
+/* The id column is wider: an account id runs longer than a single-digit count. */
+.probe-concurrency-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* SettingsTab.css gives every .form-group-vertical input a 280px floor and its
+   own block layout, which would push these three cells past the row. */
+.probe-concurrency-row input[type="text"] {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  height: var(--probe-concurrency-control);
+  padding: 0 0.625rem;
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-lg);
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Border width never changes across states, so focusing a box shifts nothing. */
+.probe-concurrency-row input[type="text"]:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Square at the row height, which is what keeps the row from looking ragged.
+   The margin-left reset undoes .form-group-vertical button, which right-aligns. */
+.probe-concurrency .probe-concurrency-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--probe-concurrency-control);
+  height: var(--probe-concurrency-control);
+  padding: 0;
+  margin-left: 0;
+}
+
+.probe-concurrency .probe-concurrency-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+  margin-left: 0;
+}
+
+.probe-concurrency .probe-concurrency-remove:focus-visible,
+.probe-concurrency .probe-concurrency-add:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.probe-concurrency-head {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.probe-concurrency-empty {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.75rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.probe-concurrency-empty .material-icons {
+  font-size: 1.125rem;
+}

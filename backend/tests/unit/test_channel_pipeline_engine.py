@@ -2354,6 +2354,64 @@ def _success_stats_dict(stream_id, resolution="1920x1080", fps="25", stream_name
     }
 
 
+class TestSmartSortMeasuredBitrate:
+    """The bitrate criterion prefers what was sampled off the stream, and a
+    sampled 0 is a stream sending nothing. Falling back to the bitrate
+    ffprobe read off the container header would sort a dead stream as if it
+    were carrying its event, which is the number a dead stream still
+    advertises.
+    """
+
+    def test_a_stream_measured_at_zero_sorts_below_one_carrying_content(self):
+        settings = _mk_smart_sort_settings(
+            stream_sort_priority=["bitrate"],
+            stream_sort_enabled={"bitrate": True},
+        )
+        stats_cache = {
+            1: {
+                "stream_id": 1, "probe_status": "success",
+                "video_bitrate": 8_000_000, "measured_bitrate": 0,
+            },
+            2: {
+                "stream_id": 2, "probe_status": "success",
+                "video_bitrate": 1_000_000, "measured_bitrate": 5_000_000,
+            },
+        }
+        result = _smart_sort_streams(
+            [1, 2],
+            stats_cache,
+            stream_m3u_map={},
+            channel_name="measured-zero",
+            settings=settings,
+        )
+        assert result == [2, 1]
+
+    def test_a_stream_nobody_measured_sorts_on_what_ffprobe_declared(self):
+        """The other half: an absent sample is not a low reading."""
+        settings = _mk_smart_sort_settings(
+            stream_sort_priority=["bitrate"],
+            stream_sort_enabled={"bitrate": True},
+        )
+        stats_cache = {
+            1: {
+                "stream_id": 1, "probe_status": "success",
+                "video_bitrate": 1_000_000, "measured_bitrate": None,
+            },
+            2: {
+                "stream_id": 2, "probe_status": "success",
+                "video_bitrate": 8_000_000, "measured_bitrate": None,
+            },
+        }
+        result = _smart_sort_streams(
+            [1, 2],
+            stats_cache,
+            stream_m3u_map={},
+            channel_name="never-measured",
+            settings=settings,
+        )
+        assert result == [2, 1]
+
+
 class TestSmartSortCustomStreams:
     """bd-sgtmx / GH #244: custom streams (operator-added, non-M3U) must participate
     in the m3u_priority sort criterion via the reserved 'custom' key in

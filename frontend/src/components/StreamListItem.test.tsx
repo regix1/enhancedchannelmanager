@@ -98,6 +98,7 @@ describe('StreamListItem — stale-stream badge (bead enhancedchannelmanager-po7
         stream_type: null,
         bitrate: null,
         video_bitrate: null,
+        measured_bitrate: null,
         probe_status: 'failed',
         error_message: 'connection refused',
         last_probed: null,

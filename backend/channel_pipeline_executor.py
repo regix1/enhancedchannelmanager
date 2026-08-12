@@ -4871,10 +4871,11 @@ class ActionExecutor:
           mechanism — there is deliberately no delete call on this path.
         * **Lead time**: with ``promote_lead_hours`` set, an event further
           ahead than the window is not created yet (counted as
-          ``skipped_early``). It gates CREATES ONLY — an event that already
-          has a channel keeps it however far away it is, because
-          un-promoting it would delete and recreate the same channel every
-          day until the window opened.
+          ``skipped_early``). It gates creates always, and adopts as well
+          when the rule turns ``apply_lead_to_existing`` on. Either way an
+          event that already has a channel keeps it: being held back means
+          it is not promoted yet, not that its channel is retired, so an
+          early adopt still joins ``channel_ids``. [36]
         * **Dateless events**: an event whose name carries a time but no
           date is never promoted (counted as ``skipped_dateless``). Like
           the health filter this retires nothing — a channel an earlier
@@ -5145,6 +5146,13 @@ class ActionExecutor:
         # Same posture for an event nobody can date: it is not promotable,
         # but a channel an earlier run already made for it stays. [30]
         for unit in plan.skipped_dateless_units:
+            _keep_existing_channel(unit)
+
+        # Holding an event back is "do not promote it yet", not "delete what it
+        # already has". With apply_lead_to_existing on, an event that already
+        # owns a channel can land here, and without this Pass 4 would delete
+        # that channel for being too far ahead. [36]
+        for unit in plan.skipped_early_units:
             _keep_existing_channel(unit)
 
         for unit in plan.units:

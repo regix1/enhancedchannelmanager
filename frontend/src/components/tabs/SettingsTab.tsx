@@ -9,6 +9,7 @@ import { AuthSettingsSection } from '../settings/AuthSettingsSection';
 import { UserManagementSection } from '../settings/UserManagementSection';
 import { LinkedAccountsSection } from '../settings/LinkedAccountsSection';
 import { SportsBannerLeagues } from '../settings/SportsBannerLeagues';
+import { ProbeConcurrencyByAccount, type ProbeAccountConcurrency } from '../settings/ProbeConcurrencyByAccount';
 import { TLSSettingsSection } from '../settings/TLSSettingsSection';
 import { BackupRestoreSection } from '../settings/BackupRestoreSection';
 import { MCPSettingsSection } from '../settings/MCPSettingsSection';
@@ -546,8 +547,12 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   // Stream probe settings (scheduled probing is controlled by Task Engine)
   const [streamProbeTimeout, setStreamProbeTimeout] = useState(30);
   const [bitrateSampleDuration, setBitrateSampleDuration] = useState(10);
+  const [minStreamBitrateKbps, setMinStreamBitrateKbps] = useState(2000);
   const [parallelProbingEnabled, setParallelProbingEnabled] = useState(true);
   const [maxConcurrentProbes, setMaxConcurrentProbes] = useState(8);
+  // Rows, not the stored dict: a row being typed has no account id yet, and a
+  // dict cannot hold two of those at once.
+  const [probeConcurrencyRows, setProbeConcurrencyRows] = useState<ProbeAccountConcurrency[]>([]);
   const [profileDistributionStrategy, setProfileDistributionStrategy] = useState('fill_first');
   const [skipRecentlyProbedHours, setSkipRecentlyProbedHours] = useState(0);
   const [refreshM3usBeforeProbe, setRefreshM3usBeforeProbe] = useState(true);
@@ -932,8 +937,14 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       // Stream probe settings (scheduled probing is controlled by Task Engine)
       setStreamProbeTimeout(settings.stream_probe_timeout ?? 30);
       setBitrateSampleDuration(settings.bitrate_sample_duration ?? 10);
+      setMinStreamBitrateKbps(settings.min_stream_bitrate_kbps ?? 2000);
       setParallelProbingEnabled(settings.parallel_probing_enabled ?? true);
       setMaxConcurrentProbes(settings.max_concurrent_probes ?? 8);
+      setProbeConcurrencyRows(
+        Object.entries(settings.probe_concurrency_by_account ?? {}).map(
+          ([accountId, concurrency]) => ({ accountId, concurrency: String(concurrency) })
+        )
+      );
       setProfileDistributionStrategy(settings.profile_distribution_strategy ?? 'fill_first');
       setSkipRecentlyProbedHours(settings.skip_recently_probed_hours ?? 0);
       setRefreshM3usBeforeProbe(settings.refresh_m3us_before_probe ?? true);
@@ -1355,8 +1366,17 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         // Stream probe settings (scheduled probing is controlled by Task Engine)
         stream_probe_timeout: streamProbeTimeout,
         bitrate_sample_duration: bitrateSampleDuration,
+        min_stream_bitrate_kbps: minStreamBitrateKbps,
         parallel_probing_enabled: parallelProbingEnabled,
         max_concurrent_probes: maxConcurrentProbes,
+        // A row with no account id, or a count that is not a whole number of
+        // streams, is what a half-finished "Add account" leaves behind, so it
+        // never reaches the stored dict.
+        probe_concurrency_by_account: Object.fromEntries(
+          probeConcurrencyRows
+            .map((row) => [row.accountId.trim(), parseInt(row.concurrency, 10)] as const)
+            .filter(([accountId, concurrency]) => accountId !== '' && concurrency >= 1)
+        ),
         profile_distribution_strategy: profileDistributionStrategy,
         skip_recently_probed_hours: skipRecentlyProbedHours,
         refresh_m3us_before_probe: refreshM3usBeforeProbe,
@@ -4682,6 +4702,25 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
             </div>
 
             <div className="form-group-vertical">
+              <label htmlFor="minStreamBitrateKbps">Minimum stream bitrate (kbps)</label>
+              <span className="form-description">
+                A stream measured below this while its event is already under way is
+                treated as dead, so Event Sync drops it. A provider&apos;s offline card
+                still pushes bytes, just far fewer than a game does, which is what this
+                number separates. Set it to 0 to judge streams on ffprobe alone.
+              </span>
+              <input
+                id="minStreamBitrateKbps"
+                type="number"
+                min="0"
+                max="50000"
+                value={minStreamBitrateKbps}
+                onChange={(e) => setMinStreamBitrateKbps(e.target.value === '' ? 2000 : parseInt(e.target.value))}
+                onBlur={() => setMinStreamBitrateKbps(Math.max(0, Math.min(50000, minStreamBitrateKbps || 0)))}
+              />
+            </div>
+
+            <div className="form-group-vertical">
               <label htmlFor="streamFetchPageLimit">Stream fetch page limit</label>
               <span className="form-description">
                 Max pages when fetching streams from Dispatcharr (×500 = max streams).
@@ -4757,6 +4796,11 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
                   </span>
                 )}
               </div>
+
+              <ProbeConcurrencyByAccount
+                rows={probeConcurrencyRows}
+                onChange={setProbeConcurrencyRows}
+              />
 
               {hasMultipleProfiles && (
               <div className="form-group-vertical">

@@ -34,6 +34,7 @@ def create_mock_stats(
     stats.resolution = resolution
     stats.bitrate = bitrate
     stats.video_bitrate = video_bitrate  # Add video_bitrate field
+    stats.measured_bitrate = None  # A spec'd Mock hands back a Mock otherwise
     stats.fps = fps
     stats.audio_channels = audio_channels
     stats.probe_status = probe_status
@@ -619,6 +620,45 @@ class TestEdgeCases:
 
         # Stream with stats should come first
         assert sorted_ids[0] == 1
+
+    def test_a_stream_measured_at_zero_sorts_below_one_carrying_content(self):
+        """A stream sending nothing measures 0, and 0 is a reading. It must
+        not fall back to the bitrate ffprobe declared off the container
+        header, which is the number a dead stream still advertises.
+        """
+        prober = create_prober(
+            stream_sort_priority=["bitrate"],
+            stream_sort_enabled={"bitrate": True}
+        )
+
+        stats_map = {
+            1: create_mock_stats(1, video_bitrate=8_000_000),
+            2: create_mock_stats(2, video_bitrate=1_000_000),
+        }
+        stats_map[1].measured_bitrate = 0
+        stats_map[2].measured_bitrate = 5_000_000
+
+        sorted_ids = prober._smart_sort_streams([1, 2], stats_map, {}, "Test Channel")
+
+        assert sorted_ids == [2, 1]
+
+    def test_a_stream_nobody_measured_still_sorts_on_what_ffprobe_declared(self):
+        """The other half: an absent sample is not a low reading, so the
+        declared bitrate still decides.
+        """
+        prober = create_prober(
+            stream_sort_priority=["bitrate"],
+            stream_sort_enabled={"bitrate": True}
+        )
+
+        stats_map = {
+            1: create_mock_stats(1, video_bitrate=1_000_000),
+            2: create_mock_stats(2, video_bitrate=8_000_000),
+        }
+
+        sorted_ids = prober._smart_sort_streams([1, 2], stats_map, {}, "Test Channel")
+
+        assert sorted_ids == [2, 1]
 
     def test_failed_stream_deprioritized(self):
         """Failed streams are sorted to the bottom when deprioritize is enabled."""

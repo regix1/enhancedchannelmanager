@@ -225,6 +225,7 @@ export interface StreamStats {
   stream_type: string | null;      // e.g., "HLS", "MPEG-TS"
   bitrate: number | null;          // bits per second (overall stream)
   video_bitrate: number | null;    // bits per second (video stream only)
+  measured_bitrate: number | null; // bits per second actually sampled off the stream, not ffprobe's claim
   probe_status: 'success' | 'failed' | 'pending' | 'timeout';
   error_message: string | null;
   last_probed: string | null;      // ISO timestamp

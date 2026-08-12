@@ -922,6 +922,37 @@ class TestPromoteLeadHours:
         assert "already HAS a channel" in message
 
 
+class TestApplyLeadToExisting:
+    """Whether the lead window also reaches an event whose channel exists.
+
+    Opt-in, because turning it on reverses what the ``promote_lead_hours``
+    message states in words.
+    """
+
+    def test_absent_key_stays_absent(self):
+        config = _valid_config()
+        assert validate_event_sync_config(config) == []
+        assert "apply_lead_to_existing" not in config
+
+    def test_bool_accepted(self):
+        for good in (True, False):
+            config = _valid_config(apply_lead_to_existing=good)
+            assert validate_event_sync_config(config) == []
+            assert config["apply_lead_to_existing"] is good
+
+    @pytest.mark.parametrize("bad", ["yes", 1, 0, 2.5])
+    def test_non_bool_rejected(self, bad):
+        config = _valid_config(apply_lead_to_existing=bad)
+        errors = validate_event_sync_config(config)
+        assert any("apply_lead_to_existing" in e for e in errors)
+
+    def test_error_message_says_what_turning_it_on_costs(self):
+        config = _valid_config(apply_lead_to_existing="yes")
+        errors = validate_event_sync_config(config)
+        message = next(e for e in errors if "apply_lead_to_existing" in e)
+        assert "leaves the run's managed set" in message
+
+
 class TestSkipDeadStreams:
     """The stream-health gate. Opt-in, and absent means invisible."""
 

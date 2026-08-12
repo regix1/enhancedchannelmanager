@@ -31,6 +31,12 @@ signals only count once the event has started.
   (``consecutive_failures`` at or past the configured ``strike_threshold``,
   the same signal auto-creation's ``skip_struck_streams`` uses) — dead only
   once the event's start time has gone by.
+* **Sampled throughput under ``min_stream_bitrate_kbps``** — dead once the
+  event's start time has gone by, and where a sample exists it overrules
+  both probe signals above, in both directions. ffprobe reads a container
+  header and stops, so it never asks whether bytes keep arriving: a stream
+  it could not parse may be carrying its event at 7 Mbps, and one it
+  parsed happily may be an offline card looping at 0.5.
 * **Never probed, or not probed recently** — never dead. About sixty of
   some thirty-seven thousand streams have ever been probed, so treating an
   absent verdict as a failure would reject essentially every candidate and
@@ -113,8 +119,9 @@ async def find_dead_streams(
             dialling a stream the playlist no longer has is exactly the
             wasted work this saves.
         event_start_by_stream: When the event began, for the candidates
-            whose event HAS begun. ONLY these can be marked dead by a probe
-            verdict, stored or fresh. A candidate left out is one whose
+            whose event HAS begun. ONLY these can be marked dead by what a
+            probe left behind — a verdict or a sampled throughput, stored
+            or fresh. A candidate left out is one whose
             event is still ahead, and a stream that has nothing to serve yet
             is not a broken stream. The instant matters as well as the
             membership: a stored verdict recorded before that start was
@@ -144,26 +151,30 @@ async def find_dead_streams(
         return stale
 
     threshold = _strike_threshold()
+    floor_bps = _min_stream_bitrate_bps()
     started = event_start_by_stream or {}
     dead = set(stale)
     dead |= {
         sid for sid in ids
         if sid in started
-        and (
-            _is_struck(stats.get(sid), threshold)
-            or _probe_failed(stats.get(sid), started[sid])
+        and _dead_once_started(
+            stats.get(sid), started[sid], threshold, floor_bps
         )
     }
 
     if probe_missing and client is not None:
         # A stale stream is left out: the provider has already answered
-        # the question a probe would ask.
+        # the question a probe would ask. So is a stream whose event has not
+        # started: its result is discarded below anyway, and the row it would
+        # leave behind is one nothing re-probes, so the reading taken while
+        # the event had nothing to serve would decide that event forever.
         unprobed = [
-            sid for sid in ids if sid not in stats and sid not in stale
+            sid for sid in ids
+            if sid not in stats and sid not in stale and sid in started
         ]
         if unprobed:
             fresh_failures = await _probe_and_collect_failures(
-                client, unprobed
+                client, unprobed, floor_bps
             )
             dead |= fresh_failures & set(started)
 
@@ -265,6 +276,74 @@ def _strike_threshold() -> int:
         return 3
 
 
+def _min_stream_bitrate_bps() -> int:
+    """What a started event's stream must be pushing, in bits per second.
+
+    A stored ``0`` is the operator switching the throughput check off,
+    since nothing measures below zero. An unreadable setting is not that
+    statement, so it falls back to the shipped default rather than turning
+    the check off on the operator's behalf without saying so — the same
+    rule :func:`_strike_threshold` follows. [9]
+    """
+    try:
+        from config import get_settings
+
+        return int(get_settings().min_stream_bitrate_kbps or 0) * 1000
+    except Exception as e:
+        logger.warning(
+            "[EVENT-SYNC] minimum stream bitrate unreadable (%s) — using "
+            "the shipped default of 2000 kbps, because returning 0 here "
+            "would switch the throughput check off silently", e,
+        )
+        return 2000 * 1000
+
+
+def _dead_once_started(
+    stat: dict | None,
+    started_at: datetime,
+    threshold: int,
+    floor_bps: int,
+) -> bool:
+    """Is there nothing behind this stream, now that its event is on air?
+
+    A sampled throughput answers whenever the row carries one taken at or
+    after kickoff, because it is the only thing here that watched bytes
+    arrive. At or above the floor the stream is carrying its event, and
+    under it the provider is looping an offline card or sending nothing at
+    all — two shapes of the same statement, both of which sample low.
+    ffprobe disagreed with the sampled number on 5 of 11 event streams
+    measured, in both directions, so its stored verdict decides only a row
+    with no sample of its own: one probed before kickoff, one whose sample
+    could not be taken because nothing ever answered, or one written
+    before the column existed. [10]
+    """
+    if stat is not None and _probed_after_kickoff(stat, started_at):
+        sampled = _sample_says_dead(stat, floor_bps)
+        if sampled is not None:
+            return sampled
+    return _is_struck(stat, threshold) or _probe_failed(stat, started_at)
+
+
+def _sample_says_dead(stat: dict | None, floor_bps: int) -> bool | None:
+    """What the sampled throughput says, or ``None`` when it says nothing.
+
+    ``None`` for every row written before the column existed, and for a
+    probe whose sample could not be taken because nothing ever arrived.
+    Neither is a low reading, so neither may be read as one.
+
+    ``None`` too when the floor is 0, which is the operator switching the
+    throughput check off. Off means the stored probe verdict decides again
+    exactly as it did before, NOT that every sampled stream is now beyond
+    reach of it.
+    """
+    if floor_bps <= 0:
+        return None
+    measured = (stat or {}).get("measured_bitrate")
+    if measured is None:
+        return None
+    return measured < floor_bps
+
+
 def _is_struck(stat: dict | None, threshold: int) -> bool:
     """Has this stream failed often enough in a row to count as struck out?"""
     if stat is None or threshold <= 0:
@@ -280,15 +359,24 @@ def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
     though the strike counter has not reached its threshold. [6]
 
     It counts only when the probe itself happened at or after the event
-    started. A stream dialled while its event was still ahead had nothing
-    to serve, and the record it left is never refreshed, so an earlier
-    verdict would decide the event forever. A row with no timestamp cannot
-    be shown to be a live-event verdict and does not count either. [59]
+    started, for the reason :func:`_probed_after_kickoff` gives. [59]
     """
     if stat is None:
         return False
     if stat.get("probe_status") not in _FAILED_PROBE_STATUSES:
         return False
+    return _probed_after_kickoff(stat, started_at)
+
+
+def _probed_after_kickoff(stat: dict, started_at: datetime) -> bool:
+    """Was this stream's stored row written at or after the event started?
+
+    A row written while the event was still ahead was taken when there was
+    nothing to serve, and nothing re-probes a stream that already has a
+    row, so an earlier reading would decide the event forever. A row with
+    no timestamp cannot be shown to be a live-event reading, so it does
+    not count either. [59]
+    """
     # The health table keeps naive UTC and serializes it with a Z.
     raw = stat.get("last_probed")
     if not raw:
@@ -298,8 +386,17 @@ def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
     return probed_at >= started_at
 
 
-async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]:
+async def _probe_and_collect_failures(
+    client, stream_ids: list[int], floor_bps: int
+) -> set[int]:
     """Probe candidates with no health record and report the failures.
+
+    A fresh probe answers the same way a stored row does: its sampled
+    throughput decides where it took one, and ffprobe's verdict decides
+    only where it could not. This is the path a live run takes for nearly
+    every candidate, because the provider re-issues each event under a new
+    stream id on every refresh, so almost nothing here has a stored row to
+    read. [9][10]
 
     Bounded twice over: at most ``MAX_HEALTH_PROBES_PER_RUN`` streams, and
     no more at a time than the prober's own ``max_concurrent_probes``. The
@@ -357,8 +454,11 @@ async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]
                     "treating it as working", stream_id, e,
                 )
                 return
-            status = (result or {}).get("probe_status")
-            if status in _FAILED_PROBE_STATUSES:
+            is_dead = _sample_says_dead(result, floor_bps)
+            if is_dead is None:
+                is_dead = ((result or {}).get("probe_status")
+                           in _FAILED_PROBE_STATUSES)
+            if is_dead:
                 async with failures_lock:
                     dead.add(stream_id)
 
@@ -368,7 +468,7 @@ async def _probe_and_collect_failures(client, stream_ids: list[int]) -> set[int]
     ])
     logger.info(
         "[EVENT-SYNC] promotion health check probed %d candidate stream(s), "
-        "%d did not answer", len(urls), len(dead),
+        "%d had nothing behind them", len(urls), len(dead),
     )
     return dead
 

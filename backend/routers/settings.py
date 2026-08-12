@@ -379,6 +379,8 @@ class SettingsRequest(BaseModel):
     bitrate_sample_duration: int = 10  # Duration in seconds to sample stream for bitrate (10, 20, or 30)
     parallel_probing_enabled: bool = True  # Probe multiple streams from different M3Us simultaneously
     max_concurrent_probes: int = 8  # Max simultaneous probes when parallel probing is enabled (1-16)
+    probe_concurrency_by_account: Optional[dict[str, int]] = None  # Per-provider probe ceiling, keyed by M3U account id
+    min_stream_bitrate_kbps: Optional[int] = None  # Sustained throughput below this means the stream is carrying nothing
     profile_distribution_strategy: str = "fill_first"  # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     skip_recently_probed_hours: int = 0  # Skip streams successfully probed within last N hours (0 = always probe)
     refresh_m3us_before_probe: bool = True  # Refresh all M3U accounts before starting probe
@@ -514,6 +516,8 @@ class SettingsResponse(BaseModel):
     bitrate_sample_duration: int
     parallel_probing_enabled: bool  # Probe multiple streams from different M3Us simultaneously
     max_concurrent_probes: int  # Max simultaneous probes when parallel probing is enabled (1-16)
+    probe_concurrency_by_account: dict[str, int]  # Per-provider probe ceiling, keyed by M3U account id
+    min_stream_bitrate_kbps: int  # Sustained throughput below this means the stream is carrying nothing
     profile_distribution_strategy: str  # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     skip_recently_probed_hours: int  # Skip streams successfully probed within last N hours (0 = always probe)
     refresh_m3us_before_probe: bool  # Refresh all M3U accounts before starting probe
@@ -753,6 +757,8 @@ async def get_current_settings():
         bitrate_sample_duration=settings.bitrate_sample_duration,
         parallel_probing_enabled=settings.parallel_probing_enabled,
         max_concurrent_probes=settings.max_concurrent_probes,
+        probe_concurrency_by_account=settings.probe_concurrency_by_account,
+        min_stream_bitrate_kbps=settings.min_stream_bitrate_kbps,
         profile_distribution_strategy=settings.profile_distribution_strategy,
         skip_recently_probed_hours=settings.skip_recently_probed_hours,
         refresh_m3us_before_probe=settings.refresh_m3us_before_probe,
@@ -933,6 +939,21 @@ async def update_settings(
         else current_settings.trusted_media_networks
     )
 
+    # The per-provider probe ceiling and the throughput floor follow the same
+    # preserve-on-omit rule. A body without the key keeps the stored value, so a
+    # cached older bundle cannot drop a one-connection provider's ceiling back to
+    # unlimited or a tuned floor back to 2000 kbps. [35]
+    probe_concurrency_by_account = (
+        request.probe_concurrency_by_account
+        if request.probe_concurrency_by_account is not None
+        else current_settings.probe_concurrency_by_account
+    )
+    min_stream_bitrate_kbps = (
+        request.min_stream_bitrate_kbps
+        if request.min_stream_bitrate_kbps is not None
+        else current_settings.min_stream_bitrate_kbps
+    )
+
     # MCP API key is never accepted on this endpoint (it has dedicated
     # generate/revoke endpoints) — always preserve the stored value so a
     # partial POST cannot silently revoke it (bd-vj8n9).
@@ -1021,6 +1042,9 @@ async def update_settings(
         "jellyfin_api_key": jellyfin_api_key,
         # bd-mlcla: trusted media/proxy networks (preserve-on-omit above).
         "trusted_media_networks": trusted_media_networks,
+        # Probe ceiling per provider and the throughput floor (preserve-on-omit above).
+        "probe_concurrency_by_account": probe_concurrency_by_account,
+        "min_stream_bitrate_kbps": min_stream_bitrate_kbps,
         # Internal bookkeeping marker (GH #484): never sent by the UI, so it MUST
         # be preserved from current settings — rebuilding the model here would
         # otherwise reset it to False and re-arm the one-time league-strip heal,

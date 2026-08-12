@@ -818,8 +818,10 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     "skip_past_events",
     "past_event_grace_hours",
     # Lead-time window — keeps an event that is still days away from
-    # getting its channel today.
+    # getting its channel today, and whether that also applies to an event
+    # whose channel already exists.
     "promote_lead_hours",
+    "apply_lead_to_existing",
     # Health gate — keeps a stream that does not play from becoming a
     # channel.
     "skip_dead_streams",
@@ -1540,9 +1542,26 @@ def validate_event_sync_config(config: Any) -> list[str]:
                 f"{MAX_PROMOTE_LEAD_HOURS} — how far ahead of its start "
                 f"time an event may get a channel; an event further away "
                 f"than this waits, and an event that already HAS a channel "
-                f"keeps it however far away it is (omit the key for no "
-                f"lead limit)",
+                f"keeps it however far away it is unless "
+                f"apply_lead_to_existing is on (omit the key for no lead "
+                f"limit)",
             ))
+
+    # Whether the lead window also applies to an event whose channel
+    # already exists. Opt-in because it reverses the stated contract above.
+    apply_lead_to_existing = config.get("apply_lead_to_existing")
+    if apply_lead_to_existing is not None and not isinstance(
+            apply_lead_to_existing, bool):
+        errors.append(_event_sync_error(
+            "apply_lead_to_existing", apply_lead_to_existing,
+            "a boolean (default false) — true makes promote_lead_hours "
+            "hold back an event that already has a channel as well as one "
+            "being created, so a provider that lists an event hours early "
+            "stops holding a channel open until the event is close; the "
+            "channel leaves the run's managed set while it waits, which is "
+            "the churn the default avoids (omit the key to keep the lead "
+            "window on creates only)",
+        ))
 
     # Stream-health gate. Opt-in because it probes the provider, which
     # costs time a run does not otherwise spend.

@@ -185,11 +185,17 @@ export interface EventSyncConfig {
    * How far ahead of its start time an event may be promoted (1..720).
    * An event further away than this is left alone and picked up on a later
    * run. Absent means there is no lead limit, so an event promotes as soon
-   * as it parses. Gates CREATES only: a channel that already exists is
-   * never removed for being far away, because that would delete and
-   * recreate the same channel every day.
+   * as it parses. Gates CREATES only unless `apply_lead_to_existing` says
+   * otherwise: a channel that already exists is not removed for being far
+   * away, because that would delete and recreate the same channel every day.
    */
   promote_lead_hours?: number;
+  /**
+   * Whether `promote_lead_hours` also holds back a unit that would attach an
+   * event to a channel that already exists. Absent means false, which keeps
+   * the create-only behaviour above.
+   */
+  apply_lead_to_existing?: boolean;
   /**
    * Where promoted event channels are numbered: 'auto', a positive integer,
    * or a 'min-max' range like '900-999'. Absent means 'auto', which starts
@@ -402,6 +408,10 @@ export interface EventSyncUnmatchedStream {
    * `promote_skipped_past`, it re-surfaces on a later run. Absent on a
    * backend without the lead window. */
   promote_skipped_early?: boolean;
+  /** True when the held-back event already has a channel. The run keeps that
+   * channel instead of handing it to the orphan cleanup. Only ever set
+   * alongside `promote_skipped_early`. */
+  promote_skipped_early_adopted?: boolean;
   /** True when the stream name carries no date, so there is no event day to
    * build a channel around and the stream is left alone. It comes back on a
    * later run only if the provider renames the stream. Absent on a backend

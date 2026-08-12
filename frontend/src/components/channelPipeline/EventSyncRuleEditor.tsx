@@ -404,6 +404,12 @@ export function EventSyncRuleEditor({
   const [promoteLeadText, setPromoteLeadText] = useState(
     String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS)
   );
+  // Whether the lead window also reaches units that attach an existing
+  // channel. Default OFF, because holding one back leaves the channel in
+  // place rather than removing it, which is the older stated behaviour.
+  const [applyLeadToExisting, setApplyLeadToExisting] = useState(
+    config?.apply_lead_to_existing ?? false
+  );
   // Channel-number block for promoted events. Same shape as the lead-time
   // box: an absent promote_channel_number IS the off state, and off means
   // 'auto' — which starts at 1, so event channels land among the real
@@ -805,6 +811,12 @@ export function EventSyncRuleEditor({
         )
       );
     }
+    // Same shape as the stream health check below, not the lead window it sits
+    // under: `false` is expressible here, so an unticked box still has to be
+    // written back whenever the stored config carries the key.
+    if (applyLeadToExisting || config?.apply_lead_to_existing != null) {
+      built.apply_lead_to_existing = applyLeadToExisting;
+    }
     // Same absence-is-off rule as the lead window. The backend rejects
     // anything that is not 'auto', a positive integer, or 'min-max', so an
     // unparseable box falls back to the default rather than saving a value
@@ -1062,6 +1074,7 @@ export function EventSyncRuleEditor({
       limitPromoteLead !== (config?.promote_lead_hours != null) ||
       promoteLeadText !==
         String(config?.promote_lead_hours ?? DEFAULT_PROMOTE_LEAD_HOURS) ||
+      applyLeadToExisting !== (config?.apply_lead_to_existing ?? false) ||
       numberPromoted !== (config?.promote_channel_number != null) ||
       promoteNumberText !==
         String(config?.promote_channel_number ?? DEFAULT_PROMOTE_CHANNEL_NUMBER) ||
@@ -1076,7 +1089,7 @@ export function EventSyncRuleEditor({
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
     promoteTargetGroupId, skipPastEvents, pastEventGraceText,
-    limitPromoteLead, promoteLeadText, numberPromoted, promoteNumberText,
+    limitPromoteLead, promoteLeadText, applyLeadToExisting, numberPromoted, promoteNumberText,
     skipDeadStreams,
     dummyEpgProfileId, config, rule,
     initial, customSharedMeta, streamSortField, streamSortOrder,
@@ -2385,9 +2398,9 @@ export function EventSyncRuleEditor({
                         as it shows up in the playlist. Providers list some
                         events weeks ahead, so a show nobody can watch yet
                         sits in the channel list the whole time. Turn this on
-                        to hold it back until its start time is near. A
-                        channel that already exists is never taken away for
-                        being far off.
+                        to hold it back until its start time is near. On its
+                        own this only gates new channels; the box below extends
+                        it to events that already have one.
                       </span>
                     </div>
                   )}
@@ -2411,6 +2424,27 @@ export function EventSyncRuleEditor({
                         picked up on a later run, so nothing is lost by
                         waiting (default {DEFAULT_PROMOTE_LEAD_HOURS}, max{' '}
                         {MAX_PROMOTE_LEAD_HOURS}).
+                      </span>
+                    </div>
+                  )}
+                  {promoteUnmatched && limitPromoteLead && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={applyLeadToExisting}
+                          onChange={e => setApplyLeadToExisting(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-apply-lead-to-existing"
+                        />
+                        <span>Wait for events that already have a channel too</span>
+                      </label>
+                      <span className="form-hint">
+                        Off by default, so the wait above applies only to
+                        channels being created. Turn this on and a far-off
+                        event is left alone even when a channel for it already
+                        exists, which stops that channel being handed streams
+                        days before anyone can watch.
                       </span>
                     </div>
                   )}

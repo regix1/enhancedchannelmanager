@@ -221,7 +221,9 @@ function promotionRowReason(row: EventSyncUnmatchedStream): string {
       : 'Skipped — event already finished';
   }
   if (row.promote_skipped_early) {
-    return 'Deferred (further ahead than the lead window), so it gets its channel on a later run';
+    return row.promote_skipped_early_adopted
+      ? 'Deferred (further ahead than the lead window), and it keeps the channel it already has'
+      : 'Deferred (further ahead than the lead window), so it gets its channel on a later run';
   }
   if (row.promote_skipped_dateless) {
     return 'Skipped because this stream name carries no date, so there is no event day to build a channel around';

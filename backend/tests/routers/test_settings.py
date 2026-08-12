@@ -126,6 +126,11 @@ def _mock_settings(**overrides):
         # LAN-friendly so existing tests ignore it; the security endpoint +
         # preserve-on-save suites below exercise both modes.
         "ssrf_outbound_mode": "lan_friendly",
+        # Real values, not MagicMock auto-attrs: both are preserve-on-omit, so a
+        # POST that leaves them out reads them off this object and hands them
+        # straight to DispatcharrSettings, which type-checks them. [35]
+        "probe_concurrency_by_account": {},
+        "min_stream_bitrate_kbps": 2000,
     }
     defaults.update(overrides)
     mock = MagicMock()

@@ -2296,7 +2296,7 @@ describe('EventSyncRuleEditor', () => {
       expect(config.promote_unmatched).toBe(true);
     });
 
-    it('says on the lead window that an existing channel is not taken away', async () => {
+    it('says on the lead window which channels it gates', async () => {
       const user = userEvent.setup();
       seedPromoGroup();
       stubGroupSettings({ 1: true, 2: false });
@@ -2307,7 +2307,7 @@ describe('EventSyncRuleEditor', () => {
       await user.click(screen.getByTestId('event-sync-promote-unmatched'));
       const toggle = screen.getByTestId('event-sync-limit-promote-lead');
       const toggleGroup = toggle.closest('.form-group')!;
-      expect(toggleGroup.textContent).toMatch(/never taken away/i);
+      expect(toggleGroup.textContent).toMatch(/only gates new channels/i);
 
       await user.click(toggle);
       const lead = await screen.findByTestId('event-sync-promote-lead-hours');
@@ -2316,6 +2316,126 @@ describe('EventSyncRuleEditor', () => {
       expect(lead.closest('.form-group')!.textContent).toMatch(
         /picked up on a later run/i
       );
+    });
+
+    it('hides the existing-channel box until there is a lead window to extend', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />
+      );
+
+      await user.click(screen.getByTestId('event-sync-promote-unmatched'));
+      expect(
+        screen.queryByTestId('event-sync-apply-lead-to-existing')
+      ).toBeNull();
+
+      await user.click(screen.getByTestId('event-sync-limit-promote-lead'));
+      expect(
+        screen.getByTestId('event-sync-apply-lead-to-existing')
+      ).not.toBeChecked();
+    });
+
+    it('extends the lead window to existing channels once the box is ticked', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(await screen.findByTestId('event-sync-apply-lead-to-existing'));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.apply_lead_to_existing
+      ).toBe(true);
+    });
+
+    it('leaves the key out of a config that never carried it', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await screen.findByTestId('event-sync-apply-lead-to-existing');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(
+        onSave.mock.calls[0][0].event_sync_config
+      ).not.toHaveProperty('apply_lead_to_existing');
+    });
+
+    it('starts ticked from a stored true and writes false back when unticked', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+          apply_lead_to_existing: true,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      const box = await screen.findByTestId('event-sync-apply-lead-to-existing');
+      expect(box).toBeChecked();
+
+      await user.click(box);
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      // Unlike the lead window itself, false is expressible here, so the
+      // written false is what turns a stored true back off.
+      expect(
+        onSave.mock.calls[0][0].event_sync_config.apply_lead_to_existing
+      ).toBe(false);
+    });
+
+    it('marks the form dirty when the existing-channel box changes', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onCancel = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 12,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={vi.fn()} onCancel={onCancel} />);
+
+      await user.click(await screen.findByTestId('event-sync-apply-lead-to-existing'));
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      expect(screen.getByTestId('event-sync-discard-dialog')).toBeInTheDocument();
+      expect(onCancel).not.toHaveBeenCalled();
     });
 
     it('emits the stream health check once the box is ticked, and says what it costs', async () => {

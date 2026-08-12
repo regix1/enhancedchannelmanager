@@ -1,20 +1,20 @@
 /**
- * Tests for the `custom_streams` Smart Sort criterion in the Settings UI
- * (bead ap1ud / GH #244).
+ * Tests for the two probe settings on the Maintenance page: the minimum
+ * stream bitrate and the per-account probe limit.
  *
- * The Smart Sort Priority list lives in SettingsTab.tsx (Channel Defaults page).
- * These tests verify that the dedicated `custom_streams` criterion:
- *   - renders as a draggable, toggleable row in the priority list,
- *   - reflects its saved enabled state (default disabled),
- *   - can be toggled on and persisted via saveSettings,
- *   - is auto-merged into the list (disabled) for existing installs whose
- *     saved settings predate the criterion (mergeSortCriteria behaviour).
- *
- * Mirrors the harness in DeduplicationSettingsSection.test.tsx — the api module
- * is mocked and SettingsTab is rendered on the channel-defaults page.
+ * Both are plumbing, and plumbing breaks quietly. A field missing from the
+ * save literal reads back fine and is only noticed later, when the operator
+ * saves something unrelated and their value has gone back to the default.
+ * These pin the round trip for both:
+ *   - the control renders and shows what GET /api/settings returned
+ *   - an edit reaches the saveSettings payload
+ *   - for the account list: a row can be added and removed, and a row the
+ *     operator half filled in is dropped rather than stored
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+
+let mockUser: { is_admin: boolean; username: string } = { is_admin: true, username: 'admin' };
 
 vi.mock('../../services/api', () => ({
   getSettings: vi.fn(),
@@ -27,6 +27,13 @@ vi.mock('../../services/api', () => ({
   getM3UAccounts: vi.fn(),
   getExportSections: vi.fn(),
   listSavedBackups: vi.fn(),
+  testEmbyConnection: vi.fn(),
+  testPlexConnection: vi.fn(),
+  testJellyfinConnection: vi.fn(),
+  getStreams: vi.fn().mockResolvedValue({ streams: [], total: 0 }),
+  getProbeHistory: vi.fn().mockResolvedValue([]),
+  getProbeProgress: vi.fn().mockResolvedValue(null),
+  getStreamGroups: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../../services/channelPipelineApi', () => ({
@@ -47,10 +54,9 @@ vi.mock('../../contexts/NotificationContext', () => ({
 }));
 
 vi.mock('../../hooks/useAuth', () => ({
-  useAuth: () => ({ user: { is_admin: true, username: 'admin' } }),
+  useAuth: () => ({ user: mockUser }),
 }));
 
-// Stub sub-components that pull in DnD context or heavy deps.
 vi.mock('../settings/NormalizationEngineSection', () => ({
   NormalizationEngineSection: () => <div data-testid="stub-normalization" />,
 }));
@@ -87,9 +93,6 @@ vi.mock('../SettingsModal', () => ({
 vi.mock('../DeleteOrphanedGroupsModal', () => ({
   DeleteOrphanedGroupsModal: () => <div data-testid="stub-delete-orphaned" />,
 }));
-vi.mock('../ModalOverlay', () => ({
-  ModalOverlay: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-}));
 vi.mock('../CustomSelect', () => ({
   CustomSelect: ({ value, onChange, options }: {
     value: string;
@@ -97,7 +100,7 @@ vi.mock('../CustomSelect', () => ({
     options: { value: string; label: string }[];
   }) => (
     <select value={value} onChange={(e) => onChange(e.target.value)}>
-      {options.map((o: { value: string; label: string }) => (
+      {options.map((o) => (
         <option key={o.value} value={o.value}>{o.label}</option>
       ))}
     </select>
@@ -138,7 +141,7 @@ const settingsBase = {
   allow_multi_provider_auto_sync: false,
   epg_auto_match_threshold: 80,
   sports_banner_base_url: '',
-  sports_banner_leagues: [],
+  sports_banner_leagues: [] as api.SportsBannerLeagueRule[],
   custom_network_prefixes: [],
   custom_network_suffixes: [],
   stats_poll_interval: 10,
@@ -158,7 +161,7 @@ const settingsBase = {
   min_stream_bitrate_kbps: 2000,
   parallel_probing_enabled: true,
   max_concurrent_probes: 8,
-  probe_concurrency_by_account: {},
+  probe_concurrency_by_account: {} as Record<string, number>,
   profile_distribution_strategy: 'fill_first',
   skip_recently_probed_hours: 0,
   refresh_m3us_before_probe: true,
@@ -167,7 +170,7 @@ const settingsBase = {
   probe_retry_count: 1,
   probe_retry_delay: 2,
   stream_fetch_page_limit: 200,
-  stream_sort_priority: ['resolution', 'bitrate', 'framerate', 'video_codec', 'm3u_priority', 'audio_channels', 'custom_streams'] as api.SortCriterion[],
+  stream_sort_priority: ['resolution', 'bitrate', 'framerate'] as api.SortCriterion[],
   stream_sort_enabled: { resolution: true, bitrate: true, framerate: true, video_codec: false, m3u_priority: false, audio_channels: false, custom_streams: false } as api.SortEnabledMap,
   m3u_account_priorities: {},
   black_screen_detection_enabled: false,
@@ -206,22 +209,28 @@ const settingsBase = {
   jellyfin_base_url: '',
   jellyfin_api_key_configured: false,
   trusted_media_networks: [],
-  // nngkg: DBAS outbound-policy mode (default LAN-friendly).
   ssrf_outbound_mode: 'lan_friendly' as const,
 };
 
-function renderOnChannelDefaults() {
+function renderOnMaintenance() {
   return render(
     <SettingsTab
       onSaved={vi.fn()}
-      initialSettingsPage="channel-defaults"
+      initialSettingsPage="maintenance"
     />
   );
 }
 
-describe('Smart Sort custom_streams criterion (bead ap1ud / GH #244)', () => {
+async function save(): Promise<Parameters<typeof api.saveSettings>[0]> {
+  fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+  await waitFor(() => expect(api.saveSettings).toHaveBeenCalled());
+  return vi.mocked(api.saveSettings).mock.calls[0][0];
+}
+
+describe('Minimum stream bitrate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockUser = { is_admin: true, username: 'admin' };
     vi.mocked(api.getSettings).mockResolvedValue(makeSettings());
     vi.mocked(api.saveSettings).mockResolvedValue({ status: 'ok', configured: true, server_changed: false });
     vi.mocked(api.getChannelProfiles).mockResolvedValue([]);
@@ -229,80 +238,117 @@ describe('Smart Sort custom_streams criterion (bead ap1ud / GH #244)', () => {
     vi.mocked(api.getM3UAccounts).mockResolvedValue([]);
   });
 
-  it('renders the Custom Streams criterion row in the Smart Sort priority list', async () => {
-    renderOnChannelDefaults();
+  it('shows the floor the settings were loaded with', async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({ min_stream_bitrate_kbps: 3500 }));
+    renderOnMaintenance();
 
-    await waitFor(() => {
-      expect(screen.getByText('Custom Streams')).toBeInTheDocument();
-    });
+    // The input renders from its useState default, so it exists before the
+    // mocked getSettings() promise resolves. Read the value inside waitFor.
+    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe('3500'));
   });
 
-  it('shows the Custom Streams criterion as disabled by default (checkbox unchecked)', async () => {
-    renderOnChannelDefaults();
+  it('sends an edited floor on save', async () => {
+    renderOnMaintenance();
 
-    const checkbox = await findCustomStreamsCheckbox();
-    expect(checkbox.checked).toBe(false);
+    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe('2000'));
+    fireEvent.change(input, { target: { value: '1500' } });
+
+    expect((await save()).min_stream_bitrate_kbps).toBe(1500);
   });
 
-  it('shows the Custom Streams criterion enabled when the saved setting enables it', async () => {
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
-      stream_sort_enabled: {
-        resolution: true, bitrate: true, framerate: true, video_codec: false,
-        m3u_priority: false, audio_channels: false, custom_streams: true,
-      } as api.SortEnabledMap,
-    }));
-    renderOnChannelDefaults();
+  it('sends a floor of 0, which is how the check is turned off', async () => {
+    renderOnMaintenance();
 
-    const checkbox = await findCustomStreamsCheckbox();
-    expect(checkbox.checked).toBe(true);
-  });
+    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe('2000'));
+    fireEvent.change(input, { target: { value: '0' } });
 
-  it('toggles the Custom Streams criterion on when its checkbox is clicked', async () => {
-    renderOnChannelDefaults();
-
-    const checkbox = await findCustomStreamsCheckbox();
-    expect(checkbox.checked).toBe(false);
-
-    fireEvent.click(checkbox);
-
-    await waitFor(() => {
-      expect(checkbox.checked).toBe(true);
-    });
-  });
-
-  it('auto-merges custom_streams (disabled) for existing installs whose saved settings predate it', async () => {
-    // Existing install: saved settings have no custom_streams in priority or enabled.
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
-      stream_sort_priority: ['resolution', 'bitrate', 'framerate'] as api.SortCriterion[],
-      stream_sort_enabled: {
-        resolution: true, bitrate: true, framerate: true,
-      } as unknown as api.SortEnabledMap,
-    }));
-    renderOnChannelDefaults();
-
-    // mergeSortCriteria appends the unknown criterion (disabled) so the row still appears.
-    const checkbox = await findCustomStreamsCheckbox();
-    expect(checkbox.checked).toBe(false);
+    expect((await save()).min_stream_bitrate_kbps).toBe(0);
   });
 });
 
-/**
- * The Smart Sort priority list renders each criterion as a row whose checkbox
- * carries a title describing enable/disable. The Custom Streams row's checkbox
- * is the one immediately preceding the "Custom Streams" label text.
- */
-async function findCustomStreamsCheckbox(): Promise<HTMLInputElement> {
-  const label = await screen.findByText('Custom Streams');
-  // Row container is the criterion item div; find the checkbox within it.
-  const row = label.closest('div');
-  if (!row) throw new Error('Custom Streams row container not found');
-  // Walk up to the criterion item (the flex row holding the drag handle + checkbox).
-  let container: HTMLElement | null = row;
-  let checkbox: HTMLInputElement | null = null;
-  while (container && !checkbox) {
-    checkbox = container.querySelector('input[type="checkbox"]');
-    container = container.parentElement;
-  }
-  if (!checkbox) throw new Error('Custom Streams checkbox not found');
-  return checkbox;
-}
+describe('Per-account probe limit', () => {
+  const CAPPED = { probe_concurrency_by_account: { '4': 1, '7': 3 } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUser = { is_admin: true, username: 'admin' };
+    vi.mocked(api.getSettings).mockResolvedValue(makeSettings(CAPPED));
+    vi.mocked(api.saveSettings).mockResolvedValue({ status: 'ok', configured: true, server_changed: false });
+    vi.mocked(api.getChannelProfiles).mockResolvedValue([]);
+    vi.mocked(api.listAlertMethods).mockResolvedValue([]);
+    vi.mocked(api.getM3UAccounts).mockResolvedValue([]);
+  });
+
+  it('says what an empty list means instead of showing a bare heading', async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(makeSettings());
+    renderOnMaintenance();
+
+    expect(await screen.findByText(/No accounts are capped/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Account id 1/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the accounts the settings were loaded with', async () => {
+    renderOnMaintenance();
+
+    const first = await screen.findByLabelText(/Account id 1/i) as HTMLInputElement;
+    await waitFor(() => expect(first.value).toBe('4'));
+    expect((screen.getByLabelText(/Streams at a time 1/i) as HTMLInputElement).value).toBe('1');
+    expect((screen.getByLabelText(/Account id 2/i) as HTMLInputElement).value).toBe('7');
+    expect((screen.getByLabelText(/Streams at a time 2/i) as HTMLInputElement).value).toBe('3');
+  });
+
+  it('sends an edited limit on save', async () => {
+    renderOnMaintenance();
+
+    const limit = await screen.findByLabelText(/Streams at a time 2/i) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe('3'));
+    fireEvent.change(limit, { target: { value: '2' } });
+
+    expect((await save()).probe_concurrency_by_account).toEqual({ '4': 1, '7': 2 });
+  });
+
+  it('adds an account and sends it', async () => {
+    renderOnMaintenance();
+
+    await screen.findByLabelText(/Account id 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Add account/i }));
+    fireEvent.change(screen.getByLabelText(/Account id 3/i), { target: { value: '9' } });
+    fireEvent.change(screen.getByLabelText(/Streams at a time 3/i), { target: { value: '4' } });
+
+    expect((await save()).probe_concurrency_by_account).toEqual({ '4': 1, '7': 3, '9': 4 });
+  });
+
+  it('removes an account and leaves it out of the save', async () => {
+    renderOnMaintenance();
+
+    await screen.findByLabelText(/Account id 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Remove account limit 1/i }));
+
+    expect(screen.queryByLabelText(/Account id 2/i)).not.toBeInTheDocument();
+    expect((await save()).probe_concurrency_by_account).toEqual({ '7': 3 });
+  });
+
+  it('drops a row whose account id was never filled in', async () => {
+    renderOnMaintenance();
+
+    await screen.findByLabelText(/Account id 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Add account/i }));
+    fireEvent.change(screen.getByLabelText(/Streams at a time 3/i), { target: { value: '2' } });
+
+    expect((await save()).probe_concurrency_by_account).toEqual({ '4': 1, '7': 3 });
+  });
+
+  it('drops a row whose limit is not a number', async () => {
+    renderOnMaintenance();
+
+    await screen.findByLabelText(/Account id 1/i);
+    fireEvent.click(screen.getByRole('button', { name: /Add account/i }));
+    fireEvent.change(screen.getByLabelText(/Account id 3/i), { target: { value: '9' } });
+    fireEvent.change(screen.getByLabelText(/Streams at a time 3/i), { target: { value: 'lots' } });
+
+    expect((await save()).probe_concurrency_by_account).toEqual({ '4': 1, '7': 3 });
+  });
+});

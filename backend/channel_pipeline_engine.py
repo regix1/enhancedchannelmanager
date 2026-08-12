@@ -6050,7 +6050,14 @@ def _smart_sort_streams(
             elif criterion == "bitrate":
                 bitrate_value = 0
                 if stats:
-                    bitrate_value = stats.get("video_bitrate") or stats.get("bitrate") or 0
+                    # A sampled 0 is a stream sending nothing, which is a
+                    # reading in its own right. Only an absent sample falls
+                    # through to what ffprobe declared.
+                    measured = stats.get("measured_bitrate")
+                    bitrate_value = (
+                        measured if measured is not None
+                        else stats.get("video_bitrate") or stats.get("bitrate") or 0
+                    )
                 values.append(-bitrate_value)
 
             elif criterion == "framerate":

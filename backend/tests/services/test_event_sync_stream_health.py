@@ -29,19 +29,22 @@ from services.event_sync_stream_health import (
 _KICKOFF = datetime(2026, 7, 11, 23, 0, 0, tzinfo=timezone.utc)
 
 
-def _stat(stream_id, *, failures=0, status="success", probed_at=None):
+def _stat(stream_id, *, failures=0, status="success", probed_at=None,
+          measured=None):
     return {
         "stream_id": stream_id,
         "probe_status": status,
         "consecutive_failures": failures,
+        "measured_bitrate": measured,
         "last_probed": (probed_at or _KICKOFF).replace(
             tzinfo=None).isoformat() + "Z",
     }
 
 
-def _settings(threshold=3):
+def _settings(threshold=3, floor_kbps=2000):
     settings = MagicMock()
     settings.strike_threshold = threshold
+    settings.min_stream_bitrate_kbps = floor_kbps
     return settings
 
 
@@ -146,6 +149,168 @@ class TestVerdictFromStoredHealth:
             assert await find_dead_streams([]) == set()
             assert await find_dead_streams([None, None]) == set()
         assert lookup.call_count == 0
+
+
+class TestVerdictFromSampledThroughput:
+    """What the stream was actually pushing, once its event was on air.
+
+    ffprobe reads a container header and stops, so it never asks whether
+    bytes keep arriving. Measured one at a time against 11 event channels
+    it disagreed with the sampled throughput 5 times, in BOTH directions,
+    which is worse than a coin flip. So a row carrying a sample taken at or
+    after kickoff is judged on the sample, and ffprobe's stored verdict
+    decides only a row that has none.
+
+    The provider says "no event" in three shapes and all three land here:
+    an offline card looping at 0.45 Mbps, a socket that opens and closes
+    with no bytes at all, and a socket that never sends anything and times
+    out. Content ran 4.97 Mbps and up, so the 2 Mbps floor sits in empty
+    space.
+    """
+
+    async def test_a_stream_pushing_less_than_the_floor_is_dead(self):
+        """The offline card: 0.45 Mbps, with ffprobe perfectly happy about
+        the container it read."""
+        stats = {7: _stat(7, status="success", measured=450_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_stream_sending_no_bytes_at_all_is_dead(self):
+        """The same state caught at a different moment: the socket opens,
+        nothing arrives and the provider closes it cleanly. Zero is a
+        measurement, not a missing one."""
+        stats = {7: _stat(7, status="success", measured=0)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_stream_that_timed_out_with_nothing_to_sample_is_dead(
+        self
+    ):
+        """The third shape: nothing ever arrives and the socket does not
+        even close, so there is no sample to take and the stored verdict is
+        all there is."""
+        stats = {7: _stat(7, status="timeout", measured=None)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_failed_probe_pushing_real_content_is_not_dead(self):
+        """The mirror, and the one this whole change exists for: three of
+        the channels carrying their event at 5.65 to 7.87 Mbps are stored
+        as ``failed``, because ffprobe could not parse what they sent."""
+        stats = {7: _stat(7, failures=1, status="failed",
+                          measured=6_140_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_struck_stream_pushing_real_content_is_not_dead(self):
+        """The strike counter is fed by the same ffprobe verdict, so a
+        stream ffprobe cannot parse strikes out while it plays."""
+        stats = {7: _stat(7, failures=99, status="failed",
+                          measured=7_870_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_sample_taken_before_kickoff_stays_out_of_the_verdict(
+        self
+    ):
+        """A stream dialled while its event was still ahead was sampled
+        against the offline card, and a stream that already has a record is
+        never probed again, so counting that sample now would condemn the
+        event on evidence nothing will ever refresh. [59]"""
+        stats = {7: _stat(7, status="success", measured=0,
+                          probed_at=_KICKOFF - timedelta(hours=1))}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_stream_before_its_event_is_not_judged_on_throughput(
+        self
+    ):
+        """Nothing is being broadcast yet, so an empty stream says nothing
+        about the stream."""
+        stats = {7: _stat(7, status="success", measured=0)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={}) == set()
+
+    async def test_a_stream_nobody_sampled_is_not_dead_on_that_alone(self):
+        """Every row written before this column existed reads as ``None``,
+        and so does one whose sample could not be taken. An absent number
+        is not a low one."""
+        stats = {7: _stat(7, status="success", measured=None)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_the_floor_is_the_operators_setting_in_kbps(self):
+        """6.14 Mbps of real content, against an operator who set the floor
+        to 8000 kbps. Pins both the setting and the unit conversion."""
+        stats = {7: _stat(7, status="success", measured=6_140_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings",
+                   return_value=_settings(3, floor_kbps=8000)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_an_unreadable_floor_keeps_the_check_on(self):
+        """A settings error is not the operator switching the throughput
+        check off, so it must not read as a floor of 0 — nothing is ever
+        below that."""
+        stats = {7: _stat(7, status="success", measured=0)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", side_effect=RuntimeError("boom")):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_the_floor_switched_off_reports_nothing(self):
+        """A stored 0 IS the operator switching the check off, unlike an
+        unreadable setting."""
+        stats = {7: _stat(7, status="success", measured=0)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings",
+                   return_value=_settings(3, floor_kbps=0)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_the_floor_switched_off_leaves_the_stored_verdict_alone(
+        self
+    ):
+        """Switching the throughput check off must not switch the stored
+        ffprobe verdict off along with it. The sample is what stops being
+        consulted, and everything the gate did before it existed carries
+        on."""
+        stats = {7: _stat(7, failures=1, status="failed",
+                          measured=6_140_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings",
+                   return_value=_settings(3, floor_kbps=0)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
 
 
 class TestStaleStreamsToDetach:
@@ -319,12 +484,18 @@ class TestProbing:
         client.get_streams_by_ids = AsyncMock(return_value=streams)
         return client
 
-    def _prober(self, statuses):
+    def _prober(self, statuses, measured=None):
         prober = MagicMock()
         prober.max_concurrent_probes = 4
+        samples = measured or {}
 
         async def _probe(stream_id, url, name):
-            return {"probe_status": statuses[stream_id]}
+            # probe_stream hands back the saved row, so the sampled
+            # throughput is always a key even when nothing was sampled.
+            return {
+                "probe_status": statuses[stream_id],
+                "measured_bitrate": samples.get(stream_id),
+            }
 
         prober.probe_stream = AsyncMock(side_effect=_probe)
         # Probing is bounded per provider now, so the health check refreshes
@@ -372,6 +543,50 @@ class TestProbing:
                 [7], client=client, probe_missing=True,
                 event_start_by_stream={7: _KICKOFF}) == {7}
 
+    async def test_a_fresh_probe_pushing_real_content_is_not_dead(self):
+        """This path decides most live runs, not the stored-row one: the
+        provider re-issues every event under a new stream id on each
+        refresh, so almost nothing a run promotes has a health record yet.
+        ffprobe cannot parse this stream and it is carrying its event at
+        6.14 Mbps."""
+        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
+        prober = self._prober({7: "failed"}, measured={7: 6_140_000})
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_fresh_probe_sending_almost_nothing_is_dead(self):
+        """The other direction, on the same path: ffprobe reads the
+        offline card's container perfectly happily, and 0.45 Mbps against
+        a 2 Mbps floor is the provider saying there is no event."""
+        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
+        prober = self._prober({7: "success"}, measured={7: 450_000})
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_fresh_probe_before_the_event_is_not_judged_on_it(self):
+        """The started-only rule still governs the whole path, sample or
+        no sample: the event has not begun, so an empty stream says
+        nothing."""
+        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
+        prober = self._prober({7: "success"}, measured={7: 0})
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7], client=client, probe_missing=True,
+                event_start_by_stream={}) == set()
+
     async def test_probe_missing_off_never_probes(self):
         """The preview and every dry run take this path: a probe writes a
         health row, and neither of those may write anything."""
@@ -394,7 +609,30 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             await find_dead_streams(
-                [7, 8], client=client, probe_missing=True)
+                [7, 8], client=client, probe_missing=True,
+                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF})
+        assert client.get_streams_by_ids.call_args[0][0] == [8]
+
+    async def test_a_stream_whose_event_is_still_ahead_is_not_probed(self):
+        """Dialling it now writes a row taken while the event still had
+        nothing to serve. Nothing re-probes a stream that has a row, and a
+        row from before kickoff is not read as a live-event verdict, so that
+        one probe would put the stream beyond the gate's reach for good. The
+        verdict is discarded this run either way, so nothing is lost by
+        waiting until the event is on air.
+        """
+        client = self._client([
+            {"id": 7, "url": "http://x/7", "name": "s"},
+            {"id": 8, "url": "http://x/8", "name": "s"},
+        ])
+        prober = self._prober({7: "failed", 8: "failed"})
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning({})), \
+             patch("config.get_settings", return_value=_settings(3)), \
+             patch("stream_prober.ensure_prober", return_value=prober):
+            assert await find_dead_streams(
+                [7, 8], client=client, probe_missing=True,
+                event_start_by_stream={8: _KICKOFF}) == {8}
         assert client.get_streams_by_ids.call_args[0][0] == [8]
 
     async def test_a_stream_with_no_url_is_left_alone(self):
@@ -424,7 +662,8 @@ class TestProbing:
              patch("config.get_settings", return_value=_settings(3)), \
              patch("stream_prober.ensure_prober", return_value=prober):
             await find_dead_streams(
-                candidates, client=client, probe_missing=True)
+                candidates, client=client, probe_missing=True,
+                event_start_by_stream={sid: _KICKOFF for sid in candidates})
         assert len(client.get_streams_by_ids.call_args[0][0]) \
             == MAX_HEALTH_PROBES_PER_RUN
 
