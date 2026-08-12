@@ -4884,10 +4884,14 @@ class ActionExecutor:
           this run is about to turn into channels are health-checked and
           the failures leave their unit's attach list
           (``dead_streams_skipped``). A unit with no working stream left is
-          not realized (``skipped_all_dead``) — but its EXISTING channel,
-          if it has one, still joins ``channel_ids``, so a provider having
-          a bad hour can never make Pass 4 delete an operator's channel.
-          Health blocks creates and attaches; it never retires anything.
+          not realized (``skipped_all_dead``) — and its EXISTING channel, if
+          it has one, still joins ``channel_ids``, so a provider having a bad
+          hour can never make Pass 4 delete an operator's channel. The one
+          health verdict that DOES retire a channel is the provider
+          withdrawing every stream behind the event: the channel is left out
+          of ``channel_ids`` and Pass 4 applies the rule's ``orphan_action``,
+          exactly as it does for a finished event. Probe failures never
+          retire anything.
           The check runs LAST, on the plan's post-cap units only: probing
           dials the provider, so it sees the handful of streams that
           survived the past filter, the lead window and the cap rather
@@ -5094,8 +5098,9 @@ class ActionExecutor:
             logger.info(
                 "[EVENT-SYNC] Rule '%s': the health check dropped %d "
                 "stream(s) that do not play, and %d event(s) had no working "
-                "stream left — no channel is deleted for this, any channel "
-                "they already have keeps its place",
+                "stream left — any channel they already have keeps its "
+                "place unless the provider has stopped listing every one of "
+                "its streams",
                 rule_name, plan.dead_streams_skipped, plan.skipped_all_dead,
             )
 
@@ -5137,11 +5142,33 @@ class ActionExecutor:
                 promo["channel_ids"].append(unit.existing_channel_id)
 
         # A failing stream is a reason not to CREATE a channel, never a
-        # reason to lose one. Every all-dead unit that already has a channel
-        # holds its place in the managed set, so Pass 4 leaves it alone and
-        # a provider outage cannot take an operator's channels with it. [38]
+        # reason to lose one, so an all-dead unit's existing channel holds
+        # its place in the managed set and a provider outage cannot take an
+        # operator's channels with it. [38] The exception is the provider
+        # withdrawing every stream behind the event: a delisting is the
+        # provider's own statement rather than a verdict of ours, and this
+        # provider re-lists a live event under a new id within the hour, so
+        # a unit with nothing but delisted streams left has no event behind
+        # it any more. Its channel leaves the managed set and Pass 4 applies
+        # the rule's own orphan_action, the same subtraction skip_past_events
+        # already uses. A probe failure, a struck-out stream and a stream
+        # nobody has ever probed all keep the channel. [19]
+        retired_delisted = 0
         for unit in plan.all_dead_units:
+            if all(row.stream.stream_id in stale_rows for row in unit.rows):
+                if unit.existing_channel_id is not None:
+                    retired_delisted += 1
+                continue
             _keep_existing_channel(unit)
+
+        if retired_delisted:
+            logger.info(
+                "[EVENT-SYNC] Rule '%s': %d promoted channel(s) leave the "
+                "managed set because the provider no longer lists a single "
+                "one of their streams — the rule's orphan_action acts on "
+                "them",
+                rule_name, retired_delisted,
+            )
 
         # Same posture for an event nobody can date: it is not promotable,
         # but a channel an earlier run already made for it stays. [30]

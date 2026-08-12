@@ -176,6 +176,29 @@ class TestPromotionPlan:
         # Deterministic within-unit order: (provider_id, stream_id).
         assert [r.stream.stream_id for r in unit.rows] == [301, 555]
 
+    def test_one_event_under_three_status_prefixes_forms_one_unit(self):
+        """The provider re-issues an event under a new stream id whenever
+        its status changes and leads the name with that status, so one golf
+        show was minting three units and holding channels 900, 902 and 905
+        at the same time. The derived channel name drops the status too, so
+        the run adopts one channel instead of naming three. [18]"""
+        rows = [
+            _resolved("NEXT | FURY VS USYK", DISPOSITION_UNMATCHED,
+                      _parsed("NEXT | Fury vs. Usyk", START),
+                      provider_id=2, stream_id=301),
+            _resolved("LIVE | FURY VS USYK", DISPOSITION_UNMATCHED,
+                      _parsed("LIVE | Fury vs. Usyk", START),
+                      provider_id=2, stream_id=302),
+            _resolved("ENDED | FURY VS USYK", DISPOSITION_UNMATCHED,
+                      _parsed("ENDED | Fury vs. Usyk", START),
+                      provider_id=2, stream_id=303),
+        ]
+        plan = build_promotion_plan(_promote_config(), rows, {})
+        assert len(plan.units) == 1
+        assert [r.stream.stream_id for r in plan.units[0].rows] \
+            == [301, 302, 303]
+        assert plan.units[0].channel_name == FURY_CHANNEL_NAME
+
     def test_clustering_is_exact_key_no_fuzzy(self):
         """PO decision 2, the other half: EXACT key only. 'vs.' and 'vs'
         survive the cleaner as distinct titles, so they mint two units —
@@ -1167,10 +1190,10 @@ class TestDeadStreamsAreNotPromoted:
 
     The caller checks the health of the streams the plan is about to turn
     into channels and hands the failures back here. A unit keeps promoting
-    on its survivors; a unit with no survivor is not realized. Neither
-    outcome deletes anything — the unit that loses every stream still
-    carries the id of the channel it already has, which is what the
-    executor puts back into the run's managed set.
+    on its survivors; a unit with no survivor is not realized. The plan
+    deletes nothing either way — the unit that loses every stream still
+    carries the id of the channel it already has, and the executor decides
+    what to do with it.
     """
 
     def _rows(self):
@@ -2072,8 +2095,11 @@ class TestDelistedStreamSwap:
         self, db_session_factory
     ):
         """No replacement is listed at all, so the event has nothing behind
-        it. No channel is created, and the one it already has is kept:
-        health blocks creates and attaches, it never retires."""
+        it. No channel is created, and the channel it already has leaves the
+        managed set for the rule's orphan_action: the provider withdrawing
+        every stream is its own statement that the event is gone, and this
+        provider re-lists a live event under a new id within the hour. [19]
+        """
         _add_rule(db_session_factory, _promote_config(
             secondary_group_ids=[SECONDARY_A, SECONDARY_B],
             skip_dead_streams=True,
@@ -2097,6 +2123,31 @@ class TestDelistedStreamSwap:
         assert promo["promoted_created"] == 0
         assert promo["stale_streams_removed"] == 0
         assert state.stream_ids_of(850) == [self.STALE_ID]
+        assert 850 not in promo["channel_ids"]
+
+    def test_a_channel_nobody_has_probed_keeps_its_place(
+        self, db_session_factory
+    ):
+        """The rail that stops the retirement above widening into a channel
+        deleter. About sixty of some thirty-seven thousand streams have ever
+        been probed, so an absent verdict can never read as dead: this
+        channel's one stream is listed by the provider and has no health
+        record at all, and it keeps its place. [19]"""
+        _add_rule(db_session_factory, _promote_config(
+            secondary_group_ids=[SECONDARY_A, SECONDARY_B],
+            skip_dead_streams=True,
+        ))
+        state = self._swap_state()
+        state.secondary_streams[SECONDARY_B_NAME] = [
+            {"id": self.STALE_ID, "name": STREAM_FURY, "m3u_account": 2},
+        ]
+        client = make_promote_client(state)
+
+        result, _ = self._run_at(client, db_session_factory, FROZEN_NOW)
+
+        promo = result["event_sync"][0]["promotion"]
+        assert promo["dead_streams_skipped"] == 0
+        assert promo["skipped_all_dead"] == 0
         assert 850 in promo["channel_ids"]
 
     def test_a_dry_run_removes_nothing_and_reports_what_it_would_do(
