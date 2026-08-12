@@ -444,6 +444,10 @@ class SettingsRequest(BaseModel):
     # the stored value (same preserve-on-omit contract as ``smtp_password``
     # and ``mcp_api_key`` — bd-vj8n9).
     emby_api_key: Optional[str] = None
+    # Optional for the same preserve-on-omit reason as the fields above: an
+    # operator who switched the post-run guide refresh OFF must not have it
+    # silently switched back on by a save from a cached older bundle. [42]
+    emby_refresh_guide_after_pipeline: Optional[bool] = None
     # Plex integration (bd-r5f0c.4, epic bd-r5f0c). Mirror the Emby
     # contract: an older frontend bundle that omits these fields must
     # NOT clobber stored values to defaults, so the saver applies the
@@ -582,6 +586,7 @@ class SettingsResponse(BaseModel):
     emby_enabled: bool
     emby_base_url: str
     emby_api_key_configured: bool
+    emby_refresh_guide_after_pipeline: bool
     # Plex integration (bd-r5f0c.4, epic bd-r5f0c). The token itself is
     # NOT returned — only a boolean indicator that one is stored, mirroring
     # ``emby_api_key_configured``.
@@ -824,6 +829,7 @@ async def get_current_settings():
         emby_enabled=settings.emby_enabled,
         emby_base_url=settings.emby_base_url,
         emby_api_key_configured=bool(settings.emby_api_key),
+        emby_refresh_guide_after_pipeline=settings.emby_refresh_guide_after_pipeline,
         # Plex integration (bd-r5f0c.4). Same mask-secret posture as Emby.
         plex_enabled=settings.plex_enabled,
         plex_base_url=settings.plex_base_url,
@@ -953,6 +959,11 @@ async def update_settings(
         if request.min_stream_bitrate_kbps is not None
         else current_settings.min_stream_bitrate_kbps
     )
+    emby_refresh_guide_after_pipeline = (
+        request.emby_refresh_guide_after_pipeline
+        if request.emby_refresh_guide_after_pipeline is not None
+        else current_settings.emby_refresh_guide_after_pipeline
+    )
 
     # MCP API key is never accepted on this endpoint (it has dedicated
     # generate/revoke endpoints) — always preserve the stored value so a
@@ -1045,6 +1056,8 @@ async def update_settings(
         # Probe ceiling per provider and the throughput floor (preserve-on-omit above).
         "probe_concurrency_by_account": probe_concurrency_by_account,
         "min_stream_bitrate_kbps": min_stream_bitrate_kbps,
+        # Post-run Emby guide refresh toggle (preserve-on-omit above).
+        "emby_refresh_guide_after_pipeline": emby_refresh_guide_after_pipeline,
         # Internal bookkeeping marker (GH #484): never sent by the UI, so it MUST
         # be preserved from current settings — rebuilding the model here would
         # otherwise reset it to False and re-arm the one-time league-strip heal,

@@ -212,6 +212,7 @@ const settingsBase = {
   dedup_m3u_toast_suppressed: false,
   // Emby integration fields under test (bd-8wc6q)
   emby_enabled: false,
+  emby_refresh_guide_after_pipeline: true,
   emby_base_url: '',
   emby_api_key_configured: false,
   // Plex/Jellyfin fields (added by bd-r5f0c.5 / W5; SettingsTab reads them)

@@ -678,15 +678,19 @@ class ChannelPipelineEngine:
     async def _request_emby_guide_refresh(self) -> None:
         """Tell Emby to re-read its guide after this run changed channels.
 
-        Silent no-op unless the operator has filled in the Emby section, so an
-        instance that never configured it is unaffected. Every failure is
-        swallowed and logged: the pipeline's work is already done and committed
-        by this point, and a media server that is down, slow, or holding a
-        revoked key must not turn a good run red. [41]
+        Silent no-op unless the operator has both left
+        ``emby_refresh_guide_after_pipeline`` on and filled in the Emby section,
+        so an instance that never configured it is unaffected and one that
+        manages Emby elsewhere can switch it off. Every failure is swallowed and
+        logged: the pipeline's work is already done and committed by this point,
+        and a media server that is down, slow, or holding a revoked key must not
+        turn a good run red. [41]
         """
         from config import get_settings
 
         settings = get_settings()
+        if not getattr(settings, "emby_refresh_guide_after_pipeline", True):
+            return
         if not getattr(settings, "emby_enabled", False):
             return
         base_url = getattr(settings, "emby_base_url", "") or ""

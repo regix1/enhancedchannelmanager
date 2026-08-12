@@ -469,6 +469,7 @@ export const mockDataStore: MockDataStore = {
     dedup_m3u_toast_suppressed: false,
     // Emby integration (bd-8wc6q). Defaults disabled.
     emby_enabled: false,
+    emby_refresh_guide_after_pipeline: true,
     emby_base_url: '',
     emby_api_key_configured: false,
     include_channel_number_in_name: false,

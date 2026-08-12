@@ -435,6 +435,13 @@ class DispatcharrSettings(BaseModel):
     # Emby API key (X-Emby-Token header value). Plaintext at rest, same
     # approach as ``dispatcharr_api_key``.
     emby_api_key: str = ""
+    # After a pipeline run creates or removes a channel, ask Emby to re-read its
+    # guide so the change shows up there instead of waiting for Emby's own
+    # cadence, which is hours. Only ever fires on a run that changed the channel
+    # set, never on a dry run, and is a no-op unless Emby is enabled and keyed.
+    # Operator-facing so it can be switched off when Emby is managed elsewhere
+    # or the extra calls are unwanted. [42]
+    emby_refresh_guide_after_pipeline: bool = True
     # Jellyfin integration settings (bd-r5f0c.3, epic bd-r5f0c). When
     # ``jellyfin_enabled`` is True and ``jellyfin_base_url`` +
     # ``jellyfin_api_key`` are configured, the Stats v2 / BandwidthTracker

@@ -199,6 +199,7 @@ const settingsBase = {
   dedup_m3u_toast_suppressed: false,
   // Emby integration (bd-8wc6q). Defaults disabled — not under test here.
   emby_enabled: false,
+  emby_refresh_guide_after_pipeline: true,
   emby_base_url: '',
   emby_api_key_configured: false,
   // Plex/Jellyfin integration (bd-r5f0c.5). Defaults disabled — not under test here.

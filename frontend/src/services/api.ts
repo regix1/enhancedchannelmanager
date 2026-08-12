@@ -1317,6 +1317,9 @@ export interface SettingsResponse {
   emby_enabled: boolean;
   emby_base_url: string;
   emby_api_key_configured: boolean;
+  // Ask Emby to re-read its guide after a pipeline run that created or removed
+  // a channel, instead of waiting hours for Emby's own refresh cadence.
+  emby_refresh_guide_after_pipeline: boolean;
   // Plex integration (bd-r5f0c.2 / W2). Token uses preserve-on-omit.
   plex_enabled: boolean;
   plex_base_url: string;
@@ -1475,6 +1478,9 @@ export async function saveSettings(settings: {
   emby_enabled?: boolean;
   emby_base_url?: string;
   emby_api_key?: string;
+  // Preserve-on-omit like the key above: leaving it undefined keeps whatever is
+  // stored, so a stale bundle cannot switch it back on behind the operator.
+  emby_refresh_guide_after_pipeline?: boolean;
   // Plex integration (bd-r5f0c.2 / W2). plex_token uses preserve-on-omit.
   plex_enabled?: boolean;
   plex_base_url?: string;

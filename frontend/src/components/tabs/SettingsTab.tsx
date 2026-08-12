@@ -378,6 +378,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   // only ``embyApiKeyConfigured``. On save, an empty key is omitted from
   // the request body to honor the preserve-on-omit contract.
   const [embyEnabled, setEmbyEnabled] = useState(false);
+  const [embyRefreshGuideAfterPipeline, setEmbyRefreshGuideAfterPipeline] = useState(true);
   const [embyBaseUrl, setEmbyBaseUrl] = useState('');
   const [embyApiKey, setEmbyApiKey] = useState('');
   const [embyApiKeyConfigured, setEmbyApiKeyConfigured] = useState(false);
@@ -900,6 +901,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       // only the configured indicator — so we leave the embyApiKey form
       // field blank on load. Operators re-enter the key only when rotating.
       setEmbyEnabled(settings.emby_enabled ?? false);
+      setEmbyRefreshGuideAfterPipeline(settings.emby_refresh_guide_after_pipeline ?? true);
       setEmbyBaseUrl(settings.emby_base_url ?? '');
       setEmbyApiKey('');
       setEmbyApiKeyConfigured(settings.emby_api_key_configured ?? false);
@@ -1335,6 +1337,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         // operator has entered a value — empty means "keep the stored
         // key" per the preserve-on-omit contract on the backend.
         emby_enabled: embyEnabled,
+        emby_refresh_guide_after_pipeline: embyRefreshGuideAfterPipeline,
         emby_base_url: embyBaseUrl,
         ...(embyApiKey ? { emby_api_key: embyApiKey } : {}),
         // Plex integration (bd-r5f0c.5 / W5). preserve-on-omit for token.
@@ -3812,6 +3815,25 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
             <div className="checkbox-content">
               <label htmlFor="embyEnabled">Enable Emby user attribution</label>
               <p>Requires base URL and API key below. Disabling stops the cross-reference but does not clear stored values.</p>
+            </div>
+          </div>
+
+          <div className="checkbox-group">
+            <input
+              id="embyRefreshGuideAfterPipeline"
+              type="checkbox"
+              checked={embyRefreshGuideAfterPipeline}
+              onChange={(e) => setEmbyRefreshGuideAfterPipeline(e.target.checked)}
+              data-testid="emby-refresh-guide-checkbox"
+            />
+            <div className="checkbox-content">
+              <label htmlFor="embyRefreshGuideAfterPipeline">Refresh the Emby guide after channel changes</label>
+              <p>
+                When a pipeline run creates or removes a channel, ask Emby to re-read its guide so the
+                change appears there straight away instead of waiting for Emby&apos;s own refresh, which is
+                hours. Only fires on runs that changed something, and is skipped when a refresh is
+                already running. Turn this off if Emby&apos;s guide is managed elsewhere.
+              </p>
             </div>
           </div>
 
