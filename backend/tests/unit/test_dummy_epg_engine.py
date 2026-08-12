@@ -14,6 +14,7 @@ from dummy_epg_engine import (
     generate_xmltv,
     preview_pipeline,
     render_template,
+    render_url_template,
 )
 
 
@@ -1357,3 +1358,103 @@ def test_extract_groups_title_benign_equivalence(pattern, text):
     else:
         assert groups is not None
         assert groups == dict(expected_match.groupdict())
+
+
+# ---------------------------------------------------------------------------
+# render_url_template
+# ---------------------------------------------------------------------------
+
+
+MATCHUP_URL_TEMPLATE = (
+    "http://192.0.2.10:3100/{league|lowercase}/cover"
+    "?away={away|replace: :%20}&home={home|replace: :%20}&fallback=true"
+)
+
+
+def _matchup_profile(template=MATCHUP_URL_TEMPLATE, channel_ids=(1,)):
+    """Profile whose pattern captures league/away/home from an event name."""
+    return {
+        "enabled": True,
+        "title_pattern": r"^(?P<league>Mlb) (?P<away>.+?) Vs (?P<home>.+?) @",
+        "title_template": "{away} at {home}",
+        "channel_logo_url_template": template,
+        "program_poster_url_template": template,
+        "event_timezone": "America/New_York",
+        "channel_assignments": [{"channel_id": cid} for cid in channel_ids],
+    }
+
+
+def test_url_template_renders_matchup_icon():
+    """A template whose placeholders all resolve reaches channel and programme."""
+    channel_data = {
+        1: {"name": "Mlb Yankees Vs Red Sox @ Aug 12 12:05 PM", "streams": []},
+    }
+    root = ET.fromstring(generate_xmltv([_matchup_profile()], channel_data))
+    expected = (
+        "http://192.0.2.10:3100/mlb/cover"
+        "?away=Yankees&home=Red%20Sox&fallback=true"
+    )
+    assert root.find("./channel/icon").get("src") == expected
+    assert root.find("./programme/icon").get("src") == expected
+
+
+def test_url_template_without_captured_teams_emits_no_icon():
+    """An event that captures no teams gets no icon, not away=&home=."""
+    channel_data = {
+        1: {"name": "The Pat Mcafee Show @ Aug 12 12:00 PM", "streams": []},
+    }
+    xml_str = generate_xmltv([_matchup_profile()], channel_data)
+    root = ET.fromstring(xml_str)
+    assert root.findall(".//icon") == []
+    assert "away=" not in xml_str
+    # The channel itself is still in the guide, only its artwork is missing.
+    assert root.find("./channel").get("id") is not None
+
+
+def test_url_template_syntax_error_leaves_other_channel_intact():
+    """An unreadable template drops one channel's icon, not the whole guide."""
+    channel_data = {
+        1: {"name": "Mlb Yankees Vs Red Sox @ Aug 12 12:05 PM", "streams": []},
+        2: {"name": "Mlb Cubs Vs Reds @ Aug 12 01:00 PM", "streams": []},
+    }
+    profiles = [
+        _matchup_profile(template="http://192.0.2.10/{away|nosuchtransform}"),
+        _matchup_profile(channel_ids=(2,)),
+    ]
+    root = ET.fromstring(generate_xmltv(profiles, channel_data))
+    icons = [icon.get("src") for icon in root.findall("./channel/icon")]
+    assert icons == [
+        "http://192.0.2.10:3100/mlb/cover?away=Cubs&home=Reds&fallback=true"
+    ]
+    assert len(root.findall("./channel")) == 2
+
+
+def test_url_template_that_is_not_a_string_does_not_raise():
+    """The import and restore paths write profile JSON without validating it."""
+    channel_data = {
+        1: {"name": "Mlb Yankees Vs Red Sox @ Aug 12 12:05 PM", "streams": []},
+    }
+    root = ET.fromstring(generate_xmltv([_matchup_profile(template=3100)], channel_data))
+    assert root.findall(".//icon") == []
+    assert len(root.findall("./channel")) == 1
+
+
+def test_render_url_template_keeps_a_zero_free_url_whole():
+    """Every placeholder resolving is the only case that returns a URL."""
+    groups = {"league": "Mlb", "away": "Yankees", "home": "Red Sox"}
+    assert render_url_template(MATCHUP_URL_TEMPLATE, groups).endswith(
+        "?away=Yankees&home=Red%20Sox&fallback=true"
+    )
+    assert render_url_template(MATCHUP_URL_TEMPLATE, {"away": "Yankees"}) == ""
+
+
+def test_preview_pipeline_drops_url_the_guide_will_not_emit():
+    """Preview shows the empty result rather than a URL with blank segments."""
+    config = {
+        "title_pattern": r"^(?P<away>.+?) Vs (?P<home>.+?) @",
+        "channel_logo_url_template": MATCHUP_URL_TEMPLATE,
+    }
+    result = preview_pipeline(config, "Cubs Vs Reds @ Aug 12 01:00 PM")
+    assert result["matched"] is True
+    # away and home resolved, league never appears in the pattern.
+    assert result["rendered"]["channel_logo_url"] == ""

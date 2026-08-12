@@ -181,6 +181,48 @@ def render_template(
         return template
 
 
+def render_url_template(
+    template: str,
+    groups: dict,
+    lookups: dict[str, dict[str, str]] | None = None,
+) -> str:
+    """
+    Render a template that has to come out as a URL, or "" if it cannot.
+
+    A URL is all or nothing. The engine substitutes an empty string for a group
+    it does not have, so a matchup template on an event whose variant captured
+    no teams renders as ``.../cover?away=&home=`` — still truthy, so every
+    channel on the profile ends up carrying a dead <icon>. No image is the
+    better outcome, so a placeholder that came back empty drops the whole URL.
+    The trace is what reports that: it names each placeholder and the value it
+    finished with.
+
+    Two failures return "" for the same reason rather than raising. A syntax
+    error would otherwise put a literal ``{away}`` into the src, because
+    render_template hands back the raw template. A template that is not a
+    string at all reaches here from the two write paths that put profile JSON
+    in without validating it, the YAML import and the backup restore, and
+    generate_xmltv has no try/except around the call below it, so one of those
+    would empty the guide for every profile rather than for the one channel.
+    """
+    if not template or not isinstance(template, str):
+        return ""
+    from template_engine import TemplateEngine, TemplateSyntaxError
+    try:
+        url, steps = TemplateEngine().render_with_trace(template, groups, lookups=lookups)
+    except TemplateSyntaxError:
+        logger.warning("[DUMMY-EPG] Template syntax error in URL; no icon: %r", template)
+        return ""
+    for step in steps:
+        if step.get("kind") == "placeholder" and not step.get("final_value"):
+            logger.debug(
+                "[DUMMY-EPG] No icon: {%s} is empty in %r",
+                step.get("group_name"), template,
+            )
+            return ""
+    return url
+
+
 def _parse_month(value: str) -> int | None:
     """Parse a month value as integer or name."""
     if not value:
@@ -578,6 +620,9 @@ def generate_channel_xml(
     def _render(template: str, groups: dict) -> str:
         return render_template(template, groups, lookups=lookups)
 
+    def _render_url(template: str, groups: dict) -> str:
+        return render_url_template(template, groups, lookups=lookups)
+
     if groups is not None:
         # Matched -- compute times and render templates
         time_vars = compute_event_times(
@@ -595,13 +640,13 @@ def generate_channel_xml(
         description = _render(get_template("description_template"), template_groups)
 
         # Channel logo — variant overrides profile
-        logo_url = _render(get_template("channel_logo_url_template"), template_groups)
+        logo_url = _render_url(get_template("channel_logo_url_template"), template_groups)
         if logo_url:
             icon_el = ET.SubElement(channel_el, "icon")
             icon_el.set("src", logo_url)
 
         # Poster URL
-        poster_url = _render(get_template("program_poster_url_template"), template_groups)
+        poster_url = _render_url(get_template("program_poster_url_template"), template_groups)
 
         start_dt = time_vars["start_dt"]
         end_dt = time_vars["end_dt"]
@@ -692,14 +737,14 @@ def generate_channel_xml(
         )
 
         # Channel logo (try with base groups)
-        logo_url = _render(
+        logo_url = _render_url(
             get_template("channel_logo_url_template"), template_groups
         )
         if logo_url:
             icon_el = ET.SubElement(channel_el, "icon")
             icon_el.set("src", logo_url)
 
-        poster_url = _render(
+        poster_url = _render_url(
             get_template("program_poster_url_template"), template_groups
         )
 
@@ -890,6 +935,17 @@ def preview_pipeline(
             elif field == "program_poster_url_template":
                 rendered_key = "program_poster_url"
             rendered[rendered_key] = _render_field(field)
+
+        # Hold the two URL fields to the rule the guide applies, or the operator
+        # tunes a template against a value that will never reach the guide. The
+        # loop above already recorded their traces, which is where the empty
+        # placeholder shows up.
+        rendered["channel_logo_url"] = render_url_template(
+            get_template("channel_logo_url_template"), template_groups, lookups
+        )
+        rendered["program_poster_url"] = render_url_template(
+            get_template("program_poster_url_template"), template_groups, lookups
+        )
     else:
         # Fallback rendering with base groups only
         template_groups = dict(base_groups)
@@ -910,8 +966,17 @@ def preview_pipeline(
 
         rendered["fallback_title"] = _render_field_fb("fallback_title_template")
         rendered["fallback_description"] = _render_field_fb("fallback_description_template")
-        rendered["channel_logo_url"] = _render_field_fb("channel_logo_url_template")
-        rendered["program_poster_url"] = _render_field_fb("program_poster_url_template")
+        # Traced for the operator, then held to the same rule as above. Nothing
+        # here captures teams, so a matchup URL is always dropped on a name that
+        # matched no variant.
+        _render_field_fb("channel_logo_url_template")
+        _render_field_fb("program_poster_url_template")
+        rendered["channel_logo_url"] = render_url_template(
+            get_template("channel_logo_url_template"), template_groups, lookups
+        )
+        rendered["program_poster_url"] = render_url_template(
+            get_template("program_poster_url_template"), template_groups, lookups
+        )
 
     result = {
         "original_name": sample_name,
