@@ -193,6 +193,17 @@ _TOKEN_EXTRA_CAP = 4
 # available, country/league +40 discriminates further).
 _ACRONYM_MATCH_WEIGHT = 25
 
+# --- Channel-tvg_id identity weight -------------------------------------
+# The channel's OWN tvg_id matching the EPG entry's tvg_id is the only place a
+# tvg_id says which entry this channel wants. Everything else a tvg_id
+# contributes is indirect (a country suffix, a parenthetical acronym, an
+# alternate name key), so this is the one signal that deserves score. Weighted
+# equal to "exact" (25) because it carries the same certainty as matching the
+# full flattened name, and deliberately NOT above the country/league tier: a
+# stale tvg_id left on a channel by an earlier link should not be able to
+# outweigh every other signal at once.
+_TVG_ID_MATCH_WEIGHT = 25
+
 # Parse a broadcast subchannel ("digital subchannel") number from a RAW EPG or
 # channel display name. The ATSC convention is CALLSIGN-DT for the primary feed
 # and CALLSIGN-DT2/-DT3/... for diginets. Primary feed (no marker, "-DT", or
@@ -835,11 +846,14 @@ def _compute_confidence(
     epg_entry: dict,
     match_type: str,
     channel_tokens: Optional[frozenset] = None,
+    channel_tvg_id: Optional[str] = None,
 ) -> int:
     """Compute confidence score for a channel-EPG match.
 
     Scoring:
-    - Country OR League match: 40 points
+    - Country OR League match: 40 points (a country the entry does not declare
+      is missing evidence, not a conflict — see the country block below)
+    - Channel tvg_id == entry tvg_id: 25 points (_TVG_ID_MATCH_WEIGHT)
     - Exact vs acronym vs prefix match: 25 / 25 / 15 points (bd-6rz70: an
       "acronym" candidate is an exact dict-key lookup on a parenthetical
       abbreviation, weighted equal to "exact" — see _ACRONYM_MATCH_WEIGHT)
@@ -868,14 +882,33 @@ def _compute_confidence(
     epg_league = epg_entry.get("league")
     epg_country = epg_entry.get("country")
     epg_call_sign = epg_entry.get("call_sign")
+    epg_tvg_id = epg_entry.get("tvg_id")
 
-    # Country or League match: 40 points
+    # Country or League match: 40 points.
+    #
+    # An entry that declares NO country is neutral here, not wrong. ``country``
+    # is only ever parsed out of a tvg_id country suffix ("cnn.us"), so a feed
+    # keyed by a bare Gracenote station number ("58646") declares none no matter
+    # how correct its name is. Withholding the 40 from those entries handed a
+    # decisive 40-point lead to whichever source happened to key its entries by
+    # name — including sources that carry no programme data at all — and the gap
+    # was wide enough that the source-priority tie-break in _sort_matches never
+    # got to see the two candidates in the same band. Only a country that
+    # actually CONFLICTS with the channel's now costs the bonus.
     if channel_league and epg_league:
         if channel_league.upper() == epg_league.upper():
             score += 40
-    elif channel_country and epg_country:
-        if channel_country.upper() == epg_country.upper():
-            score += 40
+    elif channel_country and (
+        not epg_country or channel_country.upper() == epg_country.upper()
+    ):
+        score += 40
+
+    # Channel tvg_id identity: 25 points. The channel's own tvg_id naming this
+    # entry's tvg_id is direct evidence about which entry it wants, unlike the
+    # country/acronym/name signals the same string feeds indirectly.
+    if channel_tvg_id and epg_tvg_id:
+        if channel_tvg_id.strip().casefold() == epg_tvg_id.strip().casefold():
+            score += _TVG_ID_MATCH_WEIGHT
 
     # Exact vs acronym vs prefix match: 25 / 25 / 15 points
     if match_type == "exact":
@@ -1216,10 +1249,11 @@ def find_epg_matches_with_lookup(
     channel_call_sign = extract_broadcast_call_sign(channel_name)
     # Meaningful tokens for the overlap signal (a6445).
     channel_tokens = _extract_match_tokens(channel_name, engine=engine)
+    channel_tvg_id = channel.get("tvg_id", "")
     # Timezone region of the channel (vznut.2): from the channel's tvg_id
     # parenthetical first, then the trailing name word ("USA Network West" ->
     # "W"). Drives the region-consistency tie-break in _sort_matches.
-    channel_region = detect_region(channel.get("tvg_id", ""), channel_name)
+    channel_region = detect_region(channel_tvg_id, channel_name)
 
     # Detect country from streams
     channel_country = detect_country_from_streams(streams)
@@ -1253,6 +1287,7 @@ def find_epg_matches_with_lookup(
                 channel_normalized, channel_league, channel_country,
                 channel_call_sign, entry, "exact",
                 channel_tokens=channel_tokens,
+                channel_tvg_id=channel_tvg_id,
             )
             matches.append(EPGMatchWithScore(
                 epg_id=epg_id,
@@ -1277,6 +1312,7 @@ def find_epg_matches_with_lookup(
                 channel_normalized, channel_league, channel_country,
                 channel_call_sign, entry, "exact",
                 channel_tokens=channel_tokens,
+                channel_tvg_id=channel_tvg_id,
             )
             matches.append(EPGMatchWithScore(
                 epg_id=epg_id,
@@ -1308,6 +1344,7 @@ def find_epg_matches_with_lookup(
                         channel_normalized, channel_league, channel_country,
                         channel_call_sign, entry, "prefix",
                         channel_tokens=channel_tokens,
+                        channel_tvg_id=channel_tvg_id,
                     )
                     matches.append(EPGMatchWithScore(
                         epg_id=epg_id,
@@ -1338,6 +1375,7 @@ def find_epg_matches_with_lookup(
                         channel_normalized, channel_league, channel_country,
                         channel_call_sign, entry, "prefix",
                         channel_tokens=channel_tokens,
+                        channel_tvg_id=channel_tvg_id,
                     )
                     matches.append(EPGMatchWithScore(
                         epg_id=epg_id,
@@ -1362,6 +1400,7 @@ def find_epg_matches_with_lookup(
                 channel_normalized, channel_league, channel_country,
                 channel_call_sign, entry, "callsign",
                 channel_tokens=channel_tokens,
+                channel_tvg_id=channel_tvg_id,
             )
             matches.append(EPGMatchWithScore(
                 epg_id=epg_id,
@@ -1391,6 +1430,7 @@ def find_epg_matches_with_lookup(
                 channel_normalized, channel_league, channel_country,
                 channel_call_sign, entry, "acronym",
                 channel_tokens=channel_tokens,
+                channel_tvg_id=channel_tvg_id,
             )
             matches.append(EPGMatchWithScore(
                 epg_id=epg_id,
@@ -1424,6 +1464,7 @@ def find_epg_matches_with_lookup(
                         channel_normalized, channel_league, channel_country,
                         channel_call_sign, entry, "league",
                         channel_tokens=channel_tokens,
+                        channel_tvg_id=channel_tvg_id,
                     )
                     matches.append(EPGMatchWithScore(
                         epg_id=epg_id,

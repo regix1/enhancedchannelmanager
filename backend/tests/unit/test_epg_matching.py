@@ -1237,3 +1237,115 @@ class TestAcronymMatching:
         score_acronym = _compute_confidence("own", None, None, None, entry, "acronym")
         score_exact = _compute_confidence("own", None, None, None, entry, "exact")
         assert score_acronym == score_exact == 25
+
+
+# ===================================================================
+# 14. Station-number tvg_ids are not penalised
+# ===================================================================
+
+class TestStationNumberTvgIds:
+    """A Gracenote feed keys its entries by station number ("60048") instead of
+    a name-shaped id ("CartoonNetworkHD(TOONHD).us"). Both carry the same
+    correct entry name, but only the name-shaped id ends in a country suffix,
+    so only it used to earn the 40-point country bonus. That gap put the two
+    candidates outside PRIORITY_TIEBREAK_BAND, so EPG source priority was never
+    consulted and channels linked to the name-keyed source even when it had no
+    programme data.
+    """
+
+    def _gracenote_and_named(self):
+        return [
+            make_epg(1, "Cartoon Network HD", "CartoonNetworkHD(TOONHD).us",
+                     {"id": 43, "name": "7dayiptv"}),
+            make_epg(2, "Cartoon Network HD", "60048",
+                     {"id": 49, "name": "7daygracenote"}),
+        ]
+
+    def test_station_number_entry_reaches_the_priority_band(self):
+        lookup = build_epg_lookup(self._gracenote_and_named())
+        channel = make_channel(1, "Cartoon Network", [1])
+        streams = [make_stream(1, "US: Cartoon Network HD")]
+        result = find_epg_matches_with_lookup(channel, streams, lookup)
+
+        assert result.detected_country == "US"
+        scores = {m.epg_id: m.confidence for m in result.matches}
+        # Same band => _sort_matches gets to apply EPG source priority. The
+        # only remaining gap is the pre-existing extra-token penalty for the
+        # "(TOONHD)" acronym, which is a name signal, not an id one.
+        assert abs(scores[1] - scores[2]) < PRIORITY_TIEBREAK_BAND
+        assert scores[2] >= scores[1]
+
+    def test_country_suffix_alone_does_not_win(self):
+        # Identical names AND identical token sets: the two entries differ only
+        # in whether their id carries a country suffix. They must tie.
+        epg_data = [
+            make_epg(1, "Cartoon Network HD", "CartoonNetwork.us"),
+            make_epg(2, "Cartoon Network HD", "60048"),
+        ]
+        lookup = build_epg_lookup(epg_data)
+        channel = make_channel(1, "Cartoon Network", [1])
+        streams = [make_stream(1, "US: Cartoon Network HD")]
+        result = find_epg_matches_with_lookup(channel, streams, lookup)
+
+        scores = {m.epg_id: m.confidence for m in result.matches}
+        assert scores[1] == scores[2]
+
+    def test_conflicting_country_still_loses_the_bonus(self):
+        # The country term keeps its job: an entry that declares a country the
+        # channel's streams contradict is still 40 points down on one that
+        # declares nothing.
+        us_entry = {
+            "id": 1, "name": "Cartoon Network HD", "tvg_id": "CartoonNetwork.gb",
+            "epg_source": {}, "normalized_name": "cartoonnetwork",
+            "league": None, "country": "GB", "call_sign": None,
+        }
+        numeric = dict(us_entry, id=2, tvg_id="60048", country=None)
+        score_conflict = _compute_confidence(
+            "cartoonnetwork", None, "US", None, us_entry, "exact",
+        )
+        score_unknown = _compute_confidence(
+            "cartoonnetwork", None, "US", None, numeric, "exact",
+        )
+        assert score_unknown - score_conflict == 40
+
+    def test_channel_tvg_id_still_prefers_its_own_entry(self):
+        # The case id matching exists for. A channel that genuinely carries
+        # tvg_id="cnn.us" must pick cnn.us over a station-number entry, even
+        # though the station-number entry now keeps the country bonus and
+        # collects the HD bonus on top.
+        epg_data = [
+            make_epg(3, "CNN", "cnn.us"),
+            make_epg(4, "CNN HD", "58646"),
+        ]
+        lookup = build_epg_lookup(epg_data)
+        channel = dict(make_channel(1, "CNN", [1]), tvg_id="cnn.us")
+        streams = [make_stream(1, "US: CNN")]
+        result = find_epg_matches_with_lookup(channel, streams, lookup)
+
+        assert result.best_match is not None
+        assert result.best_match.tvg_id == "cnn.us"
+
+    def test_channel_tvg_id_match_is_case_insensitive(self):
+        entry = {
+            "id": 1, "name": "CNN", "tvg_id": "CNN.us", "epg_source": {},
+            "normalized_name": "cnn", "league": None, "country": None,
+            "call_sign": None,
+        }
+        score_with = _compute_confidence(
+            "cnn", None, None, None, entry, "exact", channel_tvg_id="cnn.US",
+        )
+        score_without = _compute_confidence("cnn", None, None, None, entry, "exact")
+        assert score_with - score_without == 25
+
+    def test_unrelated_channel_tvg_id_adds_nothing(self):
+        entry = {
+            "id": 1, "name": "CNN", "tvg_id": "58646", "epg_source": {},
+            "normalized_name": "cnn", "league": None, "country": None,
+            "call_sign": None,
+        }
+        score_other = _compute_confidence(
+            "cnn", None, None, None, entry, "exact", channel_tvg_id="cnn.us",
+        )
+        assert score_other == _compute_confidence(
+            "cnn", None, None, None, entry, "exact",
+        )
