@@ -20,7 +20,9 @@ import safe_regex
 import httpx
 
 from database import get_session
+from epg_matching import detect_country_from_streams
 from models import StreamStats
+from stream_normalization import COUNTRY_CODE_ALIASES, get_country_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,30 @@ def get_codec_rank(codec_name: str | None) -> int:
     return CODEC_RANK.get(codec_name.lower(), 0)
 
 
+def get_channel_country(stream_names: list[str]) -> str | None:
+    """Country most of a channel's stream names declare, or None when none do.
+
+    The channel row itself carries no country, so the streams attached to it are
+    the only signal available to a sort that receives stream IDs.
+    """
+    country = detect_country_from_streams([{"name": name} for name in stream_names])
+    if country is None:
+        return None
+    return COUNTRY_CODE_ALIASES.get(country, country)
+
+
+def get_country_rank(stream_name: str, channel_country: str | None) -> int:
+    """Rank one stream against the channel's country: match, unknown, then mismatch.
+
+    An unlabelled stream ranks between the two, so a channel whose streams carry no
+    country at all keeps the order it already had.
+    """
+    code = get_country_prefix(stream_name)
+    if code is None:
+        return 1
+    return 0 if COUNTRY_CODE_ALIASES.get(code, code) == channel_country else 2
+
+
 def smart_sort_streams(
     stream_ids: list[int],
     stats_map: dict,
@@ -116,6 +142,7 @@ def smart_sort_streams(
     channel_name: str = "unknown",
     custom_stream_ids: set[int] | None = None,
     catchup_stream_ids: set[int] | None = None,
+    stream_names: dict[int, str] | None = None,
 ) -> list[int]:
     """
     Pure function — sort stream IDs by quality/priority criteria.
@@ -138,9 +165,14 @@ def smart_sort_streams(
             (Dispatcharr ``is_custom == True``). Drives the ``custom_streams``
             criterion. When None/omitted the criterion is inert (scores 0
             everywhere) so callers that don't supply it degrade gracefully.
+        stream_names: Map of stream_id -> name from the caller's stream payload.
+            Drives the country criterion for streams that have no stats row, which
+            is nearly all of them. Names in stats_map cover the rest.
     """
     if stream_m3u_map is None:
         stream_m3u_map = {}
+    if stream_names is None:
+        stream_names = {}
     if custom_stream_ids is None:
         custom_stream_ids = set()
     if catchup_stream_ids is None:
@@ -167,7 +199,7 @@ def smart_sort_streams(
     if not active_criteria:
         logger.warning(
             "[STREAM-PROBE-SORT] Channel '%s': no criteria enabled in Settings → Smart Sort; "
-            "sorting will only use stream id as a tiebreaker",
+            "sorting will only use country and stream id as tiebreakers",
             safe_name,
         )
     logger.info("[STREAM-PROBE-SORT] Channel '%s': Sorting %s streams", safe_name, len(stream_ids))
@@ -189,6 +221,16 @@ def smart_sort_streams(
                         stat.bitrate, stat.fps)
         else:
             logger.debug("[STREAM-PROBE-SORT]   Stream %s: NO STATS AVAILABLE", stream_id)
+
+    # A stats row exists only for a stream that has been probed, which is a few
+    # dozen out of tens of thousands, so the caller's payload is what carries a
+    # name for almost every stream on a channel.
+    sort_names: dict[int, str] = {}
+    for stream_id in stream_ids:
+        stat = stats_map.get(stream_id)
+        sort_names[stream_id] = stream_names.get(stream_id) or (stat.stream_name if stat else "") or ""
+    channel_country = get_channel_country(list(sort_names.values()))
+    logger.info("[STREAM-PROBE-SORT] Channel '%s': detected country %s", safe_name, channel_country)
 
     def compute_criteria_values(stat, stream_id: int) -> list:
         """Compute sort-key values for active_criteria in priority order.
@@ -274,6 +316,10 @@ def smart_sort_streams(
     def get_sort_value(stream_id: int) -> tuple:
         stat = stats_map.get(stream_id)
         stream_name = stat.stream_name if stat else f"Stream {stream_id}"
+        # Sits last, ahead of the stream id only, so every criterion above still
+        # wins. It decides the ordinary case, where nothing on the channel has
+        # been probed and the criteria above all score equal. [22]
+        country_rank = get_country_rank(sort_names.get(stream_id, ""), channel_country)
 
         # Deprioritize failed streams if enabled
         if deprioritize_failed_streams:
@@ -281,21 +327,21 @@ def smart_sort_streams(
                 rank = failed_rank.get('failed', 0)
                 logger.debug("[STREAM-PROBE-SORT]   %s: DEPRIORITIZED (status=%s, rank=%s)", stream_name, stat.probe_status if stat else 'no_stats', rank)
                 # bd-sw883: apply primary criteria within the failed bucket too.
-                return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (stream_id,)
+                return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (country_rank, stream_id)
 
         # Deprioritize black screen streams (probe succeeded but content is black)
         if deprioritize_failed_streams and deprioritize_black_screen and stat and getattr(stat, 'is_black_screen', False) is True:
             rank = failed_rank.get('black_screen', 1)
             logger.debug("[STREAM-PROBE-SORT]   %s: DEPRIORITIZED (black screen, rank=%s)", stream_name, rank)
             # bd-sw883: apply primary criteria within the black_screen bucket too.
-            return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (stream_id,)
+            return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (country_rank, stream_id)
 
         # Deprioritize low FPS streams (probe succeeded but FPS < 20)
         if deprioritize_failed_streams and deprioritize_low_fps and stat and getattr(stat, 'is_low_fps', False) is True:
             rank = failed_rank.get('low_fps', 2)
             logger.debug("[STREAM-PROBE-SORT]   %s: DEPRIORITIZED (low fps, rank=%s)", stream_name, rank)
             # bd-sw883: apply primary criteria within the low_fps bucket too.
-            return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (stream_id,)
+            return (1, rank) + tuple(compute_criteria_values(stat, stream_id)) + (country_rank, stream_id)
 
         if not stat or stat.probe_status != 'success':
             logger.debug("[STREAM-PROBE-SORT]   %s: No successful probe data", stream_name)
@@ -322,7 +368,7 @@ def smart_sort_streams(
                     sort_values.append(-(1 if stream_id in catchup_stream_ids else 0))
                 else:
                     sort_values.append(0)
-            return tuple(sort_values) + (stream_id,)
+            return tuple(sort_values) + (country_rank, stream_id)
 
         # Build sort values based on active criteria in priority order
         sort_values = [0, 0]  # First element: 0 = successful stream, second: sub-rank (unused for good streams)
@@ -407,7 +453,7 @@ def smart_sort_streams(
                     "(res=%s, br=%s, fps=%s, m3u=%s, audio_ch=%s, codec=%s)",
                     stream_name, tuple(sort_values),
                     stat.resolution, stat.bitrate, stat.fps, m3u_account_id, stat.audio_channels, stat.video_codec)
-        return tuple(sort_values) + (stream_id,)
+        return tuple(sort_values) + (country_rank, stream_id)
 
     # Sort stream IDs by their stats
     sorted_ids = sorted(stream_ids, key=get_sort_value)
@@ -2017,6 +2063,7 @@ class StreamProber:
                     custom_active = self.stream_sort_enabled.get("custom_streams", False)
                     catchup_active = self.stream_sort_enabled.get("catchup", False)
                     stream_m3u_map = {}
+                    stream_names: dict[int, str] = {}
                     custom_stream_ids: set[int] = set()
                     catchup_stream_ids: set[int] = set()
                     for s in streams_data:
@@ -2026,6 +2073,7 @@ class StreamProber:
                         stream_m3u_map[int(stream_id)] = self._extract_m3u_account_id(
                             s.get("m3u_account")
                         )
+                        stream_names[int(stream_id)] = s.get("name") or ""
                         if custom_active and s.get("is_custom"):
                             custom_stream_ids.add(int(stream_id))
                         if catchup_active and s.get("is_catchup"):
@@ -2050,6 +2098,7 @@ class StreamProber:
                             stream_ids, stats_map, stream_m3u_map, channel_name,
                             custom_stream_ids=custom_stream_ids,
                             catchup_stream_ids=catchup_stream_ids,
+                            stream_names=stream_names,
                         )
                         logger.info("[STREAM-PROBE-SORT] Channel %s: Original order: %s", channel_id, stream_ids)
                         logger.info("[STREAM-PROBE-SORT] Channel %s: Sorted order:   %s", channel_id, sorted_stream_ids)
@@ -2205,6 +2254,7 @@ class StreamProber:
         custom_active = self.stream_sort_enabled.get("custom_streams", False)
         catchup_active = self.stream_sort_enabled.get("catchup", False)
         stream_m3u_map = {}
+        stream_names: dict[int, str] = {}
         custom_stream_ids: set[int] = set()
         catchup_stream_ids: set[int] = set()
         try:
@@ -2213,6 +2263,7 @@ class StreamProber:
                 sid = s.get("id", s.get("stream_id"))
                 if sid is not None:
                     stream_m3u_map[int(sid)] = self._extract_m3u_account_id(s.get("m3u_account"))
+                    stream_names[int(sid)] = s.get("name") or ""
                     if custom_active and s.get("is_custom"):
                         custom_stream_ids.add(int(sid))
                     if catchup_active and s.get("is_catchup"):
@@ -2240,6 +2291,7 @@ class StreamProber:
                 channel_name=channel_name,
                 custom_stream_ids=custom_stream_ids,
                 catchup_stream_ids=catchup_stream_ids,
+                stream_names=stream_names,
             )
             if sorted_ids == stream_ids:
                 continue
@@ -2295,6 +2347,7 @@ class StreamProber:
         channel_name: str = "unknown",
         custom_stream_ids: set[int] | None = None,
         catchup_stream_ids: set[int] | None = None,
+        stream_names: dict[int, str] | None = None,
     ) -> list[int]:
         """Sort stream IDs using smart sort logic. Delegates to module-level function."""
         return smart_sort_streams(
@@ -2311,6 +2364,7 @@ class StreamProber:
             channel_name=channel_name,
             custom_stream_ids=custom_stream_ids,
             catchup_stream_ids=catchup_stream_ids,
+            stream_names=stream_names,
         )
 
     async def probe_all_streams(self, channel_groups_override: list[str] = None, skip_m3u_refresh: bool = False, stream_ids_filter: list[int] = None, start_send_alerts: bool = True):

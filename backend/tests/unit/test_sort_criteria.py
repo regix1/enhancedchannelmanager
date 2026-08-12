@@ -1303,3 +1303,137 @@ class TestWithinBucketPrimaryCriteria:
         assert result == [4, 5, 2, 6, 1, 3], (
             f"All-black-screen bucket ordering failed: got {result}"
         )
+
+
+# Disney Channel 2687 as the provider ships it: ten streams, none of them probed,
+# a Norwegian feed at position 1 and four US feeds scattered below it.
+DISNEY_STREAM_NAMES = {
+    1685242: "GOLD| DISNEY CHANNEL ᴿᴬᵂ",
+    1798142: "STC| DISNEY CHANNEL ʰᵉᵛᶜ",
+    1407077: "US| DISNEY CHANNEL HD",
+    1680012: "US Disney Channel (East) (H)",
+    1797900: "STC| DISNEY CHANNEL ᴴᴰ",
+    1685158: "GOLD| DISNEY CHANNEL DK ᴿᴬᵂ",
+    1798296: "CZ| DISNEY CHANNEL ᴿᴬᵂ",
+    1636376: "ES-AV| DISNEYCHANNEL ᴿᴬᵂ",
+    1679412: "US: Disney Channel",
+    1679841: "USA  DISNEY CHANNEL HD",
+}
+
+DISNEY_STREAM_ORDER = [
+    1685242, 1798142, 1407077, 1680012, 1797900,
+    1685158, 1798296, 1636376, 1679412, 1679841,
+]
+
+
+class TestCountryCriterion:
+    """Tests for the country criterion in smart_sort_streams."""
+
+    def test_us_stream_leads_when_no_stream_has_been_probed(self):
+        """The real Disney Channel list: every US feed climbs above every other one.
+
+        None of the ten streams has a stats row, so every other criterion scores
+        equal and country is the only thing left to order them by.
+        """
+        sorted_ids = smart_sort_streams(
+            DISNEY_STREAM_ORDER,
+            stats_map={},
+            channel_name="Disney Channel",
+            stream_names=DISNEY_STREAM_NAMES,
+        )
+
+        assert sorted_ids[:4] == [1407077, 1679412, 1679841, 1680012], (
+            f"Expected the four US streams first, got {sorted_ids}"
+        )
+        assert sorted_ids[-1] == 1636376, (
+            f"Expected the Spanish stream last, got {sorted_ids}"
+        )
+        assert sorted_ids.index(1685242) >= 4, (
+            f"The Norwegian feed still holds a US position: {sorted_ids}"
+        )
+
+    def test_higher_resolution_beats_a_matching_country(self):
+        """Probe stats outrank country: a foreign 1080p stream keeps its lead over a US 720p one."""
+        stats_map = {
+            1: create_mock_stats(1, stream_name="NO| DISNEY CHANNEL", resolution="1920x1080"),
+            2: create_mock_stats(2, stream_name="US| DISNEY CHANNEL HD", resolution="1280x720"),
+            3: create_mock_stats(3, stream_name="US Disney Channel (East)", resolution="1280x720"),
+        }
+
+        sorted_ids = smart_sort_streams([1, 2, 3], stats_map, channel_name="Disney Channel")
+
+        assert sorted_ids == [1, 2, 3], (
+            f"Resolution must outrank country, got {sorted_ids}"
+        )
+
+    def test_unknown_country_sorts_between_match_and_mismatch(self):
+        """A stream whose name declares no country ranks below a match and above a mismatch."""
+        stream_names = {
+            1: "GOLD| DISNEY CHANNEL",
+            2: "NO| DISNEY CHANNEL",
+            3: "US| DISNEY CHANNEL HD",
+            4: "US Disney Channel (East)",
+        }
+
+        sorted_ids = smart_sort_streams(
+            [1, 2, 3, 4],
+            stats_map={},
+            channel_name="Disney Channel",
+            stream_names=stream_names,
+        )
+
+        assert sorted_ids == [3, 4, 1, 2], (
+            f"Expected match, then unknown, then mismatch, got {sorted_ids}"
+        )
+
+    def test_streams_with_no_country_keep_their_order(self):
+        """A channel whose streams all lack a country prefix is not reshuffled."""
+        stream_names = {
+            1: "GOLD| DISNEY CHANNEL",
+            2: "STC| DISNEY CHANNEL",
+            3: "CZ| DISNEY CHANNEL",
+        }
+
+        sorted_ids = smart_sort_streams(
+            [3, 1, 2],
+            stats_map={},
+            channel_name="Disney Channel",
+            stream_names=stream_names,
+        )
+
+        assert sorted_ids == [1, 2, 3], (
+            f"Unlabelled streams must keep the id order the sort already gave them, got {sorted_ids}"
+        )
+
+    def test_usa_spelling_counts_as_the_same_country(self):
+        """``USA  DISNEY CHANNEL HD`` is a US stream, not a foreign one."""
+        stream_names = {
+            1: "GOLD| DISNEY CHANNEL",
+            2: "USA  DISNEY CHANNEL HD",
+            3: "US| DISNEY CHANNEL HD",
+        }
+
+        sorted_ids = smart_sort_streams(
+            [1, 2, 3],
+            stats_map={},
+            channel_name="Disney Channel",
+            stream_names=stream_names,
+        )
+
+        assert sorted_ids == [2, 3, 1], (
+            f"USA and US must rank as one country, got {sorted_ids}"
+        )
+
+    def test_country_comes_from_the_stats_row_when_no_names_are_passed(self):
+        """compute-sort passes no name map, so the stats rows have to supply the country."""
+        stats_map = {
+            1: create_mock_stats(1, stream_name="ES-AV| DISNEYCHANNEL"),
+            2: create_mock_stats(2, stream_name="US| DISNEY CHANNEL HD"),
+            3: create_mock_stats(3, stream_name="US Disney Channel (East)"),
+        }
+
+        sorted_ids = smart_sort_streams([1, 2, 3], stats_map, channel_name="Disney Channel")
+
+        assert sorted_ids == [2, 3, 1], (
+            f"Expected the Spanish stream last, got {sorted_ids}"
+        )

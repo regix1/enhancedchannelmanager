@@ -81,6 +81,11 @@ COUNTRY_PREFIXES = [
     "LATAM", "LATINO", "LATIN",
 ]
 
+# COUNTRY_PREFIXES holds both spellings of the United States code, so "USA| ESPN"
+# and "US| ESPN" detect as different countries and half a channel's US streams
+# would read as foreign. [20]
+COUNTRY_CODE_ALIASES: dict[str, str] = {"USA": "US"}
+
 # ---------------------------------------------------------------------------
 # Unicode → ASCII map
 # ---------------------------------------------------------------------------
@@ -342,9 +347,34 @@ def strip_regional_suffix(name: str) -> str:
 # Quality sorting with provider interleaving
 # ---------------------------------------------------------------------------
 
+def _country_rank(stream: dict, channel_country: Optional[str]) -> int:
+    """Rank one stream against the channel's country: match, unknown, then mismatch.
+
+    An unlabelled stream ranks between the two, so a channel whose streams carry no
+    country at all keeps the order it already had.
+    """
+    code = get_country_prefix(stream.get("name", ""))
+    if code is None:
+        return 1
+    return 0 if COUNTRY_CODE_ALIASES.get(code, code) == channel_country else 2
+
+
 def sort_streams_by_quality(streams: list[dict]) -> list[dict]:
-    """Sort streams by quality priority, interleaving providers for failover."""
+    """Sort streams by quality priority, interleaving providers for failover.
+
+    Within a tier, streams from the country most of the list belongs to come first,
+    so a foreign feed carrying no quality token stops taking position 1 from a
+    domestic one. [20]
+    """
     start = time.time()
+
+    # epg_matching imports this module, so importing it here rather than at module
+    # level is what keeps the two from forming a cycle.
+    from epg_matching import detect_country_from_streams
+
+    channel_country = detect_country_from_streams(streams)
+    if channel_country:
+        channel_country = COUNTRY_CODE_ALIASES.get(channel_country, channel_country)
 
     # Group by quality tier
     quality_groups: dict[int, list[dict]] = {}
@@ -374,14 +404,20 @@ def sort_streams_by_quality(streams: list[dict]) -> list[dict]:
             {"streams": provider_groups[pid], "index": 0}
             for pid in sorted_provider_ids
         ]
+        tier_result: list[dict] = []
         has_more = True
         while has_more:
             has_more = False
             for it in iterators:
                 if it["index"] < len(it["streams"]):
-                    result.append(it["streams"][it["index"]])
+                    tier_result.append(it["streams"][it["index"]])
                     it["index"] += 1
                     has_more = True
+
+        # Country breaks the tie inside a tier, never across one. The sort is stable,
+        # so providers stay interleaved within each country rank. [21]
+        tier_result.sort(key=lambda s: _country_rank(s, channel_country))
+        result.extend(tier_result)
 
     elapsed = (time.time() - start) * 1000
     logger.debug(

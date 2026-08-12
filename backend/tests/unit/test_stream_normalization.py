@@ -241,6 +241,79 @@ class TestSortStreamsByQuality:
     def test_empty_list(self):
         assert sort_streams_by_quality([]) == []
 
+    def test_us_stream_outranks_foreign_stream_in_same_tier(self):
+        # Both names are real Disney Channel streams. The Norway feed held position 1
+        # because a name with no quality token scores the same as one marked HD.
+        foreign = {"name": "GOLD| DISNEY CHANNEL ᴿᴬᵂ", "m3u_account": 1}
+        domestic = {"name": "US| DISNEY CHANNEL HD", "m3u_account": 2}
+        assert get_stream_quality_priority(foreign["name"]) == DEFAULT_QUALITY_PRIORITY
+        assert get_stream_quality_priority(domestic["name"]) == DEFAULT_QUALITY_PRIORITY
+
+        result = sort_streams_by_quality([foreign, domestic])
+
+        assert result[0]["name"] == "US| DISNEY CHANNEL HD"
+
+    def test_single_country_keeps_existing_order(self):
+        streams = [
+            {"name": "US| ESPN HD", "m3u_account": 1},
+            {"name": "US| ESPN 2 HD", "m3u_account": 2},
+            {"name": "US| ESPN 3 HD", "m3u_account": 3},
+        ]
+        result = sort_streams_by_quality(streams)
+        assert [s["name"] for s in result] == [s["name"] for s in streams]
+
+    def test_quality_tier_outranks_country(self):
+        streams = [
+            {"name": "US| ESPN SD", "m3u_account": 1},
+            {"name": "NO| ESPN HD", "m3u_account": 1},
+            {"name": "US| ESPN HD", "m3u_account": 1},
+        ]
+        result = sort_streams_by_quality(streams)
+        # The foreign HD stream still beats the US SD stream, and the US SD stream
+        # never climbs above a US HD one.
+        assert [s["name"] for s in result] == [
+            "US| ESPN HD",
+            "NO| ESPN HD",
+            "US| ESPN SD",
+        ]
+
+    def test_unknown_country_sorts_between_match_and_mismatch(self):
+        streams = [
+            {"name": "NO| CARTOON NETWORK", "m3u_account": 1},
+            {"name": "SKY| CARTOON NETWORK", "m3u_account": 1},
+            {"name": "US| CARTOON NETWORK", "m3u_account": 1},
+            {"name": "US| CARTOON NETWORK EAST", "m3u_account": 1},
+        ]
+        result = sort_streams_by_quality(streams)
+        assert [s["name"] for s in result] == [
+            "US| CARTOON NETWORK",
+            "US| CARTOON NETWORK EAST",
+            "SKY| CARTOON NETWORK",
+            "NO| CARTOON NETWORK",
+        ]
+
+    def test_unlabelled_streams_keep_their_order(self):
+        streams = [
+            {"name": "GOLD| ESPN", "m3u_account": 1},
+            {"name": "SKY| ESPN", "m3u_account": 1},
+            {"name": "STC| ESPN", "m3u_account": 1},
+        ]
+        result = sort_streams_by_quality(streams)
+        assert [s["name"] for s in result] == [s["name"] for s in streams]
+
+    def test_usa_spelling_counts_as_the_same_country(self):
+        streams = [
+            {"name": "GOLD| DISNEY CHANNEL", "m3u_account": 1},
+            {"name": "US| DISNEY CHANNEL HD", "m3u_account": 1},
+            {"name": "USA  DISNEY CHANNEL HD", "m3u_account": 1},
+        ]
+        result = sort_streams_by_quality(streams)
+        assert [s["name"] for s in result] == [
+            "US| DISNEY CHANNEL HD",
+            "USA  DISNEY CHANNEL HD",
+            "GOLD| DISNEY CHANNEL",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Enrichment
