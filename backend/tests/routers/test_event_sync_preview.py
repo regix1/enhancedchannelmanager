@@ -1105,6 +1105,124 @@ class TestPromotionPreview:
                    if r["stream_id"] == 301)
         assert row["promote_stream_dead"] is True
 
+    async def _promoted_channel_name(self, async_client) -> str:
+        """The name a previous run gave this event's channel, derived the
+        way the run derives it rather than spelled out here, so a change to
+        the naming cannot leave these tests adopting nothing."""
+        resp = await _preview(
+            async_client, _mock_client(),
+            {"event_sync_config": self._promote_config()},
+        )
+        return resp.json()["promotion"]["units"][0]["channel_name"]
+
+    @pytest.mark.asyncio
+    async def test_a_delisted_event_says_its_channel_is_retired(
+        self, async_client
+    ):
+        """The run leaves this channel out of the set the rule manages and
+        the orphan cleanup takes it from there, so the operator has to read
+        it here. Losing a whole channel is the second destructive thing the
+        feature does and the preview was blind to it. [24]"""
+        streams = {
+            "Fubo Events": SECONDARY_STREAMS["Fubo Events"],
+            "DAZN Events": [
+                {"id": 301,
+                 "name": "DAZN 05: Fury vs. Usyk @ 11 Jul 11:00 PM ET",
+                 "m3u_account": 2, "is_stale": True},
+            ],
+        }
+        client = _mock_client(
+            master_channels=MASTER_CHANNELS + [
+                {"id": 900,
+                 "name": await self._promoted_channel_name(async_client),
+                 "channel_group_id": self.PROMOTE_GROUP_ID},
+            ],
+            secondary_streams=streams,
+        )
+
+        def _stats_for(stream_ids):
+            return {
+                sid: {"stream_id": sid, "probe_status": "success",
+                      "consecutive_failures": 0}
+                for sid in stream_ids
+            }
+
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_for):
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    skip_dead_streams=True)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        assert data["promotion"]["skipped_all_dead"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["promote_skipped_all_dead"] is True
+        assert row["promote_channel_retired"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_probe_failure_does_not_report_a_retirement(
+        self, async_client
+    ):
+        """A stream the provider still lists is a stream that failed a
+        check of ours, and the run keeps the channel for it. Reporting a
+        retirement here would promise a deletion that never comes. [24]"""
+        client = _mock_client(
+            master_channels=MASTER_CHANNELS + [
+                {"id": 900,
+                 "name": await self._promoted_channel_name(async_client),
+                 "channel_group_id": self.PROMOTE_GROUP_ID},
+            ],
+        )
+        with patch("services.event_sync_stream_health.find_dead_streams",
+                   AsyncMock(return_value={301})):
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    skip_dead_streams=True)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        assert data["promotion"]["skipped_all_dead"] == 1
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["promote_skipped_all_dead"] is True
+        assert row["promote_channel_retired"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_unprobed_event_carries_no_retirement_verdict(
+        self, async_client
+    ):
+        """Almost no stream on a real instance has ever been probed. An
+        absent verdict promotes the event as usual, so the row must not
+        carry a retirement flag at all. [24]"""
+        client = _mock_client(
+            master_channels=MASTER_CHANNELS + [
+                {"id": 900,
+                 "name": await self._promoted_channel_name(async_client),
+                 "channel_group_id": self.PROMOTE_GROUP_ID},
+            ],
+        )
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   lambda stream_ids: {}):
+            resp = await _preview(
+                async_client, client,
+                {"event_sync_config": self._promote_config(
+                    skip_dead_streams=True)},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        _assert_zero_writes(client)
+        assert data["promotion"]["skipped_all_dead"] == 0
+        row = next(r for r in data["unmatched_streams"]
+                   if r["stream_id"] == 301)
+        assert row["would_promote"] is True
+        assert "promote_channel_retired" not in row
+
     @pytest.mark.asyncio
     async def test_a_dateless_event_says_so_on_the_row(self, async_client):
         """The row must carry its own reason. Without one the panel falls

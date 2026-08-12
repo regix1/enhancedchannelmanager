@@ -423,9 +423,17 @@ export interface EventSyncUnmatchedStream {
    * on a backend without the health check. */
   promote_stream_dead?: boolean;
   /** True when EVERY stream behind this event failed its health check, so
-   * no channel is created. A channel the event already has is never retired
-   * for this. Only ever set alongside `promote_stream_dead`. */
+   * no channel is created. Only ever set alongside `promote_stream_dead`.
+   * Whether a channel the event already has survives is
+   * `promote_channel_retired`. */
   promote_skipped_all_dead?: boolean;
+  /** True when the channel this event already has is retired, because the
+   * provider no longer lists a single one of its streams. The channel
+   * leaves the set the rule manages and the rule's orphan cleanup decides
+   * what happens to it. False when the event's streams merely failed a
+   * probe, or when it has no channel yet: both of those keep whatever is
+   * there. Only ever set alongside `promote_skipped_all_dead`. */
+  promote_channel_retired?: boolean;
 }
 
 /** bead ti939.4.1: one stream inside a promotion unit. */
@@ -487,9 +495,10 @@ export interface EventSyncPromotionPreview {
    * Absent on a backend without the health check. */
   dead_streams_skipped?: number;
   /** How many events were dropped because EVERY stream behind them failed
-   * the health check, leaving nothing to attach. Failing health blocks a
-   * new channel; it never retires one that already exists. Absent on a
-   * backend without the health check. */
+   * the health check, leaving nothing to attach. A failed probe blocks a
+   * new channel and keeps an existing one; a provider that has delisted
+   * every stream retires it, which the row's `promote_channel_retired`
+   * says. Absent on a backend without the health check. */
   skipped_all_dead?: number;
   /** How many streams were left alone because their names carry no date, so
    * there is no event day to build a channel around. Optional and read with

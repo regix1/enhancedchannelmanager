@@ -229,7 +229,9 @@ function promotionRowReason(row: EventSyncUnmatchedStream): string {
     return 'Skipped because this stream name carries no date, so there is no event day to build a channel around';
   }
   if (row.promote_skipped_all_dead) {
-    return 'Skipped because every stream for this event failed its health check, so there was nothing to attach';
+    return row.promote_channel_retired
+      ? 'Skipped — the provider no longer lists any stream for this event, and this rule stops managing its channel'
+      : 'Skipped because every stream for this event failed its health check, so there was nothing to attach';
   }
   if (row.promote_stream_dead) {
     return 'Dropped because this stream failed its health check. The event still promotes on the streams that passed';

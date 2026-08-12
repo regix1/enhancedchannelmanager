@@ -3364,6 +3364,9 @@ async def preview_event_sync(
         # Stays 0 when the health gate is off, which is also when the run
         # detaches nothing. [75]
         stale_streams_removed = 0
+        # Stays empty for the same reason: with the health gate off there
+        # are no all-dead units, so no channel leaves the managed set. [24]
+        retired_channel_keys: set[str] = set()
 
         if config.get("skip_dead_streams"):
             # Health the preview can read WITHOUT writing: a probe stores a
@@ -3443,6 +3446,23 @@ async def preview_event_sync(
                 row.stream.stream_id
                 for row in resolution.resolved
                 if row.stream.is_stale and row.stream.stream_id is not None
+            }
+            # And what the run would RETIRE. An event the provider no longer
+            # lists a single stream for has no event behind it any more, so
+            # the run leaves its channel out of the set the rule manages and
+            # the orphan cleanup takes it from there. Read off the same
+            # delisted set and the same all-dead bucket the run reads, so
+            # the two cannot disagree about which channel goes. A stream
+            # that merely failed a probe is not a delisting and its channel
+            # stays, which is why this is not simply "the unit is all
+            # dead". [24]
+            retired_channel_keys = {
+                unit.event_key
+                for unit in plan.all_dead_units
+                if unit.existing_channel_id is not None
+                and all(
+                    row.stream.stream_id in stale_ids for row in unit.rows
+                )
             }
             streams_by_channel = {
                 ch["id"]: [
@@ -3587,6 +3607,12 @@ async def preview_event_sync(
                     "promote_channel_name": unit.channel_name,
                     "promote_stream_dead": True,
                     "promote_skipped_all_dead": True,
+                    # Losing a channel is the second destructive thing this
+                    # feature does, and the operator has to see it coming
+                    # the same way they see a stream come off. [24]
+                    "promote_channel_retired": (
+                        unit.event_key in retired_channel_keys
+                    ),
                 }
         promotion_out = {
             "enabled": True,

@@ -1113,6 +1113,39 @@ describe('unmatched-event promotion (bead ti939.4.1)', () => {
     expect(screen.queryByText(/incomplete parsed identity/)).toBeNull();
   });
 
+  it('says the channel goes when the provider has delisted every stream', () => {
+    const preview = promotedPreview();
+    preview.promotion!.skipped_all_dead = 2;
+    // Delisted: the channel this event already has leaves the set the rule
+    // manages, and losing a channel is what the operator has to see coming.
+    preview.unmatched_streams[0].would_promote = false;
+    preview.unmatched_streams[0].promote_action = null;
+    preview.unmatched_streams[0].promote_stream_dead = true;
+    preview.unmatched_streams[0].promote_skipped_all_dead = true;
+    preview.unmatched_streams[0].promote_channel_retired = true;
+    // The same all-dead verdict off a failed check of ours. That channel
+    // stays, so this row must keep reading as a health failure.
+    preview.unmatched_streams[1].would_promote = false;
+    preview.unmatched_streams[1].promote_action = null;
+    preview.unmatched_streams[1].promote_stream_dead = true;
+    preview.unmatched_streams[1].promote_skipped_all_dead = true;
+    preview.unmatched_streams[1].promote_channel_retired = false;
+    render(
+      <EventSyncPreviewPanel
+        preview={preview}
+        loading={false}
+        error={null}
+        onRunPreview={noop}
+      />
+    );
+    expect(
+      screen.getByText(/no longer lists any stream for this event, and this rule stops managing its channel/)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/every stream for this event failed its health check/)
+    ).toBeInTheDocument();
+  });
+
   it('names the missing date on a dateless row instead of blaming the parse', () => {
     const preview = promotedPreview();
     preview.promotion!.skipped_dateless = 1;
