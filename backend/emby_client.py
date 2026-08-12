@@ -335,10 +335,12 @@ class EmbyClient:
         own guide refresh comes round, which is hours by default.
 
         Returns:
-            ``True`` when Emby accepted the task. ``False`` when the server
-            offers no ``RefreshGuide`` task — the key is stable across current
-            Emby releases, so this means an unexpected build, and the keys it
-            DID offer are logged to make that visible rather than silent.
+            ``True`` when Emby accepted a new run. ``False`` in the two cases
+            where no run was started: the server offers no ``RefreshGuide``
+            task (the key is stable across current Emby releases, so this means
+            an unexpected build, and the keys it DID offer are logged rather
+            than failing silently), or a refresh is already running. Both are
+            normal outcomes, distinguished in the log.
 
         Raises:
             EmbyClientError: On 401 (auth) or any other non-2xx, or on a
@@ -369,18 +371,26 @@ class EmbyClient:
             )
 
         tasks = response.json() or []
-        task_id = next(
-            (t.get("Id") for t in tasks if t.get("Key") == "RefreshGuide" and t.get("Id")),
+        task = next(
+            (t for t in tasks if t.get("Key") == "RefreshGuide" and t.get("Id")),
             None,
         )
-        if task_id is None:
+        if task is None:
             logger.warning(
                 "[EMBY] no RefreshGuide task on this server; keys offered: %s",
                 sorted(t.get("Key") for t in tasks if t.get("Key")),
             )
             return False
 
-        run_url = f"{self.base_url}/ScheduledTasks/Running/{task_id}"
+        # Emby reports State as Idle / Running / Cancelling. Starting a task
+        # that is already running restarts its crawl from the beginning, so a
+        # burst of channel changes would keep resetting the refresh and the
+        # guide would never actually finish updating. [42]
+        if task.get("State") == "Running":
+            logger.info("[EMBY] Guide refresh already running — leaving it alone")
+            return False
+
+        run_url = f"{self.base_url}/ScheduledTasks/Running/{task['Id']}"
         logger.debug("[EMBY] POST %s", run_url)
         try:
             response = await self._client.request("POST", run_url, headers=headers)

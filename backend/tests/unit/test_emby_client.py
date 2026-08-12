@@ -525,6 +525,42 @@ async def test_refresh_guide_returns_false_when_the_server_offers_no_such_task()
         await client.close()
 
 
+async def test_refresh_guide_leaves_a_running_refresh_alone():
+    """Starting a task Emby is already running restarts its crawl from the
+    top, so a burst of channel changes would keep resetting it and the guide
+    would never finish. No POST is sent while State is Running. [42]"""
+    client = EmbyClient(base_url="http://emby.local:8096", api_key="key-xyz")
+    try:
+        tasks = _response(200, [
+            {"Id": "task-guide", "Key": "RefreshGuide", "State": "Running"},
+        ])
+        request_mock = AsyncMock(return_value=tasks)
+        with patch.object(client._client, "request", request_mock):
+            assert await client.refresh_guide() is False
+
+        assert request_mock.call_count == 1
+    finally:
+        await client.close()
+
+
+async def test_refresh_guide_starts_an_idle_task():
+    """The mirror of the test above: Idle is the normal state and must not be
+    mistaken for a reason to skip. [42]"""
+    client = EmbyClient(base_url="http://emby.local:8096", api_key="key-xyz")
+    try:
+        tasks = _response(200, [
+            {"Id": "task-guide", "Key": "RefreshGuide", "State": "Idle"},
+        ])
+        request_mock = AsyncMock(side_effect=[tasks, _response(204)])
+        with patch.object(client._client, "request", request_mock):
+            assert await client.refresh_guide() is True
+
+        assert request_mock.call_count == 2
+        assert request_mock.call_args_list[1].args[0] == "POST"
+    finally:
+        await client.close()
+
+
 async def test_refresh_guide_raises_on_unauthorized():
     """A revoked key must surface as EmbyClientError like every other method
     here, rather than reading as 'no task offered'."""
