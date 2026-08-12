@@ -262,6 +262,11 @@ class ChannelPipelineEngine:
         self._existing_groups = None
         self._stream_stats_cache = {}
         self._struck_stream_ids = set()
+        # Channel ids the guide-link pass has already matched and could not
+        # place. Survives between runs because the engine is a singleton
+        # (get_channel_pipeline_engine), which is what keeps the every-minute
+        # tick off the EPG fetches. See _link_unmatched_channels.
+        self._epg_link_unmatched: set[int] = set()
 
     async def run_pipeline(
         self,
@@ -654,11 +659,13 @@ class ChannelPipelineEngine:
 
         # A channel this run created carries no guide link — Dispatcharr does not
         # write one and no rule action does either — so its EPG stays blank until
-        # somebody links it by hand. Do that here, and ONLY when the run actually
-        # created channels: the auto-creation tick fires every minute, and the
-        # pass re-reads every EPG source, which is tens of thousands of entries
-        # on a normal install. [5]
-        if not dry_run and results["channels_created"]:
+        # somebody links it by hand. Channels the run did NOT create can be
+        # blank too: an operator who clears a link to have it re-picked leaves
+        # one behind, and a run that creates nothing would never revisit it. So
+        # the pass runs on every live run and does its own cost control — see
+        # _link_unmatched_channels, which returns after a single channel fetch
+        # unless it is looking at a channel it has not already tried.
+        if not dry_run:
             results["epg_links_created"] = await self._link_unmatched_channels()
 
         # A channel this run created or removed stays visible in Emby until Emby
@@ -702,9 +709,15 @@ class ChannelPipelineEngine:
         already committed by this point, and an EPG source that is down or slow
         must not turn a good run red. [13]
 
+        Runs on every live run, including the every-minute auto-creation tick,
+        so the cost is controlled inside: one channel fetch, then a return
+        unless some channel has no guide data that the matcher has not already
+        rejected once. ``self._epg_link_unmatched`` holds those rejects.
+
         Returns:
             How many channels were linked. 0 when the setting is off, when every
-            channel already has guide data, or when the pass failed.
+            channel already has guide data, when every channel with none has
+            already been matched and rejected, or when the pass failed.
         """
         settings = get_settings()
         if not getattr(settings, "epg_auto_link_after_pipeline", True):
@@ -713,7 +726,7 @@ class ChannelPipelineEngine:
         from epg_matching import batch_find_epg_matches, build_source_priority_order
         from normalization_engine import NormalizationEngine
 
-        linked = 0
+        linked_ids: set[int] = set()
         try:
             # The engine's own paginated fetch. self._existing_channels is read
             # at run start, so the channels this run just created are missing
@@ -729,7 +742,19 @@ class ChannelPipelineEngine:
                 page += 1
 
             unlinked = [c for c in all_channels if c.get("epg_data_id") is None]
-            if not unlinked:
+            unlinked_ids = {c["id"] for c in unlinked}
+            # Everything below this line is expensive: an EPG-source fetch, an
+            # EPG-data fetch of tens of thousands of entries and a stream fetch,
+            # once a minute forever. Every id in _epg_link_unmatched has already
+            # been through the matcher and scored under the threshold, and the
+            # run that just finished did not touch the EPG data, so re-matching
+            # it reaches the same answer at that price. Narrowing the record to
+            # what is still unlinked is what lets a channel come back: once it
+            # has a link it drops out of the record, and clearing that link
+            # makes it an id the pass has not tried. An empty set is a subset
+            # too, which is the steady state and the cheapest path.
+            if unlinked_ids <= self._epg_link_unmatched:
+                self._epg_link_unmatched = unlinked_ids
                 return 0
 
             epg_sources = await self.client.get_epg_sources()
@@ -776,16 +801,21 @@ class ChannelPipelineEngine:
                     user_initiated=False,
                     mutation_source=journal.MUTATION_SOURCE_AUTO_CREATION,
                 )
-                linked += 1
+                linked_ids.add(match_result.channel_id)
+
+            # What the matcher would not place, so the next tick can skip the
+            # fetches above. Only reached on a clean pass: a source that was
+            # down leaves the previous record standing and gets retried.
+            self._epg_link_unmatched = unlinked_ids - linked_ids
 
             logger.info(
                 "[AUTO-CREATE-ENGINE] EPG auto-link: linked %s of %s channel(s) "
                 "with no guide data at threshold %s",
-                linked, len(unlinked), threshold,
+                len(linked_ids), len(unlinked), threshold,
             )
         except Exception as e:
             logger.warning("[AUTO-CREATE-ENGINE] EPG auto-link failed: %s", e)
-        return linked
+        return len(linked_ids)
 
     async def run_rule(
         self,

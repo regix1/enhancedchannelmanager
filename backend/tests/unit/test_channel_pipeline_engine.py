@@ -504,8 +504,14 @@ class TestChannelPipelineEngineRunPipeline:
         self.client.update_channel.assert_not_called()
 
     @patch("channel_pipeline_engine.get_session")
-    def test_auto_link_skipped_when_no_channels_were_created(self, mock_get_session):
-        """The every-minute tick that creates nothing costs no EPG fetch at all."""
+    def test_auto_link_costs_no_epg_fetch_when_nothing_is_unlinked(
+        self, mock_get_session,
+    ):
+        """The every-minute tick in its steady state stops at the channel fetch.
+
+        setup_method's get_channels returns an empty page, so nothing has a
+        blank guide link and the pass returns before the EPG fetches.
+        """
         self.client.update_channel = AsyncMock()
         self.client.get_epg_data = AsyncMock(return_value=[])
 
@@ -516,6 +522,39 @@ class TestChannelPipelineEngineRunPipeline:
         self.client.get_epg_data.assert_not_called()
         self.client.update_channel.assert_not_called()
         assert result["epg_links_created"] == 0
+
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_links_an_existing_channel_when_nothing_was_created(
+        self, mock_get_session,
+    ):
+        """A run that creates nothing still links a channel whose guide link is
+        blank.
+
+        This is the operator who clears the links on channels they already have
+        so the pass re-picks them against corrected EPG source priorities. The
+        run reports 0 channels created, which used to switch the pass off and
+        leave those channels with no guide data at all.
+        """
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+            ],
+        })
+        self.client.get_epg_sources = AsyncMock(return_value=[])
+        self.client.get_epg_data = AsyncMock(return_value=[])
+        self.client.get_streams_by_ids = AsyncMock(return_value=[])
+        self.client.update_channel = AsyncMock(return_value={"id": 7})
+
+        with patch("normalization_engine.NormalizationEngine"), \
+             patch("epg_matching.batch_find_epg_matches",
+                   return_value=[_epg_match(7, "ESPN", 55, 95)]):
+            result = self._run_with_created(
+                mock_get_session, channels_created=0, dry_run=False,
+            )
+
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
+        assert result["epg_links_created"] == 1
 
     @patch("epg_matching.batch_find_epg_matches", return_value=[])
     @patch("channel_pipeline_engine.get_session")
@@ -4471,7 +4510,11 @@ class TestChannelPipelineEngineAutoLink:
         assert linked == 1
 
     def test_every_channel_already_linked_costs_no_epg_fetch(self):
-        """The common case returns before the expensive fetches."""
+        """The common case returns before the expensive fetches.
+
+        One channel fetch and nothing else is what makes the pass affordable on
+        the every-minute tick, so the request count is pinned here.
+        """
         self.client.get_channels = AsyncMock(return_value={
             "count": 1,
             "results": [{"id": 8, "name": "CNN", "epg_data_id": 42, "streams": []}],
@@ -4480,7 +4523,10 @@ class TestChannelPipelineEngineAutoLink:
         linked, mock_batch = self._link(matches=[])
 
         assert linked == 0
+        self.client.get_channels.assert_called_once()
+        self.client.get_epg_sources.assert_not_called()
         self.client.get_epg_data.assert_not_called()
+        self.client.get_streams_by_ids.assert_not_called()
         mock_batch.assert_not_called()
 
     def test_match_below_the_threshold_is_left_unlinked(self):
@@ -4522,6 +4568,70 @@ class TestChannelPipelineEngineAutoLink:
 
         self.client.get_streams_by_ids.assert_called_once_with([101])
         self.client.get_streams.assert_not_called()
+
+    def test_a_channel_the_matcher_rejected_is_not_matched_again(self):
+        """A channel nothing can match costs one channel fetch per run, not a
+        full EPG sweep every minute forever.
+
+        20 is under the threshold of 80, so the first pass records channel 7 and
+        the second one stops at the channel fetch.
+        """
+        self._link(matches=[_epg_match(7, "ESPN", 55, 20)])
+        self.client.get_epg_data.reset_mock()
+
+        linked, mock_batch = self._link(matches=[_epg_match(7, "ESPN", 55, 20)])
+
+        assert linked == 0
+        self.client.get_epg_data.assert_not_called()
+        mock_batch.assert_not_called()
+
+    def test_one_rejected_channel_does_not_suppress_the_pass_for_a_new_one(self):
+        """A channel the pass has never tried reopens the match, and the
+        rejected one rides along rather than waiting for a pass of its own."""
+        self._link(matches=[_epg_match(7, "ESPN", 55, 20)])
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 2,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+                {"id": 9, "name": "TNT", "epg_data_id": None, "streams": [103]},
+            ],
+        })
+
+        linked, mock_batch = self._link(matches=[_epg_match(9, "TNT", 60, 95)])
+
+        assert [c["id"] for c in mock_batch.call_args.kwargs["channels"]] == [7, 9]
+        assert linked == 1
+
+    def test_a_link_cleared_after_a_rejection_is_matched_again(self):
+        """The record only ever holds channels that have no guide link right
+        now, so a link cleared later is retried instead of skipped.
+
+        Channel 7 is rejected, then linked by hand, then cleared. Without the
+        narrowing step it would sit in the record from that first rejection and
+        never be matched again, which is the whole reason the operator clears a
+        link in the first place.
+        """
+        self._link(matches=[_epg_match(7, "ESPN", 55, 20)])
+
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": 42, "streams": [101]},
+            ],
+        })
+        self._link(matches=[])
+
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+            ],
+        })
+        linked, mock_batch = self._link(matches=[_epg_match(7, "ESPN", 55, 95)])
+
+        mock_batch.assert_called_once()
+        assert linked == 1
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
 
 
 # Disney Channel 2687 as the provider ships it, in ascending id order: ten streams,
