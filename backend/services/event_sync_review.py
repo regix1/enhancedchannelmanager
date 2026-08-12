@@ -65,6 +65,7 @@ isolation contract as ``services.event_sync_matcher``.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -186,6 +187,17 @@ def _dateless_clock_token(start: datetime) -> str:
     )
 
 
+# Some providers re-issue an event under a new stream id every time its
+# status changes and lead the name with that status: "NEXT | FAIRWAYS OF
+# LIFE WITH MATT ADAMS | Wed 12 Aug 09:00 EDT", then "LIVE | ...", then
+# "ENDED | ...". The status rode into the title, so one golf show keyed as
+# three events and held three channels at once. The pipe is required and
+# the word must be the whole token before it: that is what separates a
+# status marker from a title that merely starts with the same word ("Live
+# Aid At 40", "Next Gen ATP Finals"). [18]
+_STATUS_PREFIX_RE = re.compile(r"^(?:NEXT|LIVE|ENDED)\s*\|\s*", re.IGNORECASE)
+
+
 def master_event_key(parsed: ParsedEvent) -> str | None:
     """Normalized event identity of one parsed MASTER channel name.
 
@@ -196,7 +208,11 @@ def master_event_key(parsed: ParsedEvent) -> str | None:
     The start time is converted to UTC so the key is independent of the
     rule's display timezone; the title is cleaned with the same shared
     cleaner the fuzzy scorer uses (see :func:`normalize_stream_name` for
-    the empty-clean fallback rationale).
+    the empty-clean fallback rationale), after the provider's status
+    prefix comes off it (:data:`_STATUS_PREFIX_RE`) so one event at one
+    start time is one key whatever status the provider is currently
+    advertising. A stored row whose name carried such a prefix keys
+    differently from here on and re-asks once. [18]
 
     SYNTHESIZED-DATE EXCEPTION (bead t6bin): when ``matched_pattern`` is
     one of the assume_current_date dateless variants
@@ -215,7 +231,9 @@ def master_event_key(parsed: ParsedEvent) -> str | None:
     """
     if parsed.title is None or parsed.start is None:
         return None
-    cleaned = clean_name(parsed.title, mode=NameCleanMode.LOCALS)
+    cleaned = clean_name(
+        _STATUS_PREFIX_RE.sub("", parsed.title), mode=NameCleanMode.LOCALS
+    )
     if not cleaned:
         cleaned = " ".join(parsed.title.lower().split())
     if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:

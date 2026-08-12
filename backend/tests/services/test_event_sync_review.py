@@ -473,6 +473,45 @@ class TestDatedKeyRegression:
         assert master_event_key(a) != master_event_key(b)
 
 
+class TestProviderStatusPrefix:
+    """One event is one key however the provider currently labels it.
+
+    This provider re-issues an event under a new stream id every time its
+    status changes, and puts the status at the front of the name. Keying on
+    it made one golf show three events, holding three channels at the same
+    time. [18]
+    """
+
+    STATUS_NAMES = tuple(
+        f"{status} | FAIRWAYS OF LIFE WITH MATT ADAMS | Wed 12 Aug 09:00 "
+        f"EDT (US) | 8K EXCLUSIVE | US: ESPN+ PPV 1"
+        for status in ("NEXT", "LIVE", "ENDED")
+    )
+
+    def test_every_status_of_one_event_keys_the_same(self):
+        keys = {
+            master_event_key(parse_event_name(name, None, now=NOW))
+            for name in self.STATUS_NAMES
+        }
+        assert keys == {
+            "fairways of life with matt adams|2026-08-12T13:00:00+00:00"
+        }
+
+    def test_a_title_starting_with_a_status_word_keeps_it(self):
+        # The pipe is what tells a status marker from a title, and without
+        # it these three would lose their first word and collide with
+        # whatever else shares the rest of the name.
+        pins = {
+            "Live Aid At 40 @ 11 Jul 08:00 PM ET": "live aid at 40",
+            "Next Gen ATP Finals @ 11 Jul 08:00 PM ET": "next gen atp finals",
+            "Livestream Classics @ 11 Jul 08:00 PM ET": "livestream classics",
+        }
+        for name, cleaned_title in pins.items():
+            parsed = parse_event_name(name, None, now=NOW)
+            assert master_event_key(parsed) \
+                == f"{cleaned_title}|2026-07-12T00:00:00+00:00"
+
+
 class TestRecurringDatelessSlotCarryForward:
     """End-to-end: decisions on a recurring dateless slot survive midnight.
 

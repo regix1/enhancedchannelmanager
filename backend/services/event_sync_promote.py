@@ -404,10 +404,12 @@ class PromotionPlan:
     streams that failed. Both are counted among the units that survived
     every earlier filter INCLUDING the cap, because that is the only set
     the health check ever looks at, so neither is a whole-playlist figure.
-    Neither is a deletion signal either: the caller keeps an all-dead
+    Neither is a deletion signal on its own: the caller keeps an all-dead
     unit's existing channel in the managed set, because a stream failing
     right now says nothing about whether the operator still wants the
-    channel.
+    channel. The caller reads one exception off the rows itself — a unit
+    whose every stream carries the provider's own delisting flag has no
+    event left behind it, and the executor retires that channel. [19]
     """
 
     units: tuple[PromotionUnit, ...]
@@ -795,9 +797,9 @@ def build_promotion_plan(
                 dead_streams_skipped += dropped
                 if not live_rows:
                     # No working stream behind this event. The unit is not
-                    # realized, and the CALLER keeps any channel it already
-                    # has in the managed set — health blocks creates and
-                    # attaches, it never retires a channel.
+                    # realized; what happens to any channel it already has
+                    # is the CALLER's call, and it keeps the channel unless
+                    # the provider has delisted every one of these rows.
                     all_dead_units.append(unit)
                     continue
                 unit = replace(unit, rows=tuple(live_rows))
