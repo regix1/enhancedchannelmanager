@@ -1862,6 +1862,42 @@ class TestLinkChannelToEPG:
 
         assert response.status_code == 500
 
+    @pytest.mark.asyncio
+    async def test_link_asks_emby_to_refresh_its_guide(self, async_client):
+        """A newly linked channel shows no programmes in Emby until Emby re-reads
+        its guide, which is hours out on its own cadence — so ask for it now."""
+        mock_client = AsyncMock()
+        mock_client.update_channel.return_value = {"id": 7, "epg_data_id": 42}
+
+        with patch("routers.epg.get_client", return_value=mock_client), \
+             patch("routers.epg.journal"), \
+             patch("routers.epg.request_guide_refresh",
+                   new=AsyncMock()) as mock_refresh:
+            response = await async_client.post(
+                "/api/epg/channels/7/link", json={"epg_data_id": 42},
+            )
+
+        assert response.status_code == 200
+        mock_refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_guide_refresh_still_returns_the_link(self, async_client):
+        """The link is written and journaled before Emby is asked, so a media
+        server that is down must not turn a good link into a 500."""
+        mock_client = AsyncMock()
+        mock_client.update_channel.return_value = {"id": 7, "epg_data_id": 42}
+
+        with patch("routers.epg.get_client", return_value=mock_client), \
+             patch("routers.epg.journal"), \
+             patch("routers.epg.request_guide_refresh",
+                   new=AsyncMock(side_effect=Exception("emby unreachable"))):
+            response = await async_client.post(
+                "/api/epg/channels/7/link", json={"epg_data_id": 42},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["epg_data_id"] == 42
+
 
 class TestSDLineups:
     """Tests for the Schedules Direct lineup proxy endpoints."""

@@ -144,6 +144,7 @@ const settingsBase = {
   linked_m3u_accounts: [],
   allow_multi_provider_auto_sync: false,
   epg_auto_match_threshold: 80,
+  epg_auto_link_after_pipeline: true,
   sports_banner_base_url: '',
   sports_banner_leagues: [] as api.SportsBannerLeagueRule[],
   custom_network_prefixes: [],

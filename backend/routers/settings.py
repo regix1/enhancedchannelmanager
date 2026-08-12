@@ -354,6 +354,10 @@ class SettingsRequest(BaseModel):
     # guard. Admin-only (see _ADMIN_ONLY_SETTINGS_FIELDS). Default False.
     allow_multi_provider_auto_sync: bool = False
     epg_auto_match_threshold: int = 80
+    # Optional for the same preserve-on-omit reason as the fields below: an
+    # operator who switched automatic guide linking OFF must not have it
+    # switched back on by a save from a cached older bundle. [2]
+    epg_auto_link_after_pipeline: Optional[bool] = None
     sports_banner_base_url: str = ""
     # None is "never configured" and falls back to the built-in league rules;
     # [] is a deliberate "no leagues". Both must survive the round trip.
@@ -501,6 +505,7 @@ class SettingsResponse(BaseModel):
     # bd-dgs64 (GH #591): see DispatcharrSettings.allow_multi_provider_auto_sync.
     allow_multi_provider_auto_sync: bool
     epg_auto_match_threshold: int
+    epg_auto_link_after_pipeline: bool
     sports_banner_base_url: str
     # The EFFECTIVE rules, so the editor opens on the built-in defaults
     # instead of on an empty list the operator would have to recreate.
@@ -741,6 +746,7 @@ async def get_current_settings():
         linked_m3u_accounts=settings.linked_m3u_accounts,
         allow_multi_provider_auto_sync=settings.allow_multi_provider_auto_sync,
         epg_auto_match_threshold=settings.epg_auto_match_threshold,
+        epg_auto_link_after_pipeline=settings.epg_auto_link_after_pipeline,
         sports_banner_base_url=settings.sports_banner_base_url,
         # Hand back the EFFECTIVE rules: unset means the built-ins are what is
         # running, so that is what the editor has to open on.
@@ -964,6 +970,11 @@ async def update_settings(
         if request.emby_refresh_guide_after_pipeline is not None
         else current_settings.emby_refresh_guide_after_pipeline
     )
+    epg_auto_link_after_pipeline = (
+        request.epg_auto_link_after_pipeline
+        if request.epg_auto_link_after_pipeline is not None
+        else current_settings.epg_auto_link_after_pipeline
+    )
 
     # MCP API key is never accepted on this endpoint (it has dedicated
     # generate/revoke endpoints) — always preserve the stored value so a
@@ -1058,6 +1069,8 @@ async def update_settings(
         "min_stream_bitrate_kbps": min_stream_bitrate_kbps,
         # Post-run Emby guide refresh toggle (preserve-on-omit above).
         "emby_refresh_guide_after_pipeline": emby_refresh_guide_after_pipeline,
+        # Post-run automatic guide linking toggle (preserve-on-omit above).
+        "epg_auto_link_after_pipeline": epg_auto_link_after_pipeline,
         # Internal bookkeeping marker (GH #484): never sent by the UI, so it MUST
         # be preserved from current settings — rebuilding the model here would
         # otherwise reset it to False and re-arm the one-time league-strip heal,

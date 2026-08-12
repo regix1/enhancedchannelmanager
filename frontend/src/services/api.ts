@@ -1239,6 +1239,7 @@ export interface SettingsResponse {
   // Default False preserves today's locked behavior.
   allow_multi_provider_auto_sync: boolean;
   epg_auto_match_threshold: number;  // 0-100, confidence score threshold for auto-matching
+  epg_auto_link_after_pipeline: boolean;  // link channels with no guide data after a run that created channels
   sports_banner_base_url: string;  // game-thumbs base URL; empty leaves programme artwork as the feed had it
   sports_banner_leagues: SportsBannerLeagueRule[];  // EFFECTIVE rules — the built-in defaults when unset
   custom_network_prefixes: string[];  // User-defined network prefixes to strip
@@ -1407,6 +1408,7 @@ export async function saveSettings(settings: {
   // bd-dgs64 (GH #591): optional - admin-only on the backend, defaults to false.
   allow_multi_provider_auto_sync?: boolean;
   epg_auto_match_threshold?: number;  // Optional - 0-100, defaults to 80
+  epg_auto_link_after_pipeline?: boolean;  // Optional - omit to keep the stored value, defaults to true
   sports_banner_base_url?: string;  // Optional - game-thumbs base URL, defaults to '' (feature off)
   sports_banner_leagues?: SportsBannerLeagueRule[];  // Optional - omit to keep the built-in defaults, [] for none
   custom_network_prefixes?: string[];  // Optional - user-defined network prefixes

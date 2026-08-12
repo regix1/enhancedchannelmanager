@@ -26,6 +26,7 @@ from auth import get_jwt_secret_key
 from cache import get_cache
 from config import CONFIG_DIR, get_settings, validate_url_scheme
 from dispatcharr_client import get_client, upstream_http_exception
+from emby_client import request_guide_refresh
 from epg_matching import (
     _epg_source_id,
     batch_find_epg_matches,
@@ -2203,6 +2204,19 @@ async def link_channel_to_epg(channel_id: int, request: EPGLinkRequest):
         logger.info(
             "[EPG-LINK] Linked channel=%s -> epg_data_id=%s", channel_id, epg_data_id,
         )
+
+        # A channel Emby already knows about keeps showing no programmes until
+        # Emby re-reads its guide, which is hours out on its own cadence. The
+        # client skips the call when a refresh is already running, so linking a
+        # long list of channels one by one does not keep restarting the crawl.
+        # The link is written and journaled by now, so a refresh that fails on
+        # the way out (its client teardown runs outside its own except) must not
+        # turn a successful link into a 500. [14]
+        try:
+            await request_guide_refresh()
+        except Exception as e:
+            logger.warning("[EPG-LINK] Emby guide refresh request failed: %s", e)
+
         return result
 
     except HTTPException:

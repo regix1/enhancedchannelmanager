@@ -363,6 +363,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   const [timezonePreference, setTimezonePreference] = useState('both');
   const [defaultChannelProfileIds, setDefaultChannelProfileIds] = useState<number[]>([]);
   const [epgAutoMatchThreshold, setEpgAutoMatchThreshold] = useState(80);
+  const [epgAutoLinkAfterPipeline, setEpgAutoLinkAfterPipeline] = useState(true);
   const [sportsBannerBaseUrl, setSportsBannerBaseUrl] = useState('');
   const [sportsBannerLeagues, setSportsBannerLeagues] = useState<SportsBannerLeagueRule[]>([]);
   const [customNetworkPrefixes, setCustomNetworkPrefixes] = useState<string[]>([]);
@@ -889,6 +890,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       setMaxChannelPipelineLogEntries(settings.max_auto_creation_log_entries ?? 500);
       setDefaultChannelProfileIds(settings.default_channel_profile_ids);
       setEpgAutoMatchThreshold(settings.epg_auto_match_threshold ?? 80);
+      setEpgAutoLinkAfterPipeline(settings.epg_auto_link_after_pipeline ?? true);
       setSportsBannerBaseUrl(settings.sports_banner_base_url ?? '');
       setSportsBannerLeagues(settings.sports_banner_leagues ?? []);
       setCustomNetworkPrefixes(settings.custom_network_prefixes ?? []);
@@ -1321,6 +1323,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         date_format: dateFormat,
         default_channel_profile_ids: defaultChannelProfileIds,
         epg_auto_match_threshold: epgAutoMatchThreshold,
+        epg_auto_link_after_pipeline: epgAutoLinkAfterPipeline,
         sports_banner_base_url: sportsBannerBaseUrl.trim(),
         // Blank rows are what a half-finished "Add rule" leaves behind; the
         // backend drops them anyway, so they never reach the stored list.
@@ -2731,6 +2734,25 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         <div className="settings-section-header">
           <span className="material-icons">live_tv</span>
           <h3>EPG Matching</h3>
+        </div>
+
+        <div className="checkbox-group">
+          <input
+            id="epgAutoLinkAfterPipeline"
+            type="checkbox"
+            checked={epgAutoLinkAfterPipeline}
+            onChange={(e) => setEpgAutoLinkAfterPipeline(e.target.checked)}
+            data-testid="epg-auto-link-checkbox"
+          />
+          <div className="checkbox-content">
+            <label htmlFor="epgAutoLinkAfterPipeline">Link new channels to guide data after a pipeline run</label>
+            <p>
+              When a pipeline run creates a channel, look up guide data for every channel that
+              still has none and link the best match scoring at or above the threshold below.
+              Only runs that created a channel do this, so a scheduled run that changed nothing
+              costs nothing. Turn it off to link guide data by hand.
+            </p>
+          </div>
         </div>
 
         <div className="form-group">

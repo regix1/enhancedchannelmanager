@@ -51,6 +51,16 @@ def _mock_settings(**overrides):
         "default_channel_profile_ids": [],
         "linked_m3u_accounts": [],
         "epg_auto_match_threshold": 80,
+        # Real bool, not a MagicMock auto-attr: this field is preserve-on-omit,
+        # so a POST that leaves it out reads it off this object and hands it to
+        # DispatcharrSettings, which type-checks it. [2]
+        "epg_auto_link_after_pipeline": True,
+        # Real values, not MagicMock auto-attrs: SettingsResponse types the URL
+        # as a str, and the response build hands the league rules to
+        # compile_leagues(), so a GET blows up on a mock that leaves them out.
+        # None is "never configured", which is what falls back to the built-ins.
+        "sports_banner_base_url": "",
+        "sports_banner_leagues": None,
         "custom_network_prefixes": [],
         "custom_network_suffixes": [],
         "stats_poll_interval": 30,
@@ -2645,3 +2655,51 @@ class TestSettingsDiscordWebhookOnSave:
         assert response.status_code == 200, response.json()
         saved = mock_save.call_args[0][0]
         assert saved.discord_webhook_url == ""
+
+
+class TestEPGAutoLinkAfterPipeline:
+    """The post-run automatic guide linking toggle.
+
+    ``epg_auto_link_after_pipeline`` is preserve-on-omit: an older frontend
+    bundle that saves without the field must not switch automatic linking back
+    on for an operator who turned it off.
+    """
+
+    @pytest.mark.asyncio
+    async def test_partial_post_preserves_stored_value(self, async_client):
+        """A POST that omits the field keeps the stored False. [2]"""
+        current = _mock_settings(epg_auto_link_after_pipeline=False)
+        s1, s2, s3, s4, s5 = _save_mocks()
+        with patch("routers.settings.get_settings", return_value=current), \
+             s1 as mock_save, s2, s3, s4, s5:
+            payload = _full_payload(current)
+            assert "epg_auto_link_after_pipeline" not in payload
+            response = await async_client.post("/api/settings", json=payload)
+
+        assert response.status_code == 200, response.json()
+        saved = mock_save.call_args[0][0]
+        assert saved.epg_auto_link_after_pipeline is False, (
+            "Partial POST switched automatic guide linking back on"
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_then_get_returns_stored_value(self, async_client):
+        """GET hands back the value POST stored. [3]"""
+        current = _mock_settings(epg_auto_link_after_pipeline=True)
+        s1, s2, s3, s4, s5 = _save_mocks()
+        with patch("routers.settings.get_settings", return_value=current), \
+             s1 as mock_save, s2, s3, s4, s5:
+            payload = _full_payload(current)
+            payload["epg_auto_link_after_pipeline"] = False
+            response = await async_client.post("/api/settings", json=payload)
+
+        assert response.status_code == 200, response.json()
+        saved = mock_save.call_args[0][0]
+
+        with patch("routers.settings.get_settings", return_value=saved), \
+             patch("routers.settings._has_discord_alert_method", return_value=False):
+            response = await async_client.get("/api/settings")
+
+        assert response.status_code == 200
+        assert response.json()["epg_auto_link_after_pipeline"] is False
+

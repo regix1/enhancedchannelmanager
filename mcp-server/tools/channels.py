@@ -800,12 +800,17 @@ def register(mcp: FastMCP):
 
     @mcp.tool()
     async def bulk_assign_epg(mappings: list[dict]) -> str:
-        """Assign EPG IDs (tvg_id) to multiple channels at once.
+        """Set the tvg_id field on multiple channels at once.
+
+        This writes tvg_id and nothing else. It does not link a channel to guide
+        data: the link is a separate field, epg_data_id, that this tool never
+        touches, so a channel updated here still has an empty guide. Use
+        link_channel_epg to write the link itself.
 
         Args:
             mappings: List of dicts, each with 'channel_id' (int) and 'tvg_id' (str).
                 Example: [{"channel_id": 1, "tvg_id": "ESPN.us"}, {"channel_id": 2, "tvg_id": "CNN.us"}]
-                Set tvg_id to "" to clear the EPG assignment.
+                Set tvg_id to "" to clear it.
         """
         try:
             client = get_ecm_client()

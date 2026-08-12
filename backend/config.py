@@ -141,6 +141,12 @@ class DispatcharrSettings(BaseModel):
     # Set to 0 to disable auto-matching (all matches need review)
     # Set to 100 to require perfect confidence for auto-match
     epg_auto_match_threshold: int = 80
+    # After a pipeline run creates a channel, link the channels that still have
+    # no guide data to their best EPG match at or above
+    # ``epg_auto_match_threshold``. Only ever fires on a run that created
+    # channels, never on a dry run. Operator-facing so it can be switched off
+    # where guide links are made by hand. [1]
+    epg_auto_link_after_pipeline: bool = True
     # Base URL of a game-thumbs instance (e.g. http://host:3100). When set, the
     # EPG artwork proxy gives a sports matchup a banner built from its two
     # teams. Gracenote publishes no per-game art for these, only one series

@@ -27,6 +27,7 @@ from config import (
     get_settings,
 )
 from database import get_session
+from emby_client import request_guide_refresh
 from models import (
     ChannelPipelineRule,
     ChannelPipelineExecution,
@@ -651,13 +652,22 @@ class ChannelPipelineEngine:
             results['channels_created'], results['channels_updated'], orphan_info
         )
 
+        # A channel this run created carries no guide link — Dispatcharr does not
+        # write one and no rule action does either — so its EPG stays blank until
+        # somebody links it by hand. Do that here, and ONLY when the run actually
+        # created channels: the auto-creation tick fires every minute, and the
+        # pass re-reads every EPG source, which is tens of thousands of entries
+        # on a normal install. [5]
+        if not dry_run and results["channels_created"]:
+            results["epg_links_created"] = await self._link_unmatched_channels()
+
         # A channel this run created or removed stays visible in Emby until Emby
         # re-reads its guide, which is hours out on its own cadence. Ask for that
         # now, and ONLY when the channel set actually moved: the auto-creation
         # tick fires every minute and the overwhelming majority of ticks change
         # nothing, so an unconditional call would hammer the media server. [41]
         if not dry_run and (results["channels_created"] or removed):
-            await self._request_emby_guide_refresh()
+            await request_guide_refresh()
 
         return {
             # y3m6o.1 (0152): the top-level API result reflects action-level
@@ -675,38 +685,107 @@ class ChannelPipelineEngine:
             **results
         }
 
-    async def _request_emby_guide_refresh(self) -> None:
-        """Tell Emby to re-read its guide after this run changed channels.
+    async def _link_unmatched_channels(self) -> int:
+        """Link every channel that has no guide data to its best EPG match.
 
-        Silent no-op unless the operator has both left
-        ``emby_refresh_guide_after_pipeline`` on and filled in the Emby section,
-        so an instance that never configured it is unaffected and one that
-        manages Emby elsewhere can switch it off. Every failure is swallowed and
-        logged: the pipeline's work is already done and committed by this point,
-        and a media server that is down, slow, or holding a revoked key must not
-        turn a good run red. [41]
+        Silent no-op unless the operator has left ``epg_auto_link_after_pipeline``
+        on. A channel that already carries an ``epg_data_id`` is never touched,
+        so a link written by hand or by Dispatcharr itself always wins and the
+        two sides can never fight over the same channel.
+
+        Scoring belongs entirely to ``batch_find_epg_matches`` — the same matcher
+        the EPG Match screen runs — and a candidate is written only when it
+        clears ``epg_auto_match_threshold``, the threshold the operator already
+        sets for the bulk-assign screen.
+
+        Every failure is swallowed and logged: the channels this run created are
+        already committed by this point, and an EPG source that is down or slow
+        must not turn a good run red. [13]
+
+        Returns:
+            How many channels were linked. 0 when the setting is off, when every
+            channel already has guide data, or when the pass failed.
         """
-        from config import get_settings
-
         settings = get_settings()
-        if not getattr(settings, "emby_refresh_guide_after_pipeline", True):
-            return
-        if not getattr(settings, "emby_enabled", False):
-            return
-        base_url = getattr(settings, "emby_base_url", "") or ""
-        api_key = getattr(settings, "emby_api_key", "") or ""
-        if not base_url or not api_key:
-            return
+        if not getattr(settings, "epg_auto_link_after_pipeline", True):
+            return 0
 
-        from emby_client import EmbyClient
+        from epg_matching import batch_find_epg_matches, build_source_priority_order
+        from normalization_engine import NormalizationEngine
 
-        client = EmbyClient(base_url=base_url, api_key=api_key)
+        linked = 0
         try:
-            await client.refresh_guide()
+            # The engine's own paginated fetch. self._existing_channels is read
+            # at run start, so the channels this run just created are missing
+            # from it — exactly the ones that need a link. [8]
+            all_channels = []
+            page = 1
+            while True:
+                result = await self.client.get_channels(page=page, page_size=100)
+                channels = result.get("results", [])
+                all_channels.extend(channels)
+                if len(all_channels) >= result.get("count", 0) or not channels:
+                    break
+                page += 1
+
+            unlinked = [c for c in all_channels if c.get("epg_data_id") is None]
+            if not unlinked:
+                return 0
+
+            epg_sources = await self.client.get_epg_sources()
+            source_order = build_source_priority_order(epg_sources)
+            epg_data = await self.client.get_epg_data()
+
+            # Only the target channels' own streams. Sweeping every stream is
+            # ~86 requests on a normal install, and the matcher reads streams
+            # for country detection alone. [12]
+            stream_ids = [
+                sid for channel in unlinked for sid in (channel.get("streams") or [])
+            ]
+            streams = (
+                await self.client.get_streams_by_ids(stream_ids) if stream_ids else []
+            )
+
+            session = get_session()
+            try:
+                match_results = batch_find_epg_matches(
+                    channels=unlinked,
+                    all_streams=streams,
+                    epg_data=epg_data,
+                    source_order=source_order or None,
+                    engine=NormalizationEngine(session),
+                )
+            finally:
+                session.close()
+
+            threshold = settings.epg_auto_match_threshold
+            for match_result in match_results:
+                best = match_result.best_match
+                if best is None or best.confidence < threshold:
+                    continue
+                await self.client.update_channel(
+                    match_result.channel_id, {"epg_data_id": best.epg_id}
+                )
+                journal.log_entry(
+                    category="channel",
+                    action_type="update",
+                    entity_id=match_result.channel_id,
+                    entity_name=match_result.channel_name,
+                    description=f"Linked channel to EPG data id={best.epg_id}",
+                    after_value={"epg_data_id": best.epg_id},
+                    user_initiated=False,
+                    mutation_source=journal.MUTATION_SOURCE_AUTO_CREATION,
+                )
+                linked += 1
+
+            logger.info(
+                "[AUTO-CREATE-ENGINE] EPG auto-link: linked %s of %s channel(s) "
+                "with no guide data at threshold %s",
+                linked, len(unlinked), threshold,
+            )
         except Exception as e:
-            logger.warning("[AUTO-CREATE-ENGINE] Emby guide refresh failed: %s", e)
-        finally:
-            await client.close()
+            logger.warning("[AUTO-CREATE-ENGINE] EPG auto-link failed: %s", e)
+        return linked
 
     async def run_rule(
         self,
@@ -2353,6 +2432,10 @@ class ChannelPipelineEngine:
             "streams_matched": 0,
             "channels_created": 0,
             "channels_updated": 0,
+            # Channels given guide data by the post-run auto-link pass. Filled
+            # by run_pipeline after this function returns, so it is declared
+            # here only to keep the key on every run's result.
+            "epg_links_created": 0,
             "groups_created": 0,
             "streams_merged": 0,
             # Count of distinct channels that received at least one merge this
@@ -6060,10 +6143,20 @@ def _smart_sort_streams(
 
     active_criteria = [c for c in sort_priority if sort_enabled.get(c, False)]
 
+    from stream_prober import get_channel_country, get_country_rank
+
+    # The caller seeds a name-only entry for every stream the channel lists, so a
+    # name is readable here even when nothing on the channel has been probed.
+    sort_names = {
+        sid: (stats_cache.get(sid) or {}).get("stream_name") or ""
+        for sid in stream_ids
+    }
+    channel_country = get_channel_country(list(sort_names.values()))
+
     logger.info(
         "[AUTO-CREATE-ENGINE] Channel '%s': smart sort with "
-        "active_criteria=%s, deprioritize_failed=%s, failed_order=%s",
-        channel_name, active_criteria, deprioritize_failed, fail_order
+        "active_criteria=%s, deprioritize_failed=%s, failed_order=%s, country=%s",
+        channel_name, active_criteria, deprioritize_failed, fail_order, channel_country
     )
 
     def compute_criteria_values(stats: dict | None, sid: int) -> list:
@@ -6150,25 +6243,29 @@ def _smart_sort_streams(
 
     def get_sort_value(sid: int) -> tuple:
         stats = stats_cache.get(sid)
+        # Sits last, so every criterion above still wins. It decides the ordinary
+        # case, where nothing on the channel has been probed and the criteria
+        # above all score equal. [23]
+        country_rank = get_country_rank(sort_names.get(sid, ""), channel_country)
 
         # Deprioritize failed/missing streams
         if deprioritize_failed:
             if not stats or stats.get("probe_status") in ("failed", "timeout", "pending"):
                 rank = failed_rank.get('failed', 0)
                 # bd-bqpq0: apply primary criteria within the failed bucket too.
-                return (1, rank) + tuple(compute_criteria_values(stats, sid))
+                return (1, rank) + tuple(compute_criteria_values(stats, sid)) + (country_rank,)
 
         # Deprioritize black screen streams (probe succeeded but content is black)
         if deprioritize_failed and stats and stats.get("is_black_screen"):
             rank = failed_rank.get('black_screen', 1)
             # bd-bqpq0: apply primary criteria within the black_screen bucket too.
-            return (1, rank) + tuple(compute_criteria_values(stats, sid))
+            return (1, rank) + tuple(compute_criteria_values(stats, sid)) + (country_rank,)
 
         # Deprioritize low FPS streams (probe succeeded but FPS below threshold)
         if deprioritize_failed and stats and stats.get("is_low_fps"):
             rank = failed_rank.get('low_fps', 2)
             # bd-bqpq0: apply primary criteria within the low_fps bucket too.
-            return (1, rank) + tuple(compute_criteria_values(stats, sid))
+            return (1, rank) + tuple(compute_criteria_values(stats, sid)) + (country_rank,)
 
         if not stats or stats.get("probe_status") != "success":
             # custom_streams is a binary criterion that does not require a probe,
@@ -6181,11 +6278,11 @@ def _smart_sort_streams(
                 else 0
                 for criterion in active_criteria
             ]
-            return (0, 0) + tuple(unprobed_values)
+            return (0, 0) + tuple(unprobed_values) + (country_rank,)
 
         sort_values = [0, 0]  # 0 = successful stream, 0 = sub-rank (unused)
         sort_values.extend(compute_criteria_values(stats, sid))
-        return tuple(sort_values)
+        return tuple(sort_values) + (country_rank,)
 
     # Log each stream's sort values
     for sid in stream_ids:

@@ -24,6 +24,8 @@ from channel_pipeline_engine import (
 from channel_pipeline_evaluator import StreamContext
 from channel_pipeline_evaluator import StreamContext
 from channel_pipeline_executor import ActionExecutor, ExecutionContext
+from epg_matching import EPGMatchResult, EPGMatchWithScore
+import journal
 
 
 class TestChannelPipelineEngineInit:
@@ -303,6 +305,58 @@ class TestChannelPipelineEngineFetchStreams:
         assert len(streams) == 2
 
 
+def _session_with_one_rule(mock_get_session):
+    """Wire a MagicMock session so _load_rules returns one enabled standard rule."""
+    rule = MagicMock()
+    rule.id = 1
+    rule.name = "Test Rule"
+    rule.priority = 0
+    rule.enabled = True
+    rule.m3u_account_id = None
+    rule.target_group_id = None
+    rule.stop_on_first_match = True
+    rule.get_conditions.return_value = [{"type": "always"}]
+    rule.get_actions.return_value = [{"type": "skip"}]
+    # ti939.1.3: a MagicMock's is_event_sync() is truthy by default, which would
+    # wrongly classify this standard rule as event_sync and exclude it.
+    rule.is_event_sync.return_value = False
+
+    mock_session = MagicMock()
+    mock_get_session.return_value = mock_session
+    mock_query = MagicMock()
+    mock_query.filter.return_value = mock_query
+    mock_query.order_by.return_value = mock_query
+    mock_query.all.return_value = [rule]
+    mock_session.query.return_value = mock_query
+    return mock_session
+
+
+def _canned_run_results(channels_created: int) -> dict:
+    """The results dict _process_streams hands back, counts only.
+
+    run_pipeline indexes these keys directly on its way to the post-run block,
+    so a test that stubs _process_streams has to supply every one of them.
+    """
+    return {
+        "streams_evaluated": 0,
+        "streams_matched": 0,
+        "channels_created": channels_created,
+        "channels_updated": 0,
+        "epg_links_created": 0,
+        "groups_created": 0,
+        "streams_merged": 0,
+        "channels_touched": 0,
+        "streams_skipped": 0,
+        "streams_removed": 0,
+        "channels_removed": 0,
+        "channels_moved": 0,
+        "created_entities": [],
+        "modified_entities": [],
+        "execution_log": [],
+        "dry_run_results": [],
+    }
+
+
 class TestChannelPipelineEngineRunPipeline:
     """Tests for run_pipeline method."""
 
@@ -426,6 +480,85 @@ class TestChannelPipelineEngineRunPipeline:
 
         assert result["success"] is True
         assert result["message"] == "No active enabled rules to process"
+
+    def _run_with_created(self, mock_get_session, channels_created, dry_run):
+        """Run the pipeline with _process_streams stubbed to a fixed created count."""
+        _session_with_one_rule(mock_get_session)
+        with patch.object(
+            self.engine, "_process_streams",
+            AsyncMock(return_value=_canned_run_results(channels_created)),
+        ):
+            return asyncio.get_event_loop().run_until_complete(
+                self.engine.run_pipeline(dry_run=dry_run)
+            )
+
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_skipped_on_dry_run(self, mock_get_session):
+        """A dry run writes no guide links, however many channels it would create."""
+        self.client.update_channel = AsyncMock()
+        self.client.get_epg_data = AsyncMock(return_value=[])
+
+        self._run_with_created(mock_get_session, channels_created=3, dry_run=True)
+
+        self.client.get_epg_data.assert_not_called()
+        self.client.update_channel.assert_not_called()
+
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_skipped_when_no_channels_were_created(self, mock_get_session):
+        """The every-minute tick that creates nothing costs no EPG fetch at all."""
+        self.client.update_channel = AsyncMock()
+        self.client.get_epg_data = AsyncMock(return_value=[])
+
+        result = self._run_with_created(
+            mock_get_session, channels_created=0, dry_run=False,
+        )
+
+        self.client.get_epg_data.assert_not_called()
+        self.client.update_channel.assert_not_called()
+        assert result["epg_links_created"] == 0
+
+    @patch("epg_matching.batch_find_epg_matches", return_value=[])
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_runs_when_channels_were_created(
+        self, mock_get_session, mock_batch_match,
+    ):
+        """A live run that created channels matches the ones with no guide data."""
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+            ],
+        })
+        self.client.get_epg_sources = AsyncMock(return_value=[])
+        self.client.get_epg_data = AsyncMock(return_value=[])
+        self.client.get_streams_by_ids = AsyncMock(return_value=[])
+
+        with patch("normalization_engine.NormalizationEngine"):
+            self._run_with_created(
+                mock_get_session, channels_created=1, dry_run=False,
+            )
+
+        mock_batch_match.assert_called_once()
+
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_failure_does_not_fail_the_run(self, mock_get_session):
+        """An EPG source that is down leaves the run's own results untouched."""
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+            ],
+        })
+        self.client.get_epg_sources = AsyncMock(return_value=[])
+        self.client.get_epg_data = AsyncMock(side_effect=Exception("epg source down"))
+
+        result = self._run_with_created(
+            mock_get_session, channels_created=2, dry_run=False,
+        )
+
+        assert result["success"] is True
+        assert result["channels_created"] == 2
+        assert result["epg_links_created"] == 0
 
 
 def _route_rollback_queries(mock_session, mock_execution):
@@ -4246,3 +4379,296 @@ class TestProfileUniverseSentinelBehavioral:
         result = self._assign(captured["executor"], selected=(2,))
         assert result.success is False
         client.update_profile_channel.assert_not_called()
+
+
+def _auto_link_settings(enabled: bool):
+    """Settings stub carrying only the two fields the auto-link pass reads."""
+    settings = MagicMock()
+    settings.epg_auto_link_after_pipeline = enabled
+    settings.epg_auto_match_threshold = 80
+    return settings
+
+
+def _epg_match(
+    channel_id: int, channel_name: str, epg_id: int, confidence: int,
+) -> EPGMatchResult:
+    """One channel's match result carrying a single scored candidate."""
+    candidate = EPGMatchWithScore(
+        epg_id=epg_id,
+        epg_name=channel_name,
+        tvg_id=f"{channel_name}.us",
+        epg_source={"id": 1, "name": "Source"},
+        confidence=confidence,
+        match_type="exact",
+    )
+    return EPGMatchResult(
+        channel_id=channel_id,
+        channel_name=channel_name,
+        matches=[candidate],
+        best_match=candidate,
+    )
+
+
+class TestChannelPipelineEngineAutoLink:
+    """Tests for _link_unmatched_channels, the post-run guide-link pass."""
+
+    def setup_method(self):
+        """One channel with no guide data and one stream on it."""
+        self.client = MagicMock()
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+            ],
+        })
+        self.client.get_epg_sources = AsyncMock(return_value=[])
+        self.client.get_epg_data = AsyncMock(return_value=[])
+        self.client.get_streams_by_ids = AsyncMock(return_value=[])
+        self.client.get_streams = AsyncMock()
+        self.client.update_channel = AsyncMock(return_value={"id": 7, "name": "ESPN"})
+        self.engine = ChannelPipelineEngine(self.client)
+
+    def _link(self, matches, enabled=True):
+        """Run the pass with the shared matcher stubbed to a fixed result list."""
+        with patch("channel_pipeline_engine.get_settings",
+                   return_value=_auto_link_settings(enabled)), \
+             patch("channel_pipeline_engine.get_session", MagicMock()), \
+             patch("normalization_engine.NormalizationEngine"), \
+             patch("epg_matching.batch_find_epg_matches",
+                   return_value=matches) as mock_batch:
+            linked = asyncio.get_event_loop().run_until_complete(
+                self.engine._link_unmatched_channels()
+            )
+        return linked, mock_batch
+
+    def test_setting_off_writes_nothing(self):
+        """The toggle switches the whole pass off before it reads anything."""
+        linked, mock_batch = self._link(matches=[], enabled=False)
+
+        assert linked == 0
+        self.client.get_channels.assert_not_called()
+        self.client.update_channel.assert_not_called()
+        mock_batch.assert_not_called()
+
+    def test_only_channels_without_guide_data_are_considered(self):
+        """A channel that already has a link is never matched and never written.
+
+        This is what keeps ECM and Dispatcharr from fighting over the same
+        channel: whichever side links it first, the other one skips it.
+        """
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 2,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+                {"id": 8, "name": "CNN", "epg_data_id": 42, "streams": [102]},
+            ],
+        })
+
+        linked, mock_batch = self._link(matches=[_epg_match(7, "ESPN", 55, 95)])
+
+        assert [c["id"] for c in mock_batch.call_args.kwargs["channels"]] == [7]
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
+        assert linked == 1
+
+    def test_every_channel_already_linked_costs_no_epg_fetch(self):
+        """The common case returns before the expensive fetches."""
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 1,
+            "results": [{"id": 8, "name": "CNN", "epg_data_id": 42, "streams": []}],
+        })
+
+        linked, mock_batch = self._link(matches=[])
+
+        assert linked == 0
+        self.client.get_epg_data.assert_not_called()
+        mock_batch.assert_not_called()
+
+    def test_match_below_the_threshold_is_left_unlinked(self):
+        """79 against a threshold of 80 leaves epg_data_id alone."""
+        linked, _ = self._link(matches=[_epg_match(7, "ESPN", 55, 79)])
+
+        assert linked == 0
+        self.client.update_channel.assert_not_called()
+
+    def test_match_at_the_threshold_is_linked(self):
+        """80 against a threshold of 80 writes the link."""
+        linked, _ = self._link(matches=[_epg_match(7, "ESPN", 55, 80)])
+
+        assert linked == 1
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
+
+    def test_link_is_journaled_as_an_automatic_change(self):
+        """The journal row matches the link endpoint's wording and marks itself
+        automatic, so one journal query finds hand-made and automatic links."""
+        with patch("channel_pipeline_engine.journal.log_entry") as mock_log_entry:
+            self._link(matches=[_epg_match(7, "ESPN", 55, 90)])
+
+        kwargs = mock_log_entry.call_args.kwargs
+        assert kwargs["category"] == "channel"
+        assert kwargs["action_type"] == "update"
+        assert kwargs["entity_id"] == 7
+        assert kwargs["entity_name"] == "ESPN"
+        assert kwargs["description"] == "Linked channel to EPG data id=55"
+        assert kwargs["after_value"] == {"epg_data_id": 55}
+        assert kwargs["user_initiated"] is False
+        assert kwargs["mutation_source"] == journal.MUTATION_SOURCE_AUTO_CREATION
+
+    def test_streams_are_fetched_by_id_never_swept(self):
+        """Only the target channels' own streams are fetched.
+
+        The full sweep is ~86 requests against tens of thousands of streams.
+        """
+        self._link(matches=[])
+
+        self.client.get_streams_by_ids.assert_called_once_with([101])
+        self.client.get_streams.assert_not_called()
+
+
+# Disney Channel 2687 as the provider ships it, in ascending id order: ten streams,
+# none of them probed, four US feeds and a Spanish one among six others.
+DISNEY_STREAM_NAMES = {
+    1407077: "US| DISNEY CHANNEL HD",
+    1636376: "ES-AV| DISNEYCHANNEL ᴿᴬᵂ",
+    1679412: "US: Disney Channel",
+    1679841: "USA  DISNEY CHANNEL HD",
+    1680012: "US Disney Channel (East) (H)",
+    1685158: "GOLD| DISNEY CHANNEL DK ᴿᴬᵂ",
+    1685242: "GOLD| DISNEY CHANNEL ᴿᴬᵂ",
+    1797900: "STC| DISNEY CHANNEL ᴴᴰ",
+    1798142: "STC| DISNEY CHANNEL ʰᵉᵛᶜ",
+    1798296: "CZ| DISNEY CHANNEL ᴿᴬᵂ",
+}
+
+DISNEY_STREAM_IDS = sorted(DISNEY_STREAM_NAMES)
+
+# The shape _reorder_channel_streams seeds into the stats cache for a stream that
+# has no probe row (channel_pipeline_engine.py:1826-1834).
+DISNEY_STATS_CACHE = {
+    sid: {"stream_name": name} for sid, name in DISNEY_STREAM_NAMES.items()
+}
+
+
+class TestAutoCreateSmartSortCountry:
+    """Tests for the country criterion in channel_pipeline_engine._smart_sort_streams."""
+
+    def test_us_stream_leads_when_no_stream_has_been_probed(self):
+        """The real Disney Channel list: every US feed climbs above every other one."""
+        settings = _mk_smart_sort_settings()
+
+        result = _smart_sort_streams(
+            DISNEY_STREAM_IDS,
+            DISNEY_STATS_CACHE,
+            stream_m3u_map={},
+            channel_name="Disney Channel",
+            settings=settings,
+        )
+
+        assert result[:4] == [1407077, 1679412, 1679841, 1680012], (
+            f"Expected the four US streams first, got {result}"
+        )
+        assert result[-1] == 1636376, (
+            f"Expected the Spanish stream last, got {result}"
+        )
+
+    def test_higher_resolution_beats_a_matching_country(self):
+        """Probe stats outrank country: a foreign 1080p stream keeps its lead over a US 720p one."""
+        settings = _mk_smart_sort_settings()
+        stats_cache = {
+            1: _failed_stats_dict(1, resolution="1920x1080", fps="25", stream_name="NO| DISNEY CHANNEL"),
+            2: _failed_stats_dict(2, resolution="1280x720", fps="25", stream_name="US| DISNEY CHANNEL HD"),
+            3: _failed_stats_dict(3, resolution="1280x720", fps="25", stream_name="US Disney Channel (East)"),
+        }
+
+        result = _smart_sort_streams(
+            [1, 2, 3],
+            stats_cache,
+            stream_m3u_map={},
+            channel_name="Disney Channel",
+            settings=settings,
+        )
+
+        assert result == [1, 2, 3], (
+            f"Resolution must outrank country, got {result}"
+        )
+
+    def test_unknown_country_sorts_between_match_and_mismatch(self):
+        """A stream whose name declares no country ranks below a match and above a mismatch."""
+        settings = _mk_smart_sort_settings()
+        stats_cache = {
+            1: {"stream_name": "GOLD| DISNEY CHANNEL"},
+            2: {"stream_name": "NO| DISNEY CHANNEL"},
+            3: {"stream_name": "US| DISNEY CHANNEL HD"},
+            4: {"stream_name": "US Disney Channel (East)"},
+        }
+
+        result = _smart_sort_streams(
+            [1, 2, 3, 4],
+            stats_cache,
+            stream_m3u_map={},
+            channel_name="Disney Channel",
+            settings=settings,
+        )
+
+        assert result == [3, 4, 1, 2], (
+            f"Expected match, then unknown, then mismatch, got {result}"
+        )
+
+    def test_streams_with_no_country_keep_their_order(self):
+        """A channel whose streams all lack a country prefix is not reshuffled."""
+        settings = _mk_smart_sort_settings()
+        stats_cache = {
+            1: {"stream_name": "GOLD| DISNEY CHANNEL"},
+            2: {"stream_name": "STC| DISNEY CHANNEL"},
+            3: {"stream_name": "CZ| DISNEY CHANNEL"},
+        }
+
+        result = _smart_sort_streams(
+            [3, 1, 2],
+            stats_cache,
+            stream_m3u_map={},
+            channel_name="Disney Channel",
+            settings=settings,
+        )
+
+        assert result == [3, 1, 2], (
+            f"Unlabelled streams must keep the order they came in, got {result}"
+        )
+
+    def test_engine_and_prober_agree_on_the_disney_order(self):
+        """Both sorts put the same stream first, so the pipeline and the prober cannot disagree.
+
+        The pipeline reads names from its stats cache and the prober takes them
+        from the caller's stream payload; the same ten streams go into each.
+        """
+        from stream_prober import smart_sort_streams
+
+        criteria = ["resolution", "bitrate", "framerate"]
+        enabled = {"resolution": True, "bitrate": True, "framerate": True}
+
+        engine_order = _smart_sort_streams(
+            DISNEY_STREAM_IDS,
+            DISNEY_STATS_CACHE,
+            stream_m3u_map={},
+            channel_name="Disney Channel",
+            settings=_mk_smart_sort_settings(
+                stream_sort_priority=criteria,
+                stream_sort_enabled=enabled,
+                deprioritize_failed_streams=False,
+            ),
+        )
+        prober_order = smart_sort_streams(
+            DISNEY_STREAM_IDS,
+            stats_map={},
+            stream_sort_priority=criteria,
+            stream_sort_enabled=enabled,
+            deprioritize_failed_streams=False,
+            channel_name="Disney Channel",
+            stream_names=DISNEY_STREAM_NAMES,
+        )
+
+        assert engine_order == prober_order, (
+            f"engine gave {engine_order}, prober gave {prober_order}"
+        )
+        assert engine_order[0] == 1407077, (
+            f"Expected a US stream at position 1, got {engine_order}"
+        )

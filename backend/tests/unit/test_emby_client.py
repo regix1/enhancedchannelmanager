@@ -12,7 +12,7 @@ bd-8wc6q (Settings UI test-connection wiring) both depend on them.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -22,6 +22,7 @@ from emby_client import (
     EmbyClientError,
     EmbyLiveTvChannel,
     EmbySession,
+    request_guide_refresh,
     VALID_LOGO_IMAGE_TYPES,
 )
 
@@ -572,3 +573,37 @@ async def test_refresh_guide_raises_on_unauthorized():
                 await client.refresh_guide()
     finally:
         await client.close()
+
+
+def _emby_settings(enabled: bool) -> MagicMock:
+    """Settings stub carrying the four fields request_guide_refresh reads."""
+    settings = MagicMock()
+    settings.emby_refresh_guide_after_pipeline = True
+    settings.emby_enabled = enabled
+    settings.emby_base_url = "http://emby.local:8096"
+    settings.emby_api_key = "key-xyz"
+    return settings
+
+
+async def test_request_guide_refresh_does_nothing_when_emby_is_off():
+    """An instance that never configured Emby must not even build a client, so
+    the pipeline and the link endpoint can both call this unconditionally. [41]"""
+    with patch("config.get_settings", return_value=_emby_settings(enabled=False)), \
+         patch("emby_client.EmbyClient") as mock_client:
+        await request_guide_refresh()
+
+    mock_client.assert_not_called()
+
+
+async def test_request_guide_refresh_swallows_a_failure_and_closes_the_client():
+    """The caller's channel write is already committed by the time this runs, so
+    a media server that is down must not raise back into it. [41]"""
+    client = AsyncMock()
+    client.refresh_guide.side_effect = EmbyClientError("emby unreachable")
+
+    with patch("config.get_settings", return_value=_emby_settings(enabled=True)), \
+         patch("emby_client.EmbyClient", return_value=client):
+        await request_guide_refresh()
+
+    client.refresh_guide.assert_awaited_once()
+    client.close.assert_awaited_once()
