@@ -30,12 +30,13 @@ _KICKOFF = datetime(2026, 7, 11, 23, 0, 0, tzinfo=timezone.utc)
 
 
 def _stat(stream_id, *, failures=0, status="success", probed_at=None,
-          measured=None):
+          measured=None, declared=None):
     return {
         "stream_id": stream_id,
         "probe_status": status,
         "consecutive_failures": failures,
         "measured_bitrate": measured,
+        "video_bitrate": declared,
         "last_probed": (probed_at or _KICKOFF).replace(
             tzinfo=None).isoformat() + "Z",
     }
@@ -262,6 +263,35 @@ class TestVerdictFromSampledThroughput:
              patch("config.get_settings", return_value=_settings(3)):
             assert await find_dead_streams(
                 [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_slate_ffprobe_parsed_is_dead_without_any_sample(self):
+        """Measured live 2026-08-12 on stream 1876738, the Concacaf slate:
+        ``probe_status`` success, ``measured_bitrate`` null because the
+        sampler timed out, and ``video_bitrate`` 561969. Every other signal
+        reads healthy, so the channel survived while the provider looped an
+        offline card. A declared 0.56 Mbps against a 2 Mbps floor is the
+        stream saying what it carries. [40]"""
+        stats = {7: _stat(7, status="success", measured=None,
+                          declared=561_969)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+
+    async def test_a_high_declared_bitrate_is_not_proof_of_life(self):
+        """The reverse must NOT hold. ffprobe reports what the provider
+        claims, and it disagreed with the sampled figure on 5 of 11 event
+        streams, so a declaration at or above the floor stays no answer and
+        the stored verdict still decides. Here that verdict is a failure
+        after kickoff, so the stream is dead despite declaring 8 Mbps. [40]"""
+        stats = {7: _stat(7, status="failed", measured=None,
+                          declared=8_000_000)}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == {7}
 
     async def test_the_floor_is_the_operators_setting_in_kbps(self):
         """6.14 Mbps of real content, against an operator who set the floor

@@ -335,11 +335,23 @@ def _sample_says_dead(stat: dict | None, floor_bps: int) -> bool | None:
     throughput check off. Off means the stored probe verdict decides again
     exactly as it did before, NOT that every sampled stream is now beyond
     reach of it.
+
+    With no sample, ffprobe's declared bitrate still answers in ONE
+    direction. A slate that ffprobe parsed cleanly reports a real figure far
+    under the floor, and a stream declaring 0.56 Mbps against a 2 Mbps floor
+    is carrying an offline card whether or not the sampler managed to read
+    it. The reverse does not hold: a high declared figure is what the
+    provider claims rather than what it sends, and ffprobe disagreed with
+    the sampled number on 5 of 11 event streams measured, so a declaration
+    at or above the floor stays no answer at all. [40]
     """
     if floor_bps <= 0:
         return None
     measured = (stat or {}).get("measured_bitrate")
     if measured is None:
+        declared = (stat or {}).get("video_bitrate")
+        if declared is not None and declared < floor_bps:
+            return True
         return None
     return measured < floor_bps
 
