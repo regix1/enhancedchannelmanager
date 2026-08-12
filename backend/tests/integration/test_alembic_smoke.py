@@ -1818,6 +1818,12 @@ class TestSmartBootstrapFastPath:
                     "ALTER TABLE m3u_digest_settings "
                     "ADD COLUMN account_ids TEXT"
                 ))
+                # 0040: sampled throughput on the pre-0005 stream_stats table —
+                # same create_all() limitation, add the nullable column by hand.
+                conn.execute(text(
+                    "ALTER TABLE stream_stats "
+                    "ADD COLUMN measured_bitrate BIGINT"
+                ))
 
             # Sanity: alembic_version is still at 0005 (create_all does not
             # touch the version row), but every model table is now present.

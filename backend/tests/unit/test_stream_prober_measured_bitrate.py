@@ -10,9 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import StaticPool
 
-from database import _add_stream_stats_measured_bitrate_column
+import database
 from models import StreamStats
 from stream_prober import StreamProber
 
@@ -21,7 +20,7 @@ SAMPLED_BPS = 6_140_000
 DECLARED_BPS = 3_000_000
 
 
-def create_prober(measured: int = SAMPLED_BPS) -> StreamProber:
+def create_prober(measured: int | None = SAMPLED_BPS) -> StreamProber:
     """A prober whose ffprobe and sampler are both stubbed by the caller."""
     prober = StreamProber(
         client=MagicMock(),
@@ -162,29 +161,59 @@ class TestStreamStatsCarriesTheColumn:
 
         assert stats.to_dict()["measured_bitrate"] == SAMPLED_BPS
 
-    def test_column_is_added_to_a_database_that_predates_it(self):
-        """Boot runs the check on every start, so it has to be safe twice. [5]"""
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
+    def test_column_is_added_to_a_database_that_predates_it(self, tmp_path):
+        """An upgrade has to reach a database that already exists. [5]
+
+        ``init_db`` asserts every model column is physically present BEFORE it
+        runs the in-process column additions, so a new column can only arrive
+        through a migration: alembic runs ahead of that assertion, and
+        ``create_all`` adds tables rather than columns. Building the schema one
+        revision back is what makes this a real check, since a fresh database
+        gets the column from ``create_all`` and would pass either way.
+        """
+        from alembic import command
+        from alembic.config import Config
+
+        db_file = tmp_path / "predates.db"
+        url = f"sqlite:///{db_file}"
+        cfg = Config(str(database.ALEMBIC_INI_PATH))
+        cfg.set_main_option("sqlalchemy.url", url)
+
+        command.upgrade(cfg, "0039")
+        engine = create_engine(url)
+        try:
+            before = [
+                row[1]
+                for row in engine.connect().execute(
+                    text("PRAGMA table_info(stream_stats)")
+                ).fetchall()
+            ]
+            assert "measured_bitrate" not in before, "0039 is the state this has to upgrade FROM"
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO stream_stats (stream_id, probe_status, created_at,"
+                    " consecutive_failures, is_black_screen, is_low_fps)"
+                    " VALUES (4711, 'success', '2026-08-12 00:00:00', 0, 0, 0)"
+                ))
+        finally:
+            engine.dispose()
+
+        command.upgrade(cfg, "head")
+
+        engine = create_engine(url)
         try:
             with engine.connect() as conn:
-                conn.execute(text(
-                    "CREATE TABLE stream_stats ("
-                    "id INTEGER PRIMARY KEY, stream_id INTEGER, video_bitrate BIGINT)"
-                ))
-                conn.commit()
-
-                _add_stream_stats_measured_bitrate_column(conn)
-                _add_stream_stats_measured_bitrate_column(conn)
-
                 columns = [
                     row[1]
                     for row in conn.execute(text("PRAGMA table_info(stream_stats)")).fetchall()
                 ]
+                row = conn.execute(text(
+                    "SELECT measured_bitrate FROM stream_stats WHERE stream_id = 4711"
+                )).fetchone()
         finally:
             engine.dispose()
 
         assert "measured_bitrate" in columns
+        # A row written before the column existed reads as never measured, which
+        # the health check treats differently from a measured zero. [34]
+        assert row is not None and row[0] is None
