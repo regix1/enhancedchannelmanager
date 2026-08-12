@@ -68,3 +68,26 @@ frontend/test-results/
 
 # Local MCP server config: carries the ECM host and can carry an API key
 .mcp.json
+
+# SQLite databases and their write-ahead sidecars. The runtime journal.db
+# lives under CONFIG_DIR outside the tree, so anything matching here is a
+# local artifact: a hand-made scratch copy, or a test database written into
+# the working tree. The -wal and -shm files are separate patterns because
+# they sit beside the database rather than inside it, and a stale pair left
+# behind reads as corruption the next time that database is opened.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# pytest's tmp_path factory roots at the working directory when TMPDIR is
+# unset, which is the usual case for a non-login shell. Each run leaves a
+# full set of test databases behind and they accumulate silently: one local
+# sweep reached 128 MB across ~180 files before anyone noticed.
+pytest-of-*/
+
+# tempfile.mkdtemp() falls back to the working directory under the same
+# missing-TMPDIR condition, so scratch directories land at the repo root.
+/tmp[a-z0-9_]*/
