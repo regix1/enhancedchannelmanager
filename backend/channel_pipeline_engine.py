@@ -761,6 +761,25 @@ class ChannelPipelineEngine:
             source_order = build_source_priority_order(epg_sources)
             epg_data = await self.client.get_epg_data()
 
+            # A source the operator switched off must not win a channel. Its
+            # rows stay in epg_data after deactivation, and nothing downstream
+            # reads is_active, so an inactive feed keyed in a shape the matcher
+            # scores well takes channels away from an active one that carries
+            # the programmes. Entries whose source cannot be resolved are kept:
+            # dropping them would silently narrow the pool on a payload shape
+            # this does not recognise. [26]
+            active_source_ids = {
+                source["id"]
+                for source in epg_sources
+                if source.get("id") is not None and source.get("is_active", True)
+            }
+            epg_data = [
+                entry
+                for entry in epg_data
+                if entry.get("epg_source") is None
+                or entry.get("epg_source") in active_source_ids
+            ]
+
             # Only the target channels' own streams. Sweeping every stream is
             # ~86 requests on a normal install, and the matcher reads streams
             # for country detection alone. [12]

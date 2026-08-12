@@ -4529,6 +4529,29 @@ class TestChannelPipelineEngineAutoLink:
         self.client.get_streams_by_ids.assert_not_called()
         mock_batch.assert_not_called()
 
+    def test_a_deactivated_source_cannot_win_a_channel(self):
+        """Rows from an inactive source are dropped before matching.
+
+        Deactivating a source leaves its epg_data rows in place, so without
+        this filter a switched-off feed still competes for channels, and one
+        keyed in a shape the matcher scores well takes them from the active
+        feed that carries the programmes.
+        """
+        self.client.get_epg_sources = AsyncMock(return_value=[
+            {"id": 49, "name": "guru", "is_active": True},
+            {"id": 1, "name": "iptorrents", "is_active": False},
+        ])
+        self.client.get_epg_data = AsyncMock(return_value=[
+            {"id": 900, "tvg_id": "58646", "name": "CNN HD", "epg_source": 49},
+            {"id": 901, "tvg_id": "cnn.us", "name": "CNN", "epg_source": 1},
+            {"id": 902, "tvg_id": "espn.us", "name": "ESPN", "epg_source": None},
+        ])
+
+        _, mock_batch = self._link(matches=[])
+
+        passed = mock_batch.call_args.kwargs["epg_data"]
+        assert [e["id"] for e in passed] == [900, 902]
+
     def test_match_below_the_threshold_is_left_unlinked(self):
         """79 against a threshold of 80 leaves epg_data_id alone."""
         linked, _ = self._link(matches=[_epg_match(7, "ESPN", 55, 79)])
