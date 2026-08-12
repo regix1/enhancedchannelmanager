@@ -477,3 +477,62 @@ def test_valid_logo_image_types_whitelist():
     targets — guards against an accidental widening that would let an
     arbitrary image type through to the DELETE path."""
     assert VALID_LOGO_IMAGE_TYPES == {"Primary", "LogoLight", "LogoLightColor"}
+
+
+async def test_refresh_guide_starts_the_refresh_guide_task():
+    """Emby has no direct guide-refresh endpoint: the refresh is a scheduled
+    task, so the client reads the task list and starts the one keyed
+    ``RefreshGuide`` by its id. A channel the pipeline removed keeps showing
+    in Emby until that runs. [41]"""
+    client = EmbyClient(base_url="http://emby.local:8096", api_key="key-xyz")
+    try:
+        tasks = _response(200, [
+            {"Id": "task-1", "Key": "RefreshChapterImages"},
+            {"Id": "task-guide", "Key": "RefreshGuide"},
+        ])
+        started = _response(204)
+        request_mock = AsyncMock(side_effect=[tasks, started])
+        with patch.object(client._client, "request", request_mock):
+            assert await client.refresh_guide() is True
+
+        assert request_mock.call_count == 2
+        listed = request_mock.call_args_list[0]
+        run = request_mock.call_args_list[1]
+        assert listed.args[0] == "GET"
+        assert listed.args[1] == "http://emby.local:8096/ScheduledTasks"
+        assert run.args[0] == "POST"
+        # The id from the matching row, not the row's position or its key.
+        assert run.args[1] == "http://emby.local:8096/ScheduledTasks/Running/task-guide"
+        assert run.kwargs["headers"] == {"X-Emby-Token": "key-xyz"}
+    finally:
+        await client.close()
+
+
+async def test_refresh_guide_returns_false_when_the_server_offers_no_such_task():
+    """An Emby build without that task must not have a POST aimed at a
+    guessed id. Returning False lets the caller carry on: the pipeline's work
+    is already committed and a missing task is not a reason to fail it. [41]"""
+    client = EmbyClient(base_url="http://emby.local:8096", api_key="key-xyz")
+    try:
+        tasks = _response(200, [{"Id": "task-1", "Key": "RefreshChapterImages"}])
+        request_mock = AsyncMock(return_value=tasks)
+        with patch.object(client._client, "request", request_mock):
+            assert await client.refresh_guide() is False
+
+        # Exactly one call: the list. No speculative POST.
+        assert request_mock.call_count == 1
+    finally:
+        await client.close()
+
+
+async def test_refresh_guide_raises_on_unauthorized():
+    """A revoked key must surface as EmbyClientError like every other method
+    here, rather than reading as 'no task offered'."""
+    client = EmbyClient(base_url="http://emby.local:8096", api_key="stale")
+    try:
+        request_mock = AsyncMock(return_value=_response(401))
+        with patch.object(client._client, "request", request_mock):
+            with pytest.raises(EmbyClientError):
+                await client.refresh_guide()
+    finally:
+        await client.close()

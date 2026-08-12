@@ -651,6 +651,14 @@ class ChannelPipelineEngine:
             results['channels_created'], results['channels_updated'], orphan_info
         )
 
+        # A channel this run created or removed stays visible in Emby until Emby
+        # re-reads its guide, which is hours out on its own cadence. Ask for that
+        # now, and ONLY when the channel set actually moved: the auto-creation
+        # tick fires every minute and the overwhelming majority of ticks change
+        # nothing, so an unconditional call would hammer the media server. [41]
+        if not dry_run and (results["channels_created"] or removed):
+            await self._request_emby_guide_refresh()
+
         return {
             # y3m6o.1 (0152): the top-level API result reflects action-level
             # failures — a run with any failed action is NOT a success, so
@@ -666,6 +674,35 @@ class ChannelPipelineEngine:
             "normalization_warnings": normalization_warnings,
             **results
         }
+
+    async def _request_emby_guide_refresh(self) -> None:
+        """Tell Emby to re-read its guide after this run changed channels.
+
+        Silent no-op unless the operator has filled in the Emby section, so an
+        instance that never configured it is unaffected. Every failure is
+        swallowed and logged: the pipeline's work is already done and committed
+        by this point, and a media server that is down, slow, or holding a
+        revoked key must not turn a good run red. [41]
+        """
+        from config import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "emby_enabled", False):
+            return
+        base_url = getattr(settings, "emby_base_url", "") or ""
+        api_key = getattr(settings, "emby_api_key", "") or ""
+        if not base_url or not api_key:
+            return
+
+        from emby_client import EmbyClient
+
+        client = EmbyClient(base_url=base_url, api_key=api_key)
+        try:
+            await client.refresh_guide()
+        except Exception as e:
+            logger.warning("[AUTO-CREATE-ENGINE] Emby guide refresh failed: %s", e)
+        finally:
+            await client.close()
 
     async def run_rule(
         self,

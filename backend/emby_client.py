@@ -321,6 +321,84 @@ class EmbyClient:
             )
         return True
 
+    async def refresh_guide(self) -> bool:
+        """Ask Emby to re-read its Live TV guide.
+
+        Emby exposes the guide refresh as a scheduled task rather than a
+        direct endpoint, so this reads ``GET /ScheduledTasks``, finds the one
+        whose ``Key`` is ``RefreshGuide``, and starts it with
+        ``POST /ScheduledTasks/Running/{id}``. Emby runs it in the background
+        and answers 204 immediately, so a success here means "accepted", not
+        "finished".
+
+        Without this, a channel ECM deleted keeps showing in Emby until Emby's
+        own guide refresh comes round, which is hours by default.
+
+        Returns:
+            ``True`` when Emby accepted the task. ``False`` when the server
+            offers no ``RefreshGuide`` task — the key is stable across current
+            Emby releases, so this means an unexpected build, and the keys it
+            DID offer are logged to make that visible rather than silent.
+
+        Raises:
+            EmbyClientError: On 401 (auth) or any other non-2xx, or on a
+                network-level failure, matching the other methods here.
+        """
+        headers = {"X-Emby-Token": self.api_key}
+        list_url = f"{self.base_url}/ScheduledTasks"
+
+        logger.debug("[EMBY] GET %s", list_url)
+        try:
+            response = await self._client.request("GET", list_url, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.warning("[EMBY] scheduled-task list failed: %s", exc)
+            raise EmbyClientError(f"Emby scheduled-task list failed: {exc}") from exc
+
+        if response.status_code == 401:
+            logger.warning("[EMBY] scheduled-task list returned 401 unauthorized")
+            raise EmbyClientError(
+                "Emby scheduled-task list returned 401 unauthorized — check API key"
+            )
+        if response.status_code >= 400:
+            logger.warning(
+                "[EMBY] scheduled-task list returned non-2xx status=%s",
+                response.status_code,
+            )
+            raise EmbyClientError(
+                f"Emby scheduled-task list returned {response.status_code}"
+            )
+
+        tasks = response.json() or []
+        task_id = next(
+            (t.get("Id") for t in tasks if t.get("Key") == "RefreshGuide" and t.get("Id")),
+            None,
+        )
+        if task_id is None:
+            logger.warning(
+                "[EMBY] no RefreshGuide task on this server; keys offered: %s",
+                sorted(t.get("Key") for t in tasks if t.get("Key")),
+            )
+            return False
+
+        run_url = f"{self.base_url}/ScheduledTasks/Running/{task_id}"
+        logger.debug("[EMBY] POST %s", run_url)
+        try:
+            response = await self._client.request("POST", run_url, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.warning("[EMBY] guide refresh failed: %s", exc)
+            raise EmbyClientError(f"Emby guide refresh failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            logger.warning(
+                "[EMBY] guide refresh returned non-2xx status=%s",
+                response.status_code,
+            )
+            raise EmbyClientError(
+                f"Emby guide refresh returned {response.status_code}"
+            )
+        logger.info("[EMBY] Guide refresh requested")
+        return True
+
     async def test_connection(self) -> bool:
         """Verify the configured URL + API key reach a working Emby server.
 
