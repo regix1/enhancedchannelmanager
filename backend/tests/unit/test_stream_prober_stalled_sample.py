@@ -73,6 +73,36 @@ class OneChunkThenSilence(httpx.AsyncByteStream):
         return self._chunk
 
 
+class OneChunkThenClose(httpx.AsyncByteStream):
+    """A body that delivers once and then ends the response cleanly."""
+
+    def __init__(self, chunk: bytes) -> None:
+        self._chunk = chunk
+        self._sent = False
+
+    def __aiter__(self) -> "OneChunkThenClose":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._sent:
+            raise StopAsyncIteration
+        self._sent = True
+        return self._chunk
+
+
+class KeepsDelivering(httpx.AsyncByteStream):
+    """A body that never stops, the way a live feed behaves."""
+
+    def __init__(self, chunk: bytes) -> None:
+        self._chunk = chunk
+
+    def __aiter__(self) -> "KeepsDelivering":
+        return self
+
+    async def __anext__(self) -> bytes:
+        return self._chunk
+
+
 def client_serving(body: httpx.AsyncByteStream) -> type[httpx.AsyncClient]:
     """A client class that answers 200 and then hands over ``body``.
 
@@ -140,6 +170,45 @@ class TestASourceThatSendsNothingMeasuresZero:
             measured = await prober._measure_stream_bitrate(STREAM_URL)
 
         assert measured == int(len(ONE_CHUNK) * 8 / 25.0)
+
+
+class TestASourceThatHangsUpSustainedNothing:
+    @pytest.mark.asyncio
+    async def test_a_burst_then_a_close_measures_zero(self):
+        """Channel 907's actual failure, and the costly one.
+
+        The provider hands over a burst and ends the response. Dividing those
+        bytes by the fraction of a second the connection lasted reported 60
+        Mbps on a stream carrying no event, which clears any floor and reads as
+        the healthiest stream in the group. What the division measured was the
+        connection's lifetime, not the feed: widening the window from 10s to
+        20s moved the same stream to 7.4 Mbps.
+        """
+        prober = create_prober()
+        body = OneChunkThenClose(ONE_CHUNK)
+
+        with patch("stream_prober.httpx.AsyncClient", client_serving(body)), \
+                patch("stream_prober.time", FrozenClock([0.0, 1.0, 2.65])):
+            measured = await prober._measure_stream_bitrate(STREAM_URL)
+
+        assert measured == 0
+
+    @pytest.mark.asyncio
+    async def test_a_feed_that_fills_the_window_keeps_its_rate(self):
+        """The other side of the same branch, and the one that must not move.
+
+        A source still delivering when the window closes is measured exactly as
+        before. Without this, the check above would be free to call every
+        stream dead and nothing here would notice.
+        """
+        prober = create_prober()
+        body = KeepsDelivering(ONE_CHUNK)
+
+        with patch("stream_prober.httpx.AsyncClient", client_serving(body)), \
+                patch("stream_prober.time", FrozenClock([0.0, 21.0])):
+            measured = await prober._measure_stream_bitrate(STREAM_URL)
+
+        assert measured == int(len(ONE_CHUNK) * 8 / 21.0)
 
 
 class TestUnreachableIsStillUnmeasurable:

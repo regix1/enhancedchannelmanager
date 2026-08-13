@@ -1245,6 +1245,23 @@ class StreamProber:
 
             elapsed = time.time() - start_time
 
+            # The loop above ends two ways: the window ran out, or the source
+            # ended the stream. Only the first is a measurement. A live feed
+            # does not hang up, so a source that hands over a burst and closes
+            # is not carrying its event, however fast the burst arrived, and
+            # dividing those bytes by the seconds the connection happened to
+            # last reports that speed as the stream's throughput: one event
+            # stream read 60 Mbps over a 10s window and 7.4 Mbps over a 20s
+            # one, the same bytes over a longer divisor, while declaring 193
+            # kbps to ffprobe. Nothing was sustained, so nothing is the rate.
+            if elapsed < self.bitrate_sample_duration:
+                logger.info(
+                    "[STREAM-PROBE] Source ended the stream after %.2fs of a "
+                    "%ss window (%d bytes) — not a sustained feed",
+                    elapsed, self.bitrate_sample_duration, bytes_downloaded,
+                )
+                return 0
+
             # Calculate bitrate (bits per second)
             if elapsed > 0:
                 bitrate_bps = int((bytes_downloaded * 8) / elapsed)
