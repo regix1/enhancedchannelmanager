@@ -130,7 +130,10 @@ export const StreamListItem = memo(function StreamListItem({
                 {formatBitrate(streamStats.video_bitrate)}
               </span>
             )}
-            {streamStats.measured_bitrate && (
+            {/* A sampled 0 is a stream sending nothing, which is the reading
+                worth showing. Testing it for truthiness hid the tag on exactly
+                those streams, leaving them to look unmeasured. */}
+            {streamStats.measured_bitrate !== null && (
               <span className="meta-tag bitrate" title={`Measured throughput: ${formatBitrate(streamStats.measured_bitrate)}`}>
                 {formatBitrate(streamStats.measured_bitrate)}
               </span>
