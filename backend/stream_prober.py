@@ -1214,11 +1214,11 @@ class StreamProber:
 
         Returns bitrate in bits per second, or None if measurement fails.
         """
+        bytes_downloaded = 0
+        start_time = time.time()
+        answered = False
         try:
             logger.debug("[STREAM-PROBE] Starting bitrate measurement for %ss...", self.bitrate_sample_duration)
-
-            bytes_downloaded = 0
-            start_time = time.time()
 
             # Stream download with timeout (all four parameters required by httpx.Timeout)
             timeout = httpx.Timeout(
@@ -1232,6 +1232,7 @@ class StreamProber:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
                 async with client.stream("GET", url) as response:
                     response.raise_for_status()
+                    answered = True
 
                     # Download stream data for the sample duration
                     async for chunk in response.aiter_bytes(chunk_size=65536):  # 64KB chunks
@@ -1257,6 +1258,21 @@ class StreamProber:
             logger.warning("[STREAM-PROBE] HTTP error during bitrate measurement: %s", e.response.status_code)
             return None
         except httpx.TimeoutException:
+            # Headers arrived and then nothing did: a source with nothing to
+            # send, not one that cannot be measured. The rate that describes is
+            # what lets a caller's throughput floor reject it, where returning
+            # None leaves it with no verdict at all and no verdict reads as
+            # working. A timeout before the headers is a stream that could not
+            # be reached, which is a different thing and still None.
+            elapsed = time.time() - start_time
+            if answered and elapsed >= self.bitrate_sample_duration:
+                bitrate_bps = int((bytes_downloaded * 8) / elapsed)
+                logger.info(
+                    "[STREAM-PROBE] Sample window closed on a stalled stream: "
+                    "%d bytes in %.2fs = %d bps (%.2f Mbps)",
+                    bytes_downloaded, elapsed, bitrate_bps, bitrate_bps / 1000000,
+                )
+                return bitrate_bps
             logger.warning("[STREAM-PROBE] Timeout during bitrate measurement")
             return None
         except Exception as e:
