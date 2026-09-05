@@ -15,6 +15,12 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.dist_root/
+# CSS chunk-leak audit build output (vite.audit.config.ts). Was untracked AND
+# unignored, so it polluted `git status` and broke `npm run lint`.
+frontend/.audit-dist/
+# Dev-only modal harness build output (bead enhancedchannelmanager-xhldy.1).
+# Never deployed; produced by `vite build --config vite.harness.config.ts`.
+frontend/.modal-harness-dist/
 
 # IDE
 .idea/
@@ -26,14 +32,20 @@ frontend/.dist_root/
 .DS_Store
 Thumbs.db
 
-# Claude Code temp files
+# Claude Code temp files and local-only settings
 tmpclaude-*-cwd
+.claude/settings.local.json
 
 # Build
 backend/static/
 *.egg-info/
 dist/
 build/
+# `mkdocs build` (a required gate, see docs/shipping.md) writes here by
+# default: mkdocs.yml sets no site_dir. Left untracked it trips the
+# binary-artifacts ratchet on site/sitemap.xml.gz, which reads as a real
+# finding rather than as build output nobody meant to keep.
+site/
 
 # Test coverage artifacts (enforced in CI, see docs/testing.md)
 frontend/coverage/
@@ -43,6 +55,11 @@ backend/htmlcov/
 mcp-server/.coverage
 mcp-server/coverage.xml
 mcp-server/htmlcov/
+
+# Root-level coverage db, same artifact as backend/.coverage above but left
+# by a pytest run invoked from the repo root instead of backend/; the
+# subdir-scoped entry does not match this path.
+/.coverage
 
 # JUnit XML reports — emitted in CI for the flake-pr-comment workflow
 # (bead xq19y) and locally when running pytest/vitest with --junitxml.
@@ -55,8 +72,22 @@ mcp-server/junit.xml
 backend/.benchmarks/
 backend/tests/performance/.benchmarks/
 
-# User guide screenshots (may contain PII)
-docs/images/
+# Screenshots of a live instance (may contain PII). The default is to ignore
+# everything under docs/images/ — captures taken against a real instance can
+# render Xtream stream URLs (provider password is in the path), provider
+# hostnames, private/public IPs, real email addresses, and account usernames.
+# This repository is public, so an accidental `git add` is unrecoverable.
+#
+# Exception (bd-2mluw): docs/images/user_guide/ is tracked. Those screenshots
+# are captured against the sanitized documentation environment — placeholder
+# hosts (dispatcharr.example.local), the `e2e_test` operator, pseudonymized
+# provider names, empty credential fields, and provider-identifying strings
+# blurred at capture time. Every file under it was individually PII-audited
+# before being committed. Anything added there later must clear the same bar.
+# `docs/images/*` (not `docs/images/`) is required: git will not descend into
+# an excluded directory, so a negation under it can never re-include anything.
+docs/images/*
+!docs/images/user_guide/
 
 # Playwright run-time artifacts (bd-lln2x). The visual-regression
 # baseline PNGs under e2e/visual/__screenshots__/ ARE checked in (they
@@ -91,3 +122,29 @@ pytest-of-*/
 # tempfile.mkdtemp() falls back to the working directory under the same
 # missing-TMPDIR condition, so scratch directories land at the repo root.
 /tmp[a-z0-9_]*/
+
+# Local browser snapshots and downloads can contain instance credentials.
+/snap-*.yml
+/snap-*.yaml
+/*-snap.yml
+/*-snap.yaml
+.playwright-mcp/
+
+# Keep root scratch files out of commits; add an exception for new root docs.
+/*.yml
+/*.yaml
+/*.png
+/*.md
+!/.semgrep.yml
+!/docker-compose*.yml
+!/docker-compose*.yaml
+!/mkdocs.yml
+!/AGENTS.md
+!/CHANGELOG.md
+!/CLAUDE.md
+!/COMPONENTS.md
+!/CONTRIBUTING.md
+!/README.md
+!/SECURITY.md
+!/USER_GUIDE.md
+!/rebuild-instructions.md

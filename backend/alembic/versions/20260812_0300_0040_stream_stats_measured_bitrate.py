@@ -1,7 +1,7 @@
 """Add stream_stats.measured_bitrate for sampled throughput.
 
-Revision ID: 0040
-Revises: 0039
+Revision ID: 0051
+Revises: 0050
 
 ``StreamStats.measured_bitrate`` holds the throughput actually read off a
 stream, kept separate from ``video_bitrate`` (what ffprobe declares). The two
@@ -29,8 +29,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy import inspect
 
-revision: str = "0040"
-down_revision: Union[str, Sequence[str], None] = "0039"
+revision: str = "0051"
+down_revision: Union[str, Sequence[str], None] = "0050"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -48,9 +48,28 @@ def _has_column() -> bool:
 
 
 def upgrade() -> None:
-    if _has_column():
-        return
-    op.add_column(TABLE, sa.Column(COLUMN, sa.BigInteger(), nullable=True))
+    if not _has_column():
+        op.add_column(TABLE, sa.Column(COLUMN, sa.BigInteger(), nullable=True))
+
+    # The former local 0040 added measured_bitrate instead of sync_logos.
+    # Both histories reach this revision, so repair the skipped column here.
+    conn = op.get_bind()
+    if inspect(conn).has_table("sync_targets") and not any(
+        col["name"] == "sync_logos"
+        for col in inspect(conn).get_columns("sync_targets")
+    ):
+        op.add_column(
+            "sync_targets",
+            sa.Column("sync_logos", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        )
+        # Existing targets keep the original opt-out; new targets default on.
+        with op.batch_alter_table("sync_targets") as batch:
+            batch.alter_column(
+                "sync_logos",
+                existing_type=sa.Boolean(),
+                existing_nullable=False,
+                server_default=sa.text("1"),
+            )
 
 
 def downgrade() -> None:

@@ -1,5 +1,12 @@
 # Agent Instructions
 
+## Verification Discipline
+
+- Test monitoring and inspection commands against both known-good and known-bad input before trusting their results. A failed command must not silently become an empty success result.
+- Report the exact check and scope performed. A text search, a test run and a deployment check establish different facts.
+- Open a linked issue before claiming another change covers it. Confirm the actual behavior before closing an issue as already fixed.
+- Check the evidence supporting your own conclusions, including counts, route dependencies and test coverage.
+
 ## Invoking Personas (project-engineer, qa-engineer, sre, etc.)
 
 Personas are skills at `~/.claude/skills/<persona>/SKILL.md`, NOT subagent types. To spawn them — especially in parallel — use the Agent tool with `subagent_type: "general-purpose"` and load the persona identity in the prompt:
@@ -18,17 +25,21 @@ For multi-persona workflows (team-plan, team-review, spike, grooming, standup, r
 
 ## Worktree & Agent Isolation (this environment)
 
-The Claude Code worktree mechanism is unreliable here. Two harness-level bugs — NOT fixable in-repo:
+The Claude Code worktree mechanism is unreliable here. Three harness-level bugs, NOT fixable in-repo:
 
 - **cwd-trap:** a worktree-spawned agent's Bash cwd resets to the MAIN checkout between calls, while Read/Edit act on the literal absolute path given. An agent that doesn't make EVERY path worktree-absolute ends up editing `dev` directly — silently polluting the main checkout.
 - **Lock accumulation:** a finished agent's worktree stays locked and is never auto-cleaned; `git worktree remove` then needs `-f -f`.
+- **Stale-base:** a worktree is branched from `origin/main`, not `dev`, unless a start point is given explicitly. `origin/main` is the repo's default branch, so this is the silent default, not an edge case. Measured 2026-08-12: a worktree agent's branch reflog read `Created from origin/main` at `ae25ad70` (PR #748, 2026-07-26), while `dev` was 858 files and roughly 141k lines ahead at `eecd257a`. The agent's brief named a symbol added on `dev` by a later PR; that symbol did not exist on the worktree's base, and the agent only caught it mid-task. Nothing about this looks wrong from the outside: `git status` is clean, gates pass, and the diff against the worktree's own (stale) base looks small and correct. An agent that doesn't notice ships a branch written against an old API surface: the code it targeted has moved, so part of its fix can be missing or wrong, its gates passed against a tree that is not the one it will land in, and its conflicts are likelier and easy to mis-resolve toward the stale side.
+
+  The merge itself does NOT revert `dev`. An earlier version of this bullet said it "reverts everything `dev` gained since the stale base"; that is wrong. A three-way merge takes the stale commit as its merge base and keeps dev-only work on dev's side. That was verified empirically in a throwaway repo: branch from an old commit, advance the target four commits, then merge, and all target-side work and files survive. The damage is a quietly incomplete fix plus meaningless gate results, not mass reversion, and the distinction matters because it changes the remediation. Standing rule 4 below is unaffected: verify the merge-base regardless. Full evidence in enhancedchannelmanager-2lwz3.
 
 Standing defaults (these OVERRIDE the global "worktree-isolate every write agent" rule, which assumes a working mechanism):
 
 1. **Default: non-worktree, sequential engineers.** For typical small / single-domain changes, spawn the engineer WITHOUT `isolation: "worktree"` and brief it to work on a branch in the main checkout (do NOT create a worktree). No second tree ⇒ no cwd-trap, nothing left locked.
 2. **Worktrees only for genuinely parallel, independent write agents.** When used: brief the cwd-trap hard (every Read/Edit/Bash path worktree-absolute; verify `git -C <wt> branch --show-current` before any commit), and on return verify each agent's gates AND that the main checkout is clean (`git status` shows none of the agent's files).
 3. **Clean up on merge, every time.** `git worktree remove -f -f <path>` is part of the PR-merge step — never defer to a later sweep. Skip and flag any worktree with uncommitted tracked changes instead of force-removing it.
-4. **Trust nothing unverified.** Independently re-run the agent's claimed gates before merging — the agent's report is not the gate.
+4. **First action in every worktree agent: verify the base, then rebase onto `origin/dev`.** Before any other work, compare `git -C <worktree> merge-base HEAD origin/dev` against `git rev-parse origin/dev`. These agreeing is the pass condition; if they disagree, the worktree is stale and must be rebased onto `origin/dev` before the brief's actual task starts.
+5. **Trust nothing unverified.** Independently re-run the agent's claimed gates before merging, AND independently re-verify the branch's merge-base against `origin/dev` before merging: gates passing on a stale base proves nothing about the merge.
 
 Frontend tooling in a worktree (writable `.vite-temp`) is fixed in `scripts/worktree-bootstrap.sh`; full caveats in `docs/shipping.md` → "Worktree quirks".
 
@@ -172,6 +183,8 @@ dependent frontend is still live.
 ### Shipping (When User Says "Ship the Fix")
 
 Follow `docs/shipping.md`. The full PR-driven flow (branch from `origin/dev`, push, open PR via `gh pr create --base dev`, wait for the 5 required checks, then `gh pr merge --merge --delete-branch`) lives in `docs/shipping.md` §6 — do not duplicate it here.
+
+Run `gh pr create` from the checkout being shipped. The local preflight hook resolves the session cwd before Bash runs and cannot follow an inline `cd <other-checkout> && gh pr create ...`; that form is unsupported. Remove the branch worktree and check the branch out in the main checkout before opening its PR.
 
 **Non-negotiable rules:**
 - Work is NOT complete until the PR merges into `dev`

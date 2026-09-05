@@ -56,6 +56,9 @@ def _distinct_request_values() -> dict[str, object]:
     # auth_method is a closed set, and api_key mode needs the canonical key,
     # which this body sends.
     values["auth_method"] = "api_key"
+    # Log retention has a bounded count; public links require an HTTP origin.
+    values["backend_log_file_backup_count"] = 5
+    values["public_base_url"] = "https://ecm.example.test"
     return values
 
 

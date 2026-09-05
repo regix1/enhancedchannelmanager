@@ -115,7 +115,8 @@ def client_serving(body: httpx.AsyncByteStream) -> type[httpx.AsyncClient]:
 
     class HeadersThenBody(httpx.AsyncClient):
         def __init__(self, **kwargs: Any) -> None:
-            super().__init__(transport=httpx.MockTransport(respond), **kwargs)
+            kwargs["transport"] = httpx.MockTransport(respond)
+            super().__init__(**kwargs)
 
     return HeadersThenBody
 
@@ -128,7 +129,8 @@ def client_that_never_answers() -> type[httpx.AsyncClient]:
 
     class NoHeaders(httpx.AsyncClient):
         def __init__(self, **kwargs: Any) -> None:
-            super().__init__(transport=httpx.MockTransport(respond), **kwargs)
+            kwargs["transport"] = httpx.MockTransport(respond)
+            super().__init__(**kwargs)
 
     return NoHeaders
 

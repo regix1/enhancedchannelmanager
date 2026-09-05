@@ -18,7 +18,8 @@ Pinned here (acceptance criteria):
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -965,7 +966,7 @@ class TestPromotionPreview:
         client = _mock_client(
             master_channels=MASTER_CHANNELS + [
                 {"id": 900, "name": derived_name,
-                 "channel_group_id": self.PROMOTE_GROUP_ID},
+                 "channel_group_id": self.PROMOTE_GROUP_ID, "auto_created": True},
             ],
         )
         resp = await _preview(
@@ -977,6 +978,48 @@ class TestPromotionPreview:
         assert promo["would_attach_existing"] == 1
         assert promo["units"][0]["action"] == "attach_existing"
         assert promo["units"][0]["existing_channel_id"] == 900
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ownership", ["manual", "marker", "ledger"])
+    @pytest.mark.parametrize("prefix", ["", "900.5 - "])
+    async def test_promotion_adoption_requires_channel_ownership(
+        self, async_client, test_session, ownership, prefix
+    ):
+        derived_name = await self._promoted_channel_name(async_client)
+        channel = {
+            "id": 900,
+            "name": prefix + derived_name,
+            "channel_group_id": self.PROMOTE_GROUP_ID,
+        }
+        if ownership == "marker":
+            channel["auto_created"] = True
+        elif ownership == "ledger":
+            rule = TestReviewQueueMarkers()._saved_rule(test_session)
+            rule.managed_channel_ids = json.dumps([900])
+            test_session.commit()
+
+        from config import DispatcharrSettings
+
+        client = _mock_client(master_channels=MASTER_CHANNELS + [channel])
+        with patch(
+            "config.get_settings",
+            return_value=DispatcharrSettings(
+                include_channel_number_in_name=True,
+                channel_number_separator="-",
+            ),
+        ):
+            resp = await _preview(
+                async_client, client, {"event_sync_config": self._promote_config()}
+            )
+
+        assert resp.status_code == 200
+        promo = resp.json()["promotion"]
+        assert promo["would_create"] == (1 if ownership == "manual" else 0)
+        assert promo["would_attach_existing"] == (0 if ownership == "manual" else 1)
+        assert promo["units"][0]["existing_channel_id"] == (
+            None if ownership == "manual" else 900
+        )
+        _assert_zero_writes(client)
 
     @pytest.mark.asyncio
     async def test_new_filters_off_report_zero(self, async_client):
@@ -1135,7 +1178,7 @@ class TestPromotionPreview:
             master_channels=MASTER_CHANNELS + [
                 {"id": 900,
                  "name": await self._promoted_channel_name(async_client),
-                 "channel_group_id": self.PROMOTE_GROUP_ID},
+                 "channel_group_id": self.PROMOTE_GROUP_ID, "auto_created": True},
             ],
             secondary_streams=streams,
         )
@@ -1174,7 +1217,7 @@ class TestPromotionPreview:
             master_channels=MASTER_CHANNELS + [
                 {"id": 900,
                  "name": await self._promoted_channel_name(async_client),
-                 "channel_group_id": self.PROMOTE_GROUP_ID},
+                 "channel_group_id": self.PROMOTE_GROUP_ID, "auto_created": True},
             ],
         )
         with patch("services.event_sync_stream_health.find_dead_streams",
@@ -1204,7 +1247,7 @@ class TestPromotionPreview:
             master_channels=MASTER_CHANNELS + [
                 {"id": 900,
                  "name": await self._promoted_channel_name(async_client),
-                 "channel_group_id": self.PROMOTE_GROUP_ID},
+                 "channel_group_id": self.PROMOTE_GROUP_ID, "auto_created": True},
             ],
         )
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
@@ -1268,8 +1311,21 @@ class TestPromotionPreview:
         assert check.await_count == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "owner,active_from_days,active_until_days,enabled,adopts",
+        [
+            ("absent", None, None, True, False),
+            ("future", 1, None, True, False),
+            ("expired", None, -1, True, False),
+            ("active", None, None, True, True),
+            ("starts_today", 0, None, True, True),
+            ("ends_today", None, 0, True, True),
+            ("disabled", None, None, False, False),
+        ],
+    )
     async def test_preview_counts_equal_live_run_promotions(
-        self, async_client, test_session
+        self, async_client, test_session,
+        owner, active_from_days, active_until_days, enabled, adopts,
     ):
         """AC-8: would_promote rows/counts == live promotions on unchanged
         data (frozen resolver clock on both sides, shared fixtures)."""
@@ -1286,9 +1342,35 @@ class TestPromotionPreview:
             datetime(2026, 7, 11, 12, 0, 0)
         )
         config = self._promote_config()
+        rule = ChannelPipelineRule(
+            name="Event Rule", enabled=True, priority=0,
+            conditions=json.dumps([{"type": "always"}]),
+            actions=json.dumps([{"type": "skip"}]),
+            event_sync_config=json.dumps(config),
+        )
+        test_session.add(rule)
+        channels = live_master_channels()
+        if owner != "absent":
+            today = datetime.utcnow().date()
+            test_session.add(ChannelPipelineRule(
+                name="Owner Rule", enabled=enabled, priority=10,
+                conditions=json.dumps([]), actions=json.dumps([]),
+                orphan_action="none", managed_channel_ids=json.dumps([500]),
+                active_from=(today + timedelta(days=active_from_days)
+                             if active_from_days is not None else None),
+                active_until=(today + timedelta(days=active_until_days)
+                              if active_until_days is not None else None),
+            ))
+            channels.append({
+                "id": 500,
+                "name": await self._promoted_channel_name(async_client),
+                "channel_group_id": self.PROMOTE_GROUP_ID,
+                "streams": [301],
+            })
+        test_session.commit()
 
         preview_state = FakeDispatcharrState(
-            channels=live_master_channels(),
+            channels=deepcopy(channels),
             secondary_streams=SECONDARY_STREAMS,
         )
         preview_client = make_promote_client(preview_state)
@@ -1305,17 +1387,8 @@ class TestPromotionPreview:
         preview_client.create_channel.assert_not_awaited()
         assert preview_state.update_channel_calls == []
 
-        rule = ChannelPipelineRule(
-            name="Event Rule", enabled=True, priority=0,
-            conditions=json.dumps([{"type": "always"}]),
-            actions=json.dumps([{"type": "skip"}]),
-            event_sync_config=json.dumps(config),
-        )
-        test_session.add(rule)
-        test_session.commit()
-
         run_state = FakeDispatcharrState(
-            channels=live_master_channels(),
+            channels=deepcopy(channels),
             secondary_streams=SECONDARY_STREAMS,
         )
         run_client = make_promote_client(run_state)
@@ -1336,8 +1409,12 @@ class TestPromotionPreview:
             promo_live["promoted_created"] + promo_live["promoted_adopted"]
         )
         assert promo_preview["would_create"] == promo_live["promoted_created"]
+        assert promo_preview["would_attach_existing"] == promo_live["promoted_adopted"]
+        assert promo_live["promoted_adopted"] == int(adopts)
         assert (promo_preview["would_promote_streams"]
-                == promo_live["streams_attached"])
+                == promo_live["streams_attached"] + promo_live["already_attached"])
+        if owner != "absent":
+            assert 500 in run_state.channels
         # The exact derived channel names got created.
         created_names = {
             run_state.channels[cid]["name"]

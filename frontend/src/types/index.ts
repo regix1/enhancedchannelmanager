@@ -74,9 +74,6 @@ export interface DummyEPGCustomProperties {
   include_live_tag?: boolean;                // Mark programs as live content
   include_new_tag?: boolean;                 // Mark programs as new content
 
-  // Lookup tables used by the template engine's {key|lookup:<name>} pipe.
-  inline_lookups?: Record<string, Record<string, string>>;  // Per-source tables (name → entries)
-  global_lookup_ids?: number[];                             // IDs from /api/lookup-tables to attach
 }
 
 // Custom properties for Schedules Direct EPG sources.
@@ -1731,6 +1728,14 @@ export interface TLSStatus {
   last_renewal_error: string | null;
   has_certificate: boolean;
   certificate_valid: boolean;
+  // Break-glass visibility (bead enhancedchannelmanager-04c0u.9). The stored
+  // flag alone cannot show the hazard: an operator who recovered with the
+  // ECM_ALLOW_HTTP_SESSION_COOKIES environment variable and then forgot the
+  // line saw an unchecked box and an "Encrypted" badge while every session
+  // cookie shipped without Secure.
+  allow_http_session_cookies: boolean;
+  http_session_cookies_env_override: boolean;
+  session_cookies_plaintext: boolean;
 }
 
 // TLS settings (for form)
@@ -1750,6 +1755,7 @@ export interface TLSSettings {
   aws_region: string;
   auto_renew: boolean;
   renew_days_before_expiry: number;
+  allow_http_session_cookies: boolean;
 }
 
 // TLS configure request
@@ -1769,6 +1775,7 @@ export interface TLSConfigureRequest {
   aws_region: string;
   auto_renew: boolean;
   renew_days_before_expiry: number;
+  allow_http_session_cookies: boolean;
 }
 
 // Certificate request response
@@ -1972,8 +1979,6 @@ export interface DummyEPGPreviewRequest {
   channel_logo_url_template?: string;
   program_poster_url_template?: string;
   pattern_variants?: PatternVariant[];
-  inline_lookups?: Record<string, Record<string, string>>;
-  global_lookup_ids?: number[];
   include_trace?: boolean;
 }
 
@@ -2002,8 +2007,8 @@ export interface DummyEPGPreviewPipeStep {
   arg: string | null;
   input: string;
   output: string;
+  /** Provenance note for synthesised steps (e.g. the legacy _normalize suffix). */
   source?: string;
-  matched?: boolean;
 }
 
 // Batch preview request

@@ -87,7 +87,8 @@ class TestRangeResolution:
 
     def test_a_range_skips_numbers_already_taken(self):
         ex = self._executor()
-        ex._used_channel_numbers = {900, 901}
+        ex._mark_channel_number_used(900)
+        ex._mark_channel_number_used(901)
         assert ex._get_next_channel_number("900-999") == 902
 
     def test_auto_still_starts_at_one(self):
