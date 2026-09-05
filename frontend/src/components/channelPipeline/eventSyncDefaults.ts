@@ -57,7 +57,7 @@ export const DEFAULT_PROMOTE_LEAD_HOURS = 24;
 export const DEFAULT_PROMOTE_CHANNEL_NUMBER = '900-999';
 
 /** Mirror of MIN_PROMOTE_LEAD_HOURS in backend/services/event_sync_promote.py. */
-export const MIN_PROMOTE_LEAD_HOURS = 1;
+export const MIN_PROMOTE_LEAD_HOURS = 0;
 
 /** Mirror of MAX_PROMOTE_LEAD_HOURS in backend/services/event_sync_promote.py (30 days). */
 export const MAX_PROMOTE_LEAD_HOURS = 720;

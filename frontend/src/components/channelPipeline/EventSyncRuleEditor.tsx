@@ -390,6 +390,9 @@ export function EventSyncRuleEditor({
   const [skipPastEvents, setSkipPastEvents] = useState(
     config?.skip_past_events ?? false
   );
+  const [retireFinishedEvents, setRetireFinishedEvents] = useState(
+    config?.retire_finished_events ?? false
+  );
   const [pastEventGraceText, setPastEventGraceText] = useState(
     String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS)
   );
@@ -668,6 +671,9 @@ export function EventSyncRuleEditor({
           + 'pick a dedicated group for ECM-managed promoted channels';
       }
     }
+    if (retireFinishedEvents && (!promoteUnmatched || dummyEpgProfileId == null)) {
+      return 'Confirmed idle event removal requires promotion and a dummy EPG profile';
+    }
     return null;
   })();
 
@@ -773,6 +779,9 @@ export function EventSyncRuleEditor({
     // on — the backend fills its default on save.
     if (skipPastEvents || config?.skip_past_events != null) {
       built.skip_past_events = skipPastEvents;
+    }
+    if (retireFinishedEvents || config?.retire_finished_events != null) {
+      built.retire_finished_events = retireFinishedEvents;
     }
     if (skipPastEvents || config?.past_event_grace_hours != null) {
       // 0 is a legal grace ("past the moment the start time passes"), so an
@@ -929,7 +938,10 @@ export function EventSyncRuleEditor({
     setPreviewLoading(true);
     setPreviewError(null);
     try {
-      const response = await previewEventSync({ event_sync_config: builtConfig });
+      const response = await previewEventSync({
+        ...(rule?.id != null ? { rule_id: rule.id } : {}),
+        event_sync_config: builtConfig,
+      });
       setPreview(response);
     } catch (err) {
       setPreviewError(err instanceof Error ? err.message : 'Preview failed');
@@ -1069,6 +1081,7 @@ export function EventSyncRuleEditor({
       promoteUnmatched !== (config?.promote_unmatched ?? false) ||
       promoteTargetGroupId !== (config?.promote_target_group_id ?? null) ||
       skipPastEvents !== (config?.skip_past_events ?? false) ||
+      retireFinishedEvents !== (config?.retire_finished_events ?? false) ||
       pastEventGraceText !==
         String(config?.past_event_grace_hours ?? DEFAULT_PAST_EVENT_GRACE_HOURS) ||
       limitPromoteLead !== (config?.promote_lead_hours != null) ||
@@ -1088,7 +1101,7 @@ export function EventSyncRuleEditor({
     customShared, groupOverrides, timeWindowText, thresholdText, enforceTimeWindow,
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
-    promoteTargetGroupId, skipPastEvents, pastEventGraceText,
+    promoteTargetGroupId, skipPastEvents, retireFinishedEvents, pastEventGraceText,
     limitPromoteLead, promoteLeadText, applyLeadToExisting, numberPromoted, promoteNumberText,
     skipDeadStreams,
     dummyEpgProfileId, config, rule,
@@ -2353,6 +2366,25 @@ export function EventSyncRuleEditor({
                         happens to it, and orphan cleanup deletes channels by
                         default. Events whose date had to be assumed are never
                         skipped.
+                      </span>
+                    </div>
+                  )}
+                  {(promoteUnmatched || retireFinishedEvents) && (
+                    <div className="form-group">
+                      <label className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={retireFinishedEvents}
+                          onChange={e => setRetireFinishedEvents(e.target.checked)}
+                          disabled={isLoading}
+                          data-testid="event-sync-retire-finished-events"
+                        />
+                        <span>Remove confirmed idle event channels</span>
+                      </label>
+                      <span className="form-hint">
+                        Requires an actual guide end, fresh provider evidence
+                        of a later event or idle slot, and no active viewers.
+                        Enable promotion and select a dummy EPG profile.
                       </span>
                     </div>
                   )}

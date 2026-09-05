@@ -101,6 +101,8 @@ async def find_dead_streams(
     probe_missing: bool = False,
     stale_stream_ids: set[int] | None = None,
     event_start_by_stream: dict[int, datetime] | None = None,
+    probe_before: datetime | None = None,
+    probe_first: set[int] | None = None,
 ) -> set[int]:
     """Return the subset of ``stream_ids`` that has no working stream.
 
@@ -128,6 +130,20 @@ async def find_dead_streams(
             taken while the event still had nothing to serve, and nothing
             re-probes a stream that already has a record, so counting it
             would make a pre-kickoff failure permanent. [59]
+        probe_before: Optional earliest usable measurement for an event
+            lifecycle check. Older readings are discarded from this verdict
+            and use the same bounded missing-probe path on live runs.
+        probe_first: The candidates whose reading this run cannot do
+            without — the streams still waiting for a channel. While any of
+            them has no usable record, this run probes those alone and the
+            other candidates keep their "no verdict" reading for a later
+            run, the same way the per-run cap already holds streams back.
+            The streams already on a channel are re-probed every run once
+            ``probe_before`` is set, and there can be hundreds of them: id
+            order let them fill the cap ahead of the one new event every
+            run, and a batch that dials them all outlasts the freshness
+            window the new event's own reading has to land inside. Absent
+            or empty, every candidate competes for the budget as before.
 
     Never raises. Every failure path returns the streams the provider
     already disowned and nothing else, because a database that will not
@@ -153,6 +169,17 @@ async def find_dead_streams(
     threshold = _strike_threshold()
     floor_bps = _min_stream_bitrate_bps()
     started = event_start_by_stream or {}
+    if probe_before is not None:
+        stats = dict(stats)
+        for sid in ids:
+            if sid not in stats or sid not in started:
+                continue
+            try:
+                usable = _probed_after_kickoff(stats[sid], max(started[sid], probe_before))
+            except (TypeError, ValueError):
+                usable = False
+            if not usable:
+                stats.pop(sid)
     dead = set(stale)
     dead |= {
         sid for sid in ids
@@ -172,6 +199,16 @@ async def find_dead_streams(
             sid for sid in ids
             if sid not in stats and sid not in stale and sid in started
         ]
+        if probe_first:
+            waiting = [sid for sid in unprobed if sid in probe_first]
+            if waiting and len(waiting) < len(unprobed):
+                logger.info(
+                    "[EVENT-SYNC] probing the %d stream(s) still waiting "
+                    "for a channel first — %d already-promoted stream(s) "
+                    "keep no health verdict until a run has nothing new "
+                    "to measure", len(waiting), len(unprobed) - len(waiting),
+                )
+                unprobed = waiting
         if unprobed:
             fresh_failures = await _probe_and_collect_failures(
                 client, unprobed, floor_bps
@@ -452,12 +489,11 @@ async def _probe_and_collect_failures(
 
     dead: set[int] = set()
     failures_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(max(1, prober.max_concurrent_probes))
 
     async def _probe_one(stream_id: int, url: str, name: str, m3u_account) -> None:
-        # Per provider, not global: a line that allows one connection answers
-        # every probe past the first with a failure, and this function records
-        # those as dead streams. [76]
-        async with prober.semaphore_for_account(m3u_account):
+        # Respect the total probe budget as well as each account's smaller limit.
+        async with prober.semaphore_for_account(m3u_account), semaphore:
             try:
                 result = await prober.probe_stream(stream_id, url, name)
             except Exception as e:

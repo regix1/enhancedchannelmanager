@@ -257,7 +257,10 @@ async def _resolve_targets(name: str, arguments: dict[str, Any], original_run) -
         from _endpoint_contracts import ENDPOINTS
         from tools import channel_pipeline
         return await channel_pipeline.get_ecm_client().call_endpoint(
-            ENDPOINTS["ac_prepare_run"], body={"dry_run": True}
+            ENDPOINTS["ac_prepare_run"], body={
+                "dry_run": True,
+                **channel_pipeline._run_scope(clean.get("rule_ids"), clean.get("m3u_account_ids")),
+            }
         )
     if name == "apply_normalization_to_channels":
         from _endpoint_contracts import ENDPOINTS

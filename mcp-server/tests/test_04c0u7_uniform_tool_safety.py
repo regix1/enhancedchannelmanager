@@ -384,6 +384,64 @@ async def test_pipeline_prerefresh_requires_two_distinct_confirmations(tool_name
     assert client.call_endpoint.await_args_list[1].kwargs["body"]["phase"] == "refresh"
     assert client.call_endpoint.await_args_list[2].kwargs["body"]["phase"] == "execute"
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["run_channel_pipeline", "run_auto_creation"])
+async def test_pipeline_confirmation_preserves_requested_rule_scope(tool_name):
+    mcp = _registry()
+    client = AsyncMock()
+    client.call_endpoint.return_value = {
+        "phase": "execute", "plan_id": "selected-plan", "plan_hash": "selected-hash",
+        "preview": {"channels_updated": 1}, "write_count": 1, "unique_target_count": 1,
+    }
+    args = {"dry_run": False, "rule_ids": [12], "m3u_account_ids": [18]}
+    with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+        first = await mcp.call_tool(tool_name, args)
+        token = _token(_text(first))
+        changed = await mcp.call_tool(
+            tool_name, {**args, "rule_ids": [5], "confirmation_token": token},
+        )
+    assert client.call_endpoint.await_args_list[0].kwargs["body"] == {
+        "dry_run": True, "rule_ids": [12], "m3u_account_ids": [18],
+    }
+    assert "drift" in _text(changed) or "does not match" in _text(changed)
+    assert not any(call.args[0].name == "ac_commit_run" for call in client.call_endpoint.await_args_list)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["run_channel_pipeline", "run_auto_creation"])
+async def test_scoped_pipeline_confirmation_commits_only_prepared_plan(tool_name):
+    mcp = _registry()
+    client = AsyncMock()
+    client.call_endpoint.side_effect = [
+        {"phase": "execute", "plan_id": "selected-plan", "plan_hash": "selected-hash",
+         "preview": {"channels_updated": 1}, "write_count": 1, "unique_target_count": 1},
+        {"execution_id": 99, "status": "completed"},
+        {"execution_id": 99, "status": "completed", "channels_updated": 1},
+    ]
+    arguments = {"dry_run": False, "rule_ids": [12], "m3u_account_ids": [18]}
+    with patch("tools.channel_pipeline.get_ecm_client", return_value=client), patch(
+        "tools.channel_pipeline._poll_sleep", AsyncMock()
+    ):
+        preview = await mcp.call_tool(tool_name, arguments)
+        result = await mcp.call_tool(tool_name, {**arguments, "confirmation_token": _token(_text(preview))})
+    assert "complete" in _text(result).lower()
+    assert client.call_endpoint.await_args_list[0].kwargs["body"] == {
+        "dry_run": True, "rule_ids": [12], "m3u_account_ids": [18],
+    }
+    assert client.call_endpoint.await_args_list[1].kwargs["body"] == {
+        "plan_id": "selected-plan", "plan_hash": "selected-hash", "phase": "execute",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pipeline_policy_refuses_empty_scope_before_preparation():
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    client = AsyncMock()
+    with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+        with pytest.raises((ToolError, ValueError), match="rule_ids"):
+            await _registry().call_tool("run_channel_pipeline", {"dry_run": False, "rule_ids": []})
+    client.call_endpoint.assert_not_called()
+
 
 @pytest.mark.parametrize(
     "name",

@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 import httpx
@@ -3036,22 +3036,15 @@ _EVENT_PREVIEW_MAX_FAILURE_SAMPLES = 25
 
 
 class EventSyncPreviewRequest(BaseModel):
-    """Preview an event_sync rule: a saved rule id OR an inline config.
-
-    Exactly one source must be provided — ``event_sync_config`` exists so the
-    rule editor can preview BEFORE saving (bead ti939.1.4).
-    """
+    """Preview saved settings or an inline draft with optional saved ownership."""
 
     rule_id: Optional[int] = None
     event_sync_config: Optional[dict] = None
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
-        if (self.rule_id is None) == (self.event_sync_config is None):
-            raise ValueError(
-                "provide exactly one of rule_id (preview a saved rule) or "
-                "event_sync_config (preview before saving)"
-            )
+        if self.rule_id is None and self.event_sync_config is None:
+            raise ValueError("provide rule_id or event_sync_config")
         return self
 
 
@@ -3079,9 +3072,8 @@ async def _load_event_sync_preview_config(request: EventSyncPreviewRequest) -> d
                 )
         finally:
             session.close()
-    else:
-        # Shallow copy: the validator fills defaults in place and the
-        # request object must not be mutated.
+    if request.event_sync_config is not None:
+        # Draft settings reuse saved ownership without changing the saved rule.
         config = dict(request.event_sync_config)
 
     # Inline configs are unvalidated by definition; stored configs are
@@ -3814,7 +3806,7 @@ async def preview_event_sync(
         # are no all-dead units, so no channel leaves the managed set. [24]
         retired_channel_keys: set[str] = set()
 
-        if config.get("skip_dead_streams"):
+        if config.get("skip_dead_streams") or config.get("retire_finished_events"):
             # Health the preview can read WITHOUT writing: a probe stores a
             # row, and this endpoint promises to store nothing, so the
             # preview reports the verdicts that already exist and the run
@@ -3841,10 +3833,15 @@ async def preview_event_sync(
                 event_start_by_stream={
                     row.stream.stream_id: unit.rows[0].result.parsed.start
                     for unit in plan.units
-                    if event_has_started(unit.rows[0].result.parsed, now)
+                    if event_has_started(
+                        unit.rows[0].result.parsed, now,
+                        since=now - timedelta(hours=24) if config.get("retire_finished_events") else None,
+                    )
                     for row in unit.rows
                     if row.stream.stream_id is not None
                 },
+                **({"probe_before": now - timedelta(minutes=5)}
+                   if config.get("retire_finished_events") else {}),
             )
             # Which streams belong to which event, read BEFORE the health
             # replan, the same instant the run reads it. A delisted stream
@@ -3952,6 +3949,38 @@ async def preview_event_sync(
                         working,
                     )
                 )
+
+        event_states = {}
+        retirements = []
+        if config.get("retire_finished_events"):
+            import copy
+            from channel_pipeline_executor import ActionExecutor
+            from channel_pipeline_engine import ChannelPipelineEngine
+
+            executor = ActionExecutor(client, existing_channels=target_channels,
+                                      managed_channel_ids=managed_channel_ids)
+            eligible, event_states = await executor._event_lifecycle(
+                request.rule_id, config, (*plan.units, *plan.capped_units), now,
+            )
+            plan = build_promotion_plan(config, resolution.resolved, existing_name_to_id,
+                                        now=now, dead_stream_ids=dead, eligible_event_keys=eligible)
+            retired_channel_keys = set()
+            if request.rule_id is not None:
+                session = get_session()
+                try:
+                    saved_rule = session.get(ChannelPipelineRule, request.rule_id)
+                    rule = copy.copy(saved_rule) if saved_rule is not None else None
+                finally:
+                    session.close()
+                if rule is not None:
+                    rule.set_event_sync_config(config)
+                    current = [cid for cid, status in event_states.items() if cid > 0 and status != "idle"]
+                    cleanup = {"channels_removed": 0, "channels_moved": 0,
+                               "dry_run_results": [], "execution_log": []}
+                    await ChannelPipelineEngine(client)._reconcile_orphans(
+                        [rule], {rule.id: current}, executor, None, cleanup, True,
+                    )
+                    retirements = cleanup["dry_run_results"]
 
         units_out = []
         for unit in plan.units:
@@ -4062,6 +4091,7 @@ async def preview_event_sync(
                 }
         promotion_out = {
             "enabled": True,
+            **({"retire_finished_events": True} if config.get("retire_finished_events") else {}),
             "target_group_id": promote_target_group_id,
             "would_promote": len(plan.units),
             "would_promote_streams": plan.stream_count,
@@ -4078,6 +4108,8 @@ async def preview_event_sync(
             "skipped_all_dead": plan.skipped_all_dead,
             "stale_streams_removed": stale_streams_removed,
             "units": units_out,
+            "event_states": [{"channel_id": cid, "status": status} for cid, status in event_states.items() if cid > 0],
+            "retirements": retirements,
         }
         # Annotate the unmatched rows in place — the operator reads the
         # unmatched table first, so the promotion verdict belongs on it.

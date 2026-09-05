@@ -204,7 +204,7 @@ function staleStreamsRemovedText(count: number): string {
  * reason has to be named above it, or a perfectly parsed row gets told its
  * parse failed.
  */
-function promotionRowReason(row: EventSyncUnmatchedStream): string {
+function promotionRowReason(row: EventSyncUnmatchedStream, retireFinishedEvents = false): string {
   if (row.would_promote) {
     const kind =
       row.promote_action === 'attach_existing'
@@ -216,11 +216,13 @@ function promotionRowReason(row: EventSyncUnmatchedStream): string {
     return 'Deferred (per-run cap)';
   }
   if (row.promote_skipped_past) {
+    if (retireFinishedEvents) return 'Skipped — start is before the current 24-hour event window';
     return row.promote_skipped_past_adopted
       ? 'Skipped — event already finished, and this rule stops managing its channel'
       : 'Skipped — event already finished';
   }
   if (row.promote_skipped_early) {
+    if (retireFinishedEvents) return 'Deferred until this event starts';
     return row.promote_skipped_early_adopted
       ? 'Deferred (further ahead than the lead window), and it keeps the channel it already has'
       : 'Deferred (further ahead than the lead window), so it gets its channel on a later run';
@@ -628,7 +630,7 @@ export function EventSyncPreviewPanel({
                             : 'None in time window'}
                         </td>
                         {preview.promotion && (
-                          <td>{promotionRowReason(row)}</td>
+                          <td>{promotionRowReason(row, preview.promotion.retire_finished_events)}</td>
                         )}
                       </tr>
                     ))}
@@ -646,6 +648,34 @@ export function EventSyncPreviewPanel({
               data-testid="event-sync-would-promote"
             >
               <h4>Would promote ({preview.promotion.would_promote})</h4>
+              {preview.promotion.event_states != null && (
+                <>
+                  <h5>Event states ({preview.promotion.event_states.length})</h5>
+                  <ul>
+                    {preview.promotion.event_states.slice(0, 100).map(row => (
+                      <li key={row.channel_id}>Channel {row.channel_id}: {row.status}</li>
+                    ))}
+                  </ul>
+                  {preview.promotion.event_states.length > 100 && (
+                    <p className="form-hint">Showing 100 of {preview.promotion.event_states.length} event states.</p>
+                  )}
+                </>
+              )}
+              {preview.promotion.retirements != null && (
+                <>
+                  <h5>Retirement decisions ({preview.promotion.retirements.length})</h5>
+                  <ul>
+                    {preview.promotion.retirements.slice(0, 100).map((row, index) => (
+                      <li key={index}>
+                        {row.channel_id != null ? `Channel ${row.channel_id}: ` : ''}{row.action}
+                      </li>
+                    ))}
+                  </ul>
+                  {preview.promotion.retirements.length > 100 && (
+                    <p className="form-hint">Showing 100 of {preview.promotion.retirements.length} retirement decisions.</p>
+                  )}
+                </>
+              )}
               <p className="form-hint">
                 Each entry becomes ONE ECM-managed channel in the target
                 group ({preview.promotion.would_create} new,{' '}
@@ -673,10 +703,14 @@ export function EventSyncPreviewPanel({
                 >
                   {preview.promotion.skipped_past} event
                   {preview.promotion.skipped_past === 1 ? '' : 's'} skipped
-                  because they had already finished. Turn off &quot;Skip
-                  events that have already finished, and remove their
-                  channels&quot; on the rule, or raise the grace hours, if
-                  you expected them here.
+                  {preview.promotion.retire_finished_events ? (
+                    <> because their starts are before the current 24-hour event window. This does not establish that a broadcast has ended.</>
+                  ) : (
+                    <> because they had already finished. Turn off &quot;Skip
+                    events that have already finished, and remove their
+                    channels&quot; on the rule, or raise the grace hours, if
+                    you expected them here.</>
+                  )}
                 </p>
               )}
               {preview.promotion.skipped_past_adopted > 0 && (
@@ -702,7 +736,9 @@ export function EventSyncPreviewPanel({
                   className="form-hint"
                   data-testid="event-sync-promote-skipped-early"
                 >
-                  {skippedEarlyText(preview.promotion.skipped_early ?? 0)}
+                  {preview.promotion.retire_finished_events
+                    ? `${preview.promotion.skipped_early} event(s) deferred until their starts.`
+                    : skippedEarlyText(preview.promotion.skipped_early ?? 0)}
                 </p>
               )}
               {(preview.promotion.dead_streams_skipped ?? 0) > 0 && (

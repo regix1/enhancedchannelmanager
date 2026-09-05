@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from channel_pipeline_engine import ChannelPipelineEngine
@@ -266,6 +267,16 @@ class TestAutoRunTriggerGate:
             "m3u_refresh", {"auto_run": "true"}) is False
         assert event_sync_trigger_allowed(
             "m3u_refresh", {"auto_run": 1}) is False
+
+    @pytest.mark.parametrize("config,allowed", [
+        ({"auto_run": True, "retire_finished_events": True}, True),
+        ({"auto_run": False, "retire_finished_events": True}, False),
+        ({"auto_run": True, "retire_finished_events": False}, False),
+        ({"auto_run": True, "retire_finished_events": "true"}, False),
+    ])
+    def test_scheduled_event_lifecycle_requires_both_flags(self, config, allowed):
+        from channel_pipeline_engine import event_sync_trigger_allowed
+        assert event_sync_trigger_allowed("scheduled", config) is allowed
 
     def test_scheduled_and_unspecified_denied_even_with_opt_in(self):
         """auto_run opts into the WATERMARK trigger only — every other

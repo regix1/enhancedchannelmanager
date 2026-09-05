@@ -1693,6 +1693,85 @@ describe('EventSyncRuleEditor', () => {
       );
     }
 
+    it.each([1, 101])('previews and saves the same confirmed idle settings without changing zero or false', async (count) => {
+      const user = userEvent.setup();
+      seedGroups();
+      mockDataStore.channelGroups.push(
+        createMockChannelGroup({ id: 40, name: 'Promoted Events' })
+      );
+      stubGroupSettings({ 1: true, 2: false });
+      const previewRequest = vi.fn();
+      server.use(
+        http.post('/api/channel-pipeline/event-sync-preview', async ({ request }) => {
+          previewRequest(await request.json());
+          return HttpResponse.json({
+            ...PREVIEW_FIXTURE,
+            summary: { ...PREVIEW_FIXTURE.summary, secondary_streams: 3, unmatched: 2 },
+            unmatched_streams: [
+              { group_id: 2, stream_id: 101, stream_name: 'Old event', provider: 'Example',
+                parsed: { title: 'Old event', start: null }, would_promote: false, promote_skipped_past: true },
+              { group_id: 2, stream_id: 102, stream_name: 'Future event', provider: 'Example',
+                parsed: { title: 'Future event', start: null }, would_promote: false, promote_skipped_early: true },
+            ],
+            promotion: {
+              retire_finished_events: true,
+              enabled: true, target_group_id: 40, would_promote: 0,
+              would_promote_streams: 0, would_create: 0, would_attach_existing: 0,
+              cap: 25, capped: false, cap_overage: 0, skipped_past: 1, skipped_early: 1,
+              skipped_past_adopted: 0, units: [],
+              event_states: Array.from({ length: count }, (_, index) => ({ channel_id: 900 + index, status: 'idle' })),
+              retirements: Array.from({ length: count }, (_, index) => ({
+                channel_id: 900 + index,
+                action: index === 0 ? "Would delete orphaned channel 'Fury vs. Usyk'" : `Preserve channel ${900 + index}`,
+              })),
+            },
+          });
+        })
+      );
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          dummy_epg_profile_id: 7,
+          retire_finished_events: true,
+          promote_lead_hours: 0,
+          skip_past_events: false,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+      await screen.findByTestId('psg-master');
+
+      await user.click(screen.getByRole('button', { name: /preview matches/i }));
+      await screen.findByTestId('event-sync-summary');
+      await goToStep(user, 4);
+      expect(await screen.findByText(/Would delete orphaned channel 'Fury vs. Usyk'/)).toBeInTheDocument();
+      expect(screen.getByText('Skipped — start is before the current 24-hour event window')).toBeInTheDocument();
+      expect(screen.getByText('Deferred until this event starts')).toBeInTheDocument();
+      expect(screen.getByText(/This does not establish that a broadcast has ended/)).toBeInTheDocument();
+      expect(screen.getByText(`Event states (${count})`)).toBeInTheDocument();
+      expect(screen.getByText(`Retirement decisions (${count})`)).toBeInTheDocument();
+      if (count > 100) {
+        expect(screen.getByText('Showing 100 of 101 event states.')).toBeInTheDocument();
+        expect(screen.getByText('Showing 100 of 101 retirement decisions.')).toBeInTheDocument();
+        expect(screen.queryByText('Channel 1000: idle')).not.toBeInTheDocument();
+        expect(screen.queryByText(/Preserve channel 1000/)).not.toBeInTheDocument();
+      }
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(previewRequest.mock.calls[0][0].event_sync_config).toEqual(
+        onSave.mock.calls[0][0].event_sync_config
+      );
+      expect(previewRequest.mock.calls[0][0].rule_id).toBe(rule.id);
+      expect(onSave.mock.calls[0][0].event_sync_config).toMatchObject({
+        retire_finished_events: true,
+        promote_lead_hours: 0,
+        skip_past_events: false,
+      });
+    });
+
     it('step pills switch the visible left-column section and mark the active pill', async () => {
       const user = userEvent.setup();
       seedGroups();
@@ -1911,6 +1990,7 @@ describe('EventSyncRuleEditor', () => {
       expect(config).not.toHaveProperty('promote_unmatched');
       expect(config).not.toHaveProperty('promote_target_group_id');
       expect(config).not.toHaveProperty('max_promote_per_run');
+      expect(config).not.toHaveProperty('retire_finished_events');
     });
 
     it('blocks save when enabled without a target group, with a teaching error', async () => {
@@ -2524,6 +2604,139 @@ describe('EventSyncRuleEditor', () => {
       // not start writing the key.
       expect(config).not.toHaveProperty('skip_dead_streams');
       expect(config.promote_unmatched).toBe(true);
+    });
+
+    it.each([true, false])('preserves confirmed idle retirement %s on save', async retireFinishedEvents => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          dummy_epg_profile_id: 7,
+          retire_finished_events: retireFinishedEvents,
+          promote_lead_hours: 0,
+          skip_past_events: false,
+          past_event_grace_hours: 0,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config).toMatchObject({
+        retire_finished_events: retireFinishedEvents,
+        promote_lead_hours: 0,
+        skip_past_events: false,
+        past_event_grace_hours: 0,
+      });
+    });
+
+    it('preserves a zero-hour promotion lead on save', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          promote_lead_hours: 0,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.promote_lead_hours).toBe(0);
+    });
+
+    it.each([true, false])('marks a retirement toggle from %s dirty and saves the new value', async retireFinishedEvents => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const onCancel = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          dummy_epg_profile_id: 7,
+          retire_finished_events: retireFinishedEvents,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={onCancel} />);
+
+      const toggle = screen.getByLabelText('Remove confirmed idle event channels');
+      expect(toggle).toHaveProperty('checked', retireFinishedEvents);
+      await user.click(toggle);
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(screen.getByTestId('event-sync-discard-dialog')).toBeInTheDocument();
+      expect(onCancel).not.toHaveBeenCalled();
+      await user.click(screen.getByRole('button', { name: 'Keep editing' }));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.retire_finished_events).toBe(!retireFinishedEvents);
+    });
+
+    it.each([
+      { promote_unmatched: true, dummy_epg_profile_id: undefined },
+      { promote_unmatched: false, dummy_epg_profile_id: 7 },
+    ])('requires promotion and a guide for retirement but allows turning it off: %s', async prerequisites => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_target_group_id: 40,
+          retire_finished_events: true,
+          ...prerequisites,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      expect(onSave).not.toHaveBeenCalled();
+      expect(screen.getAllByText(/Confirmed idle event removal requires promotion and a dummy EPG profile/).length).toBeGreaterThan(0);
+      await user.click(screen.getByLabelText('Remove confirmed idle event channels'));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.retire_finished_events).toBe(false);
+    });
+
+    it('keeps untouched confirmed idle settings pristine when closing', async () => {
+      const user = userEvent.setup();
+      seedPromoGroup();
+      stubGroupSettings({ 1: true, 2: false });
+      const onCancel = vi.fn();
+      const rule = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          promote_unmatched: true,
+          promote_target_group_id: 40,
+          dummy_epg_profile_id: 7,
+          retire_finished_events: true,
+          promote_lead_hours: 0,
+          skip_past_events: false,
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={vi.fn()} onCancel={onCancel} />);
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(onCancel).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId('event-sync-discard-dialog')).not.toBeInTheDocument();
     });
 
     it('round-trips a stored promotion config and preserves an API-set cap', async () => {

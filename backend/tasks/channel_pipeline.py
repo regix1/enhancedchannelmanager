@@ -6,7 +6,7 @@ from streams based on configured rules.
 """
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import journal
@@ -130,35 +130,18 @@ class ChannelPipelineTask(TaskScheduler):
 
 
     async def execute(self) -> TaskResult:
-        """Run the post-refresh auto-creation pipeline, behind the AUTO-FIRE GUARD.
+        """Run eligible refresh rules or due event rules through the same pipeline.
 
-        ADR-011 (bd-ka7j9): this is now the SINGLE auto-creation entry point for
-        the unattended path. It ticks on an INTERVAL schedule (~60s); the guard
-        below decides whether the tick actually runs anything. The manual
-        pipeline ``POST /api/auto-creation/run`` path goes straight to
-        ``engine.run_pipeline`` and is deliberately NOT gated here.
-
-        AUTO-FIRE GUARD — the pipeline runs only when ALL of these hold:
-          (a) the task is enabled (the engine already filters disabled tasks,
-              re-checked here so a direct execute() call is also safe);
-          (b) ``_run_on_refresh_suppressed()`` is False — the exo4j breaker is
-              clear AND ``ECM_DISABLE_RUN_ON_REFRESH`` is unset (read FRESH every
-              tick: the breaker scenario is a restart, so a cached value is wrong);
-          (c) at least one ``enabled AND run_on_refresh=True`` rule exists (Q2 —
-              only that rule set ever runs on this path);
-          (d) the refresh watermark is newer than the consumed watermark
-              (``last_m3u_refresh_completed_at > last_auto_creation_consumed_refresh_at``)
-              — i.e. an M3U refresh has completed since we last consumed one.
-
-        When it runs, it advances ``last_auto_creation_consumed_refresh_at`` to
-        the consumed refresh value BEFORE running the pipeline (so an overlapping
-        tick — already guarded by the engine's "already running" check — and a
-        crash mid-run both leave the watermark consumed, preventing a re-fire
-        loop against the same refresh).
+        The existing interval tick respects task enablement, the circuit breaker,
+        active UTC date windows and each rule's auto-run opt-in. Without a new
+        provider refresh, only event rules with retirement enabled and no run in
+        the preceding five minutes are eligible. That pass leaves the provider
+        refresh watermark untouched; pipeline locks still serialize execution.
         """
         from channel_pipeline_engine import get_channel_pipeline_engine, init_channel_pipeline_engine
         from database import get_session
         from models import ChannelPipelineRule
+        from cache import get_cache
 
         started_at = datetime.utcnow()
         self._set_progress(status="initializing")
@@ -182,35 +165,8 @@ class ChannelPipelineTask(TaskScheduler):
         refresh_at = getattr(settings, "last_m3u_refresh_completed_at", "") or ""
         consumed_at = getattr(settings, "last_auto_creation_consumed_refresh_at", "") or ""
 
-        # (d) A new refresh must have completed since we last consumed one.
-        # Empty refresh watermark == "never refreshed" -> nothing to do. Empty
-        # consumed watermark with a real refresh watermark == first-ever refresh
-        # -> fire once. String compare is correct for ISO-8601 UTC timestamps.
-        if not refresh_at or not (refresh_at > consumed_at):
-            logger.debug(
-                "[%s] No new M3U refresh to consume (refresh=%s consumed=%s) — skipping",
-                self.task_id, refresh_at or "never", consumed_at or "never",
-            )
-            return TaskResult(
-                success=True, message="No new M3U refresh to process",
-                started_at=started_at, completed_at=datetime.utcnow(), total_items=0,
-            )
+        refresh_due = bool(refresh_at and refresh_at > consumed_at)
 
-        # (c) At least one rule eligible for the unattended path. Two
-        # DISJOINT rule sets ride it:
-        #
-        # * Standard rules: enabled AND run_on_refresh=True (Q2 — unchanged).
-        #   The query still excludes every event_sync rule, even one with
-        #   run_on_refresh set — that flag is not the event_sync opt-in.
-        # * event_sync rules (ti939.3.1): enabled AND the config carries the
-        #   EXPLICIT auto_run=true opt-in. The flag lives inside the JSON
-        #   config column, so candidates are selected by SQL
-        #   (event_sync_config IS NOT NULL) and the flag is read in Python —
-        #   only the literal True opts in (absent == false, the
-        #   backward-compat rail for stored configs). The engine's per-rule
-        #   trigger gate (event_sync_trigger_allowed) is the second,
-        #   independent layer, and the attach phase re-checks the breaker +
-        #   pre-flight as the third.
         self._set_progress(status="loading_rules")
         session = get_session()
         try:
@@ -236,6 +192,18 @@ class ChannelPipelineTask(TaskScheduler):
                 r for r in event_sync_candidates
                 if (r.get_event_sync_config() or {}).get("auto_run") is True
             ]
+            if not refresh_due:
+                rules_to_run = []
+                event_sync_to_run = [
+                    rule for rule in event_sync_to_run
+                    if (rule.get_event_sync_config() or {}).get("retire_finished_events") is True
+                    and (rule.get_event_sync_config() or {}).get("enabled", True)
+                    and (not rule.last_run_at or rule.last_run_at.replace(
+                        tzinfo=rule.last_run_at.tzinfo or timezone.utc,
+                    ) <= (started_at - timedelta(minutes=5)).replace(tzinfo=timezone.utc))
+                    and (not self.rule_ids or rule.id in self.rule_ids)
+                    and get_cache().get(f"event_sync_attempt:{self.task_id}:{rule.id}", ttl=300) is None
+                ]
             rule_ids = (
                 [r.id for r in rules_to_run]
                 + [r.id for r in event_sync_to_run]
@@ -270,6 +238,18 @@ class ChannelPipelineTask(TaskScheduler):
                 )
         finally:
             session.close()
+
+        if not rule_ids and not refresh_due:
+            return TaskResult(
+                success=True, message="No new M3U refresh or due event rule",
+                started_at=started_at, completed_at=datetime.utcnow(), total_items=0,
+                suppress_completion_notification=any(
+                    (rule.get_event_sync_config() or {}).get("auto_run") is True
+                    and (rule.get_event_sync_config() or {}).get("retire_finished_events") is True
+                    and (rule.get_event_sync_config() or {}).get("enabled", True)
+                    for rule in event_sync_candidates
+                ),
+            )
 
         if not rule_ids:
             date_gated = date_gated_standard or date_gated_event_sync
@@ -315,8 +295,12 @@ class ChannelPipelineTask(TaskScheduler):
         # All guard conditions hold — CONSUME the watermark BEFORE running, so a
         # crash or an overlapping tick cannot re-fire against the same refresh.
         try:
-            settings.last_auto_creation_consumed_refresh_at = refresh_at
-            save_settings(settings)
+            if not refresh_due:
+                for rule_id in rule_ids:
+                    get_cache().set(f"event_sync_attempt:{self.task_id}:{rule_id}", True)
+            if refresh_due:
+                settings.last_auto_creation_consumed_refresh_at = refresh_at
+                save_settings(settings)
         except Exception as e:  # pragma: no cover — best-effort, must not block the run
             logger.warning("[%s] Failed to advance consumed-refresh watermark: %s", self.task_id, e)
 
@@ -324,7 +308,10 @@ class ChannelPipelineTask(TaskScheduler):
             "[%s] Auto-firing %s run_on_refresh rule(s) for refresh watermark %s",
             self.task_id, len(rule_ids), refresh_at,
         )
-        return await self._run_post_refresh_pipeline(rule_ids, rule_names, started_at)
+        return await self._run_post_refresh_pipeline(
+            rule_ids, rule_names, started_at,
+            triggered_by="m3u_refresh" if refresh_due else "scheduled",
+        )
 
     async def _handle_suppressed(self, reason: str, started_at: datetime) -> TaskResult:
         """Breaker / break-glass suppression path (migrated from the old
@@ -378,7 +365,7 @@ class ChannelPipelineTask(TaskScheduler):
         )
 
     async def _run_post_refresh_pipeline(
-        self, rule_ids: list, rule_names: list, started_at: datetime
+        self, rule_ids: list, rule_names: list, started_at: datetime, triggered_by: str = "m3u_refresh",
     ) -> TaskResult:
         """Run the run_on_refresh rule set and emit the start/completion/cap
         notifications (migrated from the old run_auto_creation_after_refresh so
@@ -391,16 +378,18 @@ class ChannelPipelineTask(TaskScheduler):
             current_item=f"Processing {len(rule_ids)} rule(s)...",
         )
 
-        # Notify: starting
-        await create_notification_internal(
-            notification_type="info",
-            title="Auto-Creation: Starting",
-            message=f"Running {len(rule_ids)} rule{'s' if len(rule_ids) != 1 else ''} "
-                    f"after M3U refresh: {', '.join(rule_names)}",
-            source="auto_creation",
-            source_id="m3u_refresh",
-            send_alerts=False,
-        )
+        # Scheduled checks report changes and failures without a start notification.
+        if triggered_by != "scheduled":
+            await create_notification_internal(
+                notification_type="info",
+                title="Auto-Creation: Starting",
+                message=f"Running {len(rule_ids)} rule{'s' if len(rule_ids) != 1 else ''} "
+                        + ("after M3U refresh" if triggered_by == "m3u_refresh" else "on a scheduled event check")
+                        + f": {', '.join(rule_names)}",
+                source="auto_creation",
+                source_id=triggered_by,
+                send_alerts=False,
+            )
 
         client = get_client()
         engine = get_channel_pipeline_engine()
@@ -411,7 +400,7 @@ class ChannelPipelineTask(TaskScheduler):
         try:
             result = await engine.run_pipeline(
                 dry_run=False,
-                triggered_by="m3u_refresh",
+                triggered_by=triggered_by,
                 m3u_account_ids=self.m3u_account_ids if self.m3u_account_ids else None,
                 rule_ids=rule_ids,
             )
@@ -477,14 +466,24 @@ class ChannelPipelineTask(TaskScheduler):
                 or bool(failed_action_count)
             )
 
+            quiet = triggered_by == "scheduled" and not any((
+                created, updated, pending_merges, event_sync_attached, event_sync_review_queued,
+                result.get("channels_removed"), result.get("channels_moved"), result.get("capped"),
+                has_failed_actions,
+            ))
+
             # Notify: completed — clean / partial-info runs only. A failed-action
             # run defers its single warning to the task-engine layer (above).
-            if not has_failed_actions:
+            if not has_failed_actions and not quiet:
                 parts = []
                 if created:
                     parts.append(f"{created} created")
                 if updated:
                     parts.append(f"{updated} updated")
+                if result.get("channels_removed"):
+                    parts.append(f"{result['channels_removed']} removed")
+                if result.get("channels_moved"):
+                    parts.append(f"{result['channels_moved']} moved")
                 if pending_merges:
                     parts.append(f"{pending_merges} pending merge{'s' if pending_merges != 1 else ''} queued")
                 if event_sync_attached:
@@ -504,10 +503,11 @@ class ChannelPipelineTask(TaskScheduler):
                 await create_notification_internal(
                     notification_type=ntype,
                     title=title,
-                    message=f"Ran {len(rule_ids)} rule(s) after M3U refresh. "
-                            f"{matched}/{evaluated} streams matched.",
+                    message=f"Ran {len(rule_ids)} rule(s) "
+                            + ("after M3U refresh. " if triggered_by == "m3u_refresh" else "on a scheduled event check. ")
+                            + f"{matched}/{evaluated} streams matched.",
                     source="auto_creation",
-                    source_id="m3u_refresh",
+                    source_id=triggered_by,
                     send_alerts=False,
                 )
 
@@ -603,12 +603,12 @@ class ChannelPipelineTask(TaskScheduler):
                 # skip its generic "Task Completed with Warnings" — otherwise the
                 # unattended path emits two separate warnings for one run.
                 suppress_completion_notification=bool(
-                    result.get("capped") and has_failed_actions
+                    (result.get("capped") and has_failed_actions) or quiet
                 ),
                 details={
                     "execution_id": result.get("execution_id"),
                     "mode": "execute",
-                    "triggered_by": "m3u_refresh",
+                    "triggered_by": triggered_by,
                     "streams_evaluated": evaluated,
                     "streams_matched": matched,
                     "channels_created": created,
@@ -630,7 +630,7 @@ class ChannelPipelineTask(TaskScheduler):
                 title="Auto-Creation: Failed",
                 message=f"Auto-creation after M3U refresh failed: {e}",
                 source="auto_creation",
-                source_id="m3u_refresh",
+                source_id=triggered_by,
                 send_alerts=False,
             )
             return TaskResult(

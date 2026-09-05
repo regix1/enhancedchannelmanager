@@ -3,7 +3,7 @@
 Pins:
 * the tool calls the ac_event_sync_preview endpoint (POST
   /api/channel-pipeline/event-sync-preview) through call_endpoint — the
-  contract-checked path — with exactly one of rule_id / event_sync_config;
+  contract-checked path with saved ownership and optional draft settings;
 * zero write endpoints are ever touched (read-only by construction: the
   ONLY backend call is the preview endpoint);
 * pre-flight failures and parse failures from the response surface in the
@@ -232,19 +232,24 @@ class TestPreviewEventSync:
         assert "12 stream(s)" in text
 
     @pytest.mark.asyncio
-    async def test_exactly_one_source_enforced(self):
+    async def test_source_enforced(self):
         mcp = _make_mcp_and_register()
         client = AsyncMock()
         neither = await _call_tool(mcp, client, {})
+        assert "provide rule_id or event_sync_config" in neither
+        client.call_endpoint.assert_not_called()
+        client.call_endpoint.return_value = _preview_response()
         both = await _call_tool(
             mcp, client,
             {"rule_id": 1,
              "event_sync_config": {"master_group_id": 10,
                                    "secondary_group_ids": [20]}},
         )
-        assert "exactly one" in neither
-        assert "exactly one" in both
-        client.call_endpoint.assert_not_called()
+        assert "Pre-flight: OK" in both
+        assert client.call_endpoint.call_args.kwargs["body"] == {
+            "rule_id": 1, "event_sync_config": {"master_group_id": 10, "secondary_group_ids": [20]},
+        }
+        client.call_endpoint.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_backend_error_is_reported_not_raised(self):

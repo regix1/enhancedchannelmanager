@@ -132,6 +132,7 @@ _AC_RULE_CREATE_FIELDS = frozenset(
         # the request client-side, which left the documented churn workaround
         # unreachable through the sidecar.
         "allow_manual_channel_merge",
+        "event_sync_config",
     }
 )
 
@@ -157,16 +158,12 @@ _AC_RULE_UPDATE_FIELDS = _AC_RULE_CREATE_FIELDS
 #                               Set through the UI; the sidecar exposes only
 #                               the match_scope_target_group boolean.
 #   fold_match_key              Fold-match opt-in (GH #645).
-#   event_sync_config           Event Sync rule config. A nested object edited
-#                               through its own preview/config tooling, not a
-#                               scalar the rule tools set.
 AC_RULE_FIELDS_NOT_EXPOSED = frozenset(
     {
         "active_from",
         "active_until",
         "match_scope_group_id",
         "fold_match_key",
-        "event_sync_config",
     }
 )
 

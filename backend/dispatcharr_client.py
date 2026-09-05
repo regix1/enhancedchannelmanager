@@ -1608,108 +1608,226 @@ class DispatcharrClient:
         epg_source: Optional[int] = None,
         max_results: Optional[int] = None,
     ) -> list:
-        """Get all EPG data entries.
-
-        Handles both old (paginated dict) and new (flat list) Dispatcharr responses.
-        For paginated responses, fetches all pages automatically.
-        """
+        """Read EPG rows from flat or paginated responses, selecting before limiting."""
         params = {"page": page, "page_size": page_size}
         if search:
             params["search"] = search
-        if epg_source:
+        if epg_source is not None:
             params["epg_source"] = epg_source
 
-        if max_results is None:
-            response = await self._request("GET", "/api/epg/epgdata/", params=params)
-            response.raise_for_status()
-            data = response.json()
-        else:
-            # Newer Dispatcharr versions ignore pagination and return one flat
-            # array. Stream that response behind a byte ceiling so a bounded
-            # caller cannot be forced to materialize arbitrarily large JSON.
-            max_bytes = max(
-                _EPG_DATA_MIN_RESPONSE_BYTES,
-                max_results * _EPG_DATA_BYTES_PER_RESULT,
-            )
-            data = await self._get_json_bounded(
-                "/api/epg/epgdata/", params=params, max_bytes=max_bytes
-            )
+        limits = None
+        deadline = asyncio.get_running_loop().time() + 120
+        if max_results is not None:
+            max_bytes = max(_EPG_DATA_MIN_RESPONSE_BYTES, max_results * _EPG_DATA_BYTES_PER_RESULT)
+            if search or epg_source is not None:
+                async with asyncio.timeout_at(deadline):
+                    sources = await self.get_epg_sources()
+                if isinstance(sources, dict):
+                    sources = sources.get("results", sources.get("sources"))
+                if not isinstance(sources, list) or any(not isinstance(source, dict) for source in sources):
+                    raise ValueError("Dispatcharr EPG source counts are unavailable")
+                counts = [source.get("epg_data_count", source.get("channel_count")) for source in sources]
+                if not counts or any(type(count) is not int or count < 0 for count in counts):
+                    raise ValueError("Dispatcharr EPG source counts are unavailable")
+                total = sum(counts)
+                # The flat endpoint ignores page and filter parameters. Its input
+                # budget follows the catalogue count, not the retained match count.
+                # Reserve 10% (at least one page) for a refresh in progress.
+                if total > 200000:
+                    raise ValueError("Dispatcharr EPG catalogue exceeds 200000 rows")
+                rows = min(200000, total + max(page_size, (total + 9) // 10))
+                limits = {"rows": rows, "bytes": max(_EPG_DATA_MIN_RESPONSE_BYTES,
+                                                      rows * _EPG_DATA_BYTES_PER_RESULT)}
+                max_bytes = limits["bytes"]
 
-        # New Dispatcharr: flat list response
-        if isinstance(data, list):
-            return data[:max_results] if max_results is not None else data
-
-        # Old Dispatcharr: paginated dict response - fetch all pages
-        all_results = data.get("results", [])
-        if max_results is not None and len(all_results) >= max_results:
-            return all_results[:max_results]
-        while data.get("next"):
-            page += 1
-            params["page"] = page
+        all_results = []
+        while True:
             if max_results is None:
-                response = await self._request(
-                    "GET", "/api/epg/epgdata/", params=params
-                )
+                response = await self._request("GET", "/api/epg/epgdata/", params=params)
                 response.raise_for_status()
                 data = response.json()
             else:
                 data = await self._get_json_bounded(
-                    "/api/epg/epgdata/", params=params, max_bytes=max_bytes
+                    "/api/epg/epgdata/", params=params, max_bytes=max_bytes,
+                    max_results=max_results - len(all_results) if limits is not None else None,
+                    limits=limits, deadline=deadline,
                 )
-            if isinstance(data, list):
-                # Switched to new format mid-pagination (unlikely but safe)
-                all_results.extend(data)
-                break
-            all_results.extend(data.get("results", []))
+            rows = data if isinstance(data, list) else data.get("results", [])
+            all_results.extend(rows)
             if max_results is not None and len(all_results) >= max_results:
                 return all_results[:max_results]
-
-        return all_results[:max_results] if max_results is not None else all_results
+            if isinstance(data, list) or not data.get("next"):
+                return all_results
+            page += 1
+            params["page"] = page
 
     async def _get_json_bounded(
-        self, path: str, *, params: dict, max_bytes: int
+        self, path: str, *, params: dict, max_bytes: int,
+        max_results: int | None = None, limits: dict | None = None,
+        deadline: float | None = None,
     ):
-        """GET and decode JSON only after its streamed body fits ``max_bytes``."""
-        await self._ensure_authenticated()
-        headers = {}
-        if self._uses_api_key:
-            headers["X-API-Key"] = (
-                self.settings.dispatcharr_api_key or self.settings.api_key
-            )
-        else:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        headers["Accept-Encoding"] = "identity"
+        """Read bounded JSON, retaining only selected rows from a filtered catalogue."""
+        import codecs
+        from epg_matching import _epg_source_id
 
-        async def send() -> httpx.Response:
-            request = self._client.build_request(
-                "GET", f"{self.base_url}{path}", headers=headers, params=params
-            )
-            return await self._client.send(request, stream=True)
+        deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 120
+        async with asyncio.timeout_at(deadline):
+            await self._ensure_authenticated()
+            headers = {}
+            if self._uses_api_key:
+                headers["X-API-Key"] = self.settings.dispatcharr_api_key or self.settings.api_key
+            else:
+                headers["Authorization"] = f"Bearer {self.access_token}"
+            headers["Accept-Encoding"] = "identity"
 
-        response = await send()
-        if response.status_code == 401 and not self._uses_api_key:
-            await response.aclose()
-            await self._refresh_access_token()
-            headers["Authorization"] = f"Bearer {self.access_token}"
-            response = await send()
-        try:
-            response.raise_for_status()
-            content_encoding = response.headers.get("Content-Encoding", "").strip()
-            if content_encoding and content_encoding.lower() != "identity":
-                raise ValueError(
-                    "Dispatcharr EPG response used unexpected Content-Encoding"
+            async def send() -> httpx.Response:
+                request = self._client.build_request(
+                    "GET", f"{self.base_url}{path}", headers=headers, params=params
                 )
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                if len(body) + len(chunk) > max_bytes:
-                    raise ValueError(
-                        f"Dispatcharr EPG response exceeds {max_bytes} bytes"
-                    )
-                body.extend(chunk)
-            # Parsing occurs only after the bounded stream is complete.
-            return await run_cpu_bound(json.loads, bytes(body))
-        finally:
-            await response.aclose()
+                return await self._client.send(request, stream=True)
+
+            response = await send()
+            if response.status_code == 401 and not self._uses_api_key:
+                await response.aclose()
+                await self._refresh_access_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                response = await send()
+            try:
+                response.raise_for_status()
+                content_encoding = response.headers.get("Content-Encoding", "").strip()
+                if content_encoding and content_encoding.lower() != "identity":
+                    raise ValueError("Dispatcharr EPG response used unexpected Content-Encoding")
+                if limits is None:
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > max_bytes:
+                            raise ValueError(f"Dispatcharr EPG response exceeds {max_bytes} bytes")
+                        body.extend(chunk)
+                    return await run_cpu_bound(json.loads, bytes(body))
+
+                # A catalogue row has bounded name, TVG and icon fields. 16 KiB
+                # also accommodates JSON surrogate escaping of those fields.
+                row_bytes = _EPG_DATA_BYTES_PER_RESULT * 8
+                decoder = json.JSONDecoder()
+                utf8 = codecs.getincrementaldecoder("utf-8")()
+                buffer = ""
+                state = "start"
+                shape = None
+                allow_end = True
+                key = None
+                field_count = 0
+                results_seen = False
+                selected = []
+                next_page = None
+                query = str(params.get("search") or "").casefold()
+                source_id = params.get("epg_source")
+
+                def consume(chunk: bytes, final: bool = False) -> None:
+                    nonlocal buffer, state, shape, allow_end, key, field_count
+                    nonlocal results_seen, next_page
+                    buffer += utf8.decode(chunk, final=final)
+                    while True:
+                        buffer = buffer.lstrip(" \t\r\n")
+                        if not buffer:
+                            break
+                        token = buffer[0]
+                        if state == "done":
+                            raise ValueError("Dispatcharr EPG response contains trailing JSON")
+                        if state == "start":
+                            if token not in "[{":
+                                raise ValueError("Dispatcharr EPG response must be an array or object")
+                            shape = token
+                            state = "array_value" if token == "[" else "object_key"
+                            buffer = buffer[1:]
+                            continue
+                        if state == "object_colon":
+                            if token != ":":
+                                raise ValueError("Dispatcharr EPG response has an invalid object")
+                            state, buffer = "object_value", buffer[1:]
+                            continue
+                        if state in ("array_delimiter", "object_delimiter"):
+                            closing = "]" if state == "array_delimiter" else "}"
+                            if token == closing:
+                                buffer = buffer[1:]
+                                if state == "array_delimiter" and shape == "{":
+                                    state = "object_delimiter"
+                                else:
+                                    state = "done"
+                                continue
+                            if token != ",":
+                                raise ValueError("Dispatcharr EPG response has an invalid delimiter")
+                            state = "array_value" if state == "array_delimiter" else "object_key"
+                            allow_end, buffer = False, buffer[1:]
+                            continue
+                        if state == "array_value" and token == "]" and allow_end:
+                            state = "done" if shape == "[" else "object_delimiter"
+                            buffer = buffer[1:]
+                            continue
+                        if state == "object_key" and token == "}" and allow_end:
+                            state, buffer = "done", buffer[1:]
+                            continue
+                        if state == "object_value" and key == "results":
+                            if token != "[" or results_seen:
+                                raise ValueError("Dispatcharr EPG response has invalid results")
+                            results_seen = True
+                            state, allow_end, buffer = "array_value", True, buffer[1:]
+                            continue
+                        try:
+                            value, end = decoder.raw_decode(buffer)
+                        except json.JSONDecodeError:
+                            if final:
+                                raise
+                            if len(buffer.encode("utf-8")) > row_bytes:
+                                raise ValueError(f"Dispatcharr EPG response exceeds {row_bytes} bytes per row")
+                            break
+                        # A number can continue in the next chunk. Wait for its
+                        # delimiter before consuming a value at a chunk boundary.
+                        if end == len(buffer) and not final:
+                            if len(buffer.encode("utf-8")) > row_bytes:
+                                raise ValueError(f"Dispatcharr EPG response exceeds {row_bytes} bytes per row")
+                            break
+                        encoded_size = len(buffer[:end].encode("utf-8"))
+                        if encoded_size > row_bytes:
+                            raise ValueError(f"Dispatcharr EPG response exceeds {row_bytes} bytes per row")
+                        buffer = buffer[end:]
+                        if state == "object_key":
+                            if not isinstance(value, str):
+                                raise ValueError("Dispatcharr EPG response has an invalid object key")
+                            field_count += 1
+                            if field_count > 64:
+                                raise ValueError("Dispatcharr EPG response has too many fields")
+                            key, state = value, "object_colon"
+                        elif state == "object_value":
+                            if key == "next":
+                                next_page = value
+                            state = "object_delimiter"
+                        elif state == "array_value":
+                            if not isinstance(value, dict):
+                                raise ValueError("Dispatcharr EPG response contains a non-object row")
+                            limits["rows"] -= 1
+                            if limits["rows"] < 0:
+                                raise ValueError("Dispatcharr EPG response exceeds its source row counts")
+                            row_source = _epg_source_id(value.get("epg_source") or value.get("epg_source_id"))
+                            source_matches = (source_id is None or (type(row_source) is int and source_id == row_source))
+                            name_matches = (not query or any(
+                                query in str(value.get(field) or "").casefold() for field in ("name", "tvg_id")))
+                            if source_matches and name_matches and len(selected) < max_results:
+                                selected.append(value)
+                            state = "array_delimiter"
+                        else:
+                            raise ValueError("Dispatcharr EPG response has an invalid structure")
+                    if final and (state != "done" or (shape == "{" and not results_seen)):
+                        raise ValueError("Dispatcharr EPG response is incomplete")
+
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    limits["bytes"] -= len(chunk)
+                    if limits["bytes"] < 0:
+                        raise ValueError(f"Dispatcharr EPG response exceeds {max_bytes} bytes")
+                    await run_cpu_bound(consume, chunk)
+                await run_cpu_bound(consume, b"", True)
+                return selected if shape == "[" else {"results": selected, "next": next_page}
+            finally:
+                await response.aclose()
 
     async def get_epg_data_by_id(self, data_id: int) -> dict:
         """Get a single EPG data entry by ID."""

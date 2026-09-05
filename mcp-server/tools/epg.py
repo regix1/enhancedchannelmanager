@@ -160,6 +160,7 @@ def register(mcp: FastMCP):
                             "Request timed out while reading.",
                             "Unsupported catalogue response encoding.",
                             "Response exceeded the catalogue size limit.",
+                            "Catalogue source counts are unavailable.",
                         } or re.fullmatch(r"HTTP status [1-5][0-9]{2}\.", detail):
                             reason += f" Catalogue error: {detail}"
                 elif isinstance(exc, httpx.RequestError):

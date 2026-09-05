@@ -493,6 +493,21 @@ class TestChannelPipelineEngineRunPipeline:
             )
 
     @patch("channel_pipeline_engine.get_session")
+    def test_delete_only_run_invalidates_the_dummy_guide(self, mock_get_session):
+        from cache import get_cache
+        _session_with_one_rule(mock_get_session)
+        results = _canned_run_results(0)
+        results["channels_removed"] = 1
+        cache = get_cache()
+        cache.set("dummy_epg_xmltv:all", "old channel")
+        with patch.object(self.engine, "_process_streams", AsyncMock(return_value=results)), \
+             patch("channel_pipeline_engine.request_guide_refresh", new=AsyncMock()) as refresh:
+            result = asyncio.get_event_loop().run_until_complete(self.engine.run_pipeline(dry_run=False))
+        assert result["channels_removed"] == 1
+        assert cache.get("dummy_epg_xmltv:all") is None
+        refresh.assert_awaited_once()
+
+    @patch("channel_pipeline_engine.get_session")
     def test_auto_link_skipped_on_dry_run(self, mock_get_session):
         """A dry run writes no guide links, however many channels it would create."""
         self.client.update_channel = AsyncMock()

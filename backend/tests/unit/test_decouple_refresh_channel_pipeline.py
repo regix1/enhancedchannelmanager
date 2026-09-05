@@ -17,7 +17,7 @@ auto-creation, the watermark advances, and the auto-fire guard fires iff all
 four conditions hold.
 """
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -156,12 +156,13 @@ def _patch_settings(**kwargs):
     return MagicMock(**base)
 
 
-async def _run_autofire(settings, rules, engine_result=None, env=None):
+async def _run_autofire(settings, rules, engine_result=None, env=None, rule_ids=None):
     """Run ChannelPipelineTask.execute() with the given settings + run_on_refresh rules.
 
     Returns (result, engine_mock, save_settings_mock).
     """
     from tasks.channel_pipeline import ChannelPipelineTask
+    from cache import Cache
 
     fake_engine = MagicMock()
     fake_engine.run_pipeline = AsyncMock(
@@ -177,6 +178,7 @@ async def _run_autofire(settings, rules, engine_result=None, env=None):
 
     env = env or {}
     with patch.dict(os.environ, env, clear=False), \
+         patch("cache.get_cache", return_value=Cache()), \
          patch("tasks.channel_pipeline.get_settings", return_value=settings), \
          patch("tasks.channel_pipeline.save_settings") as mock_save, \
          patch("services.notification_service.create_notification_internal", new=AsyncMock()), \
@@ -193,6 +195,7 @@ async def _run_autofire(settings, rules, engine_result=None, env=None):
         # tests exercise AUTO-FIRE GUARD conditions (b)/(c)/(d), which only apply
         # once condition (a) "enabled" holds — i.e. after an operator opts in.
         task._enabled = True
+        task.rule_ids = rule_ids or []
         result = await task.execute()
 
     return result, fake_engine, mock_save
@@ -202,6 +205,116 @@ def _rule(rid=1, name="R1"):
     r = MagicMock(id=rid)
     r.name = name
     return r
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["due", "aware_due", "recent", "aware_recent", "opt_out", "manual_only", "disabled", "scope", "breaker"])
+async def test_event_only_tick_keeps_the_refresh_watermark(case):
+    settings = _patch_settings(last_m3u_refresh_completed_at="2026-01-01",
+                               last_auto_creation_consumed_refresh_at="2026-01-01")
+    rule = _rule(22)
+    config = {"auto_run": True, "enabled": True, "retire_finished_events": True}
+    rule.last_run_at = datetime.utcnow() - timedelta(minutes=6)
+    if case in {"recent", "aware_recent"}:
+        rule.last_run_at = datetime.utcnow()
+    elif case == "opt_out":
+        config["retire_finished_events"] = False
+    elif case == "manual_only":
+        config["auto_run"] = False
+    elif case == "disabled":
+        config["enabled"] = False
+    elif case == "breaker":
+        settings.auto_creation_run_on_refresh_disabled = True
+    if case.startswith("aware"):
+        rule.last_run_at = rule.last_run_at.replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=5)))
+    rule.get_event_sync_config.return_value = config
+    result, engine, save = await _run_autofire(
+        settings, [_rule(1), rule], rule_ids=[99] if case == "scope" else [22],
+    )
+    assert result.success
+    if case in {"due", "aware_due"}:
+        engine.run_pipeline.assert_awaited_once()
+        assert engine.run_pipeline.await_args.kwargs["rule_ids"] == [22]
+        assert engine.run_pipeline.await_args.kwargs["triggered_by"] == "scheduled"
+    else:
+        engine.run_pipeline.assert_not_awaited()
+    save.assert_not_called()
+    assert settings.last_auto_creation_consumed_refresh_at == "2026-01-01"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["offline", "ALREADY_RUNNING", "cancelled"])
+async def test_scheduled_attempts_wait_after_failure(failure):
+    import asyncio
+    from cache import Cache
+    from tasks.channel_pipeline import ChannelPipelineTask
+
+    settings = _patch_settings()
+    rule = _rule(22)
+    rule.last_run_at = None
+    rule.get_event_sync_config.return_value = {"auto_run": True, "retire_finished_events": True}
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [rule]
+    engine = MagicMock()
+    engine.run_pipeline = AsyncMock(side_effect=asyncio.CancelledError() if failure == "cancelled" else RuntimeError(failure))
+    task = ChannelPipelineTask()
+    task._enabled = True
+    cache = Cache()
+    with patch("tasks.channel_pipeline.get_settings", return_value=settings), \
+         patch("database.get_session", return_value=session), \
+         patch("channel_pipeline_engine.get_channel_pipeline_engine", return_value=engine), \
+         patch("tasks.channel_pipeline.get_client", return_value=MagicMock()), \
+         patch("services.notification_service.create_notification_internal", new=AsyncMock()) as notify, \
+         patch("cache.get_cache", return_value=cache), \
+         patch("cache.time.time") as clock:
+        clock.return_value = 1000
+        if failure == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await task.execute()
+        else:
+            assert not (await task.execute()).success
+        clock.return_value = 1060
+        second = ChannelPipelineTask()
+        second._enabled = True
+        skipped = await second.execute()
+        assert skipped.success
+        assert skipped.suppress_completion_notification is True
+        clock.return_value = 1301
+        if failure == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await second.execute()
+        else:
+            assert not (await second.execute()).success
+    assert engine.run_pipeline.await_count == 2
+    titles = [call.kwargs["title"] for call in notify.await_args_list]
+    assert titles == ([] if failure == "cancelled" else ["Auto-Creation: Failed"] * 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [0, 1])
+async def test_scheduled_no_change_pass_is_quiet(removed):
+    from tasks.channel_pipeline import ChannelPipelineTask
+
+    task = ChannelPipelineTask()
+    engine = MagicMock()
+    engine.run_pipeline = AsyncMock(return_value={"channels_removed": removed})
+    with patch("channel_pipeline_engine.get_channel_pipeline_engine", return_value=engine), \
+         patch("tasks.channel_pipeline.get_client", return_value=MagicMock()), \
+         patch("services.notification_service.create_notification_internal", new=AsyncMock()) as notify:
+        result = await task._run_post_refresh_pipeline([22], ["Events"], datetime.utcnow(), triggered_by="scheduled")
+        first_calls = list(notify.await_args_list)
+        notify.reset_mock()
+        engine.run_pipeline.side_effect = RuntimeError("offline")
+        failed = await task._run_post_refresh_pipeline([22], ["Events"], datetime.utcnow(), triggered_by="manual")
+        assert failed.success is False
+        assert failed.suppress_completion_notification is False
+        assert [call.kwargs["title"] for call in notify.await_args_list] == ["Auto-Creation: Starting", "Auto-Creation: Failed"]
+    assert result.success
+    assert result.suppress_completion_notification is (removed == 0)
+    if removed:
+        assert [call.kwargs["title"] for call in first_calls] == ["Auto-Creation: 1 removed"]
+    else:
+        assert first_calls == []
 
 
 @pytest.mark.asyncio

@@ -180,10 +180,10 @@ MAX_PAST_EVENT_GRACE_HOURS: int = 72
 # Bounds for event_sync_config.promote_lead_hours (validated in
 # channel_pipeline_schema.validate_event_sync_config). There is deliberately
 # NO default: an absent key means no lead limit at all, the same
-# absent-means-off contract the other promotion keys follow. One hour is the
-# tightest useful window (below it a channel appears too late to find), and
+# absent-means-off contract the other promotion keys follow. Zero waits until
+# the event starts before creating its channel, and
 # thirty days is past the horizon any provider publishes.
-MIN_PROMOTE_LEAD_HOURS: int = 1
+MIN_PROMOTE_LEAD_HOURS: int = 0
 MAX_PROMOTE_LEAD_HOURS: int = 720
 
 # Ceiling on how far apart two same-title starts may be and still fold into
@@ -267,8 +267,11 @@ def event_is_early(
     return parsed.start - timedelta(hours=lead_hours) > now
 
 
-def event_has_started(parsed: ParsedEvent, now: datetime) -> bool:
+def event_has_started(parsed: ParsedEvent, now: datetime, *, since: datetime | None = None) -> bool:
     """Is this event's parsed start already behind us?
+
+    ``since`` optionally excludes older starts from probing without declaring
+    those events finished.
 
     The health gate asks this before it lets a probe verdict count against a
     stream: a stream for an event that has not begun may fail simply because
@@ -289,7 +292,7 @@ def event_has_started(parsed: ParsedEvent, now: datetime) -> bool:
         return False
     if parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES:
         return False
-    return parsed.start <= now
+    return parsed.start <= now and (since is None or parsed.start >= since)
 
 
 def promoted_channel_name(parsed: ParsedEvent) -> str | None:
@@ -597,6 +600,7 @@ def build_promotion_plan(
     *,
     now: datetime | None = None,
     dead_stream_ids: set[int] | None = None,
+    eligible_event_keys: set[str] | None = None,
 ) -> PromotionPlan:
     """Build the promotion plan for one rule's resolved streams.
 
@@ -675,7 +679,7 @@ def build_promotion_plan(
     """
     cap = config.get("max_promote_per_run", DEFAULT_MAX_PROMOTE_PER_RUN)
     target_group_id = config.get("promote_target_group_id")
-    skip_past = bool(config.get("skip_past_events"))
+    skip_past = bool(config.get("skip_past_events")) and not config.get("retire_finished_events")
     grace_hours = config.get(
         "past_event_grace_hours", DEFAULT_PAST_EVENT_GRACE_HOURS
     )
@@ -683,7 +687,7 @@ def build_promotion_plan(
     # Absent means false, like every other promotion key: a stored rule
     # must not start diverting channels it kept yesterday.
     apply_lead_to_existing = bool(config.get("apply_lead_to_existing"))
-    if (skip_past or lead_hours is not None) and now is None:
+    if (skip_past or lead_hours is not None or config.get("retire_finished_events")) and now is None:
         now = datetime.now(timezone.utc)
     # Clustering forgives a clock disagreement of up to the rule's own
     # matching window, and no further than MAX_CLUSTER_WINDOW_MINUTES —
@@ -781,6 +785,15 @@ def build_promotion_plan(
             # ahead and serves an offline card until it starts is the case
             # where an operator wants that trade anyway. [16]
             skipped_early_units.append(unit)
+            continue
+        if config.get("retire_finished_events") and action == PROMOTE_ACTION_CREATE:
+            if parsed.start < now - timedelta(hours=24):
+                skipped_past_units.append(unit)
+                continue
+            if parsed.start > now:
+                skipped_early_units.append(unit)
+                continue
+        if eligible_event_keys is not None and key not in eligible_event_keys:
             continue
         if action == PROMOTE_ACTION_CREATE:
             if cap and creates >= cap:

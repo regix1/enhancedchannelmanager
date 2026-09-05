@@ -1686,6 +1686,34 @@ class TestGetEPGData:
             page=2, page_size=10, search="Sports", epg_source=49, max_results=25,
         )
 
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("paginated", [False, True])
+    async def test_returns_only_requested_source_and_text_from_unfiltered_upstream(self, async_client, paginated):
+        import httpx
+        from config import DispatcharrSettings
+        from dispatcharr_client import DispatcharrClient
+
+        wanted = {"id": 731, "epg_source": 46, "tvg_id": "ecm-2950", "name": "ESPN"}
+        def handler(request):
+            if request.url.path == "/api/epg/sources/":
+                return httpx.Response(200, json=[{"id": 46, "epg_data_count": 3}])
+            rows = [dict(wanted, id=732, epg_source=50),
+                    dict(wanted, id=733, name="Unrelated", tvg_id="other"), wanted]
+            return httpx.Response(200, json={"results": rows, "next": None} if paginated else rows)
+
+        client = DispatcharrClient(DispatcharrSettings(url="http://dispatcharr", auth_method="api_key", api_key="k"))
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with patch("routers.epg.get_client", return_value=client):
+                response = await async_client.get("/api/epg/data", params={
+                    "search": "ECM-2950", "epg_source": 46, "limit": 1,
+                })
+            assert response.status_code == 200, response.text
+            assert response.json() == [wanted]
+        finally:
+            await client._client.aclose()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("limit", [0, -1, 1001])
     async def test_invalid_total_limit_does_not_fetch_catalogue(self, async_client, limit):

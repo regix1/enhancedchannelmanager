@@ -327,14 +327,19 @@ class TestValidationAndErrors:
         client.get_all_m3u_group_settings.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unknown_rule_id_is_404(self, async_client):
+    @pytest.mark.parametrize("draft", [False, True])
+    async def test_unknown_rule_id_is_404(self, async_client, draft):
         client = _mock_client()
-        resp = await _preview(async_client, client, {"rule_id": 999999})
+        request = {"rule_id": 999999}
+        if draft:
+            request["event_sync_config"] = _config()
+        resp = await _preview(async_client, client, request)
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("draft", [False, True])
     async def test_rule_without_event_sync_config_is_400(
-        self, async_client, test_session
+        self, async_client, test_session, draft
     ):
         rule = ChannelPipelineRule(
             name="Standard Rule",
@@ -352,20 +357,18 @@ class TestValidationAndErrors:
         test_session.refresh(rule)
 
         client = _mock_client()
-        resp = await _preview(async_client, client, {"rule_id": rule.id})
+        request = {"rule_id": rule.id}
+        if draft:
+            request["event_sync_config"] = _config()
+        resp = await _preview(async_client, client, request)
         assert resp.status_code == 400
         assert "event_sync" in str(resp.json()["detail"])
 
     @pytest.mark.asyncio
-    async def test_neither_or_both_sources_rejected(self, async_client):
+    async def test_neither_rejected(self, async_client):
         client = _mock_client()
         neither = await _preview(async_client, client, {})
-        both = await _preview(
-            async_client, client,
-            {"rule_id": 1, "event_sync_config": _config()},
-        )
         assert neither.status_code == 422
-        assert both.status_code == 422
 
 
 class TestReviewQueueMarkers:

@@ -913,6 +913,7 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     # Past-event filter — keeps finished events (which providers leave in
     # the playlist forever) from being promoted to new channels.
     "skip_past_events",
+    "retire_finished_events",
     "past_event_grace_hours",
     # Lead-time window — keeps an event that is still days away from
     # getting its channel today, and whether that also applies to an event
@@ -1577,6 +1578,17 @@ def validate_event_sync_config(config: Any) -> list[str]:
     # Both keys stay ABSENT unless the operator sets them (the same
     # invisibility contract as the promotion keys above) — an existing rule
     # keeps promoting exactly what it promoted before.
+    retire_finished_events = config.get("retire_finished_events")
+    if retire_finished_events is not None and not isinstance(retire_finished_events, bool):
+        errors.append(_event_sync_error(
+            "retire_finished_events", retire_finished_events, "a boolean (default false)",
+        ))
+    elif retire_finished_events and (not config.get("promote_unmatched") or not config.get("dummy_epg_profile_id")):
+        errors.append(_event_sync_error(
+            "retire_finished_events", retire_finished_events,
+            "requires promote_unmatched and dummy_epg_profile_id for verified event schedules",
+        ))
+
     skip_past_events = config.get("skip_past_events")
     if skip_past_events is not None and not isinstance(skip_past_events, bool):
         errors.append(_event_sync_error(

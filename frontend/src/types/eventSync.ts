@@ -166,6 +166,8 @@ export interface EventSyncConfig {
    * off.
    */
   skip_past_events?: boolean;
+  /** Remove confirmed idle promoted events using guide and provider evidence. */
+  retire_finished_events?: boolean;
   /**
    * How long after its start time an event still counts as current for
    * `skip_past_events` (0..72; backend default 4, filled only when the
@@ -182,7 +184,7 @@ export interface EventSyncConfig {
    */
   skip_dead_streams?: boolean;
   /**
-   * How far ahead of its start time an event may be promoted (1..720).
+   * How far ahead of its start time an event may be promoted (0..720).
    * An event further away than this is left alone and picked up on a later
    * run. Absent means there is no lead limit, so an event promotes as soon
    * as it parses. Gates CREATES only unless `apply_lead_to_existing` says
@@ -459,6 +461,9 @@ export interface EventSyncPromotionUnit {
 /** bead ti939.4.1: the promotion plan block — present ONLY when the
  * previewed config carries `promote_unmatched: true`. */
 export interface EventSyncPromotionPreview {
+  retire_finished_events?: boolean;
+  event_states?: { channel_id: number; status: 'active' | 'idle' | 'unknown' }[];
+  retirements?: { channel_id?: number; action: string }[];
   enabled: boolean;
   target_group_id: number;
   would_promote: number;
@@ -535,10 +540,10 @@ export interface EventSyncPreviewResponse {
   promotion?: EventSyncPromotionPreview;
 }
 
-/** Request body: exactly one of rule_id / event_sync_config. */
+/** A saved rule can supply ownership for an inline draft. */
 export type EventSyncPreviewRequest =
   | { rule_id: number }
-  | { event_sync_config: EventSyncConfig };
+  | { rule_id?: number; event_sync_config: EventSyncConfig };
 
 // =============================================================================
 // Review queue (bead ti939.3.2) — /api/event-sync-reviews

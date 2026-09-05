@@ -8,7 +8,7 @@ potential rollback.
 import contextlib
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Union
 import re
 
@@ -5023,6 +5023,161 @@ class ActionExecutor:
 
         return summary
 
+    async def _event_lifecycle(self, rule_id, config, units, now):
+        """Read one bounded evidence batch for event creation and retirement."""
+        import asyncio
+        import copy
+        import xml.etree.ElementTree as ET
+        from datetime import timedelta
+        from database import get_session
+        from models import ChannelPipelineRule, DummyEPGProfile
+        from services.epg_programmes import prepare_profiles, SOURCE_TTL, _placeholder
+        from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
+        from services.event_sync_stream_health import _load_stats, _min_stream_bitrate_bps
+
+        states, eligible = {}, set()
+        if not hasattr(self, "_event_states"):
+            self._event_states = {}
+        self._event_states[rule_id] = states
+        db = get_session()
+        try:
+            rule = db.get(ChannelPipelineRule, rule_id)
+            owned = rule.get_managed_channel_ids() if rule else []
+            profile = db.get(DummyEPGProfile, config.get("dummy_epg_profile_id"))
+            profile = profile.to_dict() if profile and profile.enabled else None
+        finally:
+            db.close()
+        channels = {
+            cid: copy.deepcopy(self._channel_by_id[cid]) for cid in owned
+            if cid in self._channel_by_id
+            and self._channel_by_id[cid].get("channel_group_id") == config["promote_target_group_id"]
+        }
+        states.update({cid: "unknown" for cid in channels})
+        if not profile or len(channels) > 256:
+            return eligible, states
+        unit_ids = {}
+        for index, unit in enumerate(units, 1):
+            cid = unit.existing_channel_id
+            if cid is None:
+                start = unit.rows[0].result.parsed.start
+                if start is None or not now - timedelta(hours=24) <= start <= now or len(channels) >= 256:
+                    continue
+                cid = -index
+                channels[cid] = {
+                    "id": cid, "name": unit.channel_name,
+                    "channel_group_id": config["promote_target_group_id"],
+                    "streams": [row.stream.stream_id for row in unit.rows if row.stream.stream_id is not None],
+                }
+            unit_ids[unit.event_key] = cid
+        stream_ids = {
+            stream.get("id") if isinstance(stream, dict) else stream
+            for channel in channels.values() for stream in channel.get("streams", [])
+        }
+        if not stream_ids or None in stream_ids or len(stream_ids) > 1000:
+            return eligible, states
+        try:
+            async with asyncio.timeout(10):
+                streams = await self.client.get_streams_by_ids(sorted(stream_ids))
+            if not isinstance(streams, list) or any(not isinstance(row, dict) for row in streams):
+                return eligible, states
+            by_id = {row.get("id"): row for row in streams if row.get("id") in stream_ids}
+            stats = await _load_stats(sorted(stream_ids))
+        except Exception:
+            return eligible, states
+        for channel in channels.values():
+            ids = [row.get("id") if isinstance(row, dict) else row for row in channel.get("streams", [])]
+            channel["streams"] = [by_id[sid] for sid in ids if sid in by_id]
+            channel["_event_streams_complete"] = bool(ids) and all(sid in by_id for sid in ids)
+        profile["name_source"] = "channel"
+        try:
+            _, coverage = await prepare_profiles([profile], channels, self.client, now=now)
+        except Exception:
+            return eligible, states
+        sources = {row["source_id"]: row for row in coverage["sources"]}
+        observations = {row["channel_id"]: row for row in coverage["channels"]}
+        floor = _min_stream_bitrate_bps()
+        parsed_units = {unit_ids[unit.event_key]: unit.rows[0].result.parsed for unit in units
+                        if unit.event_key in unit_ids}
+        for cid, channel in channels.items():
+            status = "unknown"
+            witness = observations.get(cid, {}).get("event")
+            if not channel["_event_streams_complete"]:
+                continue
+            parsed_channel = parsed_units.get(cid) or parse_event_name(
+                channel.get("name") or "", now=now, event_timezone=profile.get("event_timezone") or "US/Eastern",
+            )
+            if not witness and parsed_channel.start is not None and parsed_channel.start <= now:
+                for stream in channel["streams"]:
+                    stat = stats.get(stream["id"], {})
+                    try:
+                        probed = datetime.fromisoformat((stat.get("last_probed") or "").replace("Z", "+00:00"))
+                        if probed.tzinfo is None:
+                            probed = probed.replace(tzinfo=timezone.utc)
+                        measured = stat.get("measured_bitrate")
+                        parsed = parse_event_name(stream.get("name") or "", now=now,
+                                                  event_timezone=profile.get("event_timezone") or "US/Eastern")
+                        same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
+                        if (same and stream.get("is_stale") is not True and floor > 0
+                                and isinstance(measured, (int, float)) and measured >= floor
+                                and max(parsed_channel.start, now - timedelta(minutes=5)) <= probed <= now):
+                            states[cid] = "active"
+                    except (TypeError, ValueError):
+                        pass
+                continue
+            if not witness:
+                continue
+            try:
+                start = datetime.fromisoformat(witness["start"])
+                stop = datetime.fromisoformat(witness["stop"])
+                if parsed_channel.start is None or abs((parsed_channel.start - start).total_seconds()) > 1800:
+                    continue
+                source = sources.get(witness["source_id"], {})
+                success = datetime.fromisoformat(source.get("last_success") or "")
+                if source.get("status") != "ready" or not 0 <= (now - success).total_seconds() <= SOURCE_TTL:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            positive, transitioned = False, True
+            for stream in channel["streams"]:
+                stat = stats.get(stream["id"], {})
+                try:
+                    probed = datetime.fromisoformat((stat.get("last_probed") or "").replace("Z", "+00:00"))
+                    if probed.tzinfo is None:
+                        probed = probed.replace(tzinfo=timezone.utc)
+                    measured = stat.get("measured_bitrate")
+                    working = (floor > 0 and isinstance(measured, (int, float)) and measured >= floor
+                               and max(start, now - timedelta(minutes=5)) <= probed <= now)
+                except (TypeError, ValueError):
+                    working = False
+                try:
+                    observed = datetime.fromisoformat((stream.get("updated_at") or stream.get("last_seen") or "").replace("Z", "+00:00"))
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=timezone.utc)
+                    fresh = max(stop, now - timedelta(hours=1)) <= observed <= now
+                except (TypeError, ValueError):
+                    fresh = False
+                parsed = parse_event_name(stream.get("name") or "", now=now,
+                                          event_timezone=profile.get("event_timezone") or "US/Eastern")
+                same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
+                positive |= working and same and stream.get("is_stale") is not True
+                marker = ET.Element("programme")
+                ET.SubElement(marker, "title").text = stream.get("name") or ""
+                different = parsed.start is not None and parsed.start > start and parsed.start >= stop
+                offline = _placeholder(marker)
+                changed = stream.get("is_stale") is True or different or offline
+                transitioned &= fresh and changed
+                if working and not (different or offline):
+                    transitioned = False
+            if start <= now < stop and positive:
+                status = "active"
+            elif stop <= now and transitioned:
+                status = "idle"
+            states[cid] = status
+        for key, cid in unit_ids.items():
+            if states.get(cid) == "active":
+                eligible.add(key)
+        return eligible, states
+
     async def _execute_event_sync_promotion(
         self, rule_id: Optional[int], rule_name: str, config: dict,
         resolution, exec_ctx: ExecutionContext,
@@ -5159,9 +5314,10 @@ class ActionExecutor:
         )
 
         stale_rows: dict = {}
+        dead = set()
         working_stream_ids: set = set()
         unit_stream_ids_by_key: dict = {}
-        if config.get("skip_dead_streams"):
+        if config.get("skip_dead_streams") or config.get("retire_finished_events"):
             # Plan first, then check ONLY the streams that plan is about to
             # turn into channels. plan.units is what is left after the past
             # filter, the lead window AND the cap, which on a real rule is
@@ -5201,7 +5357,10 @@ class ActionExecutor:
             event_start_by_stream = {
                 row.stream.stream_id: unit.rows[0].result.parsed.start
                 for unit in plan.units
-                if event_has_started(unit.rows[0].result.parsed, now)
+                if event_has_started(
+                    unit.rows[0].result.parsed, now,
+                    since=now - timedelta(hours=24) if config.get("retire_finished_events") else None,
+                )
                 for row in unit.rows
                 if row.stream.stream_id is not None
             }
@@ -5214,6 +5373,22 @@ class ActionExecutor:
                 probe_missing=not exec_ctx.dry_run,
                 stale_stream_ids=set(stale_rows),
                 event_start_by_stream=event_start_by_stream,
+                # Retirement re-reads every started stream within five
+                # minutes, so the streams already on a promoted channel are
+                # re-probed every run and, in id order, fill the per-run
+                # cap ahead of the one event that still has no channel. The
+                # lifecycle needs that event's fresh reading to let it
+                # through; the owned streams keep their units, their
+                # source-end evidence and the viewer guard without a probe.
+                **({"probe_before": now - timedelta(minutes=5),
+                    "probe_first": {
+                        row.stream.stream_id
+                        for unit in plan.units
+                        if unit.existing_channel_id is None
+                        for row in unit.rows
+                        if row.stream.stream_id is not None
+                    }}
+                   if config.get("retire_finished_events") else {}),
             )
             if dead:
                 plan = build_promotion_plan(
@@ -5230,6 +5405,17 @@ class ActionExecutor:
                 row.stream.stream_id
                 for unit in plan.units for row in unit.rows
             ])
+
+        event_states = {}
+        if config.get("retire_finished_events"):
+            now = datetime.now(timezone.utc)
+            eligible, event_states = await self._event_lifecycle(
+                rule_id, config, (*plan.units, *plan.capped_units), now,
+            )
+            plan = build_promotion_plan(
+                config, resolution.resolved, existing_name_to_id, now=now,
+                dead_stream_ids=dead, eligible_event_keys=eligible,
+            )
 
         promo = {
             "target_group_id": target_group_id,
@@ -5256,8 +5442,9 @@ class ActionExecutor:
             "dead_streams_skipped": plan.dead_streams_skipped,
             "skipped_all_dead": plan.skipped_all_dead,
             "stale_streams_removed": 0,
-            "channel_ids": [],
+            "channel_ids": [cid for cid, state in event_states.items() if cid > 0 and state != "idle"],
             "promote_entries": [],
+            "event_states": [{"channel_id": cid, "status": state} for cid, state in event_states.items() if cid > 0],
         }
 
         if plan.skipped_past:

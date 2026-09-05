@@ -40,6 +40,15 @@ async def test_source_error_retains_wrapped_timeout_reason(monkeypatch):
     (ValueError("XMLTV document is empty."), "XMLTV document is empty."),
     (ValueError("XMLTV element exceeds the retained size limit."), "XMLTV element exceeds the retained size limit."),
     (ValueError("Selected XMLTV schedules exceed the retained size limit."), "Selected XMLTV schedules exceed the retained size limit."),
+    (ValueError("Dispatcharr EPG catalogue exceeds 200000 rows"), "Response exceeded the catalogue size limit."),
+    (ValueError("Dispatcharr EPG response exceeds its source row counts"), "Response exceeded the catalogue size limit."),
+    (ValueError("Dispatcharr EPG response exceeds 16384 bytes per row"), "Response exceeded the catalogue size limit."),
+    (ValueError("Dispatcharr EPG response contains trailing JSON"), "Invalid JSON response."),
+    (ValueError("Dispatcharr EPG response contains a non-object row"), "Invalid JSON response."),
+    (ValueError("Dispatcharr EPG source counts are unavailable"), "Catalogue source counts are unavailable."),
+    (ValueError("Dispatcharr EPG source counts are unavailable https://guide.invalid/?key=private"), "Request failed."),
+    (ValueError("Dispatcharr EPG response is incomplete"), "Invalid JSON response."),
+    (ValueError("Dispatcharr EPG response exceeds 16384 bytes per row https://guide.invalid/?key=private"), "Request failed."),
     (ValueError("private https://guide.invalid/?key=private"), "Request failed."),
 ])
 async def test_source_errors_preserve_only_known_reasons(monkeypatch, failure, expected):
@@ -946,3 +955,38 @@ async def test_wrong_day_event_reports_date_conflict(monkeypatch):
     )
     assert profiles[0]["source_programmes"][1] == []
     assert "event_date_conflict" in coverage["channels"][0]["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_original_ended_event_remains_evidence_without_expired_xml(monkeypatch):
+    install_feed(monkeypatch, feed(programme(title="ONE Fight Night 47", stop="20260905013000 +0000")))
+    channels = {1: channel(name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id="")}
+    profiles, coverage = await guides.prepare_profiles([profile()], channels, client(), now=NOW, wait_for_sources=True)
+    event = coverage["channels"][0]["event"]
+    assert event is not None
+    assert event["start"] == "2026-09-05T01:00:00+00:00"
+    assert event["stop"] == "2026-09-05T01:30:00+00:00"
+    assert coverage["channels"][0]["current"] is None
+    assert profiles[0]["source_programmes"][1] == []
+    assert all(row.findtext("title") != "ONE Fight Night 47" for row in ET.fromstring(generate_xmltv(profiles, channels)).findall("programme"))
+
+
+@pytest.mark.asyncio
+async def test_ended_event_evidence_counts_toward_source_limits(monkeypatch):
+    install_feed(monkeypatch, feed(programme(title="ONE Fight Night 47", stop="20260905013000 +0000")))
+    monkeypatch.setattr(guides, "MAX_PROGRAMMES", 0)
+    query = guides._query(profile(), channel(name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id=""), None, NOW)
+    with pytest.raises(ValueError, match="retained size limit"):
+        await guides._read_source(source(), [query], START, STOP, NOW)
+
+
+@pytest.mark.asyncio
+async def test_cached_original_event_becomes_ended_evidence(monkeypatch):
+    install_feed(monkeypatch, feed(programme(title="ONE Fight Night 47", stop="20260905021000 +0000")))
+    channels = {1: channel(name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id="")}
+    upstream = client()
+    _, first = await guides.prepare_profiles([profile()], channels, upstream, now=NOW, wait_for_sources=True)
+    assert first["channels"][0]["current"] is not None
+    _, later = await guides.prepare_profiles([profile()], channels, upstream, now=NOW + timedelta(minutes=11), wait_for_sources=True)
+    assert later["channels"][0]["current"] is None
+    assert later["channels"][0]["event"]["stop"] == "2026-09-05T02:10:00+00:00"

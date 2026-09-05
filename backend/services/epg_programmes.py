@@ -250,6 +250,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     parser = ET.XMLPullParser(events=("start", "end"))
     root = None
     headers, rows, warnings = {}, {}, set()
+    ended = {}
     channel_warnings = {}
     retained = count = pending_size = 0
     event_headers = any(query["dynamic"] and query["event"].start is not None for query in queries)
@@ -287,6 +288,27 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                 except ValueError:
                     warnings.add("invalid_schedule")
                 else:
+                    if now - timedelta(hours=24) < end <= now and end - begin <= timedelta(hours=24) and not _placeholder(element):
+                        for query in queries:
+                            parsed = query["event"]
+                            if (not query["dynamic"] or parsed.start is None
+                                    or abs((parsed.start - begin).total_seconds()) > 1800):
+                                continue
+                            if _score_parsed_pair(parsed, _event(element, begin), window_minutes=30,
+                                                  threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index).band != BAND_ATTACH:
+                                continue
+                            previous = ended.get(query["channel_id"])
+                            if previous and previous[1] != begin:
+                                channel_warnings.setdefault(query["channel_id"], set()).add("ambiguous_event")
+                            if previous and previous[2] >= end:
+                                continue
+                            saved = copy.deepcopy(element)
+                            retained += len(ET.tostring(saved))
+                            if previous:
+                                retained -= len(ET.tostring(previous[3]))
+                            else:
+                                count += 1
+                            ended[query["channel_id"]] = (tvg_id, begin, end, saved)
                     if end > now and end > start and begin < stop and not _placeholder(element):
                         if end - begin > timedelta(hours=24) or begin < start - timedelta(days=1):
                             warnings.add("implausible_schedule")
@@ -339,7 +361,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
         if tvg_id not in rows and not any(_identity(query, source["id"], tvg_id, headers[tvg_id]) is not None for query in queries):
             retained -= len(ET.tostring(headers[tvg_id]))
             del headers[tvg_id]
-    return {"headers": headers, "rows": rows, "warnings": sorted(warnings), "size": retained,
+    return {"headers": headers, "rows": rows, "ended": ended, "warnings": sorted(warnings), "size": retained,
             "channel_warnings": {channel: sorted(values) for channel, values in channel_warnings.items()}}
 
 
@@ -364,6 +386,9 @@ def _error_reason(exc: Exception) -> str:
         "XMLTV root must be tv.": "XMLTV root must be tv.",
         "XMLTV document is empty.": "XMLTV document is empty.",
         "Dispatcharr EPG response used unexpected Content-Encoding": "Unsupported catalogue response encoding.",
+        "Dispatcharr EPG source counts are unavailable": "Catalogue source counts are unavailable.",
+        "Dispatcharr EPG catalogue exceeds 200000 rows": "Response exceeded the catalogue size limit.",
+        "Dispatcharr EPG response exceeds its source row counts": "Response exceeded the catalogue size limit.",
     }
     reason = "Request failed."
     seen = set()
@@ -394,8 +419,16 @@ def _error_reason(exc: Exception) -> str:
             if type(detail) is str:
                 if detail in reasons:
                     reason = reasons[detail]
-                elif re.fullmatch(r"Dispatcharr EPG response exceeds [0-9]{1,10} bytes", detail):
+                elif re.fullmatch(r"Dispatcharr EPG response exceeds [0-9]{1,10} bytes(?: per row)?", detail):
                     reason = "Response exceeded the catalogue size limit."
+                elif detail in {
+                    "Dispatcharr EPG response " + ending for ending in (
+                        "contains trailing JSON", "must be an array or object", "has an invalid object",
+                        "has an invalid delimiter", "has invalid results", "has an invalid object key",
+                        "has too many fields", "contains a non-object row", "has an invalid structure", "is incomplete",
+                    )
+                }:
+                    reason = "Invalid JSON response."
         exc = exc.__cause__
     return reason
 
@@ -484,17 +517,19 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
     priority = build_source_priority_order(sources)
     candidates, warnings = [], set()
+    witnesses = []
     parsed = query["event"]
     for source in sources:
         entry = entries.get(source["id"], {})
         warnings.update(entry.get("warnings", []))
         warnings.update(entry.get("channel_warnings", {}).get(query["channel_id"], []))
+        ended = entry.get("ended", {}).get(query["channel_id"])
+        if ended:
+            witnesses.append((ended[1], ended[2], source["id"], ended[0], ended[3]))
         for tvg_id, programmes in entry.get("rows", {}).items():
             identity = _identity(query, source["id"], tvg_id, entry.get("headers", {}).get(tvg_id))
             for programme in programmes:
                 begin, end = programme_times(programme)
-                if end <= now or end <= start or begin >= stop:
-                    continue
                 match = identity
                 if query["dynamic"] and parsed.start is not None:
                     pair = _score_parsed_pair(parsed, _event(programme, begin), window_minutes=30,
@@ -503,6 +538,10 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
                         continue
                     match = 0 if identity == 0 else 1
                 elif identity is None:
+                    continue
+                if query["dynamic"] and parsed.start is not None:
+                    witnesses.append((begin, end, source["id"], tvg_id, programme))
+                if end <= now or end <= start or begin >= stop:
                     continue
                 candidates.append((match, priority[source["id"]], begin, end, source["id"], tvg_id, programme))
     if query["dynamic"] and parsed.start is None and not candidates:
@@ -542,6 +581,14 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
         "gap_minutes": int((stop - start).total_seconds() / 60) - real_minutes,
         "warnings": sorted(warnings),
     }
+    result["event"] = None
+    if witnesses and len({row[0] for row in witnesses}) == 1 and "ambiguous_event" not in warnings:
+        witness = max(witnesses, key=lambda row: (row[1], -priority[row[2]]))
+        result["event"] = {
+            "start": witness[0].isoformat(), "stop": witness[1].isoformat(),
+            "source_id": witness[2], "source_tvg_id": witness[3],
+            "title": witness[4].findtext("title") or "",
+        }
     for label, row in (("current", current), ("next", following)):
         if row:
             result[label] = {"start": row[0].isoformat(), "stop": row[1].isoformat(), "title": row[4].findtext("title") or ""}

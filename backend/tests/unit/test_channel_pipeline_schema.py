@@ -14,7 +14,33 @@ from channel_pipeline_schema import (
     validate_rule,
     parse_conditions,
     parse_actions,
+    validate_event_sync_config,
 )
+
+
+@pytest.fixture
+def event_profile(test_session, override_get_session, monkeypatch):
+    from models import DummyEPGProfile
+    test_session.add(DummyEPGProfile(id=1, name="Events"))
+    test_session.commit()
+    monkeypatch.setattr("database.get_session", override_get_session)
+
+
+@pytest.mark.parametrize("value,valid", [(True, True), (False, True), ("true", False), (1, False)])
+def test_event_retirement_is_an_explicit_boolean(value, valid, event_profile):
+    config = {"master_group_id": 1, "secondary_group_ids": [2], "promote_unmatched": True,
+              "promote_target_group_id": 3, "dummy_epg_profile_id": 1,
+              "retire_finished_events": value, "promote_lead_hours": 0}
+    assert (validate_event_sync_config(config) == []) is valid
+
+
+@pytest.mark.parametrize("missing", ["promote_unmatched", "dummy_epg_profile_id"])
+def test_event_retirement_requires_promotion_and_a_guide(missing, event_profile):
+    config = {"master_group_id": 1, "secondary_group_ids": [2], "promote_unmatched": True,
+              "promote_target_group_id": 3, "dummy_epg_profile_id": 1,
+              "retire_finished_events": True, "promote_lead_hours": 0}
+    config.pop(missing)
+    assert any("retire_finished_events" in error for error in validate_event_sync_config(config))
 
 
 class TestConditionFromDict:

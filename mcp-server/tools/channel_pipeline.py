@@ -9,12 +9,14 @@ have migrated (tracking bead to be filed after this phase ships).
 """
 import asyncio
 import json
-import json
 import logging
+from typing import Annotated
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
-from _endpoint_contracts import ENDPOINTS
+from _endpoint_contracts import AC_RULE_FIELDS_NOT_EXPOSED, ENDPOINTS
 from ecm_client import get_ecm_client
 
 logger = logging.getLogger(__name__)
@@ -234,6 +236,73 @@ def _action_descriptor(a: dict) -> str:
             return str(a[key])
     return "?"
 
+def _rule_details(rule: dict) -> str:
+    """Return complete copyable configuration or refuse unsafe/unbounded output."""
+    import re
+    from urllib.parse import parse_qsl, urlsplit
+
+    fields = ENDPOINTS["ac_create_rule"].request_fields | AC_RULE_FIELDS_NOT_EXPOSED | {"id"}
+    selected = {key: value for key, value in rule.items() if key in fields}
+    pending = [(selected, 0)]
+    nodes = 0
+    while pending:
+        value, depth = pending.pop()
+        nodes += 1
+        if nodes > 2000 or depth > 12:
+            return "Cannot return complete rule details: configuration exceeds the structural limit."
+        if isinstance(value, dict):
+            if len(value) > 2000:
+                return "Cannot return complete rule details: configuration exceeds the structural limit."
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return "Cannot return complete rule details: unsupported configuration field."
+                if any(marker in key.lower() for marker in ("password", "secret", "token", "credential", "api_key", "authorization")) and item not in (None, ""):
+                    return "Cannot return complete rule details: configuration contains sensitive fields."
+                pending.append((item, depth + 1))
+        elif isinstance(value, list):
+            if len(value) > 2000:
+                return "Cannot return complete rule details: configuration exceeds the structural limit."
+            pending.extend((item, depth + 1) for item in value)
+        elif isinstance(value, str):
+            if len(value) > 65536:
+                return "Cannot return complete rule details: configuration exceeds the 64 KiB limit."
+            if re.search(r"\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer)\s+\S+", value, re.IGNORECASE):
+                return "Cannot return complete rule details: configuration contains sensitive values."
+            for match in re.finditer(r"https?://[^\s<>]+", value, re.IGNORECASE):
+                try:
+                    url = urlsplit(match.group())
+                    if url.username is not None or url.password is not None or any(
+                        any(marker in key.lower() for marker in ("key", "token", "secret", "password", "auth", "signature"))
+                        for key, _ in parse_qsl(url.query, keep_blank_values=True)
+                    ):
+                        return "Cannot return complete rule details: configuration contains credential-bearing URLs."
+                except ValueError:
+                    return "Cannot return complete rule details: configuration contains an unrecognized URL."
+        elif value is not None and type(value) not in (bool, int, float):
+            return "Cannot return complete rule details: unsupported configuration value."
+    try:
+        text = json.dumps(selected, ensure_ascii=False, allow_nan=False)
+        size = len(text.encode("utf-8"))
+    except (ValueError, UnicodeError):
+        return "Cannot return complete rule details: unsupported configuration value."
+    if size > 65536:
+        return "Cannot return complete rule details: configuration exceeds the 64 KiB limit."
+    return text
+
+
+def _run_scope(rule_ids=None, m3u_account_ids=None) -> dict:
+    """Preserve explicit scopes and refuse values that could become a global run."""
+    scope = {}
+    for key, values in (("rule_ids", rule_ids), ("m3u_account_ids", m3u_account_ids)):
+        if values is None:
+            continue
+        if not isinstance(values, list) or not values or len(values) > 1000 or any(
+            type(value) is not int or value < 1 for value in values
+        ):
+            raise ValueError(f"{key} must contain 1 to 1000 positive integer IDs.")
+        scope[key] = values
+    return scope
+
 
 def _format_analyze_result(result: dict, source: str) -> str:
     """Render a /rules/analyze response as a markdown report.
@@ -334,6 +403,9 @@ def register(mcp: FastMCP):
     async def run_channel_pipeline(
         dry_run: bool = True, plan_id: str | None = None, plan_hash: str | None = None
         , plan_phase: str = "execute"
+        , rule_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
+        , m3u_account_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
+        , details: bool = False, max_rows: int = 25
     ) -> str:
         """Run the auto-creation pipeline to create channels from matching streams.
 
@@ -342,22 +414,31 @@ def register(mcp: FastMCP):
         then reports the real results.
 
         Args:
+            rule_ids: Positive saved rule IDs; omit for the existing global selection.
+            m3u_account_ids: Positive provider IDs; omit to preserve existing selection.
+            details: Return bounded dry-run action details, including EPG row/source descriptions.
+                     Real runs retain the terminal summary and its warnings.
+            max_rows: Details row limit from 1 to 100 (default 25).
             dry_run: If true (default), preview what would be created without making changes.
                      Set to false to actually create the channels.
         """
         try:
+            scope = _run_scope(rule_ids, m3u_account_ids)
+            if details and (type(max_rows) is not int or not 1 <= max_rows <= 100):
+                return "Error running auto-creation: max_rows must be between 1 and 100."
             client = get_ecm_client()
             prepared_result = None
 
             # Kick off the run. Backend returns 202 + execution_id immediately.
             if plan_id and plan_hash:
+                dry_run = False
                 kickoff = await client.call_endpoint(
                     ENDPOINTS["ac_commit_run"],
                     body={"plan_id": plan_id, "plan_hash": plan_hash, "phase": plan_phase},
                 )
             elif dry_run:
                 prepared = await client.call_endpoint(
-                    ENDPOINTS["ac_prepare_run"], body={"dry_run": False}
+                    ENDPOINTS["ac_prepare_run"], body={"dry_run": False, **scope}
                 )
                 if "preview" in prepared:
                     prepared_result = prepared["preview"]
@@ -367,7 +448,7 @@ def register(mcp: FastMCP):
                     # upgrades; that response is the legacy 202 kickoff shape.
                     kickoff = prepared
             else:
-                kickoff = await client.call_endpoint(ENDPOINTS["ac_run"], body={"dry_run": dry_run})
+                kickoff = await client.call_endpoint(ENDPOINTS["ac_run"], body={"dry_run": dry_run, **scope})
             execution_id = kickoff.get("execution_id")
             if kickoff.get("requires_confirmation"):
                 return "ECM_STAGED_PLAN:" + json.dumps(kickoff, sort_keys=True, separators=(",", ":"))
@@ -407,6 +488,37 @@ def register(mcp: FastMCP):
                         f"(execution_id={execution_id}). "
                         "Check status with list_channel_pipeline_executions."
                     )
+
+            if details and dry_run:
+                rows = result.get("dry_run_results", []) or []
+                shown = []
+                truncated = len(rows) > max_rows
+                for row in rows[:max_rows]:
+                    item = {}
+                    for key in ("stream_id", "stream_name", "rule_id", "rule_name", "action",
+                                "would_create", "would_modify", "channel_id", "entity_id"):
+                        value = row.get(key)
+                        if key not in row or (value is not None and type(value) not in (str, int, float, bool)):
+                            continue
+                        if isinstance(value, str) and len(value) > 2048:
+                            value = value[:2048]
+                            truncated = True
+                        item[key] = value
+                    shown.append(item)
+                checked = _rule_details({"actions": shown})
+                if not checked.startswith("{"):
+                    return checked.replace("rule details", "action details")
+                return json.dumps({
+                    "status": result.get("status", "completed" if prepared_result is not None else "unknown"),
+                    "execution_id": execution_id,
+                    "rule_ids": rule_ids, "m3u_account_ids": m3u_account_ids,
+                    "streams_evaluated": result.get("streams_evaluated", 0),
+                    "streams_matched": result.get("streams_matched", 0),
+                    "channels_created": result.get("channels_created", 0),
+                    "channels_updated": result.get("channels_updated", 0),
+                    "dry_run_results": shown, "details_total": len(rows),
+                    "details_truncated": truncated,
+                }, ensure_ascii=False)
 
             # result is now the final execution row.
             status = result.get("status", "unknown")
@@ -531,6 +643,9 @@ def register(mcp: FastMCP):
     async def run_auto_creation(
         dry_run: bool = True, plan_id: str | None = None, plan_hash: str | None = None
         , plan_phase: str = "execute"
+        , rule_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
+        , m3u_account_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
+        , details: bool = False, max_rows: int = 25
     ) -> str:
         """[DEPRECATED — use run_channel_pipeline instead] Run the auto-creation pipeline to create channels from matching streams.
 
@@ -539,19 +654,24 @@ def register(mcp: FastMCP):
                      Set to false to actually create the channels.
         """
         return await run_channel_pipeline(
-            dry_run=dry_run, plan_id=plan_id, plan_hash=plan_hash, plan_phase=plan_phase
+            dry_run=dry_run, plan_id=plan_id, plan_hash=plan_hash, plan_phase=plan_phase,
+            rule_ids=rule_ids, m3u_account_ids=m3u_account_ids, details=details, max_rows=max_rows
         )
 
     @mcp.tool()
-    async def get_channel_pipeline_rule(rule_id: int) -> str:
+    async def get_channel_pipeline_rule(rule_id: int, details: bool = False) -> str:
         """Get detailed information about a specific auto-creation rule.
 
         Args:
+            details: Return complete bounded configuration JSON; unsafe or oversized reads are refused.
             rule_id: The rule ID to look up
         """
         try:
             client = get_ecm_client()
             r = await client.call_endpoint(ENDPOINTS["ac_get_rule"], path_args={"rule_id": rule_id})
+
+            if details:
+                return _rule_details(r)
 
             lines = [
                 f"Rule: {r.get('name', 'Unnamed')}",
@@ -601,13 +721,13 @@ def register(mcp: FastMCP):
             return f"Error getting rule {rule_id}: {e}"
 
     @mcp.tool()
-    async def get_auto_creation_rule(rule_id: int) -> str:
+    async def get_auto_creation_rule(rule_id: int, details: bool = False) -> str:
         """[DEPRECATED — use get_channel_pipeline_rule instead] Get detailed information about a specific auto-creation rule.
 
         Args:
             rule_id: The rule ID to look up
         """
-        return await get_channel_pipeline_rule(rule_id)
+        return await get_channel_pipeline_rule(rule_id, details=details)
 
     @mcp.tool()
     async def toggle_channel_pipeline_rule(rule_id: int) -> str:
@@ -769,10 +889,12 @@ def register(mcp: FastMCP):
         quality_m3u_tie_break_enabled: bool | None = None,
         match_scope_target_group: bool | None = None,
         allow_manual_channel_merge: bool | None = None,
+        event_sync_config: dict | None = None,
     ) -> str:
         """Create a new auto-creation rule.
 
         Args:
+            event_sync_config: Complete event-sync configuration, validated by the backend.
             name: Rule name
             conditions: List of condition dicts. Each has 'type', 'value', optional 'connector'
                 ("and"/"or"), optional 'negate' (bool, inverts the match — see below), and
@@ -967,6 +1089,9 @@ def register(mcp: FastMCP):
             if allow_manual_channel_merge is not None:
                 payload["allow_manual_channel_merge"] = allow_manual_channel_merge
 
+            if event_sync_config is not None:
+                payload["event_sync_config"] = event_sync_config
+
             result = await client.call_endpoint(ENDPOINTS["ac_create_rule"], body=payload)
 
             rule = result.get("rule", result)
@@ -1001,6 +1126,7 @@ def register(mcp: FastMCP):
         quality_m3u_tie_break_enabled: bool | None = None,
         match_scope_target_group: bool | None = None,
         allow_manual_channel_merge: bool | None = None,
+        event_sync_config: dict | None = None,
     ) -> str:
         """[DEPRECATED — use create_channel_pipeline_rule instead] Create a new auto-creation rule.
 
@@ -1032,6 +1158,7 @@ def register(mcp: FastMCP):
             quality_m3u_tie_break_enabled=quality_m3u_tie_break_enabled,
             match_scope_target_group=match_scope_target_group,
             allow_manual_channel_merge=allow_manual_channel_merge,
+            event_sync_config=event_sync_config,
         )
 
     @mcp.tool()
@@ -1058,10 +1185,14 @@ def register(mcp: FastMCP):
         orphan_action: str | None = None,
         quality_m3u_tie_break_enabled: bool | None = None,
         allow_manual_channel_merge: bool | None = None,
+        event_sync_config: dict | None = None,
+        clear_event_sync_config: bool = False,
     ) -> str:
         """Update an existing auto-creation rule. Only provided fields are changed.
 
         Args:
+            event_sync_config: Full replacement object, not a nested patch. Omit to preserve.
+            clear_event_sync_config: Explicitly clear the saved config; cannot accompany an object.
             rule_id: The rule ID to update
             name: New rule name
             description: New description
@@ -1096,6 +1227,8 @@ def register(mcp: FastMCP):
                 manual_channel_merge_blocked) and the rule may create a new
                 auto channel instead of merging.
         """
+        if clear_event_sync_config and event_sync_config is not None:
+            return "Cannot both replace and clear event_sync_config."
         try:
             client = get_ecm_client()
             payload = {}
@@ -1116,6 +1249,11 @@ def register(mcp: FastMCP):
             ]:
                 if value is not None:
                     payload[field_name] = value
+
+            if clear_event_sync_config:
+                payload["event_sync_config"] = None
+            elif event_sync_config is not None:
+                payload["event_sync_config"] = event_sync_config
 
             if not payload:
                 return "No fields to update."
@@ -1153,6 +1291,8 @@ def register(mcp: FastMCP):
         orphan_action: str | None = None,
         quality_m3u_tie_break_enabled: bool | None = None,
         allow_manual_channel_merge: bool | None = None,
+        event_sync_config: dict | None = None,
+        clear_event_sync_config: bool = False,
     ) -> str:
         """[DEPRECATED — use update_channel_pipeline_rule instead] Update an existing auto-creation rule. Only provided fields are changed.
 
@@ -1182,6 +1322,7 @@ def register(mcp: FastMCP):
             orphan_action=orphan_action,
             quality_m3u_tie_break_enabled=quality_m3u_tie_break_enabled,
             allow_manual_channel_merge=allow_manual_channel_merge,
+            event_sync_config=event_sync_config, clear_event_sync_config=clear_event_sync_config,
         )
 
     @mcp.tool()
@@ -1632,7 +1773,8 @@ def register(mcp: FastMCP):
         and scores every stream through the EXACT resolver the future attach
         path will use. Nothing is merged, mutated, or toggled.
 
-        Provide EXACTLY ONE of:
+        Provide a saved rule id, an inline config, or both to preview draft
+        settings with the saved rule's ownership and decisions:
             rule_id: Preview a saved event_sync rule.
             event_sync_config: Preview an inline config before saving. The
                 canonical scoping is provider-scoped:
@@ -1685,20 +1827,19 @@ def register(mcp: FastMCP):
         Args:
             rule_id: Saved channel-pipeline rule id (event_sync kind).
             event_sync_config: Inline event_sync config object.
-            max_rows: Cap on per-stream detail lines in the text report
-                (summary counts always cover everything).
+            max_rows: Cap on per-stream and lifecycle detail rows in the text report.
+                Lifecycle sections show at most 100 rows and disclose shortened text.
+                Summary counts cover all returned rows; fetch caps are reported separately.
         """
-        if (rule_id is None) == (event_sync_config is None):
-            return (
-                "Error: provide exactly one of rule_id (saved rule) or "
-                "event_sync_config (inline config)."
-            )
+        if rule_id is None and event_sync_config is None:
+            return "Error: provide rule_id or event_sync_config."
         try:
             client = get_ecm_client()
-            body = (
-                {"rule_id": rule_id} if rule_id is not None
-                else {"event_sync_config": event_sync_config}
-            )
+            body = {}
+            if rule_id is not None:
+                body["rule_id"] = rule_id
+            if event_sync_config is not None:
+                body["event_sync_config"] = event_sync_config
             result = await client.call_endpoint(
                 ENDPOINTS["ac_event_sync_preview"], body=body, timeout=120.0
             )
@@ -1775,9 +1916,12 @@ def register(mcp: FastMCP):
                 if promo.get("skipped_past"):
                     lines.append(
                         f"  NOTE: {promo['skipped_past']} event(s) skipped "
-                        f"because they had already finished, so no channel "
-                        f"is created for them."
+                        + ("because their starts precede the current 24-hour event window; this does not prove they ended."
+                           if promo.get("retire_finished_events") else
+                           "because they had already finished, so no channel is created for them.")
                     )
+                if promo.get("retire_finished_events") and promo.get("skipped_early"):
+                    lines.append(f"  NOTE: {promo['skipped_early']} event(s) deferred until their starts.")
                 if promo.get("skipped_past_adopted"):
                     lines.append(
                         f"  WARNING: {promo['skipped_past_adopted']} "
@@ -1801,6 +1945,44 @@ def register(mcp: FastMCP):
                         )
                         + (" ..." if len(streams) > 5 else "")
                     )
+
+                for key, label, fields in (
+                    ("event_states", "Event states", ("channel_id", "status")),
+                    ("retirements", "Retirement decisions", (
+                        "channel_id", "stream_id", "stream_name", "rule_id", "rule_name",
+                        "action", "would_create", "would_modify",
+                    )),
+                ):
+                    if key not in promo:
+                        continue
+                    rows = promo.get(key) or []
+                    lines.append(f"  {label}: {len(rows)} returned row(s)")
+                    shown = []
+                    shortened = False
+                    for row in rows[:max(0, min(max_rows, 100))]:
+                        item = {}
+                        for field in fields:
+                            if field not in row:
+                                continue
+                            value = row[field]
+                            if isinstance(value, str) and len(value) > 2048:
+                                value = value[:2048]
+                                shortened = True
+                            item[field] = value
+                        shown.append(item)
+                    checked = _rule_details({"actions": shown})
+                    if not checked.startswith("{"):
+                        lines.append("    " + checked.replace("rule details", "lifecycle details"))
+                        continue
+                    for row in shown:
+                        lines.append("    " + json.dumps(row, ensure_ascii=False))
+                    if key == "retirements" and any(row.get("channel_id") is None for row in shown):
+                        lines.append("    NOTE: channel ID unavailable for some backend decisions.")
+                    if len(rows) > len(shown) or shortened:
+                        lines.append(
+                            f"    NOTE: {len(rows) - len(shown)} row(s) omitted"
+                            + ("; text shortened to 2048 characters." if shortened else ".")
+                        )
 
             for group in result.get("parse_failures", []):
                 lines.append(

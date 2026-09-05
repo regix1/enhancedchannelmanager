@@ -926,3 +926,413 @@ class TestAllowManualChannelMergeParam:
             })
         body = mock_client.call_endpoint.call_args.kwargs["body"]
         assert body == {"allow_manual_channel_merge": True}
+
+
+class TestRuleConfig:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["get_channel_pipeline_rule", "get_auto_creation_rule"])
+    async def test_details_preserve_complete_nested_configuration(self, tool):
+        rule = {
+            "id": 5, "name": "Events", "enabled": False, "priority": 0,
+            "m3u_account_id": 18, "target_group_id": 65, "match_scope_group_id": None,
+            "conditions": [{"type": "always", "negate": False}],
+            "actions": [{"type": "assign_epg", "params": {"epg_id": 46, "set_tvg_id": True}}],
+            "event_sync_config": {
+                "master": {"group_id": 65, "m3u_account_id": None},
+                "secondary": [{"group_id": 2462, "m3u_account_id": 18}],
+                "promote_lead_hours": 0, "retire_finished_events": False,
+                "patterns": [{"name": "Games", "title_pattern": "(?<title>.+)"}],
+            },
+        }
+        client = _client(return_value={**rule, "last_run_stats": {"huge": "ignored"}})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool(tool, {"rule_id": 5, "details": True})
+        assert json.loads(result[0][0].text) == rule
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [
+        {"password": "private-value"},
+        {"value": "https://user:private@guide.example/file"},
+        {"value": "https://guide.example/file?token=private"},
+        {"value": "x" * 70000},
+        {"items": list(range(2100))},
+        {"items": {str(index): index for index in range(2100)}},
+    ])
+    async def test_details_refuse_unsafe_or_oversized_configuration(self, value):
+        client = _client(return_value={"id": 5, "actions": [{"type": "log_match", "params": value}]})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("get_channel_pipeline_rule", {"rule_id": 5, "details": True})
+        text = result[0][0].text
+        assert text.startswith("Cannot return complete rule details:")
+        assert "private" not in text
+        assert len(text) < 250
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["create_channel_pipeline_rule", "create_auto_creation_rule"])
+    async def test_create_forwards_complete_event_config(self, tool):
+        config = {"master": {"group_id": 65, "m3u_account_id": None},
+                  "secondary": [], "enabled": False, "promote_lead_hours": 0}
+        client = _client(return_value={"id": 5, "name": "Events"})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            await _register("auto_creation").call_tool(tool, {
+                "name": "Events", "conditions": [], "actions": [], "event_sync_config": config,
+            })
+        assert client.call_endpoint.await_args.kwargs["body"]["event_sync_config"] == config
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["update_channel_pipeline_rule", "update_auto_creation_rule"])
+    async def test_update_distinguishes_omission_replacement_and_clear(self, tool):
+        client = _client(return_value={"id": 5, "name": "Events"})
+        config = {"master": {"group_id": 65, "m3u_account_id": None}, "secondary": [], "enabled": False}
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            mcp = _register("auto_creation")
+            await mcp.call_tool(tool, {"rule_id": 5, "name": "Events"})
+            await mcp.call_tool(tool, {"rule_id": 5, "event_sync_config": config})
+            await mcp.call_tool(tool, {"rule_id": 5, "clear_event_sync_config": True})
+        assert [call.kwargs["body"] for call in client.call_endpoint.await_args_list] == [
+            {"name": "Events"}, {"event_sync_config": config}, {"event_sync_config": None},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_replacement_and_clear_together(self):
+        client = _client()
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("update_channel_pipeline_rule", {
+                "rule_id": 5, "event_sync_config": {}, "clear_event_sync_config": True,
+            })
+        assert "both" in result[0][0].text
+        client.call_endpoint.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["run_channel_pipeline", "run_auto_creation"])
+    async def test_scoped_preview_exposes_non_create_epg_actions(self, tool):
+        row = {"stream_id": 123, "stream_name": "ESPN", "rule_id": 12, "rule_name": "ESPN",
+               "action": "Would assign EPG data 730 (source 46) to channel",
+               "would_create": False, "would_modify": True}
+        client = _client(return_value={"preview": {"status": "completed", "dry_run_results": [row]}})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool(tool, {
+                "dry_run": True, "rule_ids": [12], "m3u_account_ids": [18], "details": True,
+            })
+        parsed = json.loads(result[0][0].text)
+        assert parsed["dry_run_results"] == [row]
+        assert parsed["details_truncated"] is False
+        assert client.call_endpoint.await_args.kwargs["body"] == {
+            "dry_run": False, "rule_ids": [12], "m3u_account_ids": [18],
+        }
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", [[], [0], [-1], [True], ["12"]])
+    async def test_invalid_run_scope_never_prepares_global_run(self, scope):
+        client = _client()
+        from mcp.server.fastmcp.exceptions import ToolError
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            try:
+                result = await _register("auto_creation").call_tool("run_channel_pipeline", {"rule_ids": scope})
+                message = result[0][0].text
+            except ToolError as exc:
+                message = str(exc)
+        assert "rule_ids" in message
+        client.call_endpoint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_details_allow_public_artwork_url_and_refuse_deep_config(self):
+        client = _client(return_value={"id": 5, "actions": [{"type": "assign_logo", "value": "https://images.example/logo.png"}]})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            mcp = _register("auto_creation")
+            result = await mcp.call_tool("get_channel_pipeline_rule", {"rule_id": 5, "details": True})
+            assert json.loads(result[0][0].text) == client.call_endpoint.return_value
+            nested = {}
+            for _ in range(15):
+                nested = {"child": nested}
+            client.call_endpoint.return_value = {"id": 5, "event_sync_config": nested}
+            result = await mcp.call_tool("get_channel_pipeline_rule", {"rule_id": 5, "details": True})
+        assert result[0][0].text.startswith("Cannot return complete rule details:")
+
+    @pytest.mark.asyncio
+    async def test_run_details_report_bounded_non_create_rows(self):
+        rows = [{"stream_id": i, "action": f"Would assign EPG data {730+i} (source 46) to channel",
+                 "would_create": False, "would_modify": True} for i in range(4)]
+        client = _client(return_value={"preview": {"dry_run_results": rows}})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("run_channel_pipeline", {
+                "rule_ids": [12], "details": True, "max_rows": 2,
+            })
+        parsed = json.loads(result[0][0].text)
+        assert parsed["dry_run_results"] == rows[:2]
+        assert parsed["details_total"] == 4
+        assert parsed["details_truncated"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_rows", [0, 101])
+    async def test_run_details_reject_invalid_row_limit(self, max_rows):
+        client = _client()
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("run_channel_pipeline", {
+                "details": True, "max_rows": max_rows,
+            })
+        assert "max_rows" in result[0][0].text
+        client.call_endpoint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_details_refuse_credential_bearing_action_text(self):
+        client = _client(return_value={"preview": {"dry_run_results": [
+            {"action": "Would assign logo https://images.example/logo?token=private", "would_modify": True},
+        ]}})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("run_channel_pipeline", {"details": True})
+        assert result[0][0].text.startswith("Cannot return complete action details:")
+        assert "private" not in result[0][0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["get_channel_pipeline_rule", "get_auto_creation_rule"])
+    async def test_details_preserve_basic_names(self, tool):
+        rule = {
+            "id": 5, "name": "Basic Cable", "description": "Basic sports rule",
+            "actions": [{"type": "create_channel", "params": {"name_template": "Basic {stream_name}"}}],
+        }
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=_client(return_value=rule)):
+            result = await _register("auto_creation").call_tool(tool, {"rule_id": 5, "details": True})
+        assert json.loads(result[0][0].text) == rule
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [
+        {"headers": {"Authorization": "Basic dXNlcjpwYXNz"}},
+        {"headers": {"Proxy-Authorization": "Bearer private"}},
+        {"header": "Authorization: Basic dXNlcjpwYXNz"},
+        {"header": "Proxy-Authorization: Bearer private"},
+        {"url": "https://user:private@example.test/image"},
+        {"url": "https://example.test/image?token=private"},
+    ])
+    async def test_details_refuse_credentials_in_header_context(self, value):
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=_client(return_value={"actions": [value]})):
+            result = await _register("auto_creation").call_tool(
+                "get_channel_pipeline_rule", {"rule_id": 5, "details": True}
+            )
+        assert result[0][0].text.startswith("Cannot return complete rule details:")
+        assert "private" not in result[0][0].text
+        assert "dXNlcjpwYXNz" not in result[0][0].text
+
+    @pytest.mark.asyncio
+    async def test_details_refuse_invalid_unicode(self):
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=_client(return_value={"name": "\ud800"})):
+            result = await _register("auto_creation").call_tool(
+                "get_channel_pipeline_rule", {"rule_id": 5, "details": True}
+            )
+        assert result[0][0].text == "Cannot return complete rule details: unsupported configuration value."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["run_channel_pipeline", "run_auto_creation"])
+    @pytest.mark.parametrize("status, required", [
+        ("failed", ["run failed", "specific failure"]),
+        ("abandoned", ["ABANDONED", "specific failure", "circuit breaker", "Rollback/Undo will NOT restore"]),
+        ("completed_with_errors", ["WITH ERRORS", "specific failure", "Rollback/Undo will NOT restore"]),
+        ("capped", ["CAPPED", "specific failure", "Rollback/Undo will NOT restore"]),
+        ("completed", ["Execution complete", "Rollback/Undo will NOT restore"]),
+    ])
+    async def test_real_run_details_preserve_terminal_disclosures(self, tool, status, required):
+        execution = {
+            "status": status, "error_message": "specific failure",
+            "has_non_reversible_profile_changes": True,
+        }
+        outputs = []
+        for details in (False, True):
+            client = _client(side_effect=[{"execution_id": 7}, execution])
+            with patch("tools.channel_pipeline.get_ecm_client", return_value=client), patch(
+                "tools.channel_pipeline._poll_sleep", new=AsyncMock()
+            ):
+                result = await _register("auto_creation").call_tool(
+                    tool, {"dry_run": False, "details": details}
+                )
+            outputs.append(result[0][0].text)
+        assert outputs[0] == outputs[1]
+        for text in required:
+            assert text in outputs[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["update_channel_pipeline_rule", "update_auto_creation_rule"])
+    async def test_event_config_clear_reaches_http_json(self, tool):
+        import httpx
+        from ecm_client import ECMClient
+
+        requests = []
+
+        def respond(request):
+            requests.append((request.method, request.url.path, json.loads(request.content)))
+            return httpx.Response(200, json={"id": 5, "name": "Events"})
+
+        async with httpx.AsyncClient(
+            base_url="http://example.test", transport=httpx.MockTransport(respond)
+        ) as http:
+            with patch("ecm_client._get_client", return_value=http), patch(
+                "tools.channel_pipeline.get_ecm_client", return_value=ECMClient()
+            ):
+                mcp = _register("auto_creation")
+                for arguments in (
+                    {"name": "Events"}, {"event_sync_config": {"promote_lead_hours": 0}},
+                    {"clear_event_sync_config": True},
+                ):
+                    await mcp.call_tool(tool, {"rule_id": 5, **arguments})
+        assert requests == [
+            ("PUT", "/api/channel-pipeline/rules/5", {"name": "Events"}),
+            ("PUT", "/api/channel-pipeline/rules/5", {"event_sync_config": {"promote_lead_hours": 0}}),
+            ("PUT", "/api/channel-pipeline/rules/5", {"event_sync_config": None}),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["run_channel_pipeline", "run_auto_creation"])
+    async def test_scope_schema_and_legacy_kickoff_transport(self, tool):
+        import httpx
+        from ecm_client import ECMClient
+
+        requests = []
+
+        def respond(request):
+            requests.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+            if request.method == "POST":
+                return httpx.Response(202, json={"execution_id": 7, "status": "running"})
+            return httpx.Response(200, json={"status": "completed", "dry_run_results": []})
+
+        mcp = _register("auto_creation")
+        schema = next(item for item in await mcp.list_tools() if item.name == tool).inputSchema
+        for key in ("rule_ids", "m3u_account_ids"):
+            array = next(option for option in schema["properties"][key]["anyOf"] if option.get("type") == "array")
+            assert array["items"] == {"exclusiveMinimum": 0, "type": "integer"}
+        async with httpx.AsyncClient(
+            base_url="http://example.test", transport=httpx.MockTransport(respond)
+        ) as http:
+            with patch("ecm_client._get_client", return_value=http), patch(
+                "tools.channel_pipeline.get_ecm_client", return_value=ECMClient()
+            ), patch("tools.channel_pipeline._poll_sleep", new=AsyncMock()):
+                result = await mcp.call_tool(
+                    tool, {"rule_ids": [12], "m3u_account_ids": [18], "details": True}
+                )
+        assert json.loads(result[0][0].text)["status"] == "completed"
+        assert requests == [
+            ("POST", "/api/channel-pipeline/run/prepare", {"dry_run": False, "rule_ids": [12], "m3u_account_ids": [18]}),
+            ("GET", "/api/channel-pipeline/executions/7", None),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("draft", [False, True])
+    async def test_event_preview_preserves_lifecycle_decisions(self, draft):
+        states = [{"channel_id": 900, "status": "idle"}, {"channel_id": 901, "status": "unknown"}]
+        retirement = {
+            "channel_id": 900, "stream_id": None, "stream_name": "[Orphan] Fury vs. Usyk",
+            "rule_id": 5, "rule_name": "Events",
+            "action": "Would delete orphaned channel 'Fury vs. Usyk'",
+            "would_create": False, "would_modify": False,
+        }
+        client = _client(return_value={
+            "preflight": {"ok": True}, "promotion": {
+                "event_states": states, "retirements": [retirement], "would_promote": 0,
+            },
+        })
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            request = {"rule_id": 5}
+            if draft:
+                request["event_sync_config"] = {"master_group_id": 1, "secondary_group_ids": [2]}
+            result = await _register("auto_creation").call_tool("preview_event_sync", request)
+        text = result[0][0].text
+        assert "Event states: 2 returned row(s)" in text
+        assert "Retirement decisions: 1 returned row(s)" in text
+        for row in [*states, retirement]:
+            assert json.dumps(row, ensure_ascii=False) in text
+        endpoint = client.call_endpoint.call_args.args[0]
+        assert endpoint.name == "ac_event_sync_preview"
+        assert client.call_endpoint.call_args.kwargs["body"] == request
+        client.call_endpoint.assert_awaited_once()
+
+
+    @pytest.mark.asyncio
+    async def test_event_window_reports_deferral_without_completion(self):
+        client = _client(return_value={"promotion": {
+            "retire_finished_events": True, "skipped_past": 1, "skipped_early": 1,
+            "skipped_past_adopted": 0, "retirements": [], "units": [],
+        }})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("preview_event_sync", {"rule_id": 5})
+        text = result[0][0].text
+        assert "starts precede the current 24-hour event window" in text
+        assert "does not prove they ended" in text
+        assert "1 event(s) deferred until their starts" in text
+        assert "already finished" not in text
+        assert "will be REMOVED" not in text
+
+    @pytest.mark.asyncio
+    async def test_event_preview_limits_lifecycle_rows_and_text(self):
+        rows = [{"channel_id": index, "status": "unknown"} for index in range(1, 5)]
+        client = _client(return_value={"promotion": {
+            "event_states": rows,
+            "retirements": [{"action": "x" * 3000}, {"action": "kept"}],
+        }, "truncated": True})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool(
+                "preview_event_sync", {"rule_id": 5, "max_rows": 1}
+            )
+        text = result[0][0].text
+        assert "Event states: 4 returned row(s)" in text
+        assert '"channel_id": 1' in text
+        assert '"channel_id": 2' not in text
+        assert "3 row(s) omitted" in text
+        assert "1 row(s) omitted" in text
+        assert "text shortened" in text
+        assert "x" * 2048 in text
+        assert "x" * 2049 not in text
+        assert "fetch caps hit" in text
+        assert "channel ID unavailable" in text
+
+    @pytest.mark.asyncio
+    async def test_event_preview_refuses_credential_decision_details(self):
+        client = _client(return_value={"promotion": {
+            "event_states": [{"channel_id": 900, "status": "idle"}],
+            "retirements": [{"action": "https://user:private@example.test/path"}],
+        }})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("preview_event_sync", {"rule_id": 5})
+        text = result[0][0].text
+        assert "Retirement decisions: 1 returned row(s)" in text
+        assert "Cannot return complete lifecycle details:" in text
+        assert "private" not in text
+        assert '"channel_id": 900' in text
+
+    @pytest.mark.asyncio
+    async def test_event_preview_omits_absent_lifecycle_sections(self):
+        client = _client(return_value={"preflight": {"ok": True}, "promotion": {"would_promote": 2}})
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+            result = await _register("auto_creation").call_tool("preview_event_sync", {"rule_id": 5})
+        text = result[0][0].text
+        assert "Would promote: 2" in text
+        assert "Event states:" not in text
+        assert "Retirement decisions:" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["run_channel_pipeline", "run_auto_creation"])
+    @pytest.mark.parametrize("details", [False, True])
+    @pytest.mark.parametrize("status, required", [
+        ("failed", ["run failed", "specific failure"]),
+        ("abandoned", ["Execution", "ABANDONED", "specific failure", "circuit breaker", "Rollback/Undo will NOT restore"]),
+        ("completed_with_errors", ["Execution", "WITH ERRORS", "specific failure", "Rollback/Undo will NOT restore"]),
+        ("capped", ["Execution", "CAPPED", "specific failure", "Rollback/Undo will NOT restore"]),
+        ("completed", ["Execution complete", "Rollback/Undo will NOT restore"]),
+    ])
+    async def test_direct_plan_defaults_preserve_execution_disclosures(self, tool, details, status, required):
+        client = _client(side_effect=[
+            {"execution_id": 7},
+            {"status": status, "error_message": "specific failure", "has_non_reversible_profile_changes": True},
+        ])
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client), patch(
+            "tools.channel_pipeline._poll_sleep", new=AsyncMock()
+        ):
+            result = await _register("auto_creation").call_tool(tool, {
+                "plan_id": "selected-plan", "plan_hash": "selected-hash", "details": details,
+            })
+        text = result[0][0].text
+        for value in required:
+            assert value in text
+        assert client.call_endpoint.await_args_list[0].args[0].name == "ac_commit_run"
+        assert client.call_endpoint.await_args_list[0].kwargs["body"] == {
+            "plan_id": "selected-plan", "plan_hash": "selected-hash", "phase": "execute",
+        }

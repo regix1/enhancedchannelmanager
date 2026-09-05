@@ -88,12 +88,16 @@ def event_sync_trigger_allowed(triggered_by: str, config: dict | None) -> bool:
     ``event_sync_config`` carries the literal ``auto_run: true`` — absent,
     false, or any non-bool value all read as "not opted in", so stored
     configs that predate the flag keep manual-run-only behavior exactly.
-    Every other trigger is denied.
+    Scheduled passes additionally require explicit event retirement. Every
+    other trigger is denied.
     """
     if triggered_by in EVENT_SYNC_ALLOWED_TRIGGERS:
         return True
     if triggered_by == EVENT_SYNC_AUTO_RUN_TRIGGER:
         return bool(config) and config.get("auto_run") is True
+    if triggered_by == "scheduled":
+        return (bool(config) and config.get("auto_run") is True
+                and config.get("retire_finished_events") is True)
     return False
 
 
@@ -699,6 +703,8 @@ class ChannelPipelineEngine:
         # tick fires every minute and the overwhelming majority of ticks change
         # nothing, so an unconditional call would hammer the media server. [41]
         if not dry_run and (results["channels_created"] or removed):
+            from cache import get_cache
+            get_cache().invalidate_prefix("dummy_epg_xmltv")
             await request_guide_refresh()
 
         return {
@@ -5571,6 +5577,8 @@ class ChannelPipelineEngine:
         from services.pipeline_write_plan import PlanningContext
         planning = planning or PlanningContext()
         persist = not dry_run and planning.allow_internal_side_effects
+        active_ids = None
+        viewers_checked = False
         session = get_session()
         try:
             for rule in rules:
@@ -5626,6 +5634,9 @@ class ChannelPipelineEngine:
                         continue
 
                 orphan_action = getattr(rule, 'orphan_action', 'delete') or 'delete'
+                if orphan_action not in {"delete", "move_uncategorized", "delete_and_cleanup_groups", "none"}:
+                    logger.warning("[AUTO-CREATE-ENGINE] Rule '%s': unsupported orphan action; preserving channels", rule.name)
+                    orphan_action = "none"
                 logger.debug(
                     "[AUTO-CREATE-ENGINE] Rule '%s': orphan_action=%s, "
                     "managed_channel_ids=%s",
@@ -5657,6 +5668,38 @@ class ChannelPipelineEngine:
                     continue
 
                 orphan_ids = previous_ids - current_ids
+                if event_sync_promote_group_id is not None and cfg.get("retire_finished_events"):
+                    states = getattr(executor, "_event_states", {}).get(rule.id, {})
+                    held = {cid for cid in orphan_ids
+                            if cid in executor._channel_by_id and states.get(cid) != "idle"}
+                    current_ids.update(held)
+                    orphan_ids.difference_update(held)
+                    if orphan_ids and not viewers_checked:
+                        viewers_checked = True
+                        try:
+                            async with asyncio.timeout(10):
+                                stats = await self.client.get_channel_stats()
+                            channels = stats.get("channels") if isinstance(stats, dict) else None
+                            if isinstance(channels, list) and all(isinstance(row, dict) for row in channels):
+                                identifiers = [row.get("channel_id") or row.get("uuid") or row.get("id") for row in channels]
+                                if all(type(value) is int or (isinstance(value, str) and value.strip())
+                                       for value in identifiers):
+                                    active_ids = {str(value) for value in identifiers}
+                        except Exception:
+                            active_ids = None
+                    held = {
+                        cid for cid in orphan_ids
+                        if cid in executor._channel_by_id and (
+                            active_ids is None
+                            or not isinstance(executor._channel_by_id[cid].get("uuid"), str)
+                            or not executor._channel_by_id[cid]["uuid"].strip()
+                            or active_ids.intersection({
+                            str(cid), str((executor._channel_by_id.get(cid) or {}).get("uuid")),
+                            })
+                        )
+                    }
+                    current_ids.update(held)
+                    orphan_ids.difference_update(held)
 
                 # Filter out stale orphans: IDs that no longer exist in
                 # Dispatcharr (already deleted externally or via re-import).
@@ -5740,6 +5783,7 @@ class ChannelPipelineEngine:
                         results["dry_run_results"].append({
                             "stream_id": None,
                             "stream_name": f"[Orphan] {channel_name}",
+                            "channel_id": channel_id,
                             "rule_id": rule.id,
                             "rule_name": rule.name,
                             "action": action_desc,
@@ -5763,6 +5807,8 @@ class ChannelPipelineEngine:
                             results["channels_removed"] += 1
 
                     # Log the cleanup action
+                    if not action_result.success:
+                        current_ids.add(channel_id)
                     results["execution_log"].append({
                         "stream_id": None,
                         "stream_name": f"[Orphan] {channel_name}",
