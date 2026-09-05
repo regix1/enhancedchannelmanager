@@ -128,7 +128,7 @@ async def test_scheduled_generation_uses_shared_preparation_once(status):
     prepare.assert_awaited_once_with([profile.to_dict.return_value], channels, client, wait_for_sources=True)
     assert render.await_count == 2
     assert render.await_args_list[0].args[1:] == (prepared, channels)
-    if status in {None, "ready"}:
+    if status in {None, "ready", "artwork"}:
         cache.return_value.set.assert_any_call("dummy_epg_xmltv_all", "<tv/>")
         cache.return_value.set.assert_any_call("dummy_epg_xmltv_7", "<tv/>")
     else:

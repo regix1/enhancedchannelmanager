@@ -3496,3 +3496,123 @@ async def test_lifecycle_uses_scoped_iso_patterns(retirement, shape, with_witnes
     assert states.get(-1, "unknown") == ("active" if active else "unknown")
     setup["client"].create_channel.assert_not_awaited()
     setup["client"].delete_channel.assert_not_awaited()
+
+@pytest.fixture
+def promotion_candidates(retirement, monkeypatch):
+    from cache import Cache
+    from stream_prober import StreamProber
+
+    setup = retirement
+    setup["config"].update(max_promote_per_run=1, auto_run=False)
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["rule"].set_managed_channel_ids([])
+    setup["db"].commit()
+    setup["state"].channels.clear()
+    setup["witness"].clear()
+    setup["clock"] = setup["now"]
+    setup["first_health"] = "failed"
+    setup["batches"] = []
+    start = setup["now"] - timedelta(minutes=30)
+    names = ["DAZN 01: Alpha Event @ 11 Jul 11:30 PM ET",
+             "DAZN 02: Zulu Event @ 11 Jul 11:30 PM ET"]
+    setup["rows"] = [
+        _resolved(name, DISPOSITION_UNMATCHED, _parsed(title, start),
+                  stream_id=sid, provider_id=2, group_id=SECONDARY_A)
+        for name, title, sid in zip(names, ["Alpha Event", "Zulu Event"], [7301, 7302])
+    ]
+    setup["streams"][:] = [
+        {"id": sid, "name": name, "url": "https://example.invalid/stream",
+         "is_stale": False, "m3u_account": 2, "channel_group_id": SECONDARY_A,
+         "updated_at": setup["now"].isoformat()}
+        for sid, name in zip([7301, 7302], names)
+    ]
+    prober = StreamProber.__new__(StreamProber)
+    prober.max_concurrent_probes = 1
+    prober.account_probe_limits = {2: 1}
+    prober._account_semaphores = {}
+    prober.refresh_account_probe_limits = AsyncMock()
+
+    async def probe(sid, url, name):
+        setup["batches"][-1].append(sid)
+        if sid != 7302 and setup["first_health"] == "unknown":
+            return {}
+        working = sid == 7302 or setup["first_health"] == "success"
+        stat = {"probe_status": "success" if working else "failed",
+                "measured_bitrate": 5000000 if working else 0,
+                "last_probed": setup["clock"].isoformat()}
+        setup["stats"][sid] = stat
+        return stat
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr("cache._cache", Cache())
+    monkeypatch.setattr("stream_prober.ensure_prober", lambda: prober)
+    setup["prober"] = prober
+    return setup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_health", ["failed", "unknown", "missing_url", "success"])
+@pytest.mark.parametrize("first_streams", [1, 201])
+async def test_event_health_advances_past_unavailable_candidates(promotion_candidates, first_health, first_streams):
+    from channel_pipeline_executor import ExecutionContext
+    from services.event_sync_stream_health import MAX_HEALTH_PROBES_PER_RUN
+    from types import SimpleNamespace
+
+    setup = promotion_candidates
+    setup["first_health"] = first_health
+    if first_streams > 1:
+        first = setup["rows"][0]
+        template = setup["streams"][0]
+        setup["rows"] = [
+            _resolved(first.stream.name, DISPOSITION_UNMATCHED, first.result.parsed,
+                      stream_id=sid, provider_id=2, group_id=SECONDARY_A)
+            for sid in range(1, first_streams + 1)
+        ] + [setup["rows"][1]]
+        setup["streams"][:] = [
+            {**template, "id": sid} for sid in range(1, first_streams + 1)
+        ] + [setup["streams"][1]]
+    if first_health == "missing_url":
+        for stream in setup["streams"]:
+            if stream["id"] != 7302:
+                stream.pop("url")
+    results = []
+    for index in range(1 if first_health == "success" else 2):
+        setup["clock"] = setup["now"] + timedelta(minutes=6 * index)
+        setup["batches"].append([])
+        executor = ActionExecutor(setup["client"], list(setup["state"].channels.values()), managed_channel_ids=[])
+        with patch("channel_pipeline_executor.datetime") as clock:
+            clock.now.return_value = setup["clock"]
+            clock.fromisoformat.side_effect = datetime.fromisoformat
+            result = await executor._execute_event_sync_promotion(
+                setup["rule"].id, setup["rule"].name, setup["config"],
+                SimpleNamespace(resolved=setup["rows"]), ExecutionContext(),
+            )
+        results.append(result["promoted_created"])
+    assert results == ([1] if first_health == "success" else [0, 1])
+    created = next(iter(setup["state"].channels.values()))
+    assert ("Alpha Event" if first_health == "success" else "Zulu Event") in created["name"]
+    assert all(len(batch) <= MAX_HEALTH_PROBES_PER_RUN for batch in setup["batches"])
+    if first_health != "success":
+        assert setup["batches"][-1] == [7302]
+    assert len(setup["state"].channels) == 1
+
+
+@pytest.mark.asyncio
+async def test_event_preview_does_not_consume_health_progress(promotion_candidates):
+    from channel_pipeline_executor import ExecutionContext
+    from types import SimpleNamespace
+
+    setup = promotion_candidates
+    with patch("channel_pipeline_executor.datetime") as clock:
+        clock.now.return_value = setup["clock"]
+        clock.fromisoformat.side_effect = datetime.fromisoformat
+        for dry_run in [True, True, False]:
+            setup["batches"].append([])
+            executor = ActionExecutor(setup["client"], [], managed_channel_ids=[])
+            result = await executor._execute_event_sync_promotion(
+                setup["rule"].id, setup["rule"].name, setup["config"],
+                SimpleNamespace(resolved=setup["rows"]), ExecutionContext(dry_run=dry_run),
+            )
+            assert result["promoted_created"] == 0
+    assert setup["batches"] == [[], [], [7301]]
+    setup["client"].create_channel.assert_not_awaited()

@@ -1582,6 +1582,13 @@ async def _compute_pipeline_plan_payload(request: RunPipelineRequest) -> dict:
         rule_ids=request.rule_ids, record_execution=False, plan_only=True,
         skip_prerefresh=True,
     )
+    from channel_pipeline_executor import _advance_event_probe
+
+    for summary in result.get("event_sync", []):
+        progress = (summary.get("promotion") or {}).pop("probe_after", None)
+        if progress is not None and not planning_client.plan.writes:
+            _advance_event_probe(summary["rule_id"], progress["previous"], progress["next"])
+
     scoped_rules = await engine._load_rules(request.rule_ids)
     event_master_groups = {
         config["master_group_id"]

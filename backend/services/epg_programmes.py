@@ -574,10 +574,10 @@ async def _probe_artwork(unknown: dict) -> None:
 
 
 def can_cache(coverage: dict) -> bool:
-    """Cache completed composition while source refreshes run independently."""
+    """Cache completed composition while source and portrait refreshes run independently."""
     sources = coverage.get("sources", [])
-    return not coverage.get("artwork_pending") and (
-        not sources or any(source.get("status") == "ready" or source.get("last_success") for source in sources)
+    return not sources or any(
+        source.get("status") == "ready" or source.get("last_success") for source in sources
     )
 
 

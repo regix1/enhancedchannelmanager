@@ -1162,10 +1162,10 @@ class TestProgrammeSources:
         assert "ONE Fight Night 47" in response.text
         assert 'channel="ecm-10"' in response.text
         assert "20260905050000 +0000" in response.text
-        if source_status != "ready":
-            cache.set.assert_not_called()
-        else:
+        if source_status in {"ready", "artwork"}:
             cache.set.assert_called_once()
+        else:
+            cache.set.assert_not_called()
         prepare.assert_awaited_once()
         assert prepare.await_args.kwargs == {}
 
@@ -1292,9 +1292,99 @@ class TestProgrammeSources:
                 await refresh
 
     @pytest.mark.asyncio
+    async def test_background_guide_is_cached_while_portraits_are_pending(self, async_client, test_session, monkeypatch, tmp_path):
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+        from xml.etree import ElementTree as ET
+        from cache import Cache
+        from services import epg_artwork, epg_programmes as guides
+        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+
+        for name in ("_CATALOGUE_CACHE", "_CATALOGUE_LOADS", "_SOURCE_CACHE", "_SOURCE_LOADS"):
+            monkeypatch.setattr(guides, name, {})
+        monkeypatch.setattr(guides, "_ARTWORK_LOAD", None)
+        monkeypatch.setattr(guides, "_ARTWORK_CHECKED", 0)
+        monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+        profile = _create_profile(test_session, tvg_id_template="ecm-{channel_id}")
+        profile.set_epg_source_ids([42])
+        profile.set_channel_group_ids([68])
+        test_session.commit()
+        channels = {1: {"id": 1, "name": "ESPN", "channel_number": 1, "channel_group_id": 68, "tvg_id": "ESPN.us", "streams": []}}
+        sources = [{"id": 42, "source_type": "xmltv", "is_active": True, "url": "https://guide.invalid/guide.xml"}]
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        programme = ET.Element("programme", {
+            "channel": "ESPN.us", "start": now.strftime("%Y%m%d%H%M%S %z"),
+            "stop": (now + timedelta(hours=1)).strftime("%Y%m%d%H%M%S %z"),
+        })
+        ET.SubElement(programme, "title").text = "Complete schedule"
+        landscape = "https://tmsimg.com/assets/p12345_b_h3_aa.jpg"
+        portrait = "https://tmsimg.com/assets/p12345_b_v12_aa.jpg"
+        ET.SubElement(programme, "icon", {"src": landscape})
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def probe(artwork_cache, unknown):
+            started.set()
+            await release.wait()
+            for key in unknown:
+                artwork_cache.put(key, "v12")
+            artwork_cache.save()
+            return len(unknown)
+
+        client = AsyncMock()
+        client.get_epg_sources.return_value = sources
+        read = AsyncMock(return_value={"headers": {}, "rows": {"ESPN.us": [programme]}, "warnings": [], "size": 100})
+        monkeypatch.setattr(guides, "_read_source", read)
+        monkeypatch.setattr(epg_artwork, "probe_unknown", probe)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [profile]
+        cache = Cache()
+        with patch("tasks.dummy_epg_refresh.get_client", return_value=client), patch(
+            "routers.dummy_epg.get_client", return_value=client
+        ), patch("database.get_session", return_value=db), patch(
+            "services.epg_programmes._fetch_all_channels", AsyncMock(return_value=channels)
+        ), patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)) as fetch, patch(
+            "cache.get_cache", return_value=cache
+        ), patch.object(guides, "get_cache", return_value=cache), patch("routers.dummy_epg.cache", cache):
+            task = None
+            try:
+                assert await DummyEPGRefreshTask()._regenerate_xmltv() == 1
+                await asyncio.wait_for(started.wait(), timeout=1)
+                task = guides._ARTWORK_LOAD
+                for key in ("dummy_epg_xmltv_all", f"dummy_epg_xmltv_{profile.id}"):
+                    xml = cache.get(key, ttl=300)
+                    assert xml is not None
+                    assert landscape in xml
+                    ET.fromstring(xml)
+                response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+                assert response.status_code == 200
+                assert landscape in response.text
+                assert "Complete schedule" in response.text
+                fetch.assert_not_awaited()
+                release.set()
+                await task
+                assert cache.get("dummy_epg_xmltv_all", ttl=300) is None
+                assert cache.get(f"dummy_epg_xmltv_{profile.id}", ttl=300) is None
+                response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+                assert response.status_code == 200
+                assert portrait in response.text
+                assert landscape not in response.text
+                assert cache.get(f"dummy_epg_xmltv_{profile.id}", ttl=300) == response.text
+                assert fetch.await_count == 1
+                combined = await async_client.get("/api/dummy-epg/xmltv")
+                assert combined.status_code == 200
+                assert portrait in combined.text
+                assert cache.get("dummy_epg_xmltv_all", ttl=300) == combined.text
+                read.assert_awaited_once()
+            finally:
+                release.set()
+                task = task or guides._ARTWORK_LOAD
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(("source_status", "artwork_pending", "status"), [
         ("error", False, "error"), ("stale", False, "error"),
-        ("pending", False, "pending"), ("ready", True, "pending"),
+        ("pending", False, "pending"), ("pending", True, "pending"),
     ])
     async def test_generation_reports_unready_coverage_without_publishing(self, async_client, test_session, source_status, artwork_pending, status):
         profile = _create_profile(test_session)

@@ -840,8 +840,12 @@ async def test_source_icons_variants_and_portrait_banner_settings_survive(monkey
 
 @pytest.mark.asyncio
 async def test_uncached_portraits_are_probed_once_without_delaying_guides(monkeypatch, tmp_path):
+    from cache import Cache
     from services import epg_artwork
     monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    cache = Cache()
+    api = client()
+    monkeypatch.setattr(guides, "get_cache", lambda: cache)
     landscape = "https://tmsimg.com/assets/p12345_b_h3_aa.jpg"
     install_feed(monkeypatch, feed(programme(children=f'<icon src="{landscape}"/>')))
     started, release = asyncio.Event(), asyncio.Event()
@@ -855,20 +859,31 @@ async def test_uncached_portraits_are_probed_once_without_delaying_guides(monkey
         return len(unknown)
 
     with patch.object(epg_artwork, "probe_unknown", side_effect=probe) as mock_probe:
-        first, first_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        first, first_coverage = await guides.prepare_profiles([profile()], {1: channel()}, api, now=NOW, wait_for_sources=True)
         await asyncio.wait_for(started.wait(), timeout=0.1)
-        assert first[0]["source_programmes"][1][0].find("icon").get("src") == landscape
-        assert first_coverage["artwork_pending"] is True
-        second, second_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
-        assert second_coverage["artwork_pending"] is True
-        assert mock_probe.await_count == 1
-        release.set()
-        await guides._ARTWORK_LOAD
-        assert not guides.can_cache(first_coverage)
-        assert not guides.can_cache(second_coverage)
-        third, third_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        task = guides._ARTWORK_LOAD
+        try:
+            assert first[0]["source_programmes"][1][0].find("icon").get("src") == landscape
+            assert first_coverage["artwork_pending"] is True
+            assert guides.can_cache(first_coverage)
+            for key in ("dummy_epg_xmltv_all", "dummy_epg_xmltv_1"):
+                cache.set(key, "complete guide")
+            second, second_coverage = await guides.prepare_profiles([profile()], {1: channel()}, api, now=NOW, wait_for_sources=True)
+            assert second_coverage["artwork_pending"] is True
+            assert guides.can_cache(second_coverage)
+            assert mock_probe.await_count == 1
+            assert cache.get("dummy_epg_xmltv_all") == "complete guide"
+            assert cache.get("dummy_epg_xmltv_1") == "complete guide"
+        finally:
+            release.set()
+            await task
+        assert cache.get("dummy_epg_xmltv_all") is None
+        assert cache.get("dummy_epg_xmltv_1") is None
+        third, third_coverage = await guides.prepare_profiles([profile()], {1: channel()}, api, now=NOW, wait_for_sources=True)
         assert third[0]["source_programmes"][1][0].find("icon").get("src") == "https://tmsimg.com/assets/p12345_b_v12_aa.jpg"
         assert guides.can_cache(third_coverage)
+        assert third_coverage["artwork_pending"] is False
+        assert mock_probe.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -892,7 +907,7 @@ async def test_portrait_probe_failures_release_the_task_and_retry_later(monkeypa
         task = guides._ARTWORK_LOAD
         await asyncio.gather(task, return_exceptions=True)
         assert guides._ARTWORK_LOAD is None
-        assert not guides.can_cache(coverage)
+        assert guides.can_cache(coverage)
         assert first[0]["source_programmes"][1][0].find("icon").get("src").endswith("_h3_aa.jpg")
         await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
         assert mock_probe.await_count == 1
@@ -1229,10 +1244,12 @@ async def test_unrelated_invalid_schedule_does_not_warn_a_matched_channel(monkey
     assert "invalid_schedule" in coverage["sources"][0]["warnings"]
 
 
-def test_complete_partial_output_is_cacheable():
-    assert guides.can_cache({"sources": [{"status": "ready"}, {"status": "error"}]})
-    assert guides.can_cache({"sources": [{"status": "error", "last_success": NOW.isoformat()}]})
-    assert not guides.can_cache({"sources": [{"status": "pending"}]})
+@pytest.mark.parametrize("artwork_pending", [False, True])
+def test_complete_partial_output_is_cacheable(artwork_pending):
+    assert guides.can_cache({"sources": [{"status": "ready"}, {"status": "error"}], "artwork_pending": artwork_pending})
+    assert guides.can_cache({"sources": [{"status": "error", "last_success": NOW.isoformat()}], "artwork_pending": artwork_pending})
+    for status in ("pending", "error", "stale"):
+        assert not guides.can_cache({"sources": [{"status": status}], "artwork_pending": artwork_pending})
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Union
 import re
+import time
 
 import safe_regex
 import journal
@@ -143,6 +144,27 @@ class ProfileMembershipResult:
         """True when at least one profile's enabled-state actually flipped
         (succeeded). Drives the caller's ``modified`` flag."""
         return bool(self.enabled_count or self.disabled_count)
+
+
+def _advance_event_probe(rule_id: int, previous: str | None, event_key: str) -> None:
+    """Remember bounded per-rule progress after an unsuccessful health sample."""
+    from cache import get_cache
+
+    cache = get_cache()
+    now = time.monotonic()
+    positions = {
+        key: value
+        for key, value in (cache.get("event_sync_probe_positions", ttl=86400) or {}).items()
+        if now - value[0] < 86400
+    }
+    current = positions.get(rule_id)
+    if (current[1] if current else None) != previous:
+        return
+    positions.pop(rule_id, None)
+    positions[rule_id] = (now, event_key)
+    while len(positions) > 256:
+        positions.pop(next(iter(positions)))
+    cache.set("event_sync_probe_positions", positions)
 
 
 @dataclass
@@ -5302,6 +5324,7 @@ class ActionExecutor:
         from services.event_sync_promote import (
             build_promotion_plan,
             event_has_started,
+            PROMOTE_ACTION_CREATE,
         )
         from services.event_sync_review import (
             PROVIDER_ID_UNKNOWN,
@@ -5338,19 +5361,46 @@ class ActionExecutor:
             config, resolution.resolved, existing_name_to_id, now=now,
         )
 
+        all_units = (*plan.units, *plan.capped_units)
+        health_units = plan.units
+        probe_after = None
+        if config.get("retire_finished_events") and rule_id is not None and plan.capped_units:
+            from cache import get_cache
+
+            positions = get_cache().get("event_sync_probe_positions", ttl=86400) or {}
+            position = positions.get(rule_id)
+            previous = (
+                position[1] if position and time.monotonic() - position[0] < 86400 else None
+            )
+            candidates = sorted(
+                (unit for unit in all_units if unit.action == PROMOTE_ACTION_CREATE),
+                key=lambda unit: unit.event_key,
+            )
+            if previous is not None:
+                candidates = (
+                    [unit for unit in candidates if unit.event_key > previous]
+                    + [unit for unit in candidates if unit.event_key <= previous]
+                )
+            # Rotate only the bounded new-event health sample. The final
+            # planner still applies its creation cap after lifecycle proof.
+            sample_size = sum(unit.action == PROMOTE_ACTION_CREATE for unit in plan.units)
+            selected = candidates[:sample_size]
+            health_units = (
+                *selected,
+                *(unit for unit in plan.units if unit.action != PROMOTE_ACTION_CREATE),
+            )
+            if selected and not exec_ctx.dry_run:
+                probe_after = {"previous": previous, "next": selected[-1].event_key}
+
         stale_rows: dict = {}
         dead = set()
         working_stream_ids: set = set()
         unit_stream_ids_by_key: dict = {}
         if config.get("skip_dead_streams") or config.get("retire_finished_events"):
-            # Plan first, then check ONLY the streams that plan is about to
-            # turn into channels. plan.units is what is left after the past
-            # filter, the lead window AND the cap, which on a real rule is
-            # a few dozen streams rather than the thousand-odd the parse
-            # produces — probing dials the provider, so everything cheap
-            # runs before it. The planner is pure, so replanning with the
-            # verdict costs nothing and keeps the health filter in the one
-            # place the preview reads it from too.
+            # The health sample keeps the planner's new-event count plus
+            # existing attachments, after the date and lead-window filters.
+            # Rotation lets a missing URL or inconclusive probe yield to the
+            # next candidate without enlarging any provider probe batch.
             #
             # Read off the fetch this run already performed rather than
             # scanning the provider's whole playlist again. The whole row is
@@ -5372,7 +5422,7 @@ class ActionExecutor:
                     row.stream.stream_id for row in unit.rows
                     if row.stream.stream_id is not None
                 }
-                for unit in plan.units
+                for unit in all_units
             }
             # A probe verdict only counts against a stream once its event
             # has begun; before that a failure can just mean there is
@@ -5381,7 +5431,7 @@ class ActionExecutor:
             # read. [7]
             event_start_by_stream = {
                 row.stream.stream_id: unit.rows[0].result.parsed.start
-                for unit in plan.units
+                for unit in health_units
                 if event_has_started(
                     unit.rows[0].result.parsed, now,
                     since=now - timedelta(hours=24) if config.get("retire_finished_events") else None,
@@ -5392,7 +5442,7 @@ class ActionExecutor:
             dead = await find_dead_streams(
                 [
                     row.stream.stream_id
-                    for unit in plan.units for row in unit.rows
+                    for unit in health_units for row in unit.rows
                 ],
                 client=self.client,
                 probe_missing=not exec_ctx.dry_run,
@@ -5408,7 +5458,7 @@ class ActionExecutor:
                 **({"probe_before": now - timedelta(minutes=5),
                     "probe_first": {
                         row.stream.stream_id
-                        for unit in plan.units
+                        for unit in health_units
                         if unit.existing_channel_id is None
                         for row in unit.rows
                         if row.stream.stream_id is not None
@@ -5428,14 +5478,24 @@ class ActionExecutor:
             # currently playing. [51]
             working_stream_ids = await find_working_streams([
                 row.stream.stream_id
-                for unit in plan.units for row in unit.rows
+                for unit in health_units for row in unit.rows
             ])
 
         event_states = {}
         if config.get("retire_finished_events"):
             now = datetime.now(timezone.utc)
+            sampled_keys = {unit.event_key for unit in health_units}
+            lifecycle_units = {
+                unit.event_key: unit for unit in (*plan.units, *plan.capped_units)
+            }
             eligible, event_states = await self._event_lifecycle(
-                rule_id, config, (*plan.units, *plan.capped_units), now,
+                rule_id, config,
+                (
+                    *(lifecycle_units[unit.event_key] for unit in health_units
+                      if unit.event_key in lifecycle_units),
+                    *(unit for key, unit in lifecycle_units.items() if key not in sampled_keys),
+                ),
+                now,
             )
             plan = build_promotion_plan(
                 config, resolution.resolved, existing_name_to_id, now=now,
@@ -5826,6 +5886,14 @@ class ActionExecutor:
                 "max_promote_per_run on the rule.",
                 rule_name, plan.cap, plan.cap_overage,
             )
+
+        if probe_after is not None and not promo["promoted_created"]:
+            if self._plan_only:
+                # The full write ledger is available only after later phases.
+                # A prepared plan with any writes must keep this selection.
+                promo["probe_after"] = probe_after
+            else:
+                _advance_event_probe(rule_id, probe_after["previous"], probe_after["next"])
 
         return promo
 
