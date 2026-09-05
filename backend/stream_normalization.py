@@ -347,13 +347,13 @@ def strip_regional_suffix(name: str) -> str:
 # Quality sorting with provider interleaving
 # ---------------------------------------------------------------------------
 
-def _country_rank(stream: dict, channel_country: Optional[str]) -> int:
+def get_country_rank(stream_name: str, channel_country: str | None) -> int:
     """Rank one stream against the channel's country: match, unknown, then mismatch.
 
     An unlabelled stream ranks between the two, so a channel whose streams carry no
     country at all keeps the order it already had.
     """
-    code = get_country_prefix(stream.get("name", ""))
+    code = get_country_prefix(stream_name)
     if code is None:
         return 1
     return 0 if COUNTRY_CODE_ALIASES.get(code, code) == channel_country else 2
@@ -416,7 +416,7 @@ def sort_streams_by_quality(streams: list[dict]) -> list[dict]:
 
         # Country breaks the tie inside a tier, never across one. The sort is stable,
         # so providers stay interleaved within each country rank. [21]
-        tier_result.sort(key=lambda s: _country_rank(s, channel_country))
+        tier_result.sort(key=lambda s: get_country_rank(s.get("name", ""), channel_country))
         result.extend(tier_result)
 
     elapsed = (time.time() - start) * 1000

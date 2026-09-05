@@ -1241,53 +1241,12 @@ async def update_settings(
         "emby_refresh_guide_after_pipeline": emby_refresh_guide_after_pipeline,
         # Post-run automatic guide linking toggle (preserve-on-omit above).
         "epg_auto_link_after_pipeline": epg_auto_link_after_pipeline,
-        # Internal bookkeeping marker (GH #484): never sent by the UI, so it MUST
-        # be preserved from current settings — rebuilding the model here would
-        # otherwise reset it to False and re-arm the one-time league-strip heal,
-        # re-clobbering the user's require_delimiter choice on the next boot.
-        "league_delimiter_heal_applied": current_settings.league_delimiter_heal_applied,
-        # ADR-013 (bead 312nk.2): WS channel_stats subscriber flags. Not yet
-        # surfaced in the UI (operator-driven soak via settings.json), so they
-        # MUST be preserved from current settings — rebuilding the model here
-        # would otherwise reset an operator's opt-in back to the default OFF on
-        # the next UI settings-save.
-        "use_ws_channel_stats": current_settings.use_ws_channel_stats,
-        "ws_suppress_poll_when_healthy": current_settings.ws_suppress_poll_when_healthy,
-        # ADR-013 §D2 (bead 312nk.3): steady-state session_telemetry write
-        # cadence. Like the WS flags above it is operator-driven via
-        # settings.json (not surfaced in the UI), so it MUST be preserved from
-        # current settings — rebuilding the model here would otherwise reset an
-        # operator's tuned value back to the default on the next UI settings-save.
-        "telemetry_write_interval": current_settings.telemetry_write_interval,
-        # ADR-013 §D3/§D4 (bead 312nk.4): stream->provider and user->username
-        # cache TTLs. Operator-driven via settings.json (not surfaced in the
-        # UI), so they MUST be preserved from current settings — rebuilding the
-        # model here would otherwise reset a tuned value back to the default on
-        # the next UI settings-save.
-        "stream_provider_cache_ttl": current_settings.stream_provider_cache_ttl,
-        "user_username_cache_ttl": current_settings.user_username_cache_ttl,
-        # nngkg: DBAS outbound-policy mode is written ONLY through the dedicated
-        # PATCH /api/settings/security endpoint (like mcp_api_key), never by the
-        # general settings form. It MUST be preserved from current settings here
-        # — rebuilding the model would otherwise reset an operator's public-only
-        # choice back to the lan_friendly default on the next UI settings-save.
-        "ssrf_outbound_mode": current_settings.ssrf_outbound_mode,
-        # ti939.4.2: the Event Sync team-alias dictionary is written ONLY
-        # through the dedicated PUT /api/event-sync/team-aliases endpoint
-        # (validated + journaled there), never by the general settings form.
-        # It MUST be preserved from current settings here — rebuilding the
-        # model would otherwise wipe the operator's dictionary on every
-        # ordinary settings save.
-        "event_sync_team_aliases": current_settings.event_sync_team_aliases,
     })
-    # A model field with no field of that name on the request cannot be set
-    # through this endpoint at all, so it keeps the stored value instead of the
-    # default the construction just gave it. That is the post-refresh
-    # auto-creation latch, the MCP bulk-operation caps, and the refresh and
-    # consumed timestamp pair that gates a pending auto-creation run, none of
-    # which this form asks about. Reading the split off the names the
-    # construction actually passed leaves the validation and the preserve-on-omit
-    # resolution above untouched.
+    # Fields absent from the request model keep their stored values unless
+    # explicitly resolved above. This preserves internal state and operator
+    # settings without overriding validation or preserve-on-omit handling.
+    # ssrf_outbound_mode and event_sync_team_aliases must remain absent from
+    # SettingsRequest: only their dedicated endpoints may change them.
     new_settings = requested_settings.model_copy(
         update={
             name: getattr(current_settings, name)

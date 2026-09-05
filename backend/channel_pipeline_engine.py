@@ -48,7 +48,7 @@ from channel_pipeline_executor import (
     ExecutionContext,
 )
 from channel_pipeline_sort import sort_channels_by_name
-from stream_normalization import get_quality_tier
+from stream_normalization import get_country_rank, get_quality_tier
 
 
 logger = logging.getLogger(__name__)
@@ -6273,7 +6273,7 @@ def _smart_sort_streams(
 
     active_criteria = [c for c in sort_priority if sort_enabled.get(c, False)]
 
-    from stream_prober import get_channel_country, get_country_rank
+    from stream_prober import get_channel_country
 
     # The caller seeds a name-only entry for every stream the channel lists, so a
     # name is readable here even when nothing on the channel has been probed.

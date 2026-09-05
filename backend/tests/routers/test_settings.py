@@ -2795,14 +2795,9 @@ class TestSecuritySettings:
         assert response.json()["ssrf_outbound_mode"] == "lan_friendly"
 
     @pytest.mark.asyncio
-    async def test_full_post_preserves_ssrf_outbound_mode(self, async_client):
-        """A partial POST /api/settings must NOT reset the outbound mode.
-
-        Reproduction: SettingsRequest doesn't accept ssrf_outbound_mode, so a
-        normal settings save would rebuild DispatcharrSettings(...) with the
-        field defaulting to "lan_friendly" — silently reverting an operator who
-        had chosen public-only.
-        """
+    @pytest.mark.parametrize("overrides", [{}, {"ssrf_outbound_mode": "lan_friendly"}])
+    async def test_full_post_preserves_ssrf_outbound_mode(self, async_client, overrides):
+        """Only the dedicated security endpoint may change the outbound mode."""
         current = _mock_settings(ssrf_outbound_mode="public_only")
         captured = {}
 
@@ -2820,6 +2815,7 @@ class TestSecuritySettings:
                 "url": current.url,
                 "username": current.username,
                 "telemetry_client_errors_enabled": False,
+                **overrides,
             })
 
         assert response.status_code == 200, response.json()

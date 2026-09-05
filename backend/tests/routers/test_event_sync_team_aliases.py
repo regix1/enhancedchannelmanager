@@ -213,12 +213,9 @@ class TestPutValidation:
 
 class TestSettingsPostPreservesDictionary:
     @pytest.mark.asyncio
-    async def test_general_settings_post_does_not_clobber_aliases(self, async_client):
-        """The general settings form never sends event_sync_team_aliases, and
-        routers/settings.py rebuilds the whole model on POST — the field MUST
-        be preserved from current settings or every settings save would wipe
-        the operator's dictionary.
-        """
+    @pytest.mark.parametrize("overrides", [{}, {"event_sync_team_aliases": []}])
+    async def test_general_settings_post_does_not_clobber_aliases(self, async_client, overrides):
+        """Only the dedicated aliases endpoint may change the stored dictionary."""
         from unittest.mock import MagicMock
 
         stored = [{"terms": ["Spurs", "Tottenham Hotspur"], "note": None}]
@@ -243,6 +240,7 @@ class TestSettingsPostPreservesDictionary:
             response = await async_client.post("/api/settings", json={
                 "url": current.url,
                 "username": current.username,
+                **overrides,
             })
 
         assert response.status_code == 200, response.json()
