@@ -270,6 +270,7 @@ def _identity(query: dict, source_id: int, tvg_id: str, header: ET.Element | Non
 async def _read_source(source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> dict:
     """Keep only useful identities and strictly matched events from a complete XMLTV."""
     import tempfile
+    from contextlib import aclosing
     from config import CONFIG_DIR, get_settings
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
     query_terms = {id(query): set(normalize_alias_term(query["event"].title or ""))
@@ -416,24 +417,42 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
             with tempfile.TemporaryFile(mode="w+b", dir=CONFIG_DIR) as spool:
                 download_started = time.monotonic()
                 write_elapsed = 0.0
+                buffer = bytearray()
+                block_size = 1 << 20
+
+                async def write(chunk: bytes) -> None:
+                    nonlocal write_elapsed
+                    write_started = time.monotonic()
+                    diagnostics["write_calls"] += 1
+                    try:
+                        written = await asyncio.to_thread(spool.write, chunk)
+                        diagnostics["staged_bytes"] += written
+                        if written != len(chunk):
+                            raise ValueError("XMLTV staged write is incomplete.")
+                    finally:
+                        elapsed = max(0.0, time.monotonic() - write_started)
+                        write_elapsed += elapsed
+                        diagnostics["write_ms"] = int(write_elapsed * 1000)
+                        diagnostics["write_max_ms"] = max(diagnostics["write_max_ms"], int(elapsed * 1000))
+
                 try:
-                    async for chunk in stream_xmltv(
+                    async with aclosing(stream_xmltv(
                         source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
                         timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
-                    ):
-                        write_started = time.monotonic()
-                        diagnostics["write_calls"] += 1
-                        try:
-                            written = await asyncio.to_thread(spool.write, chunk)
-                            diagnostics["staged_bytes"] += written
-                            if written != len(chunk):
-                                raise ValueError("XMLTV staged write is incomplete.")
-                        finally:
-                            elapsed = max(0.0, time.monotonic() - write_started)
-                            write_elapsed += elapsed
-                            diagnostics["write_ms"] = int(write_elapsed * 1000)
-                            diagnostics["write_max_ms"] = max(diagnostics["write_max_ms"], int(elapsed * 1000))
+                    )) as chunks:
+                        async for chunk in chunks:
+                            offset = 0
+                            while offset < len(chunk):
+                                take = min(block_size - len(buffer), len(chunk) - offset)
+                                buffer.extend(memoryview(chunk)[offset:offset + take])
+                                offset += take
+                                if len(buffer) == block_size:
+                                    await write(bytes(buffer))
+                                    buffer.clear()
+                    if buffer:
+                        await write(bytes(buffer))
                 finally:
+                    buffer.clear()
                     diagnostics["download_ms"] = max(0, int((time.monotonic() - download_started) * 1000))
                 # Reject incomplete documents before spending time matching their programmes.
                 for select, phase in ((False, "validation"), (True, "selection")):

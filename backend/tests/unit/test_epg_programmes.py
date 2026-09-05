@@ -1927,6 +1927,167 @@ async def test_short_staged_write_never_reaches_selection(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("length", [1021, 2 * 1024 * 1024, 2 * 1024 * 1024 + 257])
+async def test_source_staging_preserves_uneven_chunks_and_bounds_writes(monkeypatch, length):
+    row = programme(title="Café 🚦", children='<sub-title>Résumé</sub-title><icon src="https://example.test/portrait.jpg"/>')
+    original = feed(row)
+    document = original[:-5] + b"<!--" + b"x" * (length - len(original) - 7) + b"--></tv>"
+    assert len(document) == length
+
+    def chunks():
+        split = document.index("é".encode()) + 1
+        yield document[:split]
+        yield document[split:split + 1]
+        offset = split + 1
+        sizes = (1, 17, 4093, 65535, 3, 12345)
+        index = 0
+        while offset < len(document):
+            size = sizes[index % len(sizes)]
+            yield document[offset:offset + size]
+            offset += size
+            index += 1
+
+    writes, stored = [], []
+    to_thread = asyncio.to_thread
+
+    async def run(function, *args, **kwargs):
+        name = getattr(function, "__name__", None)
+        if name == "write":
+            assert type(args[0]) is bytes
+            writes.append(args[0])
+        result = await to_thread(function, *args, **kwargs)
+        if name == "seek" and not stored:
+            stored.append(await to_thread(function.__self__.read))
+            await to_thread(function.__self__.seek, 0)
+        return result
+
+    install_transport(monkeypatch, lambda request: httpx.Response(200, stream=Body(chunks(), None)))
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    monkeypatch.setattr(guides, "MAX_PROGRAMMES", 1)
+    query = guides._query(profile(), channel(), None, NOW)
+    loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+
+    assert stored == [document]
+    assert b"".join(writes) == document
+    assert all(0 < len(block) <= 1024 * 1024 for block in writes)
+    assert len(writes) == (len(document) + 1024 * 1024 - 1) // (1024 * 1024)
+    assert ET.tostring(loaded["rows"]["ESPN.us"][0]) == ET.tostring(row)
+    diagnostics = loaded["diagnostics"]
+    assert diagnostics["xml_complete"] is True
+    assert diagnostics["write_calls"] == len(writes)
+    assert diagnostics["staged_bytes"] == diagnostics["validation_bytes"] == diagnostics["selection_bytes"] == len(document)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["wire", "decoded", "declaration", "gzip", "transport", "cancel"])
+async def test_source_staging_discards_residual_bytes_after_upstream_failure(monkeypatch, tmp_path, failure):
+    import tempfile
+
+    prefix = b"<tv>" + b" " * (1024 * 1024 + 17 - 4)
+    headers = {}
+    error = None
+    content = (prefix, b"xx")
+    if failure == "wire":
+        monkeypatch.setattr(guides, "MAX_DOWNLOAD", len(prefix) + 1)
+    elif failure == "decoded":
+        monkeypatch.setattr(guides, "MAX_DECODED", len(prefix) + 1)
+    elif failure == "declaration":
+        content = (prefix, b"<!DOCTYPE tv>")
+    elif failure == "gzip":
+        headers = {"content-encoding": "gzip"}
+        content = (gzip.compress(prefix)[:-3],)
+    else:
+        content = (prefix,)
+        error = httpx.ReadTimeout("upstream stalled") if failure == "transport" else asyncio.CancelledError()
+    install_transport(monkeypatch, lambda request: httpx.Response(200, headers=headers, stream=Body(content, error)))
+
+    opened, writes = [], []
+    create = tempfile.TemporaryFile
+    to_thread = asyncio.to_thread
+
+    def temporary(*args, **kwargs):
+        item = create(*args, **kwargs)
+        opened.append(item)
+        return item
+
+    async def run(function, *args, **kwargs):
+        if getattr(function, "__name__", None) == "write":
+            writes.append(bytes(args[0]))
+        return await to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    previous = {"success": NOW, "rows": {"ESPN.us": [programme()]}, "checked": 0, "size": 0}
+    guides._SOURCE_CACHE["buffered"] = previous
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await guides._load_source("buffered", source(), [], START, STOP, NOW)
+        else:
+            await guides._load_source("buffered", source(), [], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["buffered"]
+    assert entry["error"]
+    assert entry["rows"] is previous["rows"] and entry["success"] == NOW
+    assert writes == [prefix[:1024 * 1024]]
+    assert entry["diagnostics"]["write_calls"] == 1
+    assert entry["diagnostics"]["staged_bytes"] == 1024 * 1024
+    assert entry["diagnostics"]["validation_bytes"] == entry["diagnostics"]["selection_bytes"] == 0
+    assert entry["diagnostics"]["attempts"] == 1
+    assert times.call_count == 0
+    assert len(opened) == 1 and opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disk", "short", "cancel"])
+async def test_source_staging_closes_source_and_file_when_write_fails(monkeypatch, tmp_path, failure):
+    import tempfile
+
+    closed = False
+    opened = []
+    create = tempfile.TemporaryFile
+    to_thread = asyncio.to_thread
+
+    async def chunks(*args, **kwargs):
+        nonlocal closed
+        try:
+            yield b"<tv>" + b" " * (1024 * 1024 - 4)
+            yield b"</tv>"
+        finally:
+            closed = True
+
+    def temporary(*args, **kwargs):
+        item = create(*args, **kwargs)
+        opened.append(item)
+        return item
+
+    async def run(function, *args, **kwargs):
+        if getattr(function, "__name__", None) == "write":
+            if failure == "disk":
+                raise OSError("No space left on device")
+            if failure == "cancel":
+                raise asyncio.CancelledError()
+            return await to_thread(function, *args, **kwargs) - 1
+        return await to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(guides, "stream_xmltv", chunks)
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    expected = OSError if failure == "disk" else ValueError if failure == "short" else asyncio.CancelledError
+    with pytest.raises(expected) as caught:
+        await guides._read_source(source(), [], START, STOP, NOW)
+    diagnostics = caught.value.diagnostics
+    assert diagnostics["write_calls"] == 1
+    assert diagnostics["staged_bytes"] == (1024 * 1024 - 1 if failure == "short" else 0)
+    assert diagnostics["validation_bytes"] == diagnostics["selection_bytes"] == 0
+    assert closed
+    assert len(opened) == 1 and opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_reused_event_terms_preserve_edition_date_and_ambiguity_checks(monkeypatch):
     guide = profile()
     queries = [guides._query(guide, channel(id=index, name=f"ONE Fight Night {edition} @ Sep 04 09:00 PM", tvg_id=""), None, NOW)
