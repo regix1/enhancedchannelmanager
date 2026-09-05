@@ -236,12 +236,13 @@ def _action_descriptor(a: dict) -> str:
             return str(a[key])
     return "?"
 
-def _rule_details(rule: dict) -> str:
+def _rule_details(rule: dict, *, fields: frozenset[str] | None = None) -> str:
     """Return complete copyable configuration or refuse unsafe/unbounded output."""
     import re
     from urllib.parse import parse_qsl, urlsplit
 
-    fields = ENDPOINTS["ac_create_rule"].request_fields | AC_RULE_FIELDS_NOT_EXPOSED | {"id"}
+    if fields is None:
+        fields = ENDPOINTS["ac_create_rule"].request_fields | AC_RULE_FIELDS_NOT_EXPOSED | {"id"}
     selected = {key: value for key, value in rule.items() if key in fields}
     pending = [(selected, 0)]
     nodes = 0

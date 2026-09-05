@@ -3411,3 +3411,88 @@ async def test_idle_or_future_event_is_not_recreated(retirement, case):
     assert result["promoted_created"] == 0
     assert result["channel_ids"] == []
     assert setup["streams"][0]["id"] == 7301
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["espn", "mlb"])
+@pytest.mark.parametrize("with_witness", [False, True])
+@pytest.mark.parametrize("case", [
+    "seconds_zero", "seconds_nonzero", "shared_patterns", "different_group",
+    "different_provider", "missing_provider", "ambiguous_scope", "different_date",
+    "different_title", "stale_sample", "bare_slot", "invalid_date",
+])
+async def test_lifecycle_uses_scoped_iso_patterns(retirement, shape, with_witness, case):
+    from services.event_sync_matcher import parse_event_name
+
+    setup = retirement
+    now = setup["now"]
+    start = now - timedelta(minutes=30)
+    local = start.astimezone(EASTERN)
+    seconds = "00" if case == "seconds_zero" else "37"
+    stamp = local.strftime("%Y-%m-%d %H:%M:") + seconds
+    if shape == "espn":
+        group_id = 1557
+        name = f"US (ESPN+ 001) | Soccer: Hansa Rostock vs. Wehen Wiesbaden ({stamp})"
+        pattern = {
+            "name": "espn-iso-date",
+            "title_pattern": r"^US\s+\(ESPN\+\s+\d+\)\s*\|\s*(?P<title>.+?)\s+\((?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\s+(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\)\s*$",
+        }
+    else:
+        group_id = 1525
+        name = f"MLB 01 | Giants x Mets start:{stamp} stop:2026-07-12 06:18:20"
+        pattern = {
+            "name": "mlb-iso-date",
+            "title_pattern": r"^MLB\s+\d+\s*\|\s*(?P<title>.+?)\s+start:(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\s+(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\s+stop:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:[0-5]\d\s*$",
+        }
+    parsed = parse_event_name(name, [pattern], event_timezone="US/Eastern", now=now)
+    assert parsed.start == start
+    config = setup["config"]
+    config.update(secondary_group_ids=[group_id],
+                  secondary=[{"group_id": group_id, "m3u_account_id": 18}],
+                  group_patterns={str(group_id): [pattern]}, max_promote_per_run=1)
+    if case == "shared_patterns":
+        config.pop("group_patterns")
+        config["patterns"] = [pattern]
+    row = _resolved(name, DISPOSITION_UNMATCHED, parsed, provider_id=18,
+                    stream_id=7301, group_id=group_id)
+    rows = [row]
+    if case == "ambiguous_scope":
+        rows.append(_resolved(name, DISPOSITION_UNMATCHED, parsed, provider_id=18,
+                              stream_id=7301, group_id=group_id + 1))
+    plan = build_promotion_plan(config, rows, {}, now=now)
+    assert len(plan.units) == 1
+    setup["rule"].set_managed_channel_ids([])
+    setup["db"].commit()
+    fresh = setup["streams"][0]
+    fresh.update(name=name, m3u_account={"id": 18}, channel_group={"id": group_id})
+    if case == "different_group":
+        fresh["channel_group"] = {"id": group_id + 1}
+    elif case == "different_provider":
+        fresh["m3u_account"] = 2
+    elif case == "missing_provider":
+        fresh.pop("m3u_account")
+    elif case == "different_date":
+        fresh["name"] = name.replace(local.strftime("%Y-%m-%d"), "2026-07-10", 1)
+    elif case == "different_title":
+        fresh["name"] = name.replace(parsed.title, "UFC 999", 1)
+    elif case == "bare_slot":
+        fresh["name"] = "ESPN PLUS 01:"
+    elif case == "invalid_date":
+        fresh["name"] = name.replace(local.strftime("%Y-%m-%d"), "2026-02-30", 1)
+    setup["stats"][7301] = {
+        "measured_bitrate": 5000000,
+        "last_probed": (now - timedelta(minutes=6) if case == "stale_sample" else now).isoformat(),
+    }
+    if with_witness:
+        setup["witness"].update(title=parsed.title, start=start.isoformat(),
+                                stop=(start + timedelta(hours=2)).isoformat())
+    else:
+        setup["witness"].clear()
+    eligible, states = await setup["executor"]._event_lifecycle(
+        setup["rule"].id, config, plan.units, now,
+    )
+    active = case in {"seconds_zero", "seconds_nonzero", "shared_patterns"}
+    assert eligible == ({plan.units[0].event_key} if active else set())
+    assert states.get(-1, "unknown") == ("active" if active else "unknown")
+    setup["client"].create_channel.assert_not_awaited()
+    setup["client"].delete_channel.assert_not_awaited()

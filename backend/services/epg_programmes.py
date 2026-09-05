@@ -269,7 +269,8 @@ def _identity(query: dict, source_id: int, tvg_id: str, header: ET.Element | Non
 
 async def _read_source(source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> dict:
     """Keep only useful identities and strictly matched events from a complete XMLTV."""
-    from config import get_settings
+    import tempfile
+    from config import CONFIG_DIR, get_settings
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
     parser = ET.XMLPullParser(events=("start", "end"))
     root = None
@@ -394,22 +395,17 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                 raise ValueError("Selected XMLTV schedules exceed the retained size limit.")
 
     try:
-        async with _SOURCE_SLOTS:
-            failure = None
-            async with asyncio.timeout(SOURCE_TIMEOUT):
+        async with asyncio.timeout(SOURCE_TIMEOUT):
+            # Selection must not slow delivery of a time-limited upstream response.
+            with tempfile.TemporaryFile(mode="w+b", dir=CONFIG_DIR) as spool:
                 async for chunk in stream_xmltv(
                     source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
                     timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
                 ):
-                    # Read at most one more chunk after a parser failure to distinguish EOF.
-                    if failure is not None:
-                        raise failure
-                    try:
-                        await asyncio.to_thread(consume, chunk)
-                    except (ET.ParseError, ValueError, LookupError) as exc:
-                        failure = exc
-                if failure is not None:
-                    raise failure
+                    await asyncio.to_thread(spool.write, chunk)
+                await asyncio.to_thread(spool.seek, 0)
+                while chunk := await asyncio.to_thread(spool.read, 65536):
+                    await asyncio.to_thread(consume, chunk)
                 await asyncio.to_thread(consume, None)
                 diagnostics["xml_complete"] = True
     except (Exception, asyncio.CancelledError) as exc:
@@ -509,8 +505,25 @@ def _error_reason(exc: Exception) -> str:
 
 async def _load_source(key: str, source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> None:
     previous = _SOURCE_CACHE.get(key, {})
+    attempt = 0
+    diagnostics = {}
     try:
-        loaded = await _read_source(source, queries, start, stop, now)
+        async with _SOURCE_SLOTS:
+            async with asyncio.timeout(SOURCE_TIMEOUT):
+                for attempt in range(1, 3):
+                    diagnostics = {}
+                    try:
+                        loaded = await _read_source(source, queries, start, stop, now)
+                    except ET.ParseError as exc:
+                        diagnostics = getattr(exc, "diagnostics", {})
+                        if (attempt == 1 and diagnostics.get("root") == "tv"
+                                and diagnostics.get("transport_complete") is True
+                                and diagnostics.get("failure") == "incomplete_xml"
+                                and getattr(exc, "code", None) in {3, 5, 6}):
+                            continue
+                        raise
+                    break
+        loaded.setdefault("diagnostics", {})["attempts"] = attempt
         loaded.update({
             "success": datetime.now(timezone.utc), "checked": time.monotonic(), "error": None,
             "selection": {"queries": frozenset(query["key"] for query in queries),
@@ -519,12 +532,14 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
         })
         _SOURCE_CACHE[key] = loaded
     except asyncio.CancelledError as exc:
+        diagnostics = getattr(exc, "diagnostics", diagnostics)
         _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled.",
-                              "diagnostics": getattr(exc, "diagnostics", {})}
+                              "diagnostics": {**diagnostics, "attempts": attempt}}
         raise
     except Exception as exc:
+        diagnostics = getattr(exc, "diagnostics", getattr(exc.__cause__, "diagnostics", diagnostics))
         _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc),
-                              "diagnostics": getattr(exc, "diagnostics", {})}
+                              "diagnostics": {**diagnostics, "attempts": attempt}}
     finally:
         _SOURCE_LOADS.pop(key, None)
         total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())

@@ -212,7 +212,7 @@ DIAGNOSTIC_LABELS = {
     "failure": {"invalid_utf8", "forbidden_character", "incomplete_xml", "incomplete_gzip", "incomplete_body",
                 "wrong_root", "malformed_xml", "unknown"},
 }
-DIAGNOSTIC_COUNTS = {"wire_bytes", "decoded_bytes", "http_status", "parser_code", "parser_line", "parser_column"}
+DIAGNOSTIC_COUNTS = {"wire_bytes", "decoded_bytes", "http_status", "parser_code", "parser_line", "parser_column", "attempts"}
 DIAGNOSTIC_FLAGS = {"transport_complete", "xml_complete"}
 PARSER_KEYS = {"parser_code", "parser_line", "parser_column"}
 
@@ -768,7 +768,8 @@ async def test_source_download_concurrency_is_two(monkeypatch):
         finally:
             active -= 1
     monkeypatch.setattr(guides, "stream_xmltv", chunks)
-    await asyncio.gather(*(guides._read_source(source(number), [], START, STOP, NOW) for number in range(4)))
+    await asyncio.gather(*(guides._load_source(str(number), source(number), [], START, STOP, NOW)
+                           for number in range(4)))
     assert maximum == 2
     assert active == 0
 
@@ -1086,7 +1087,7 @@ async def test_successful_source_load_accounts_wire_and_decoded_bytes(monkeypatc
     assert {key: diagnostics.get(key) for key in ("http_status", "transport_complete", "xml_complete", "root")} == {
         "http_status": 200, "transport_complete": True, "xml_complete": True, "root": "tv"}
     assert not ({"failure"} | PARSER_KEYS) & set(diagnostics)
-    assert "8859" not in json.dumps(entry)
+    assert "8859" not in json.dumps(diagnostics)
 
 
 @pytest.mark.asyncio
@@ -1267,6 +1268,273 @@ async def test_streaming_parser_discards_completed_unselected_elements(monkeypat
     assert loaded["rows"] == {} and loaded["headers"] == {}
     assert loaded["size"] == 0
     assert peak < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_source_download_finishes_before_slow_programme_selection(monkeypatch):
+    clock = 0
+    received = 0
+    original = guides.programme_times
+    row = ET.tostring(programme(children='<icon src="https://example.com/portrait.jpg" />'))
+
+    def select(element):
+        nonlocal clock
+        clock += 1
+        return original(element)
+
+    def chunks():
+        nonlocal received
+        yield b'<tv><channel id="ESPN.us"><display-name>ESPN</display-name></channel>'
+        for _ in range(8):
+            # The producer's response expires if selection delays its next read.
+            if clock:
+                return
+            received += 1
+            yield row
+        yield b'</tv>'
+
+    monkeypatch.setattr(guides, "programme_times", select)
+    install_transport(monkeypatch, lambda request: httpx.Response(200, stream=Body(chunks(), None)))
+    query = guides._query({}, {"id": 1, "name": "ESPN", "tvg_id": "ESPN.us"}, None, NOW)
+    loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+
+    assert received == 8
+    assert loaded["diagnostics"]["transport_complete"] is True
+    assert loaded["diagnostics"]["xml_complete"] is True
+    assert len(loaded["rows"]["ESPN.us"]) == 8
+    assert all(item.find("icon").get("src") == "https://example.com/portrait.jpg"
+               for item in loaded["rows"]["ESPN.us"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["complete", "malformed", "transport", "disk", "cancel"])
+async def test_source_temporary_file_is_private_and_closed(monkeypatch, tmp_path, outcome):
+    import errno
+    import os
+    import tempfile
+
+    opened = []
+    create = tempfile.TemporaryFile
+    to_thread = asyncio.to_thread
+
+    def temporary(*args, **kwargs):
+        assert kwargs["dir"] == tmp_path
+        item = create(*args, **kwargs)
+        assert os.fstat(item.fileno()).st_mode & 0o077 == 0
+        opened.append(item)
+        return item
+
+    async def run(function, *args, **kwargs):
+        if outcome == "disk" and getattr(function, "__name__", None) == "write":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return await to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    content = b"<tv>" if outcome == "malformed" else b"<tv></tv>"
+    failure = (httpx.ReadTimeout("upstream stalled") if outcome == "transport"
+               else asyncio.CancelledError() if outcome == "cancel" else None)
+    install_transport(monkeypatch, lambda request: reply(content, failure=failure))
+
+    if outcome == "complete":
+        loaded = await guides._read_source(source(), [], START, STOP, NOW)
+        assert loaded["diagnostics"]["xml_complete"] is True
+    else:
+        expected = (ET.ParseError if outcome == "malformed" else OSError if outcome == "disk"
+                    else asyncio.CancelledError if outcome == "cancel" else Exception)
+        with pytest.raises(expected):
+            await guides._read_source(source(), [], START, STOP, NOW)
+    assert len(opened) == 1 and opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+    if outcome == "disk":
+        previous = {"success": NOW, "rows": {"ESPN.us": [programme()]}, "checked": 0, "size": 0}
+        guides._SOURCE_CACHE["existing"] = previous
+        await guides._load_source("existing", source(), [], START, STOP, NOW)
+        assert guides._SOURCE_CACHE["existing"]["rows"] is previous["rows"]
+        assert guides._SOURCE_CACHE["existing"]["success"] == NOW
+        assert guides._SOURCE_CACHE["existing"]["error"]
+        assert all(item.closed for item in opened)
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_source_download_closes_temporary_file(monkeypatch, tmp_path):
+    import tempfile
+
+    waiting = asyncio.Event()
+    opened = []
+    create = tempfile.TemporaryFile
+
+    def temporary(*args, **kwargs):
+        item = create(*args, **kwargs)
+        opened.append(item)
+        return item
+
+    async def chunks(*args, **kwargs):
+        yield b"<tv>"
+        waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary)
+    monkeypatch.setattr(guides, "stream_xmltv", chunks)
+    task = asyncio.create_task(guides._read_source(source(), [], START, STOP, NOW))
+    await asyncio.wait_for(waiting.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(opened) == 1 and opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail,code", [(b"", 3), (b"<programme", 5), (b"\xc3", 6)])
+async def test_incomplete_source_retries_once_with_fresh_selection(monkeypatch, tmp_path, tail, code):
+    import tempfile
+
+    attempts = 0
+    opened = []
+    create = tempfile.TemporaryFile
+    broken = feed(programme(title="Discarded partial programme"))[:-5] + tail
+
+    def temporary(*args, **kwargs):
+        assert all(item.closed for item in opened)
+        item = create(*args, **kwargs)
+        opened.append(item)
+        return item
+
+    def response(request):
+        nonlocal attempts
+        attempts += 1
+        return reply(broken if attempts == 1 else GOOD)
+
+    with pytest.raises(ET.ParseError) as parsed:
+        ET.fromstring(broken)
+    assert parsed.value.code == code
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", temporary)
+    install_transport(monkeypatch, response)
+    await guides._load_source("retry", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW)
+
+    entry = guides._SOURCE_CACHE["retry"]
+    assert attempts == 2 and entry["error"] is None
+    assert entry["diagnostics"]["attempts"] == 2
+    assert entry["diagnostics"]["xml_complete"] is True
+    assert PARSER_KEYS.isdisjoint(entry["diagnostics"])
+    assert [item.findtext("title") for item in entry["rows"]["ESPN.us"]] == ["SportsCenter"]
+    assert len(opened) == 2 and all(item.closed for item in opened)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_incomplete_source_keeps_last_complete_snapshot(monkeypatch):
+    attempts = 0
+    previous = {"success": NOW, "rows": {"ESPN.us": [programme(title="Last complete guide")]}, "size": 0}
+    guides._SOURCE_CACHE["retry"] = previous
+
+    def response(request):
+        nonlocal attempts
+        attempts += 1
+        return reply(feed(programme(title="Incomplete replacement"))[:-5])
+
+    install_transport(monkeypatch, response)
+    await guides._load_source("retry", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["retry"]
+    assert attempts == 2
+    assert entry["error"] == "Malformed XML."
+    assert entry["diagnostics"]["attempts"] == 2
+    assert entry["rows"] is previous["rows"] and entry["success"] == NOW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    b"<tv><programme></tv>", b"<html>", b"<tv>\xff</tv>",
+    b"<!DOCTYPE tv><tv></tv>", b"<tv>\x00</tv>",
+])
+async def test_source_content_errors_do_not_retry(monkeypatch, content):
+    attempts = 0
+
+    def response(request):
+        nonlocal attempts
+        attempts += 1
+        return reply(content)
+
+    install_transport(monkeypatch, response)
+    await guides._load_source("failure", source(), [], START, STOP, NOW)
+    assert attempts == 1
+    assert guides._SOURCE_CACHE["failure"]["error"]
+    assert guides._SOURCE_CACHE["failure"]["diagnostics"]["attempts"] == 1
+    assert not guides._SOURCE_CACHE["failure"].get("success")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["size", "disk", "security", "timeout", "cancel"])
+async def test_source_resource_and_security_failures_do_not_retry(monkeypatch, failure):
+    from fastapi import HTTPException
+
+    attempts = 0
+    errors = {"size": HTTPException(413, "XMLTV decoded content exceeds its size limit."),
+              "disk": OSError("No space left on device"),
+              "security": HTTPException(400, "XMLTV source URL is blocked by the outbound security policy."),
+              "timeout": TimeoutError(), "cancel": asyncio.CancelledError()}
+
+    async def read(*args):
+        nonlocal attempts
+        attempts += 1
+        raise errors[failure]
+
+    monkeypatch.setattr(guides, "_read_source", read)
+    if failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await guides._load_source("failure", source(), [], START, STOP, NOW)
+    else:
+        await guides._load_source("failure", source(), [], START, STOP, NOW)
+    assert attempts == 1
+    assert guides._SOURCE_CACHE["failure"]["error"]
+    assert guides._SOURCE_CACHE["failure"]["diagnostics"]["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatch):
+    attempts = 0
+    slots = asyncio.Semaphore(1)
+    deadline = None
+    deadlines = []
+    original_timeout = asyncio.timeout
+
+    def timeout(delay):
+        nonlocal deadline
+        deadline = original_timeout(delay)
+        deadlines.append(deadline)
+        return deadline
+
+    async def read(*args):
+        nonlocal attempts
+        attempts += 1
+        assert slots.locked()
+        if attempts == 1:
+            try:
+                ET.fromstring(b"<tv>")
+            except ET.ParseError as exc:
+                exc.diagnostics = {"root": "tv", "transport_complete": True,
+                                   "xml_complete": False, "failure": "incomplete_xml"}
+                raise
+        # Move the original deadline to now; a fresh per-attempt budget cannot pass.
+        deadline.reschedule(asyncio.get_running_loop().time())
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(guides, "_SOURCE_SLOTS", slots)
+    monkeypatch.setattr(guides, "_read_source", read)
+    monkeypatch.setattr(asyncio, "timeout", timeout)
+    await guides._load_source("timed", source(), [], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["timed"]
+    assert attempts == 2 and not slots.locked()
+    assert len(deadlines) == 1
+    assert entry["error"] == "Request timed out."
+    assert entry["diagnostics"] == {"attempts": 2}
+    assert "success" not in entry and not entry.get("rows")
 
 
 @pytest.mark.asyncio

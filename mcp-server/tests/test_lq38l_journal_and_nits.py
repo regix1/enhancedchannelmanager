@@ -764,6 +764,124 @@ class TestEpgGridImportedGuideIdentity:
         assert requests.count(("GET", "/api/epg/data/10740401")) == 1
         assert all(method == "GET" for method, _path in requests)
 
+class TestDummyEpgProfile:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("details", [None, False])
+    async def test_default_summary_and_read_path_are_unchanged(self, details):
+        from _endpoint_contracts import ENDPOINTS
+
+        profile = {
+            "id": 1, "name": "Events", "enabled": True,
+            "name_source": "stream", "stream_index": 1,
+            "title_pattern": "(?P<title>.+)", "time_pattern": "", "date_pattern": None,
+            "title_template": "{title}", "event_timezone": "US/Eastern",
+            "program_duration": 180, "channel_group_ids": [65],
+            "epg_source_ids": [49], "channel_mappings": [],
+            "substitution_pairs": [{"find": "old", "replace": "new"}],
+        }
+        client = _client(return_value=profile)
+        arguments = {"profile_id": 1}
+        if details is not None:
+            arguments["details"] = details
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _register("epg").call_tool("get_dummy_epg_profile", arguments)
+        assert result[0][0].text == (
+            "Dummy EPG Profile 'Events' (id=1) — enabled\n"
+            "  name_source=stream, stream_index=1\n"
+            "  title_pattern='(?P<title>.+)'\n"
+            "  time_pattern=''\n"
+            "  date_pattern=None\n"
+            "  title_template='{title}'\n"
+            "  event_timezone=US/Eastern, program_duration=180min\n"
+            "  channel_group_ids=[65] (1 group(s) assigned)\n"
+            "  epg_source_ids=[49]\n"
+            "  channel_mappings=[]\n"
+            "  substitution_pairs: 1 configured"
+        )
+        client.call_endpoint.assert_awaited_once_with(
+            ENDPOINTS["dummy_epg_get_profile"], path_args={"profile_id": 1},
+        )
+
+    @pytest.mark.asyncio
+    async def test_details_preserve_complete_nested_configuration(self):
+        from _endpoint_contracts import ENDPOINTS
+        from tools._safety_policy import SAFETY_INVENTORY, ToolSafety
+
+        profile = {
+            "id": 1, "name": "Événements", "enabled": True, "name_source": "stream",
+            "stream_index": 1, "title_pattern": "(?P<title>.+)",
+            "time_pattern": "", "date_pattern": None,
+            "title_template": "{title}", "description_template": "",
+            "upcoming_title_template": "", "upcoming_description_template": "",
+            "ended_title_template": "", "ended_description_template": "",
+            "fallback_title_template": "{channel_name}", "fallback_description_template": "",
+            "event_timezone": "US/Eastern", "output_timezone": None,
+            "program_duration": 180, "categories": "Sports",
+            "channel_logo_url_template": "",
+            "program_poster_url_template": "http://game-thumbs:3100/mlb/{title}/cover?style=4",
+            "tvg_id_template": "ecm-{channel_id}", "include_date_tag": False,
+            "include_live_tag": False, "include_new_tag": False,
+            "pattern_builder_examples": [], "channel_group_ids": [65],
+            "epg_source_ids": [49, 50],
+            "channel_mappings": [{"channel_id": 1, "source_id": 42, "tvg_id": "11207"}],
+            "substitution_pairs": [{"find": "a\\\\b", "replace": "é", "is_regex": False}],
+            "pattern_variants": [{
+                "name": "Games", "title_pattern": "(?P<title>.+)", "time_pattern": None,
+                "date_pattern": "", "title_template": "{title}",
+                "program_poster_url_template": "http://game-thumbs:3100/mlb/{title}/cover?style=2",
+            }],
+        }
+        assert set(profile) == ENDPOINTS["dummy_epg_create_profile"].request_fields | {"id"}
+        client = _client(return_value={**profile, "last_run_stats": {"private": "not configuration"}})
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            mcp = _register("epg")
+            result = await mcp.call_tool("get_dummy_epg_profile", {"profile_id": 1, "details": True})
+        assert json.loads(result[0][0].text) == profile
+        assert len(result[0][0].text.encode("utf-8")) <= 65536
+        assert mcp._tool_manager._tools["get_dummy_epg_profile"].parameters["properties"]["details"]["default"] is False
+        assert SAFETY_INVENTORY["get_dummy_epg_profile"] is ToolSafety.READ_ONLY
+        assert ENDPOINTS["dummy_epg_get_profile"].method == "GET"
+        assert ENDPOINTS["dummy_epg_get_profile"].path == "/api/dummy-epg/profiles/{profile_id}"
+        client.call_endpoint.assert_awaited_once_with(
+            ENDPOINTS["dummy_epg_get_profile"], path_args={"profile_id": 1},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [
+        {"password": "private-value"},
+        {"program_poster_url_template": "https://user:private@guide.example/file"},
+        {"program_poster_url_template": "https://guide.example/file?token=private"},
+        {"description_template": "Authorization: Bearer private-value"},
+        {"description_template": "x" * 70000},
+        {"description_template": "é" * 40000},
+        {"pattern_variants": list(range(2100))},
+        {"description_template": "\ud800"},
+    ])
+    async def test_details_refuse_unsafe_or_oversized_configuration(self, value):
+        client = _client(return_value={"id": 1, "pattern_variants": [value]})
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _register("epg").call_tool("get_dummy_epg_profile", {"profile_id": 1, "details": True})
+        text = result[0][0].text
+        assert text.startswith("Cannot return complete profile details:")
+        assert "private" not in text
+        assert len(text) < 250
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile", [None, [], "private-value", 1])
+    @pytest.mark.parametrize("details", [False, True])
+    async def test_malformed_profile_is_a_clear_bounded_error(self, profile, details):
+        client = _client(return_value=profile)
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _register("epg").call_tool("get_dummy_epg_profile", {"profile_id": 1, "details": details})
+        assert result[0][0].text == "Error getting dummy EPG profile: unexpected response."
+
+    @pytest.mark.asyncio
+    async def test_details_do_not_echo_upstream_errors(self):
+        client = _client(side_effect=RuntimeError("https://user:private@guide.example/file"))
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _register("epg").call_tool("get_dummy_epg_profile", {"profile_id": 1, "details": True})
+        assert result[0][0].text == "Error getting dummy EPG profile."
+
 
 # ===========================================================================
 # lq38l.13 #4 — get_auto_creation_rule renders create_channel descriptor

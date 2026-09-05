@@ -5034,6 +5034,8 @@ class ActionExecutor:
         from services.epg_programmes import prepare_profiles, SOURCE_MAX_AGE, _placeholder
         from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
         from services.event_sync_stream_health import _load_stats, _min_stream_bitrate_bps
+        from services.event_sync_resolver import effective_patterns
+        from stream_prober import extract_m3u_account_id
 
         states, eligible = {}, set()
         if not hasattr(self, "_event_states"):
@@ -5069,6 +5071,12 @@ class ActionExecutor:
                     "streams": [row.stream.stream_id for row in unit.rows if row.stream.stream_id is not None],
                 }
             unit_ids[unit.event_key] = cid
+        stream_scopes = {}
+        for unit in units:
+            for row in unit.rows:
+                stream_scopes.setdefault(row.stream.stream_id, set()).add(
+                    (row.stream.provider_id, row.stream.group_id)
+                )
         stream_ids = {
             stream.get("id") if isinstance(stream, dict) else stream
             for channel in channels.values() for stream in channel.get("streams", [])
@@ -5084,6 +5092,25 @@ class ActionExecutor:
             stats = await _load_stats(sorted(stream_ids))
         except Exception:
             return eligible, states
+        parsed_streams = {}
+        for sid, stream in by_id.items():
+            patterns = None
+            scopes = stream_scopes.get(sid, set())
+            group_id = stream.get("channel_group_id")
+            if group_id is None:
+                group = stream.get("channel_group")
+                group_id = group.get("id") if isinstance(group, dict) else group if isinstance(group, int) else None
+            if len(scopes) == 1:
+                account_id, resolved_group = next(iter(scopes))
+                if (account_id is not None
+                        and extract_m3u_account_id(stream.get("m3u_account")) == account_id
+                        and (group_id is None or group_id == resolved_group)):
+                    patterns = effective_patterns(config, resolved_group)
+            # Reparse the fresh name in its confirmed source scope; a slot may now carry another event.
+            parsed_streams[sid] = parse_event_name(
+                stream.get("name") or "", patterns, now=now,
+                event_timezone=profile.get("event_timezone") or "US/Eastern",
+            )
         for channel in channels.values():
             ids = [row.get("id") if isinstance(row, dict) else row for row in channel.get("streams", [])]
             channel["streams"] = [by_id[sid] for sid in ids if sid in by_id]
@@ -5114,8 +5141,7 @@ class ActionExecutor:
                         if probed.tzinfo is None:
                             probed = probed.replace(tzinfo=timezone.utc)
                         measured = stat.get("measured_bitrate")
-                        parsed = parse_event_name(stream.get("name") or "", now=now,
-                                                  event_timezone=profile.get("event_timezone") or "US/Eastern")
+                        parsed = parsed_streams[stream["id"]]
                         same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
                         if (same and stream.get("is_stale") is not True and floor > 0
                                 and isinstance(measured, (int, float)) and measured >= floor
@@ -5156,8 +5182,7 @@ class ActionExecutor:
                     fresh = max(stop, now - timedelta(hours=1)) <= observed <= now
                 except (TypeError, ValueError):
                     fresh = False
-                parsed = parse_event_name(stream.get("name") or "", now=now,
-                                          event_timezone=profile.get("event_timezone") or "US/Eastern")
+                parsed = parsed_streams[stream["id"]]
                 same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
                 positive |= working and same and stream.get("is_stale") is not True
                 marker = ET.Element("programme")

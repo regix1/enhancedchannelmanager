@@ -898,7 +898,7 @@ def register(mcp: FastMCP):
             return f"Error generating dummy EPG: {e}"
 
     @mcp.tool()
-    async def get_dummy_epg_profile(profile_id: int) -> str:
+    async def get_dummy_epg_profile(profile_id: int, details: bool = False) -> str:
         """Get full configuration for a single Dummy EPG profile (bd-omxy5).
 
         Includes channel group assignments. See docs/template_engine.md for
@@ -906,12 +906,24 @@ def register(mcp: FastMCP):
 
         Args:
             profile_id: The profile ID.
+            details: Return complete bounded configuration JSON; unsafe or oversized reads are refused.
         """
         try:
             client = get_ecm_client()
             p = await client.call_endpoint(
                 ENDPOINTS["dummy_epg_get_profile"], path_args={"profile_id": profile_id}
             )
+            if not isinstance(p, dict):
+                return "Error getting dummy EPG profile: unexpected response."
+            if details:
+                from tools.channel_pipeline import _rule_details
+
+                result = _rule_details(
+                    p, fields=ENDPOINTS["dummy_epg_create_profile"].request_fields | {"id"},
+                )
+                if result.startswith("Cannot return complete rule details:"):
+                    return result.replace("Cannot return complete rule details:", "Cannot return complete profile details:", 1)
+                return result
             name = p.get("name", "?") if isinstance(p, dict) else "?"
             enabled = "enabled" if (isinstance(p, dict) and p.get("enabled")) else "disabled"
             groups = (p.get("channel_group_ids") or []) if isinstance(p, dict) else []
@@ -933,7 +945,7 @@ def register(mcp: FastMCP):
             return "\n".join(lines)
         except Exception as e:
             logger.error("[MCP] get_dummy_epg_profile failed: %s", e)
-            return f"Error getting dummy EPG profile {profile_id}: {e}"
+            return "Error getting dummy EPG profile." if details else f"Error getting dummy EPG profile {profile_id}: {e}"
 
     @mcp.tool()
     async def get_dummy_epg_coverage(profile_id: int) -> str:
