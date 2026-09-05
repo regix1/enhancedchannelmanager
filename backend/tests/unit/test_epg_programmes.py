@@ -207,12 +207,17 @@ SECRET = "hidden-credential"
 DIAGNOSTIC_LABELS = {
     "content_type": {"xml", "gzip", "html", "text", "other", "absent"},
     "content_encoding": {"gzip", "identity", "other", "absent"},
+    "transfer_encoding": {"chunked", "other", "absent"},
+    "http_version": {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "other"},
     "compression": {"gzip", "identity"},
     "root": {"tv", "other", "absent"},
     "failure": {"invalid_utf8", "forbidden_character", "incomplete_xml", "incomplete_gzip", "incomplete_body",
                 "wrong_root", "malformed_xml", "unknown"},
 }
-DIAGNOSTIC_COUNTS = {"wire_bytes", "decoded_bytes", "http_status", "parser_code", "parser_line", "parser_column", "attempts"}
+DIAGNOSTIC_COUNTS = {"wire_bytes", "decoded_bytes", "http_status", "parser_code", "parser_line", "parser_column", "attempts",
+                     "headers_ms", "content_length", "download_ms", "write_ms", "write_max_ms", "write_calls",
+                     "staged_bytes", "validation_ms", "validation_bytes", "selection_ms", "selection_bytes",
+                     "total_download_ms", "total_validation_ms", "total_selection_ms"}
 DIAGNOSTIC_FLAGS = {"transport_complete", "xml_complete"}
 PARSER_KEYS = {"parser_code", "parser_line", "parser_column"}
 
@@ -1754,3 +1759,193 @@ async def test_background_completion_rechecks_the_current_programme_time(monkeyp
     assert coverage["sources"][0]["last_success"] == clock[0].isoformat()
     assert coverage["channels"][0]["current"] is None
     assert prepared[0]["source_programmes"][1] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_incomplete_xml_is_rejected_before_event_selection(monkeypatch, compressed):
+    row = programme(title="Alpha vs Beta", start="20260905020000 +0000")
+    document = feed(row)[:-5]
+    content = gzip.compress(document) if compressed else document
+    headers = {"content-encoding": "gzip"} if compressed else {}
+    install_transport(monkeypatch, lambda request: reply(content, headers=headers))
+    query = guides._query({}, channel(name="PPV 1", tvg_id=""), None, NOW)
+    query["event"] = guides.ParsedEvent("Alpha vs Beta", "Alpha vs Beta", NOW, ("Alpha", "Beta"), None)
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times, \
+            patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        with pytest.raises(ET.ParseError) as failed:
+            await guides._read_source(source(), [query], START, STOP, NOW)
+    assert times.call_count == 0
+    assert score.call_count == 0
+    diagnostics = failed.value.diagnostics
+    assert diagnostics["transport_complete"] is True
+    assert diagnostics["xml_complete"] is False
+    assert diagnostics["staged_bytes"] == len(document)
+    assert diagnostics["validation_bytes"] == len(document)
+    assert diagnostics["selection_bytes"] == 0
+    assert diagnostics["selection_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_gzip_is_validated_then_selected_once(monkeypatch):
+    row = programme(children='<sub-title>Highlights</sub-title><category>Sports</category>'
+                             '<icon src="https://images.example/portrait.jpg"/>')
+    document = feed(row) + b'<!-- trailing </tv> text is legal -->'
+    compressed = gzip.compress(document)
+    install_transport(monkeypatch, lambda request: httpx.Response(
+        200, headers={"content-encoding": "gzip", "content-length": str(len(compressed))},
+        stream=Body((compressed,), None), extensions={"http_version": b"HTTP/2"},
+    ))
+    query = guides._query(profile(), channel(), None, NOW)
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
+        loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+    assert times.call_count == 1
+    assert ET.tostring(loaded["rows"]["ESPN.us"][0]) == ET.tostring(row)
+    diagnostics = loaded["diagnostics"]
+    assert diagnostics["xml_complete"] is True
+    assert diagnostics["staged_bytes"] == diagnostics["validation_bytes"] == diagnostics["selection_bytes"] == len(document)
+    assert diagnostics["content_length"] == len(compressed)
+    assert diagnostics["transfer_encoding"] == "absent"
+    assert diagnostics["http_version"] == "HTTP/2"
+    for key in ("headers_ms", "download_ms", "write_ms", "write_max_ms", "validation_ms", "selection_ms"):
+        assert type(diagnostics[key]) is int and diagnostics[key] >= 0
+    assert diagnostics["write_calls"] > 0
+
+
+@pytest.mark.asyncio
+async def test_validation_uses_source_deadline_and_keeps_previous_snapshot(monkeypatch, tmp_path):
+    import tempfile
+
+    opened = []
+    temporary = tempfile.TemporaryFile
+    to_thread = asyncio.to_thread
+
+    def create(*args, **kwargs):
+        result = temporary(*args, **kwargs)
+        opened.append(result)
+        return result
+
+    async def run(function, *args, **kwargs):
+        if getattr(function, "__name__", None) == "consume":
+            await asyncio.Event().wait()
+        return await to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", create)
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    monkeypatch.setattr(guides, "SOURCE_TIMEOUT", 0.05)
+    install_transport(monkeypatch, lambda request: reply(GOOD))
+    previous = {"success": NOW, "rows": {"ESPN.us": [programme()]}, "checked": 0, "size": 0}
+    guides._SOURCE_CACHE["previous"] = previous
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
+        await guides._load_source("previous", source(), [], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["previous"]
+    assert times.call_count == 0
+    assert entry["success"] == NOW and entry["rows"] is previous["rows"]
+    assert entry["error"] == "Request timed out."
+    assert entry["diagnostics"]["attempts"] == 1
+    assert entry["diagnostics"]["validation_ms"] > 0
+    assert entry["diagnostics"]["selection_ms"] == 0
+    assert len(opened) == 1 and opened[0].closed and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length,transfer,version,expected", [
+    (str(len(GOOD)), "chunked", b"HTTP/1.1", len(GOOD)),
+    (SECRET, SECRET, SECRET.encode(), None),
+    ("9" * 100, "", b"HTTP/1.0", None),
+])
+async def test_source_framing_diagnostics_are_bounded(monkeypatch, length, transfer, version, expected):
+    install_transport(monkeypatch, lambda request: httpx.Response(
+        200, headers={"content-length": length, "transfer-encoding": transfer},
+        stream=Body((GOOD,), None), extensions={"http_version": version},
+    ))
+    loaded = await guides._read_source(source(), [], START, STOP, NOW)
+    diagnostics = bounded(loaded["diagnostics"])
+    assert diagnostics.get("content_length") == expected
+    assert diagnostics["transfer_encoding"] == ("chunked" if transfer == "chunked" else "other" if transfer else "absent")
+    assert diagnostics["http_version"] == (version.decode() if version in {b"HTTP/1.0", b"HTTP/1.1"} else "other")
+    assert SECRET not in json.dumps(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_source_phase_totals_include_failed_validation_before_retry(monkeypatch):
+    attempts = []
+    read = guides._read_source
+    to_thread = asyncio.to_thread
+
+    async def run(function, *args, **kwargs):
+        if getattr(function, "__name__", None) == "consume" and args[-1] is False:
+            await asyncio.sleep(0.01)
+        return await to_thread(function, *args, **kwargs)
+
+    async def capture(*args):
+        try:
+            loaded = await read(*args)
+        except ET.ParseError as exc:
+            attempts.append(dict(exc.diagnostics))
+            raise
+        attempts.append(dict(loaded["diagnostics"]))
+        return loaded
+
+    install_transport(monkeypatch, lambda request: reply(GOOD[:-5] if not attempts else GOOD))
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    monkeypatch.setattr(guides, "_read_source", capture)
+    await guides._load_source("phases", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["phases"]
+    assert entry["error"] is None and len(attempts) == 2
+    diagnostics = bounded(entry["diagnostics"])
+    for phase in ("download", "validation", "selection"):
+        assert diagnostics[f"total_{phase}_ms"] == sum(attempt[f"{phase}_ms"] for attempt in attempts)
+    assert attempts[0]["validation_ms"] >= 10 and attempts[0]["selection_ms"] == 0
+    assert diagnostics["total_validation_ms"] > diagnostics["validation_ms"]
+    assert diagnostics["xml_complete"] is True and "failure" not in diagnostics
+    assert [row.findtext("title") for row in entry["rows"]["ESPN.us"]] == ["SportsCenter"]
+
+
+@pytest.mark.asyncio
+async def test_short_staged_write_never_reaches_selection(monkeypatch):
+    to_thread = asyncio.to_thread
+
+    async def run(function, *args, **kwargs):
+        result = await to_thread(function, *args, **kwargs)
+        if getattr(function, "__name__", None) == "write":
+            return result - 1
+        return result
+
+    install_transport(monkeypatch, lambda request: reply(GOOD))
+    monkeypatch.setattr(asyncio, "to_thread", run)
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
+        await guides._load_source("short", source(), [], START, STOP, NOW)
+    entry = guides._SOURCE_CACHE["short"]
+    assert entry["error"] == "XMLTV staged write is incomplete."
+    assert "success" not in entry and not entry.get("rows")
+    assert entry["diagnostics"]["attempts"] == 1
+    assert entry["diagnostics"]["staged_bytes"] == len(GOOD) - 1
+    assert entry["diagnostics"]["validation_bytes"] == entry["diagnostics"]["selection_bytes"] == 0
+    assert times.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reused_event_terms_preserve_edition_date_and_ambiguity_checks(monkeypatch):
+    guide = profile()
+    queries = [guides._query(guide, channel(id=index, name=f"ONE Fight Night {edition} @ Sep 04 09:00 PM", tvg_id=""), None, NOW)
+               for index, edition in ((1, 47), (2, 48))]
+    install_feed(monkeypatch, feed(
+        programme("PPV(1)-05.v", "ONE Fight Night 47", stop="20260905013000 +0000"),
+        programme("PPV(2)-05.v", "ONE Fight Night 47", start="20260905004500 +0000", stop="20260905012000 +0000"),
+        programme("PPV(3)-05.v", "ONE Fight Night 47", start="20260906010000 +0000", stop="20260906040000 +0000"),
+        programme("PPV(4)-05.v", "ONE Fight Night 48", start="20260906010000 +0000", stop="20260906040000 +0000"),
+    ))
+    with patch.object(guides, "_event", wraps=guides._event) as event, \
+            patch.object(guides, "normalize_alias_term", wraps=guides.normalize_alias_term) as normalize, \
+            patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+    assert event.call_count == 4 and normalize.call_count == 4 and score.call_count == 8
+    assert set(loaded["ended"]) == {queries[0]["key"]}
+    assert loaded["ended"][queries[0]["key"]][3].findtext("title") == "ONE Fight Night 47"
+    assert set(loaded["channel_warnings"][queries[0]["key"]]) == {"ambiguous_event", "event_date_conflict"}
+    assert loaded["channel_warnings"][queries[1]["key"]] == ["event_date_conflict"]
+    for query in queries:
+        rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
+        assert rows == [] and result["event"] is None

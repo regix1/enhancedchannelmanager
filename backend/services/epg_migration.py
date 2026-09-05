@@ -48,6 +48,7 @@ async def stream_xmltv(
         diagnostics.update(wire_bytes=0, decoded_bytes=0, transport_complete=False)
     try:
         async with asyncio.timeout(timeout):
+            started = time.monotonic()
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(read_timeout, connect=10.0),
                 follow_redirects=False,
@@ -73,7 +74,14 @@ async def stream_xmltv(
                                       or str(current_url).lower().split("?", 1)[0].endswith(".gz"))
                         if diagnostics is not None:
                             mime = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                            transfer = response.headers.get("transfer-encoding", "").strip().lower()
+                            length = response.headers.get("content-length", "").strip()
+                            if 0 < len(length) <= 19 and length.isascii() and length.isdigit():
+                                diagnostics["content_length"] = int(length)
                             diagnostics.update(
+                                headers_ms=max(0, int((time.monotonic() - started) * 1000)),
+                                transfer_encoding="chunked" if transfer == "chunked" else "other" if transfer else "absent",
+                                http_version=response.http_version if response.http_version in {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"} else "other",
                                 http_status=response.status_code,
                                 content_type=("absent" if not mime else "xml" if mime in {"application/xml", "text/xml"} or mime.endswith("+xml")
                                               else "gzip" if mime in {"application/gzip", "application/x-gzip"}

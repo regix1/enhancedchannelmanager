@@ -272,12 +272,17 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     import tempfile
     from config import CONFIG_DIR, get_settings
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
+    query_terms = {id(query): set(normalize_alias_term(query["event"].title or ""))
+                   for query in queries if query["event"].start is not None}
     parser = ET.XMLPullParser(events=("start", "end"))
     root = None
     headers, rows, warnings = {}, {}, set()
     ended = {}
     channel_warnings = {}
-    diagnostics = {"root": "absent", "xml_complete": False, "transport_complete": False}
+    diagnostics = {"root": "absent", "xml_complete": False, "transport_complete": False,
+                   "download_ms": 0, "write_ms": 0, "write_max_ms": 0, "write_calls": 0,
+                   "staged_bytes": 0, "validation_ms": 0, "validation_bytes": 0,
+                   "selection_ms": 0, "selection_bytes": 0}
     import codecs
     decoder = codecs.getincrementaldecoder("utf-8")()
     prefix = b""
@@ -285,7 +290,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     retained = count = pending_size = 0
     event_headers = any(query["dynamic"] and query["event"].start is not None for query in queries)
 
-    def consume(chunk: bytes | None) -> None:
+    def consume(chunk: bytes | None, select: bool = True) -> None:
         nonlocal root, retained, count, pending_size, prefix, invalid_utf8, forbidden
         if chunk is not None:
             prefix = (prefix + chunk)[:1024]
@@ -309,6 +314,11 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                     raise ValueError("XMLTV root must be tv.")
             if event != "end":
                 continue
+            if not select:
+                if root is not None and element in root:
+                    root.remove(element)
+                    pending_size = 0
+                continue
             if element.tag == "channel":
                 tvg_id = element.get("id", "")
                 if event_headers or any(_identity(query, source["id"], tvg_id, element) is not None for query in queries):
@@ -329,12 +339,15 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                             channel_warnings.setdefault(query["key"], set()).add("invalid_schedule")
                 else:
                     if now - timedelta(hours=24) < end <= now and end - begin <= timedelta(hours=24) and not _placeholder(element):
+                        ended_event = None
                         for query in queries:
                             parsed = query["event"]
                             if (not query["dynamic"] or parsed.start is None
                                     or abs((parsed.start - begin).total_seconds()) > 1800):
                                 continue
-                            if _score_parsed_pair(parsed, _event(element, begin), window_minutes=30,
+                            if ended_event is None:
+                                ended_event = _event(element, begin)
+                            if _score_parsed_pair(parsed, ended_event, window_minutes=30,
                                                   threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index).band != BAND_ATTACH:
                                 continue
                             identity = query["key"]
@@ -361,13 +374,16 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                                          for query in queries)
                             if not wanted:
                                 event_title = _event(element, begin)
+                                event_terms = None
                                 for query in queries:
                                     parsed = query["event"]
                                     if parsed.start is None:
                                         continue
                                     delta = abs((parsed.start - begin).total_seconds())
                                     if delta > 1800:
-                                        common = set(normalize_alias_term(parsed.title or "")) & set(normalize_alias_term(event_title.title or ""))
+                                        if event_terms is None:
+                                            event_terms = set(normalize_alias_term(event_title.title or ""))
+                                        common = query_terms[id(query)] & event_terms
                                         if len(common) >= 2 and _score_parsed_pair(
                                             parsed, event_title, window_minutes=None,
                                             threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index,
@@ -398,15 +414,42 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
         async with asyncio.timeout(SOURCE_TIMEOUT):
             # Selection must not slow delivery of a time-limited upstream response.
             with tempfile.TemporaryFile(mode="w+b", dir=CONFIG_DIR) as spool:
-                async for chunk in stream_xmltv(
-                    source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
-                    timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
-                ):
-                    await asyncio.to_thread(spool.write, chunk)
-                await asyncio.to_thread(spool.seek, 0)
-                while chunk := await asyncio.to_thread(spool.read, 65536):
-                    await asyncio.to_thread(consume, chunk)
-                await asyncio.to_thread(consume, None)
+                download_started = time.monotonic()
+                write_elapsed = 0.0
+                try:
+                    async for chunk in stream_xmltv(
+                        source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
+                        timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
+                    ):
+                        write_started = time.monotonic()
+                        diagnostics["write_calls"] += 1
+                        try:
+                            written = await asyncio.to_thread(spool.write, chunk)
+                            diagnostics["staged_bytes"] += written
+                            if written != len(chunk):
+                                raise ValueError("XMLTV staged write is incomplete.")
+                        finally:
+                            elapsed = max(0.0, time.monotonic() - write_started)
+                            write_elapsed += elapsed
+                            diagnostics["write_ms"] = int(write_elapsed * 1000)
+                            diagnostics["write_max_ms"] = max(diagnostics["write_max_ms"], int(elapsed * 1000))
+                finally:
+                    diagnostics["download_ms"] = max(0, int((time.monotonic() - download_started) * 1000))
+                # Reject incomplete documents before spending time matching their programmes.
+                for select, phase in ((False, "validation"), (True, "selection")):
+                    parser = ET.XMLPullParser(events=("start", "end"))
+                    root, pending_size = None, 0
+                    decoder = codecs.getincrementaldecoder("utf-8")()
+                    prefix, invalid_utf8, forbidden = b"", False, False
+                    phase_started = time.monotonic()
+                    try:
+                        await asyncio.to_thread(spool.seek, 0)
+                        while chunk := await asyncio.to_thread(spool.read, 65536):
+                            diagnostics[f"{phase}_bytes"] += len(chunk)
+                            await asyncio.to_thread(consume, chunk, select)
+                        await asyncio.to_thread(consume, None, select)
+                    finally:
+                        diagnostics[f"{phase}_ms"] = max(0, int((time.monotonic() - phase_started) * 1000))
                 diagnostics["xml_complete"] = True
     except (Exception, asyncio.CancelledError) as exc:
         if isinstance(exc, ET.ParseError):
@@ -455,6 +498,7 @@ def _error_reason(exc: Exception) -> str:
         "Selected XMLTV schedules exceed the retained size limit.": "Selected XMLTV schedules exceed the retained size limit.",
         "XMLTV root must be tv.": "XMLTV root must be tv.",
         "XMLTV document is empty.": "XMLTV document is empty.",
+        "XMLTV staged write is incomplete.": "XMLTV staged write is incomplete.",
         "Dispatcharr EPG response used unexpected Content-Encoding": "Unsupported catalogue response encoding.",
         "Dispatcharr EPG source counts are unavailable": "Catalogue source counts are unavailable.",
         "Dispatcharr EPG catalogue exceeds 200000 rows": "Response exceeded the catalogue size limit.",
@@ -507,6 +551,7 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
     previous = _SOURCE_CACHE.get(key, {})
     attempt = 0
     diagnostics = {}
+    totals = {}
     try:
         async with _SOURCE_SLOTS:
             async with asyncio.timeout(SOURCE_TIMEOUT):
@@ -514,16 +559,23 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
                     diagnostics = {}
                     try:
                         loaded = await _read_source(source, queries, start, stop, now)
-                    except ET.ParseError as exc:
+                        diagnostics = loaded.get("diagnostics", {})
+                    except (Exception, asyncio.CancelledError) as exc:
                         diagnostics = getattr(exc, "diagnostics", {})
-                        if (attempt == 1 and diagnostics.get("root") == "tv"
+                        if (isinstance(exc, ET.ParseError) and attempt == 1 and diagnostics.get("root") == "tv"
                                 and diagnostics.get("transport_complete") is True
                                 and diagnostics.get("failure") == "incomplete_xml"
                                 and getattr(exc, "code", None) in {3, 5, 6}):
                             continue
                         raise
+                    finally:
+                        for phase in ("download", "validation", "selection"):
+                            elapsed = diagnostics.get(f"{phase}_ms")
+                            if type(elapsed) is int and elapsed >= 0:
+                                name = f"total_{phase}_ms"
+                                totals[name] = totals.get(name, 0) + elapsed
                     break
-        loaded.setdefault("diagnostics", {})["attempts"] = attempt
+        loaded.setdefault("diagnostics", {}).update(totals, attempts=attempt)
         loaded.update({
             "success": datetime.now(timezone.utc), "checked": time.monotonic(), "error": None,
             "selection": {"queries": frozenset(query["key"] for query in queries),
@@ -534,12 +586,12 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
     except asyncio.CancelledError as exc:
         diagnostics = getattr(exc, "diagnostics", diagnostics)
         _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled.",
-                              "diagnostics": {**diagnostics, "attempts": attempt}}
+                              "diagnostics": {**diagnostics, **totals, "attempts": attempt}}
         raise
     except Exception as exc:
         diagnostics = getattr(exc, "diagnostics", getattr(exc.__cause__, "diagnostics", diagnostics))
         _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc),
-                              "diagnostics": {**diagnostics, "attempts": attempt}}
+                              "diagnostics": {**diagnostics, **totals, "attempts": attempt}}
     finally:
         _SOURCE_LOADS.pop(key, None)
         total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
