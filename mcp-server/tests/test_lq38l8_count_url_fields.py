@@ -6,6 +6,8 @@ Covers:
 - get_groups_with_streams: no false "0 streams" (payload only has id/name)
 - list_epg_sources: channel count from epg_data_count (not the absent channel_count)
 """
+import json
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -456,3 +458,131 @@ class TestListEpgSourcesChannelCount:
         assert "500 channels" in text, (
             f"Expected fallback to channel_count=500 in output: {text!r}"
         )
+
+
+class TestListEpgSourcesDetails:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arguments", [{}, {"details": False}])
+    async def test_default_output_is_unchanged(self, arguments):
+        mcp = _make_mcp_epg()
+        url = "https://guide.example.test/" + "guide/" * 20 + "list.xml"
+        client = AsyncMock()
+        client.call_endpoint.return_value = [
+            {"id": 42, "name": "Guide", "url": url, "epg_data_count": 54},
+            {"id": 50, "name": "Backup", "url": None},
+        ]
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", arguments)
+        assert result[0][0].text == (
+            "Found 2 EPG sources:\n"
+            f"  Guide (id=42) — 54 channels, url: {url[:50]}...\n"
+            "  Backup (id=50) — url: ..."
+        )
+        assert url not in result[0][0].text
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("container", [list, lambda rows: {"sources": rows}, lambda rows: {"results": rows}])
+    async def test_explicit_details_returns_full_url_for_only_selected_source(self, container, caplog):
+        mcp = _make_mcp_epg()
+        url = "https://user:private-password@guide.example.test/" + "feed/" * 20 + "?token=private-token"
+        selected = {
+            "id": 42, "name": "Guide", "url": url, "source_type": "xmltv",
+            "is_active": True, "epg_data_count": "54",
+        }
+        client = AsyncMock()
+        client.call_endpoint.return_value = container([
+            {**selected, "password": "unrelated-secret", "settings": {"token": "nested-secret"}},
+            {"id": 50, "name": "Backup", "url": "https://unrelated-secret.test/feed"},
+        ])
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": True, "source_id": 42})
+        text = result[0][0].text
+        assert json.loads(text) == {"sources": [selected]}
+        assert "unrelated-secret" not in text
+        assert "nested-secret" not in text
+        assert url not in caplog.text
+        assert "private-password" not in caplog.text
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_details_preserves_null_and_missing_urls(self):
+        mcp = _make_mcp_epg()
+        sources = [{"id": 42, "url": None}, {"id": 50}]
+        client = AsyncMock()
+        client.call_endpoint.return_value = sources
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": True})
+        assert json.loads(result[0][0].text) == {"sources": sources}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("details", [False, True])
+    async def test_unknown_source_is_reported_without_another_request(self, details):
+        mcp = _make_mcp_epg()
+        client = AsyncMock()
+        client.call_endpoint.return_value = [{"id": 50, "name": "Backup"}]
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": details, "source_id": 42})
+        assert result[0][0].text == "EPG source 42 was not found."
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("details", [False, True])
+    async def test_failed_request_does_not_echo_credentials(self, details, caplog):
+        mcp = _make_mcp_epg()
+        client = AsyncMock()
+        client.call_endpoint.side_effect = RuntimeError("https://user:private-password@guide.test/?token=private-token")
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": details})
+        assert result[0][0].text == "Error listing EPG sources."
+        assert "private-password" not in caplog.text
+        assert "private-token" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_oversized_details_are_refused_without_clipping_url(self):
+        mcp = _make_mcp_epg()
+        client = AsyncMock()
+        client.call_endpoint.return_value = [{"id": 42, "url": "https://guide.test/" + "x" * 65536}]
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": True})
+        assert result[0][0].text == "Cannot return EPG source details: response exceeds the 64 KiB limit."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sources", [
+        [{"id": 42, "url": "https://guide.test/" + "🚦" * 17000}],
+        [{"id": source_id, "url": "https://guide.test/" + "x" * 40000} for source_id in (42, 50)],
+    ])
+    async def test_details_budget_counts_utf8_and_all_sources(self, sources):
+        mcp = _make_mcp_epg()
+        client = AsyncMock()
+        client.call_endpoint.return_value = sources
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": True})
+        assert result[0][0].text == "Cannot return EPG source details: response exceeds the 64 KiB limit."
+
+    @pytest.mark.asyncio
+    async def test_nested_allowed_field_is_refused_without_echoing_its_contents(self, caplog):
+        mcp = _make_mcp_epg()
+        client = AsyncMock()
+        client.call_endpoint.return_value = [{"id": 42, "url": {"password": "private-password"}}]
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("list_epg_sources", {"details": True})
+        assert result[0][0].text == "Error listing EPG sources."
+        assert "private-password" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_schema_keeps_details_optional_and_validates_source_id(self):
+        mcp = _make_mcp_epg()
+        tool = next(tool for tool in await mcp.list_tools() if tool.name == "list_epg_sources")
+        properties = tool.inputSchema["properties"]
+        assert properties["details"]["type"] == "boolean"
+        assert properties["details"]["default"] is False
+        assert properties["source_id"]["default"] is None
+        assert tool.inputSchema.get("required", []) == []
+        assert any(option.get("exclusiveMinimum") == 0 for option in properties["source_id"]["anyOf"])
+        client = AsyncMock()
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            for source_id in (0, -1, True):
+                with pytest.raises(Exception):
+                    await mcp.call_tool("list_epg_sources", {"source_id": source_id})
+        client.call_endpoint.assert_not_awaited()

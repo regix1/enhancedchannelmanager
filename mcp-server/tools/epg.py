@@ -59,16 +59,49 @@ async def _build_channel_uuid_map(client, references: dict | None = None) -> dic
 
 def register(mcp: FastMCP):
     @mcp.tool()
-    async def list_epg_sources() -> str:
-        """List all configured EPG data sources."""
+    async def list_epg_sources(
+        details: bool = False,
+        source_id: Annotated[int | None, Field(gt=0, strict=True)] = None,
+    ) -> str:
+        """List configured EPG data sources.
+
+        Args:
+            details: Return selected source fields as JSON, including complete
+                configured URLs. URLs can contain credentials. Responses over
+                64 KiB are refused; use source_id to request one source.
+            source_id: Optional positive source ID to filter the existing list.
+        """
         try:
             client = get_ecm_client()
             sources = await client.call_endpoint(ENDPOINTS["epg_list_sources"])
             if isinstance(sources, dict):
                 sources = sources.get("sources", sources.get("results", []))
 
+            if source_id is not None:
+                sources = [source for source in sources if source.get("id") == source_id]
+                if not sources:
+                    return f"EPG source {source_id} was not found."
+
             if not sources:
                 return "No EPG sources configured."
+
+            if details:
+                import json
+
+                fields = ("id", "name", "url", "source_type", "is_active", "epg_data_count", "channel_count")
+                rows = []
+                size = len('{"sources": []}')
+                for source in sources:
+                    row = {key: source[key] for key in fields if key in source}
+                    if any(value is not None and type(value) not in (str, int, float, bool) for value in row.values()):
+                        raise ValueError("Unexpected EPG source field")
+                    if any(isinstance(value, str) and len(value) > 65536 for value in row.values()):
+                        return "Cannot return EPG source details: response exceeds the 64 KiB limit."
+                    size += len(json.dumps(row, ensure_ascii=False, allow_nan=False).encode("utf-8")) + (2 if rows else 0)
+                    if size > 65536:
+                        return "Cannot return EPG source details: response exceeds the 64 KiB limit."
+                    rows.append(row)
+                return json.dumps({"sources": rows}, ensure_ascii=False, allow_nan=False)
 
             lines = [f"Found {len(sources)} EPG sources:"]
             for s in sources:
@@ -82,9 +115,9 @@ def register(mcp: FastMCP):
                 lines.append(f"  {name} (id={sid}) — {count_str}url: {url}...")
 
             return "\n".join(lines)
-        except Exception as e:
-            logger.error("[MCP] list_epg_sources failed: %s", e)
-            return f"Error listing EPG sources: {e}"
+        except Exception:
+            logger.error("[MCP] list_epg_sources failed")
+            return "Error listing EPG sources."
 
     @mcp.tool()
     async def search_epg_channels(
