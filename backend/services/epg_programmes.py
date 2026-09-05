@@ -343,6 +343,63 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
             "channel_warnings": {channel: sorted(values) for channel, values in channel_warnings.items()}}
 
 
+def _error_reason(exc: Exception) -> str:
+    """Describe known read failures without exposing request or response content."""
+    import zlib
+
+    import httpx
+    from fastapi import HTTPException
+
+    reasons = {
+        "XMLTV source has no downloadable URL.": "XMLTV source has no downloadable URL.",
+        "XMLTV source returned an invalid redirect.": "XMLTV source returned an invalid redirect.",
+        "XMLTV source URL is blocked by the outbound security policy.": "XMLTV source URL is blocked by the outbound security policy.",
+        "XMLTV download exceeds its size limit.": "XMLTV download exceeds its size limit.",
+        "XMLTV decoded content exceeds its size limit.": "XMLTV decoded content exceeds its size limit.",
+        "XMLTV DTDs, entities and non-UTF encodings are not supported.": "XMLTV DTDs, entities and non-UTF encodings are not supported.",
+        "XMLTV gzip has trailing content.": "XMLTV gzip has trailing content.",
+        "XMLTV gzip is incomplete.": "XMLTV gzip is incomplete.",
+        "XMLTV element exceeds the retained size limit.": "XMLTV element exceeds the retained size limit.",
+        "Selected XMLTV schedules exceed the retained size limit.": "Selected XMLTV schedules exceed the retained size limit.",
+        "XMLTV root must be tv.": "XMLTV root must be tv.",
+        "XMLTV document is empty.": "XMLTV document is empty.",
+        "Dispatcharr EPG response used unexpected Content-Encoding": "Unsupported catalogue response encoding.",
+    }
+    reason = "Request failed."
+    seen = set()
+    for _ in range(8):
+        if exc is None or id(exc) in seen:
+            break
+        seen.add(id(exc))
+        if isinstance(exc, httpx.ConnectTimeout):
+            reason = "Request timed out while connecting."
+        elif isinstance(exc, httpx.ReadTimeout):
+            reason = "Request timed out while reading."
+        elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            reason = "Request timed out."
+        elif isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if type(status) is int and 100 <= status <= 599:
+                reason = f"HTTP status {status}."
+        elif isinstance(exc, httpx.RequestError):
+            reason = "Connection failed."
+        elif isinstance(exc, ET.ParseError):
+            reason = "Malformed XML."
+        elif isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+            reason = "Invalid JSON response."
+        elif isinstance(exc, zlib.error):
+            reason = "Invalid compressed XMLTV content."
+        elif isinstance(exc, (HTTPException, ValueError)):
+            detail = exc.detail if isinstance(exc, HTTPException) else (exc.args[0] if exc.args else None)
+            if type(detail) is str:
+                if detail in reasons:
+                    reason = reasons[detail]
+                elif re.fullmatch(r"Dispatcharr EPG response exceeds [0-9]{1,10} bytes", detail):
+                    reason = "Response exceeded the catalogue size limit."
+        exc = exc.__cause__
+    return reason
+
+
 async def _load_source(key: str, source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> None:
     previous = _SOURCE_CACHE.get(key, {})
     try:
@@ -353,8 +410,8 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
     except asyncio.CancelledError:
         _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled."}
         raise
-    except Exception:
-        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "Could not load the complete XMLTV source."}
+    except Exception as exc:
+        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc)}
     finally:
         total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
         for oldest in sorted(_SOURCE_CACHE, key=lambda item: _SOURCE_CACHE[item].get("checked", 0)):

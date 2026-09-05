@@ -110,7 +110,7 @@ def register(mcp: FastMCP):
             if epg_source_id is not None:
                 query["epg_source"] = epg_source_id
             rows = await client.call_endpoint(ENDPOINTS["epg_search"], query=query)
-            if not isinstance(rows, list):
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows[:limit]):
                 raise ValueError("Unexpected EPG catalogue response")
             channels = []
             for row in rows[:limit]:
@@ -130,8 +130,47 @@ def register(mcp: FastMCP):
                 result["note"] = "The result limit was reached; more matches may exist. Refine the search or source filter."
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:
-            logger.error("[MCP] search_epg_channels failed: %s", type(exc).__name__)
-            return "Error searching EPG channels: the catalogue request failed."
+            import httpx
+            import re
+
+            reason = "the catalogue request failed."
+            seen = set()
+            for _ in range(8):
+                if exc is None or id(exc) in seen:
+                    break
+                seen.add(id(exc))
+                if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                    reason = "Request timed out."
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    response = exc.response
+                    status = response.status_code
+                    if type(status) is int and 100 <= status <= 599:
+                        reason = f"HTTP status {status}."
+                    try:
+                        body = response.json() if len(response.content) <= 4096 else None
+                    except (ValueError, httpx.ResponseNotRead):
+                        body = None
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                    prefix = "EPG catalogue request failed: "
+                    if type(detail) is str and detail.startswith(prefix):
+                        detail = detail[len(prefix):]
+                        if detail in {
+                            "Request failed.", "Connection failed.", "Invalid JSON response.",
+                            "Request timed out.", "Request timed out while connecting.",
+                            "Request timed out while reading.",
+                            "Unsupported catalogue response encoding.",
+                            "Response exceeded the catalogue size limit.",
+                        } or re.fullmatch(r"HTTP status [1-5][0-9]{2}\.", detail):
+                            reason += f" Catalogue error: {detail}"
+                elif isinstance(exc, httpx.RequestError):
+                    reason = "Connection failed."
+                elif isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+                    reason = "Invalid JSON response."
+                elif type(exc) is ValueError and exc.args == ("Unexpected EPG catalogue response",):
+                    reason = "Invalid catalogue response."
+                exc = exc.__cause__
+            logger.error("[MCP] search_epg_channels failed: %s", reason)
+            return f"Error searching EPG channels: {reason}"
 
     @mcp.tool()
     async def refresh_epg(source_id: int) -> str:

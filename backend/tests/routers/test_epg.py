@@ -1626,6 +1626,53 @@ class TestGetEPGData:
         mock_client.get_epg_data.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_catalogue_error_retains_safe_http_status(self, async_client):
+        import httpx
+
+        request = httpx.Request("GET", "https://guide.invalid/?key=private")
+        upstream = httpx.Response(403, request=request, text="private credentials")
+        failure = httpx.HTTPStatusError("private credentials", request=request, response=upstream)
+        client = AsyncMock()
+        client.get_epg_data.side_effect = failure
+        with patch("routers.epg.get_client", return_value=client):
+            response = await async_client.get("/api/epg/data", params={"limit": 10})
+        assert response.status_code == 502
+        assert response.json() == {"detail": "EPG catalogue request failed: HTTP status 403."}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind,expected", [
+        ("timeout", "Request timed out while reading."),
+        ("connection", "Connection failed."),
+        ("size", "Response exceeded the catalogue size limit."),
+        ("encoding", "Unsupported catalogue response encoding."),
+        ("json", "Invalid JSON response."),
+        ("unknown", "Request failed."),
+        ("unknown_limit", "Request failed."),
+    ])
+    async def test_catalogue_errors_return_controlled_reasons(self, async_client, kind, expected):
+        import httpx
+        import json
+
+        failures = {
+            "timeout": httpx.ReadTimeout("https://guide.invalid/?key=private"),
+            "connection": httpx.ConnectError("private"),
+            "size": ValueError("Dispatcharr EPG response exceeds 1048576 bytes"),
+            "encoding": ValueError("Dispatcharr EPG response used unexpected Content-Encoding"),
+            "json": json.JSONDecodeError("private", "private", 0),
+            "unknown": type("private_credentials", (RuntimeError,), {})("private"),
+            "unknown_limit": ValueError("Dispatcharr EPG response exceeds 1048576 bytes private"),
+        }
+        client = AsyncMock()
+        client.get_epg_data.side_effect = failures[kind]
+        with patch("routers.epg.get_client", return_value=client):
+            response = await async_client.get("/api/epg/data", params={"limit": 10})
+        assert response.status_code == (500 if expected == "Request failed." else 502)
+        assert response.json() == {
+            "detail": "Internal server error" if expected == "Request failed." else f"EPG catalogue request failed: {expected}",
+        }
+        assert "private" not in response.text
+
+    @pytest.mark.asyncio
     async def test_forwards_total_limit_with_query_and_source(self, async_client):
         client = AsyncMock()
         client.get_epg_data.return_value = [{"id": 731, "epg_source": 49, "tvg_id": "32645", "name": "Sports"}]

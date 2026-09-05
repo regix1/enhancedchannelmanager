@@ -226,11 +226,15 @@ class TestProgrammeSourceTools:
             assert "channel_mappings" not in sent
 
     @pytest.mark.asyncio
-    async def test_coverage_only_calls_read_endpoint(self):
+    @pytest.mark.parametrize("status,error", [
+        ("pending", None), ("error", "HTTP status 503."),
+        ("error", "Request timed out while reading."),
+    ])
+    async def test_coverage_only_calls_read_endpoint(self, status, error):
         import json
         mcp = _mcp()
         client = AsyncMock()
-        coverage = {"sources": [{"source_id": 51, "status": "pending", "error": None}], "channels": []}
+        coverage = {"sources": [{"source_id": 51, "status": status, "error": error}], "channels": []}
         client.call_endpoint.return_value = coverage
         with patch("tools.epg.get_ecm_client", return_value=client):
             result = await mcp.call_tool("get_dummy_epg_coverage", {"profile_id": 1})
@@ -277,6 +281,91 @@ class TestGenerateDummyEpg:
         assert call.kwargs == {"body": {"profile_ids": [1, 2]}, "timeout": 60.0}
 
 class TestSearchEpgChannels:
+    @pytest.mark.asyncio
+    async def test_wrapped_http_error_retains_safe_status(self):
+        import httpx
+
+        request = httpx.Request("GET", "https://guide.invalid/?key=private")
+        response = httpx.Response(403, request=request, json={"detail": "private credentials"})
+        failure = RuntimeError("private credentials")
+        failure.__cause__ = httpx.HTTPStatusError("private", request=request, response=response)
+        client = AsyncMock()
+        client.call_endpoint.side_effect = failure
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == "Error searching EPG channels: HTTP status 403."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("detail,expected", [
+        ("EPG catalogue request failed: Response exceeded the catalogue size limit.",
+         "HTTP status 500. Catalogue error: Response exceeded the catalogue size limit."),
+        ("EPG catalogue request failed: Request timed out while reading.",
+         "HTTP status 500. Catalogue error: Request timed out while reading."),
+        ("EPG catalogue request failed: Invalid JSON response.",
+         "HTTP status 500. Catalogue error: Invalid JSON response."),
+        ("EPG catalogue request failed: HTTP status 401.",
+         "HTTP status 500. Catalogue error: HTTP status 401."),
+        ("EPG catalogue request failed: HTTP status 403. https://guide.invalid/?key=private",
+         "HTTP status 500."),
+        ({"url": "https://guide.invalid/?key=private"}, "HTTP status 500."),
+        ("EPG catalogue request failed: " + "private" * 1000, "HTTP status 500."),
+    ])
+    async def test_backend_reasons_are_allowlisted(self, detail, expected, caplog):
+        import httpx
+
+        request = httpx.Request("GET", "https://guide.invalid/?key=private")
+        response = httpx.Response(500, request=request, json={"detail": detail})
+        failure = RuntimeError("private")
+        failure.__cause__ = httpx.HTTPStatusError("private", request=request, response=response)
+        client = AsyncMock()
+        client.call_endpoint.side_effect = failure
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == f"Error searching EPG channels: {expected}"
+        assert "private" not in _text(result)
+        assert "private" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_real_client_wrapping_preserves_backend_reason(self):
+        import httpx
+        from ecm_client import ECMClient
+
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            502, json={"detail": "EPG catalogue request failed: Unsupported catalogue response encoding."},
+        ))
+        async with httpx.AsyncClient(transport=transport, base_url="https://backend.invalid") as http:
+            with patch("ecm_client._get_client", return_value=http), \
+                 patch("tools.epg.get_ecm_client", return_value=ECMClient()):
+                result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == (
+            "Error searching EPG channels: HTTP status 502. "
+            "Catalogue error: Unsupported catalogue response encoding."
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rows", [{"detail": "private"}, [None], ["private"]])
+    async def test_malformed_catalogue_is_an_error(self, rows):
+        client = AsyncMock()
+        client.call_endpoint.return_value = rows
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == "Error searching EPG channels: Invalid catalogue response."
+
+    @pytest.mark.asyncio
+    async def test_timeout_and_unknown_cyclic_causes_are_safe(self, caplog):
+        client = AsyncMock()
+        client.call_endpoint.side_effect = TimeoutError("private")
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == "Error searching EPG channels: Request timed out."
+        failure = type("private_credentials", (RuntimeError,), {})("private")
+        failure.__cause__ = failure
+        client.call_endpoint.side_effect = failure
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == "Error searching EPG channels: the catalogue request failed."
+        assert "private" not in caplog.text
+
     @pytest.mark.asyncio
     async def test_default_search_uses_bounded_read_endpoint(self):
         import json

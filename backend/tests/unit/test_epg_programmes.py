@@ -19,6 +19,117 @@ START = datetime(2026, 9, 4, 4, tzinfo=timezone.utc)
 STOP = datetime(2026, 9, 6, 4, tzinfo=timezone.utc)
 
 
+@pytest.mark.asyncio
+async def test_source_error_retains_wrapped_timeout_reason(monkeypatch):
+    from fastapi import HTTPException
+
+    failure = HTTPException(502, "Could not read the configured XMLTV source.")
+    failure.__cause__ = httpx.ReadTimeout("https://guide.invalid/?key=private")
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "Request timed out while reading."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,expected", [
+    (httpx.ConnectTimeout("private"), "Request timed out while connecting."),
+    (TimeoutError("private"), "Request timed out."),
+    (httpx.ConnectError("private"), "Connection failed."),
+    (ET.ParseError("private"), "Malformed XML."),
+    (ValueError("XMLTV root must be tv."), "XMLTV root must be tv."),
+    (ValueError("XMLTV document is empty."), "XMLTV document is empty."),
+    (ValueError("XMLTV element exceeds the retained size limit."), "XMLTV element exceeds the retained size limit."),
+    (ValueError("Selected XMLTV schedules exceed the retained size limit."), "Selected XMLTV schedules exceed the retained size limit."),
+    (ValueError("private https://guide.invalid/?key=private"), "Request failed."),
+])
+async def test_source_errors_preserve_only_known_reasons(monkeypatch, failure, expected):
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == expected
+    assert "private" not in guides._SOURCE_CACHE["selected"]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [
+    "XMLTV source has no downloadable URL.",
+    "XMLTV source returned an invalid redirect.",
+    "XMLTV source URL is blocked by the outbound security policy.",
+    "XMLTV download exceeds its size limit.",
+    "XMLTV decoded content exceeds its size limit.",
+    "XMLTV DTDs, entities and non-UTF encodings are not supported.",
+    "XMLTV gzip has trailing content.",
+    "XMLTV gzip is incomplete.",
+])
+async def test_source_errors_preserve_fixed_transport_details(monkeypatch, detail):
+    from fastapi import HTTPException
+
+    failure = HTTPException(422, detail)
+    failure.__cause__ = RuntimeError("https://guide.invalid/?key=private")
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == detail
+
+
+@pytest.mark.asyncio
+async def test_source_coverage_reports_safe_status_and_retains_error_state(monkeypatch):
+    from fastapi import HTTPException
+
+    request = httpx.Request("GET", "https://guide.invalid/?key=private")
+    failure = HTTPException(502, "Could not read the configured XMLTV source.")
+    failure.__cause__ = httpx.HTTPStatusError("private", request=request,
+                                            response=httpx.Response(503, request=request, text="private"))
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    _, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert coverage["sources"][0]["error"] == "HTTP status 503."
+    assert coverage["sources"][0]["status"] == "error"
+    assert coverage["sources"][0]["last_success"] is None
+    assert coverage["channels"][0]["real_minutes"] == 0
+    assert not guides.can_cache(coverage)
+
+
+@pytest.mark.asyncio
+async def test_source_parser_failure_is_visible_in_coverage(monkeypatch):
+    install_feed(monkeypatch, b"<tv><channel></tv>")
+    _, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert coverage["sources"][0]["error"] == "Malformed XML."
+    assert coverage["sources"][0]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_source_error_causes_are_bounded_and_cancellation_is_unchanged(monkeypatch):
+    failure = type("private_credentials", (RuntimeError,), {})("private")
+    failure.__cause__ = failure
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "Request failed."
+    failure = httpx.ReadTimeout("private")
+    for _ in range(9):
+        outer = RuntimeError("private")
+        outer.__cause__ = failure
+        failure = outer
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "Request failed."
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "XMLTV source loading was cancelled."
+
+
+@pytest.mark.asyncio
+async def test_source_error_ignores_unknown_details_and_classifies_gzip_cause(monkeypatch):
+    import zlib
+    from fastapi import HTTPException
+
+    failure = HTTPException(502, {"url": "https://guide.invalid/?key=private"})
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=failure))
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "Request failed."
+    failure.__cause__ = zlib.error("private")
+    await guides._load_source("selected", source(), [], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["selected"]["error"] == "Invalid compressed XMLTV content."
+
+
 @pytest.fixture(autouse=True)
 async def clean_sources(monkeypatch):
     guides._SOURCE_CACHE.clear()

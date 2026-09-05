@@ -538,7 +538,13 @@ async def get_epg_data(
         logger.debug("[EPG] Fetched EPG data in %.1fms", elapsed_ms)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Internal server error")
+        from services.epg_programmes import _error_reason
+
+        reason = _error_reason(e)
+        raise HTTPException(
+            status_code=502 if reason != "Request failed." else 500,
+            detail=f"EPG catalogue request failed: {reason}",
+        ) from None
 
 
 @router.get("/data/{data_id}")
