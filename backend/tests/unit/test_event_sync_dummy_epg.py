@@ -265,7 +265,7 @@ class TestPass5RetryPath:
         # ... and Pass 5 did the real work: regenerated the XMLTV,
         # refreshed the source, re-fetched entries, retried the assign.
         regenerate.assert_awaited_once()
-        wait_refresh.assert_awaited_once()
+        assert wait_refresh.await_count == 2
         assert state.channels[100]["epg_data_id"] == 501
         # Pass 5 step 1 auto-added the master group to the profile so the
         # regenerated XMLTV covers it (the existing mechanism, reused).
@@ -310,6 +310,196 @@ class TestPass5RetryPath:
         regenerate.assert_awaited_once()  # run 1 only
 
         assert_never_touched_group_settings(client)
+
+    def test_new_links_import_programmes_in_the_same_run(self, db_session_factory):
+        _add_profile(db_session_factory)
+        _add_event_rule(db_session_factory, _config())
+        state = _mercury_state()
+        client = make_stateful_client(state)
+        _store, regenerate, wait_refresh = _wire_epg(
+            client, initial_entries=[],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+        )
+        programmes = []
+
+        async def import_linked(*args, **kwargs):
+            if state.channels[100].get("epg_data_id") == 501:
+                programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
+            return True
+
+        wait_refresh.side_effect = import_linked
+        result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert result["success"] is True
+        assert programmes == [{"channel_id": 100, "title": MASTER_MERCURY}]
+        assert wait_refresh.await_count == 2
+
+    def test_existing_header_imports_programmes_after_first_link(self, db_session_factory):
+        _add_profile(db_session_factory)
+        _add_event_rule(db_session_factory, _config())
+        state = _mercury_state()
+        client = make_stateful_client(state)
+        _store, regenerate, wait_refresh = _wire_epg(
+            client, initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+        )
+        programmes = []
+
+        async def import_linked(*args, **kwargs):
+            if state.channels[100].get("epg_data_id") == 501:
+                programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
+            return True
+
+        wait_refresh.side_effect = import_linked
+        result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert result["success"] is True
+        assert programmes == [{"channel_id": 100, "title": MASTER_MERCURY}]
+        wait_refresh.assert_awaited_once()
+        regenerate.assert_not_awaited()
+
+    def test_failed_refresh_does_not_link_stale_rows(self, db_session_factory):
+        _add_profile(db_session_factory)
+        _add_event_rule(db_session_factory, _config())
+        state = _mercury_state()
+        client = make_stateful_client(state)
+        _store, regenerate, wait_refresh = _wire_epg(
+            client, initial_entries=[],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+        )
+        wait_refresh.return_value = False
+        result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert state.channels[100].get("epg_data_id") is None
+        assert result["failed_actions"]
+        wait_refresh.assert_awaited_once()
+
+    def test_failed_programme_import_is_reported_after_linking(self, db_session_factory):
+        _add_profile(db_session_factory)
+        _add_event_rule(db_session_factory, _config())
+        state = _mercury_state()
+        client = make_stateful_client(state)
+        _store, regenerate, wait_refresh = _wire_epg(
+            client, initial_entries=[],
+            regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+        )
+        wait_refresh.side_effect = [True, False]
+        result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert state.channels[100].get("epg_data_id") == 501
+        assert result["failed_actions"]
+        assert wait_refresh.await_count == 2
+
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_failed_programme_import_retries_on_identical_pipeline_run(self, db_session_factory, cancelled):
+        _add_profile(db_session_factory)
+        _add_event_rule(db_session_factory, _config())
+        state = _mercury_state()
+        client = make_stateful_client(state)
+        _store, regenerate, wait_refresh = _wire_epg(client, initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)])
+        programmes = []
+        wait_refresh.return_value = False
+        if cancelled:
+            wait_refresh.side_effect = asyncio.CancelledError
+            with pytest.raises(asyncio.CancelledError):
+                _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        else:
+            first = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+            assert first["failed_actions"]
+        assert state.channels[100].get("epg_data_id") == 501
+        async def import_linked(*args, **kwargs):
+            programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
+            return True
+        wait_refresh.side_effect = import_linked
+        second = _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert second["success"] is True
+        assert programmes == [{"channel_id": 100, "title": MASTER_MERCURY}]
+        _manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert len(programmes) == 1
+
+
+    def test_cancelled_import_retains_sources_not_yet_attempted(self):
+        from types import SimpleNamespace
+        from cache import Cache
+        client = MagicMock()
+        engine = ChannelPipelineEngine(client)
+        sources = [{"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"}, {"id": 101, "url": "http://ecm/api/dummy-epg/xmltv/2"}]
+        cache = Cache()
+        with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
+            wait.side_effect = asyncio.CancelledError
+            with pytest.raises(asyncio.CancelledError):
+                _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources={100, 101}), {}, sources))
+            wait.side_effect = None
+            wait.return_value = True
+            wait.reset_mock()
+            _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, sources))
+            assert [call.args[1] for call in wait.await_args_list] == [100, 101]
+            assert cache.get("dummy_epg_import_retries") is None
+
+    @pytest.mark.parametrize("change", ["client", "source_id", "source_url"])
+    def test_failed_import_retry_stays_with_its_client_and_source(self, change):
+        from types import SimpleNamespace
+        from cache import Cache
+        client = MagicMock()
+        engine = ChannelPipelineEngine(client)
+        source = {"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"}
+        cache = Cache()
+        executor = SimpleNamespace(_epg_import_sources={100})
+        with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
+            wait.return_value = False
+            _run(engine._refresh_linked_epg(executor, {}, [source]))
+            assert cache.get("dummy_epg_import_retries")
+            _run(engine._refresh_linked_epg(executor, {}, [source]))
+            assert wait.await_count == 1
+
+            other = dict(source)
+            other_engine = engine
+            if change == "client":
+                other_engine = ChannelPipelineEngine(MagicMock())
+            elif change == "source_id":
+                other["id"] = 101
+            else:
+                other["url"] = "http://ecm/api/dummy-epg/xmltv/2"
+            wait.return_value = True
+            _run(other_engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, [other]))
+            assert wait.await_count == 1
+            assert cache.get("dummy_epg_import_retries")
+            _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, [source]))
+            assert wait.await_count == 2
+            assert cache.get("dummy_epg_import_retries") is None
+
+    @pytest.mark.parametrize("late_success", [True, False])
+    def test_concurrent_imports_preserve_each_source_retry(self, late_success):
+        from types import SimpleNamespace
+        from cache import Cache
+        client = MagicMock()
+        engine = ChannelPipelineEngine(client)
+        sources = [
+            {"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"},
+            {"id": 101, "url": "http://ecm/api/dummy-epg/xmltv/2"},
+        ]
+        cache = Cache()
+
+        async def run():
+            executor = SimpleNamespace(_epg_import_sources={100})
+            with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
+                if not late_success:
+                    wait.return_value = False
+                    executor._epg_import_sources = {101}
+                    await engine._refresh_linked_epg(executor, {}, sources)
+                    executor._epg_import_sources = {100}
+                started, release = asyncio.Event(), asyncio.Event()
+                async def finish(_client, source_id, *_args, **_kwargs):
+                    if source_id == 100:
+                        started.set()
+                        await release.wait()
+                        return late_success
+                    return not late_success
+                wait.side_effect = finish
+                task = asyncio.create_task(engine._refresh_linked_epg(executor, {}, sources))
+                await started.wait()
+                await engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources={101}), {}, [sources[1]])
+                release.set()
+                await task
+                pending = cache.get("dummy_epg_import_retries") or {}
+                assert {key[1] for key in pending} == ({101} if late_success else {100})
+        _run(run())
 
 
 class TestDirectAssignment:

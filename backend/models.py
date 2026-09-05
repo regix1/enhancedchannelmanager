@@ -2763,6 +2763,8 @@ class DummyEPGProfile(Base):
 
     # Channel group assignment (JSON array of group IDs)
     channel_group_ids = Column(Text, nullable=True)
+    epg_source_ids = Column(Text, nullable=True)
+    channel_mappings = Column(Text, nullable=True)
 
     # Timestamps
     last_generated_at = Column(DateTime, nullable=True)
@@ -2812,6 +2814,26 @@ class DummyEPGProfile(Base):
         """Set channel_group_ids from list."""
         self.channel_group_ids = json.dumps(ids) if ids else None
 
+    def get_epg_source_ids(self) -> list:
+        """Return configured programme source IDs."""
+        try:
+            return json.loads(self.epg_source_ids) if self.epg_source_ids else []
+        except (ValueError, TypeError):
+            return []
+
+    def set_epg_source_ids(self, ids: list) -> None:
+        self.epg_source_ids = json.dumps(ids) if ids else None
+
+    def get_channel_mappings(self) -> list:
+        """Return remembered source channel identities."""
+        try:
+            return json.loads(self.channel_mappings) if self.channel_mappings else []
+        except (ValueError, TypeError):
+            return []
+
+    def set_channel_mappings(self, mappings: list) -> None:
+        self.channel_mappings = json.dumps(mappings) if mappings else None
+
     def to_dict(self) -> dict:
         """Convert to dictionary for API responses."""
         result = {
@@ -2845,6 +2867,8 @@ class DummyEPGProfile(Base):
             "pattern_builder_examples": self.pattern_builder_examples,
             "pattern_variants": self.get_pattern_variants(),
             "channel_group_ids": self.get_channel_group_ids(),
+            "epg_source_ids": self.get_epg_source_ids(),
+            "channel_mappings": self.get_channel_mappings(),
             "last_generated_at": self.last_generated_at.isoformat() + "Z" if self.last_generated_at else None,
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
             "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,

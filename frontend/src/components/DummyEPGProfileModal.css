@@ -460,3 +460,36 @@
   font-weight: var(--type-meta-weight);
   color: var(--text-muted);
 }
+
+.dep-coverage {
+  margin-block: 1rem;
+}
+
+.dep-coverage-table {
+  overflow-x: auto;
+}
+
+.dep-coverage-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--type-body-size);
+}
+
+.dep-coverage-table th,
+.dep-coverage-table td {
+  padding: 0.5rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.dep-coverage-table td:last-child {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dep-group-item input:focus-visible,
+.dep-coverage button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

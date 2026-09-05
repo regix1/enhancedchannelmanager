@@ -141,8 +141,14 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
   const handleRegenerate = async () => {
     setRegenerating(true);
     try {
-      await api.regenerateDummyEPG();
-      notifications.success('XMLTV regenerated successfully', 'Dummy EPG');
+      const result = await api.regenerateDummyEPG();
+      if (result.status === 'pending') {
+        notifications.warning('Guide sources or artwork are still loading. Check saved guide coverage again shortly.', 'Dummy EPG');
+      } else if (result.status === 'error') {
+        notifications.error('XMLTV generation is incomplete. Check saved guide coverage for source errors.', 'Dummy EPG');
+      } else {
+        notifications.success('XMLTV regenerated successfully', 'Dummy EPG');
+      }
       await loadProfiles();
     } catch (err) {
       logger.error('DummyEPGManagerSection: failed to regenerate XMLTV', err);
@@ -270,7 +276,7 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
       <PageHeader
         className="dep-manager-header"
         title="Dummy EPG Profiles"
-        description="Generate EPG data from channel/stream names using regex patterns and substitution rules. Copy the XMLTV URL to add as a source in Dispatcharr."
+        description="Combine selected EPG schedules with gap coverage, or generate listings from channel and stream names. Copy the XMLTV URL to add as a source in Dispatcharr."
         actions={(
           <>
             {profiles.length > 0 && (
@@ -334,7 +340,7 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
               <div className="dep-profile-info">
                 <div className="dep-profile-name">{profile.name}</div>
                 <div className="dep-profile-details">
-                  <span className="dep-profile-type">Dummy</span>
+                  <span className="dep-profile-type">{profile.epg_source_ids?.length ? "Source schedules + neutral gaps" : "Name templates"}</span>
                   <span className="dep-profile-channels">
                     {profile.group_count ?? 0} group{(profile.group_count ?? 0) !== 1 ? 's' : ''}
                   </span>

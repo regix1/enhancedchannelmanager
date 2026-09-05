@@ -86,6 +86,7 @@ import type {
   // Dummy EPG
   DummyEPGProfile,
   DummyEPGProfileCreateRequest,
+  DummyEPGCoverage,
   DummyEPGProfileUpdateRequest,
   DummyEPGPreviewRequest,
   DummyEPGPreviewResult,
@@ -4083,6 +4084,10 @@ export async function getDummyEPGProfiles(): Promise<DummyEPGProfile[]> {
 /**
  * Get a single Dummy EPG profile with channel assignments.
  */
+export async function getDummyEPGCoverage(profileId: number): Promise<DummyEPGCoverage> {
+  return fetchJson<DummyEPGCoverage>(`${API_BASE}/dummy-epg/profiles/${profileId}/coverage`);
+}
+
 export async function getDummyEPGProfile(profileId: number): Promise<DummyEPGProfile> {
   return fetchJson(`${API_BASE}/dummy-epg/profiles/${profileId}`, { credentials: 'include' });
 }
@@ -4181,7 +4186,7 @@ export async function importDummyEPGProfilesYAML(
 /**
  * Force regeneration of XMLTV cache.
  */
-export async function regenerateDummyEPG(): Promise<{ status: string; profiles: number; channels: number }> {
+export async function regenerateDummyEPG(): Promise<{ status: 'ok' | 'pending' | 'error'; profiles_generated: number; coverage?: DummyEPGCoverage }> {
   return fetchJson(`${API_BASE}/dummy-epg/generate`, {
     method: 'POST',
     credentials: 'include',

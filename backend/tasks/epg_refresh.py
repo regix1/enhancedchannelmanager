@@ -3,7 +3,6 @@ EPG Refresh Task.
 
 Scheduled task to refresh EPG (Electronic Program Guide) data from sources.
 """
-import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -131,47 +130,16 @@ class EPGRefreshTask(TaskScheduler):
                 )
 
                 try:
-                    # Get initial state to detect when refresh completes
-                    initial_source = await client.get_epg_source(source_id)
-                    initial_updated = initial_source.get("updated_at") or initial_source.get("last_updated")
-
-                    logger.info("[%s] Triggering EPG refresh for: %s (id=%s)", self.task_id, source_name, source_id)
-                    logger.debug("[%s] Initial updated_at for %s: %s", self.task_id, source_name, initial_updated)
-                    await client.refresh_epg_source(source_id)
-
-                    # Poll until refresh completes or timeout
-                    self._set_progress(current_item=f"Waiting for {source_name} to complete...")
-                    refresh_complete = False
-                    wait_start = datetime.utcnow()
-                    poll_count = 0
-
-                    while not refresh_complete and not self._cancel_requested:
-                        elapsed = (datetime.utcnow() - wait_start).total_seconds()
-                        if elapsed >= MAX_WAIT_SECONDS:
-                            logger.warning("[%s] Timeout waiting for %s refresh", self.task_id, source_name)
-                            break
-
-                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                        poll_count += 1
-
-                        # Check if source has been updated
-                        current_source = await client.get_epg_source(source_id)
-                        current_updated = current_source.get("updated_at") or current_source.get("last_updated")
-                        logger.debug(
-                            "[%s] Poll #%s for %s: current_updated=%s elapsed=%.0fs",
-                            self.task_id, poll_count, source_name, current_updated, elapsed
-                        )
-
-                        if current_updated and current_updated != initial_updated:
-                            refresh_complete = True
-                            wait_duration = (datetime.utcnow() - wait_start).total_seconds()
-                            logger.info("[%s] %s refresh complete in %.1fs", self.task_id, source_name, wait_duration)
-                        elif elapsed > 30:
-                            # After 30 seconds, assume refresh is complete if no timestamp field
-                            # (Dispatcharr might not have updated_at on EPG sources)
-                            logger.info("[%s] %s - assuming complete after %.0fs", self.task_id, source_name, elapsed)
-                            break
-
+                    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+                    completed = await wait_for_epg_source_refresh(
+                        client, source_id, source_name,
+                        poll_interval=POLL_INTERVAL_SECONDS, max_wait=MAX_WAIT_SECONDS,
+                        cancelled=lambda: self._cancel_requested,
+                    )
+                    if self._cancel_requested:
+                        break
+                    if not completed:
+                        raise RuntimeError("EPG source refresh did not complete successfully")
                     success_count += 1
                     refreshed.append(source_name)
                     self._increment_progress(success_count=1)

@@ -493,6 +493,8 @@ class ActionExecutor:
 
         # Deferred EPG assignments (populated when dummy source has no data yet)
         self._deferred_epg_assignments: list[tuple] = []  # (channel_id, action, stream_ctx, exec_ctx)
+        self._epg_import_sources: set[int] = set()
+        self._epg_sources = epg_sources or []
 
         # Pending EPG verifications for newly created channels (channel_id, payload)
         self._pending_epg_verifications: list[tuple[int, dict]] = []
@@ -2710,14 +2712,55 @@ class ActionExecutor:
             )
 
         try:
-            previous_state = {"epg_data_id": channel.get("epg_data_id")}
+            current_epg_id = channel.get("epg_data_id") or channel.get("epg_data")
+            if isinstance(current_epg_id, dict):
+                current_epg_id = current_epg_id.get("id")
+            previous_state = {"epg_data_id": current_epg_id}
             payload = {"epg_data_id": epg_data_id}
             if set_tvg_id and epg_tvg_id:
                 previous_state["tvg_id"] = channel.get("tvg_id")
                 payload["tvg_id"] = epg_tvg_id
 
+            if (epg_source_id in self._dummy_epg_source_ids
+                    and current_epg_id is not None
+                    and current_epg_id != epg_data_id):
+                from database import get_session
+                from models import DummyEPGProfile
+                from services.epg_programmes import _resolve_group_assignments, capture_mappings
+                db = get_session()
+                try:
+                    profiles = db.query(DummyEPGProfile).filter(
+                        DummyEPGProfile.enabled == True  # noqa: E712
+                    ).all()
+                    entries = [entry for rows in self._epg_data_by_source.values() for entry in rows]
+                    for profile in profiles:
+                        serves_profile = self._dummy_source_by_profile.get(profile.id) == epg_source_id
+                        serves_group = (epg_source_id in self._combined_dummy_source_ids
+                                        and bool(_resolve_group_assignments(
+                                            profile.get_channel_group_ids(),
+                                            {exec_ctx.current_channel_id: channel},
+                                        )))
+                        if not (serves_profile or serves_group) or not profile.get_epg_source_ids():
+                            continue
+                        profile_config = profile.to_dict()
+                        profile_config["channel_group_ids"] = []
+                        profile_config["channel_assignments"] = [{"channel_id": exec_ctx.current_channel_id}]
+                        mappings = capture_mappings(
+                            profile_config, {exec_ctx.current_channel_id: channel},
+                            entries, self._epg_sources,
+                        )
+                        profile.set_channel_mappings(mappings)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                finally:
+                    db.close()
             await self.client.update_channel(exec_ctx.current_channel_id, payload)
             channel.update(payload)
+            if (epg_source_id in self._dummy_epg_source_ids
+                    and previous_state["epg_data_id"] != epg_data_id):
+                self._epg_import_sources.add(epg_source_id)
 
             # Track for post-execution verification if channel was just created
             newly_created_ids = {c["id"] for c in self._created_channels.values()}

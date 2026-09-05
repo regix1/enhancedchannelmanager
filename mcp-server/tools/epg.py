@@ -1,7 +1,9 @@
 """EPG (Electronic Program Guide) tools."""
 import logging
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from _endpoint_contracts import ENDPOINTS
 from ecm_client import get_ecm_client
@@ -9,7 +11,7 @@ from ecm_client import get_ecm_client
 logger = logging.getLogger(__name__)
 
 
-async def _build_channel_uuid_map(client) -> dict:
+async def _build_channel_uuid_map(client, references: dict | None = None) -> dict:
     """Fetch all channels and map ``uuid -> {"id", "name"}``.
 
     Dispatcharr EPG grid program items key the channel by ``channel_uuid``
@@ -18,6 +20,8 @@ async def _build_channel_uuid_map(client) -> dict:
     A failed lookup degrades to an empty map (caller falls back to the uuid).
     """
     uuid_map: dict = {}
+    if references is not None:
+        references.update(channels=[], truncated=False, error=False)
     try:
         page = 1
         while True:
@@ -32,12 +36,23 @@ async def _build_channel_uuid_map(client) -> dict:
             if not batch:
                 break
             for c in batch:
+                if references is not None and isinstance(c, dict):
+                    if len(references["channels"]) < 1000:
+                        references["channels"].append({
+                            key: c[key]
+                            for key in ("id", "uuid", "epg_data_id", "epg_data", "epg", "tvg_id", "name")
+                            if key in c
+                        })
+                    else:
+                        references["truncated"] = True
                 if isinstance(c, dict) and c.get("uuid"):
                     uuid_map[c["uuid"]] = {"id": c.get("id"), "name": c.get("name")}
             if not (isinstance(result, dict) and result.get("next")):
                 break
             page += 1
     except Exception as e:  # degrade gracefully
+        if references is not None:
+            references["error"] = True
         logger.warning("[MCP] could not resolve channel names for EPG grid: %s", e)
     return uuid_map
 
@@ -70,6 +85,53 @@ def register(mcp: FastMCP):
         except Exception as e:
             logger.error("[MCP] list_epg_sources failed: %s", e)
             return f"Error listing EPG sources: {e}"
+
+    @mcp.tool()
+    async def search_epg_channels(
+        search: Annotated[str, Field(min_length=1, max_length=200)],
+        epg_source_id: Annotated[int | None, Field(gt=0, strict=True)] = None,
+        limit: Annotated[int, Field(ge=1, le=100, strict=True)] = 25,
+    ) -> str:
+        """Search imported EPG channel rows by name without changing any mappings.
+
+        Args:
+            search: Nonblank search text, up to 200 characters.
+            epg_source_id: Optional positive EPG source ID.
+            limit: Maximum rows to return, from 1 to 100 (default 25).
+        """
+        import json
+
+        search = search.strip()
+        if not search:
+            return "Error searching EPG channels: search must not be blank."
+        try:
+            client = get_ecm_client()
+            query = {"search": search, "page": 1, "page_size": limit, "limit": limit}
+            if epg_source_id is not None:
+                query["epg_source"] = epg_source_id
+            rows = await client.call_endpoint(ENDPOINTS["epg_search"], query=query)
+            if not isinstance(rows, list):
+                raise ValueError("Unexpected EPG catalogue response")
+            channels = []
+            for row in rows[:limit]:
+                source = row.get("epg_source") or row.get("epg_source_id")
+                channels.append({
+                    "id": row.get("id"),
+                    "source_id": source.get("id") if isinstance(source, dict) else source,
+                    "tvg_id": row.get("tvg_id"),
+                    "name": row.get("name"),
+                })
+            result = {
+                "search": search, "epg_source_id": epg_source_id,
+                "limit": limit, "returned": len(channels),
+                "limit_reached": len(rows) >= limit, "channels": channels,
+            }
+            if result["limit_reached"]:
+                result["note"] = "The result limit was reached; more matches may exist. Refine the search or source filter."
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            logger.error("[MCP] search_epg_channels failed: %s", type(exc).__name__)
+            return "Error searching EPG channels: the catalogue request failed."
 
     @mcp.tool()
     async def refresh_epg(source_id: int) -> str:
@@ -558,13 +620,21 @@ def register(mcp: FastMCP):
     async def get_epg_grid(
         channel_id: int | None = None,
         limit: int = 20,
+        details: bool = False,
     ) -> str:
         """Get the EPG schedule grid — what's on TV now and upcoming.
 
         Args:
             channel_id: Optional channel ID to filter for a specific channel (filtered client-side)
-            limit: Maximum number of programs to return (default 20)
+            limit: Maximum number of programs to return (default 20; details caps this at 25)
+            details: Return bounded identity/title/time fields and up to 1000 channel
+                references as JSON. Omit channel_id to inspect unrecognized associations.
+                The response is capped at 1 MiB by omitting whole rows, with returned
+                counts and truncation flags. values_truncated also covers clipped
+                association field names; values_omitted covers withheld fields or values.
         """
+        if details and limit < 1:
+            return "Error getting EPG grid: details limit must be positive."
         try:
             client = get_ecm_client()
             # Backend GET /api/epg/grid only accepts optional `start`/`end`
@@ -578,7 +648,8 @@ def register(mcp: FastMCP):
             # Resolve names + the channel-id filter through the channel list.
             programs = result if isinstance(result, list) else result.get("data", result.get("programs", []))
 
-            uuid_map = await _build_channel_uuid_map(client)
+            references = {} if details else None
+            uuid_map = await _build_channel_uuid_map(client, references)
 
             if channel_id is not None:
                 programs = [
@@ -586,6 +657,104 @@ def register(mcp: FastMCP):
                     if (uuid_map.get(p.get("channel_uuid"), {}).get("id") == channel_id)
                     or channel_id in (p.get("channel_id"), p.get("channel"))
                 ]
+
+            if details:
+                import json
+
+                fields = (
+                    "id", "uuid", "channel", "channel_id", "channel_uuid", "channel_ids",
+                    "channel_uuids", "channel_name", "epg", "epg_id", "epg_data",
+                    "epg_data_id", "epg_channel", "epg_channel_id", "tvg_id",
+                    "title", "start", "stop", "end", "start_time", "end_time",
+                )
+                nested_fields = (
+                    "id", "uuid", "channel_id", "epg_data_id", "epg_source",
+                    "epg_source_id", "tvg_id", "name",
+                )
+                output = {
+                    "programs": [], "channels": [], "association_fields": [],
+                    "programs_total": len(programs),
+                    "programs_returned": 0, "channels_returned": 0,
+                    "programs_truncated": len(programs) > min(limit, 25),
+                    "channels_truncated": references["truncated"],
+                    "channels_error": references["error"],
+                    "values_truncated": False,
+                    "values_omitted": False,
+                }
+                # Reserve the maximum UTF-8 field-name array and count growth
+                # before accepting rows, so later diagnostics stay within budget.
+                encoded_size = len(json.dumps(output, ensure_ascii=False).encode("utf-8")) + 50 * (64 * 4 + 4) + 8
+                for group, rows, allowed in (
+                    ("programs", programs[:min(limit, 25)], fields),
+                    ("channels", references["channels"], (
+                        "id", "uuid", "epg_data_id", "epg_data", "epg", "tvg_id", "name",
+                    )),
+                ):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            raise ValueError("Unexpected EPG grid row")
+                        if group == "programs":
+                            for key in row:
+                                if not isinstance(key, str) or not any(
+                                    part in key.lower() for part in ("channel", "epg", "tvg", "uuid")
+                                ):
+                                    continue
+                                if key not in allowed:
+                                    output["values_omitted"] = True
+                                if (len(key) > 64 or not key.isidentifier()
+                                        or any(part in key.lower() for part in (
+                                            "secret", "token", "password", "credential", "key",
+                                            "url", "icon", "logo", "description",
+                                        ))):
+                                    output["values_omitted"] = True
+                                    continue
+                                if key not in output["association_fields"]:
+                                    if len(output["association_fields"]) < 50:
+                                        output["association_fields"].append(key)
+                                    else:
+                                        output["values_truncated"] = True
+                        projected = {}
+                        pending = [(row, projected, allowed, True)]
+                        for original, target, keys, nested in pending:
+                            if not nested and any(key not in keys for key in original):
+                                output["values_omitted"] = True
+                            for key in keys:
+                                if key not in original:
+                                    continue
+                                value = original[key]
+                                if isinstance(value, dict) and nested:
+                                    target[key] = {}
+                                    pending.append((value, target[key], nested_fields, False))
+                                    continue
+                                values = value[:25] if isinstance(value, list) else [value]
+                                if isinstance(value, list) and len(value) > 25:
+                                    output["values_truncated"] = True
+                                kept = []
+                                for item in values:
+                                    if not (item is None or type(item) in (str, int, float, bool)):
+                                        output["values_omitted"] = True
+                                        continue
+                                    if isinstance(item, str):
+                                        if "://" in item or item.lstrip().lower().startswith(("www.", "//", "bearer ", "basic ")):
+                                            output["values_omitted"] = True
+                                            continue
+                                        if len(item) > 256:
+                                            item = item[:256]
+                                            output["values_truncated"] = True
+                                    kept.append(item)
+                                if isinstance(value, list):
+                                    target[key] = kept
+                                elif kept:
+                                    target[key] = kept[0]
+                        row_size = len(json.dumps(projected, ensure_ascii=False).encode("utf-8")) + 2
+                        if encoded_size + row_size > 1024 * 1024:
+                            output[group + "_truncated"] = True
+                            break
+                        encoded_size += row_size
+                        output[group].append(projected)
+                output["programs_returned"] = len(output["programs"])
+                output["channels_returned"] = len(output["channels"])
+                return json.dumps(output, ensure_ascii=False)
 
             if not programs:
                 return "No EPG schedule data available."
@@ -611,7 +780,7 @@ def register(mcp: FastMCP):
             return "\n".join(lines)
         except Exception as e:
             logger.error("[MCP] get_epg_grid failed: %s", e)
-            return f"Error getting EPG grid: {e}"
+            return "Error getting EPG grid." if details else f"Error getting EPG grid: {e}"
 
     @mcp.tool()
     async def list_dummy_epg_profiles() -> str:
@@ -653,6 +822,10 @@ def register(mcp: FastMCP):
                 ),
                 timeout=60.0,
             )
+            if isinstance(result, dict) and result.get("status") == "pending":
+                return "Dummy EPG sources or artwork are still loading. Check get_dummy_epg_coverage again shortly."
+            if isinstance(result, dict) and result.get("status") == "error":
+                return "Dummy EPG generation is incomplete because programme sources are unavailable. Check get_dummy_epg_coverage for details."
             count = result.get("profiles_generated", 0) if isinstance(result, dict) else 0
             return f"Dummy EPG regenerated for {count} enabled profiles."
         except Exception as e:
@@ -686,6 +859,8 @@ def register(mcp: FastMCP):
                 f"  title_template={p.get('title_template')!r}",
                 f"  event_timezone={p.get('event_timezone')}, program_duration={p.get('program_duration')}min",
                 f"  channel_group_ids={groups} ({len(groups)} group(s) assigned)",
+                f"  epg_source_ids={p.get('epg_source_ids') or []}",
+                f"  channel_mappings={p.get('channel_mappings') or []}",
             ]
             sub_pairs = p.get("substitution_pairs") or []
             if sub_pairs:
@@ -694,6 +869,20 @@ def register(mcp: FastMCP):
         except Exception as e:
             logger.error("[MCP] get_dummy_epg_profile failed: %s", e)
             return f"Error getting dummy EPG profile {profile_id}: {e}"
+
+    @mcp.tool()
+    async def get_dummy_epg_coverage(profile_id: int) -> str:
+        """Inspect saved guide coverage without changing mappings or refreshing sources."""
+        import json
+        try:
+            client = get_ecm_client()
+            coverage = await client.call_endpoint(
+                ENDPOINTS["dummy_epg_coverage"], path_args={"profile_id": profile_id}
+            )
+            return json.dumps(coverage, ensure_ascii=False)
+        except Exception:
+            logger.error("[MCP] Could not inspect dummy EPG coverage for profile %s", profile_id)
+            return f"Could not inspect guide coverage for profile {profile_id}."
 
     @mcp.tool()
     async def create_dummy_epg_profile(
@@ -726,6 +915,8 @@ def register(mcp: FastMCP):
         pattern_builder_examples: str | None = None,
         pattern_variants: list[dict] | None = None,
         channel_group_ids: list[int] | None = None,
+        epg_source_ids: list[int] | None = None,
+        channel_mappings: list[dict] | None = None,
     ) -> str:
         """Create a new Dummy EPG profile (bd-omxy5).
 
@@ -769,6 +960,8 @@ def register(mcp: FastMCP):
             pattern_variants: Optional list of per-variant pattern/template
                 override dicts.
             channel_group_ids: Channel group IDs this profile applies to.
+            epg_source_ids: Existing XMLTV source IDs to compose real schedules; [] keeps name templates.
+            channel_mappings: Original channel_id/source_id/tvg_id bindings, preserved automatically on sparse edits.
         """
         try:
             client = get_ecm_client()
@@ -804,6 +997,8 @@ def register(mcp: FastMCP):
                 "pattern_builder_examples": pattern_builder_examples,
                 "pattern_variants": pattern_variants,
                 "channel_group_ids": channel_group_ids,
+                "epg_source_ids": epg_source_ids,
+                "channel_mappings": channel_mappings,
             }
             for key, value in optional.items():
                 if value is not None:
@@ -849,6 +1044,8 @@ def register(mcp: FastMCP):
         pattern_builder_examples: str | None = None,
         pattern_variants: list[dict] | None = None,
         channel_group_ids: list[int] | None = None,
+        epg_source_ids: list[int] | None = None,
+        channel_mappings: list[dict] | None = None,
     ) -> str:
         """Update a Dummy EPG profile — only provided fields change (bd-omxy5).
 
@@ -881,6 +1078,7 @@ def register(mcp: FastMCP):
                 "include_new_tag": include_new_tag,
                 "pattern_builder_examples": pattern_builder_examples,
                 "pattern_variants": pattern_variants, "channel_group_ids": channel_group_ids,
+                "epg_source_ids": epg_source_ids, "channel_mappings": channel_mappings,
             }
             body = {k: v for k, v in fields.items() if v is not None}
 

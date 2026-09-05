@@ -204,3 +204,173 @@ class TestPreviewDummyEpg:
         text = _text(result)
         assert "NOT MATCHED" in text
         assert "Programming" in text
+
+
+class TestProgrammeSourceTools:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool, arguments", [
+        ("create_dummy_epg_profile", {"name": "Universal", "epg_source_ids": [49], "channel_mappings": [{"channel_id": 2950, "source_id": 42, "tvg_id": "32645"}]}),
+        ("update_dummy_epg_profile", {"profile_id": 1, "epg_source_ids": []}),
+    ])
+    async def test_forwards_sources_and_explicit_clear(self, tool, arguments):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = {"id": 1, "name": "Universal"}
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            await mcp.call_tool(tool, arguments)
+        sent = client.call_endpoint.call_args.kwargs["body"]
+        assert sent["epg_source_ids"] == arguments["epg_source_ids"]
+        if "channel_mappings" in arguments:
+            assert sent["channel_mappings"] == arguments["channel_mappings"]
+        else:
+            assert "channel_mappings" not in sent
+
+    @pytest.mark.asyncio
+    async def test_coverage_only_calls_read_endpoint(self):
+        import json
+        mcp = _mcp()
+        client = AsyncMock()
+        coverage = {"sources": [{"source_id": 51, "status": "pending", "error": None}], "channels": []}
+        client.call_endpoint.return_value = coverage
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("get_dummy_epg_coverage", {"profile_id": 1})
+        assert json.loads(_text(result)) == coverage
+        client.call_endpoint.assert_awaited_once()
+        call = client.call_endpoint.call_args
+        assert call.args[0].name == "dummy_epg_coverage"
+        assert call.args[0].method == "GET"
+        assert call.kwargs == {"path_args": {"profile_id": 1}}
+
+    @pytest.mark.asyncio
+    async def test_coverage_errors_do_not_reveal_upstream_credentials(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.side_effect = RuntimeError("https://guide.example/private-key")
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("get_dummy_epg_coverage", {"profile_id": 1})
+        assert "private-key" not in _text(result)
+        assert "Could not inspect" in _text(result)
+
+class TestGenerateDummyEpg:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "expected"), [
+        ("ok", "Dummy EPG regenerated for 2 enabled profiles."),
+        ("pending", "Dummy EPG sources or artwork are still loading."),
+        ("error", "Dummy EPG generation is incomplete because programme sources are unavailable."),
+    ])
+    async def test_reports_generation_readiness(self, status, expected):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = {
+            "status": status, "profiles_generated": 2,
+            "coverage": {"sources": [], "channels": []},
+        }
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("generate_dummy_epg", {"plan_profile_ids": [1, 2]})
+        message = _text(result)
+        assert expected in message
+        if status != "ok":
+            assert "get_dummy_epg_coverage" in message
+            assert "regenerated for" not in message
+        call = client.call_endpoint.call_args
+        assert call.args[0].name == "dummy_epg_generate"
+        assert call.kwargs == {"body": {"profile_ids": [1, 2]}, "timeout": 60.0}
+
+class TestSearchEpgChannels:
+    @pytest.mark.asyncio
+    async def test_default_search_uses_bounded_read_endpoint(self):
+        import json
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = []
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("search_epg_channels", {"search": " Sports "})
+        assert json.loads(_text(result)) == {
+            "search": "Sports", "epg_source_id": None, "limit": 25,
+            "returned": 0, "limit_reached": False, "channels": [],
+        }
+        client.call_endpoint.assert_awaited_once()
+        call = client.call_endpoint.call_args
+        assert call.args[0].name == "epg_search"
+        assert call.args[0].method == "GET"
+        assert call.args[0].path == "/api/epg/data"
+        assert call.kwargs == {"query": {"search": "Sports", "page": 1, "page_size": 25, "limit": 25}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    @pytest.mark.parametrize("source_fields", [{"epg_source": 49}, {"epg_source": {"id": 49}}, {"epg_source_id": 49}, {"epg_source": None, "epg_source_id": 49}, {"epg_source": None, "epg_source_id": {"id": 49}}])
+    async def test_preserves_candidate_identity_and_reports_limit(self, count, source_fields):
+        import json
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = [
+            {"id": 730 + index, **source_fields,
+             "tvg_id": str(32645 + index), "name": f"Sports {index}",
+             "icon_url": "https://asset.invalid/?token=hidden"}
+            for index in range(count)
+        ]
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("search_epg_channels", {"search": "Sports", "epg_source_id": 49, "limit": 2})
+        saved = json.loads(_text(result))
+        assert saved["channels"] == [
+            {"id": 730 + index, "source_id": 49, "tvg_id": str(32645 + index), "name": f"Sports {index}"}
+            for index in range(min(count, 2))
+        ]
+        assert saved["returned"] == min(count, 2)
+        assert saved["limit_reached"] == (count >= 2)
+        assert ("note" in saved) == (count >= 2)
+        if count >= 2:
+            assert "more matches may exist" in saved["note"]
+        assert "token=hidden" not in _text(result)
+        assert client.call_endpoint.call_args.kwargs == {
+            "query": {"search": "Sports", "epg_source": 49, "page": 1, "page_size": 2, "limit": 2},
+        }
+        client.call_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arguments", [
+        {"search": ""}, {"search": "x" * 201},
+        {"search": "Sports", "epg_source_id": 0},
+        {"search": "Sports", "epg_source_id": -1},
+        {"search": "Sports", "epg_source_id": True},
+        {"search": "Sports", "limit": True},
+        {"search": "Sports", "limit": 0},
+        {"search": "Sports", "limit": 101},
+    ])
+    async def test_invalid_arguments_never_request_catalogue(self, arguments):
+        from mcp.server.fastmcp.exceptions import ToolError
+        mcp = _mcp()
+        with patch("tools.epg.get_ecm_client") as get_client:
+            with pytest.raises(ToolError, match="validation error"):
+                await mcp.call_tool("search_epg_channels", arguments)
+        get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_whitespace_search_never_requests_catalogue(self):
+        mcp = _mcp()
+        with patch("tools.epg.get_ecm_client") as get_client:
+            result = await mcp.call_tool("search_epg_channels", {"search": " \t\n "})
+        assert _text(result).startswith("Error searching EPG channels:")
+        get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_schema_publishes_query_and_result_bounds(self):
+        tool = next(tool for tool in await _mcp().list_tools() if tool.name == "search_epg_channels")
+        fields = tool.inputSchema["properties"]
+        assert fields["search"]["minLength"] == 1
+        assert fields["search"]["maxLength"] == 200
+        assert fields["limit"]["minimum"] == 1
+        assert fields["limit"]["maximum"] == 100
+        assert fields["limit"]["default"] == 25
+        assert {"type": "integer", "exclusiveMinimum": 0} in fields["epg_source_id"]["anyOf"]
+
+    @pytest.mark.asyncio
+    async def test_upstream_error_is_not_an_empty_search_result(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.side_effect = RuntimeError("https://guide.invalid/?token=private")
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("search_epg_channels", {"search": "Sports"})
+        assert _text(result) == "Error searching EPG channels: the catalogue request failed."
+        assert "private" not in _text(result)
+        client.call_endpoint.assert_awaited_once()

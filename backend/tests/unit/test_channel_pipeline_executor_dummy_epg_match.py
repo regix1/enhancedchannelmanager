@@ -10,14 +10,70 @@ Field incident (run #40): channel 2408 'Mlb On Tbs Mariners At Yankees @ Aug
 11 06:30 PM' was linked to epg_data_id=4956333, whose tvg_id is ecm-2399 —
 the channel deleted minutes earlier.
 """
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from channel_pipeline_executor import ActionExecutor
+import pytest
+
+from channel_pipeline_executor import ActionExecutor, ExecutionContext
+from channel_pipeline_schema import Action
+from channel_pipeline_evaluator import StreamContext
 
 
 def make_executor() -> ActionExecutor:
     """Bare executor — _match_epg_data uses no instance state beyond logging."""
     return ActionExecutor(MagicMock())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("group", [None, 65, {"id": 65}])
+@pytest.mark.parametrize("link", ["primary", "alternate", "embedded"])
+async def test_source_binding_is_preserved_before_universal_assignment(dry_run, group, link):
+    from models import DummyEPGProfile
+
+    channel = {"id": 7, "name": "ESPN", "tvg_id": "ESPN.us", "epg_data_id": 90, "channel_group": group}
+    sources = [
+        {"id": 49, "name": "Guide", "source_type": "xmltv", "is_active": True,
+         "url": "https://example.com/guide.xml"},
+        {"id": 46, "url": "http://ecm/api/dummy-epg/xmltv/1" if group is None else "http://ecm/api/dummy-epg/xmltv"},
+    ]
+    entries = [
+        {"id": 90, "epg_source": 49, "tvg_id": "32645", "name": "ESPN"},
+        {"id": 91, "epg_source": 46, "tvg_id": "ecm-7", "name": "ESPN"},
+    ]
+    if link != "primary":
+        channel["epg_data_id"] = None
+        channel["epg_data"] = 90 if link == "alternate" else entries[0]
+    profile = DummyEPGProfile(id=1, name="Guide", enabled=True)
+    profile.set_epg_source_ids([49])
+    profile.set_channel_group_ids([65])
+    client = MagicMock()
+    saved = []
+
+    async def update(channel_id, values):
+        saved.extend(profile.get_channel_mappings())
+        return {**channel, **values}
+
+    client.update_channel = AsyncMock(side_effect=update)
+    executor = ActionExecutor(client, existing_channels=[channel], epg_data=entries, epg_sources=sources)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [profile]
+    context = ExecutionContext(dry_run=dry_run)
+    context.current_channel_id = 7
+    with patch("database.get_session", return_value=db):
+        result = await executor._execute_assign_epg(
+            Action(type="assign_epg", params={"epg_id": 46}),
+            StreamContext(stream_id=1, stream_name="ESPN"), context,
+        )
+    assert result.success
+    if dry_run:
+        assert profile.get_channel_mappings() == []
+        db.commit.assert_not_called()
+        client.update_channel.assert_not_awaited()
+    else:
+        assert saved == [{"channel_id": 7, "source_id": 49, "tvg_id": "32645"}]
+        assert executor._epg_import_sources == {46}
+        assert channel["tvg_id"] == "ESPN.us"
 
 
 EVENT_NAME = "Mlb On Tbs Mariners At Yankees @ Aug 11 06:30 PM"

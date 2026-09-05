@@ -1,0 +1,837 @@
+"""Selected schedules, event identity, bounds and shared guide preparation."""
+
+import asyncio
+import copy
+import gzip
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
+from dummy_epg_engine import generate_xmltv
+from services import epg_programmes as guides
+from services.epg_migration import stream_xmltv
+
+NOW = datetime(2026, 9, 5, 2, tzinfo=timezone.utc)
+START = datetime(2026, 9, 4, 4, tzinfo=timezone.utc)
+STOP = datetime(2026, 9, 6, 4, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+async def clean_sources(monkeypatch):
+    guides._SOURCE_CACHE.clear()
+    guides._SOURCE_LOADS.clear()
+    guides._CATALOGUE_CACHE.clear()
+    guides._CATALOGUE_LOADS.clear()
+    monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(4))
+    monkeypatch.setattr(guides, "_ARTWORK_LOAD", None)
+    monkeypatch.setattr(guides, "_ARTWORK_CHECKED", float("-inf"))
+    monkeypatch.setattr(guides, "_SOURCE_SLOTS", asyncio.Semaphore(2))
+    yield
+    tasks = list(guides._SOURCE_LOADS.values()) + list(guides._CATALOGUE_LOADS.values())
+    if guides._ARTWORK_LOAD is not None:
+        tasks.append(guides._ARTWORK_LOAD)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    guides._SOURCE_LOADS.clear()
+    guides._SOURCE_CACHE.clear()
+
+
+def source(source_id=50, **fields):
+    return {"id": source_id, "name": f"Guide {source_id}", "source_type": "xmltv",
+            "is_active": True, "url": f"https://example.com/{source_id}.xml", "priority": 0, **fields}
+
+
+def programme(tvg="ESPN.us", title="SportsCenter", start="20260905010000 +0000",
+              stop="20260905050000 +0000", children=""):
+    return ET.fromstring(f'<programme channel="{tvg}" start="{start}" stop="{stop}">'
+                         f'<title>{title}</title>{children}</programme>')
+
+
+def profile(**fields):
+    return {"id": 1, "enabled": True, "epg_source_ids": [50], "channel_group_ids": [65],
+            "event_timezone": "US/Eastern", "channel_mappings": [], **fields}
+
+
+def channel(**fields):
+    return {"id": 1, "name": "ESPN", "channel_group_id": 65, "tvg_id": "ESPN.us",
+            "streams": [], **fields}
+
+
+def client(sources=None, rows=None):
+    result = AsyncMock()
+    result.get_epg_sources.return_value = sources or [source()]
+    result.get_epg_data.return_value = rows or []
+    result.get_epg_data_by_id.side_effect = lambda link: next(row for row in rows or [] if row["id"] == link)
+    return result
+
+
+def feed(*programmes, headers='<channel id="ESPN.us"><display-name>ESPN</display-name></channel>'):
+    return ("<tv>" + headers + "".join(ET.tostring(row, encoding="unicode") for row in programmes) + "</tv>").encode()
+
+
+def install_feed(monkeypatch, content):
+    async def chunks(selected, **_):
+        document = content[selected["id"]] if isinstance(content, dict) else content
+        for index in range(0, len(document), 73):
+            yield document[index:index + 73]
+    monkeypatch.setattr(guides, "stream_xmltv", chunks)
+
+
+def test_canonical_sources_reject_recursion_and_disabled_inputs():
+    original = source()
+    proxy = source(51, url="https://ecm.example/api/epg/artwork-proxy/50")
+    assert guides.resolve_sources([51, 50, 51], [original, proxy]) == [original]
+    for invalid in (
+        source(url="https://ecm.example/api/dummy-epg/xmltv"),
+        source(is_active=False), source(source_type="schedules_direct"),
+        source(url=""), source(url="https://ecm.example/api/epg/artwork-proxy/50"),
+    ):
+        with pytest.raises(ValueError):
+            guides.resolve_sources([50], [invalid])
+    with pytest.raises(ValueError):
+        guides.resolve_sources([True], [original])
+
+
+def test_capture_keeps_numeric_identity_and_remembered_missing_channel():
+    profiles = profile(channel_mappings=[{"channel_id": 9, "source_id": 50, "tvg_id": "999"}])
+    channels = {1: channel(epg_data_id=44), 2: channel(id=2, channel_group_id=90, epg_data_id=55)}
+    rows = [{"id": 44, "epg_source": 50, "tvg_id": "32645"}, {"id": 55, "epg_source": 50, "tvg_id": "9999"}]
+    before = copy.deepcopy(profiles)
+    assert guides.capture_mappings(profiles, channels, rows, [source()]) == [
+        {"channel_id": 1, "source_id": 50, "tvg_id": "32645"},
+        {"channel_id": 9, "source_id": 50, "tvg_id": "999"},
+    ]
+    assert profiles == before
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_expands_mixed_streams_once_and_both_group_shapes():
+    upstream = AsyncMock()
+    upstream.get_channels.side_effect = [
+        {"results": [channel(streams=[2, {"id": 3, "name": "kept"}])], "next": "next"},
+        {"results": [{"id": 4, "name": "Other", "channel_group": 65, "streams": [2]}], "next": None},
+    ]
+    upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "resolved"}]
+    channels = await guides._fetch_all_channels(upstream)
+    assert [row["channel_id"] for row in guides._resolve_group_assignments([65], channels)] == [1, 4]
+    assert channels[1]["streams"][1]["name"] == "kept"
+    assert channels[4]["streams"][0]["name"] == "resolved"
+    upstream.get_streams_by_ids.assert_awaited_once_with([2])
+
+
+@pytest.mark.parametrize("start,stop", [
+    ("20260905010000", "20260905050000 +0000"),
+    ("20260230010000 +0000", "20260905050000 +0000"),
+    ("20260905050000 +0000", "20260905010000 +0000"),
+])
+def test_source_timestamps_require_valid_aware_positive_intervals(start, stop):
+    with pytest.raises(ValueError):
+        guides.programme_times(programme(start=start, stop=stop))
+
+
+@pytest.mark.asyncio
+async def test_complete_source_preserves_children_filters_expired_and_unrelated(monkeypatch):
+    rows = [
+        programme(children='<sub-title>Morning</sub-title><icon src="https://images.example/poster.jpg"/><episode-num system="xmltv_ns">1.2.</episode-num>'),
+        programme("unrelated", "Other"),
+        programme(start="20240905010000 +0000", stop="20240905050000 +0000"),
+    ]
+    install_feed(monkeypatch, feed(*rows))
+    query = guides._query(profile(), channel(), None, NOW)
+    loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+    assert list(loaded["rows"]) == ["ESPN.us"]
+    saved = loaded["rows"]["ESPN.us"]
+    assert len(saved) == 1
+    assert saved[0].findtext("episode-num") == "1.2."
+    assert saved[0].find("icon").get("src") == "https://images.example/poster.jpg"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tail_never_publishes_partial_success(monkeypatch):
+    install_feed(monkeypatch, feed(programme())[:-5])
+    query = guides._query(profile(), channel(), None, NOW)
+    await guides._load_source("broken", source(), [query], START, STOP, NOW)
+    assert guides._SOURCE_CACHE["broken"]["error"]
+    assert not guides._SOURCE_CACHE["broken"].get("rows")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_source_is_never_reported_ready(monkeypatch):
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=asyncio.CancelledError))
+    _, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert coverage["sources"][0]["status"] == "error"
+    assert not guides.can_cache(coverage)
+    assert next(iter(guides._SOURCE_CACHE.values())).get("checked") is not None
+
+
+@pytest.mark.asyncio
+async def test_retained_limit_is_enforced(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    monkeypatch.setattr(guides, "MAX_RETAINED", 10)
+    with pytest.raises(ValueError, match="retained"):
+        await guides._read_source(source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW)
+
+
+@pytest.mark.asyncio
+async def test_lower_priority_fills_only_real_gaps_and_placeholders_cannot_win(monkeypatch):
+    install_feed(monkeypatch, {
+        50: feed(programme(stop="20260905030000 +0000"), programme(title="No EVENT Today", start="20260905030000 +0000")),
+        51: feed(programme(title="Backup coverage", start="20260905020000 +0000")),
+    })
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(epg_source_ids=[50, 51])], {1: channel()}, client([source(priority=10), source(51)]),
+        now=NOW, wait_for_sources=True,
+    )
+    rows = profiles[0]["source_programmes"][1]
+    assert [row.findtext("title") for row in rows] == ["SportsCenter", "Backup coverage"], [(key, {tvg: [ET.tostring(row) for row in rows] for tvg, rows in value.get("rows", {}).items()}) for key, value in guides._SOURCE_CACHE.items()]
+    assert rows[1].get("start") == "20260905030000 +0000"
+    assert rows[1].get("stop") == "20260905050000 +0000"
+    assert coverage["channels"][0]["current"]["title"] == "SportsCenter"
+
+
+@pytest.mark.asyncio
+async def test_explicit_numeric_source_beats_unrelated_high_priority(monkeypatch):
+    install_feed(monkeypatch, {50: feed(programme("32645"), headers='<channel id="32645"><display-name>ESPN</display-name></channel>'),
+                              51: feed(programme("32645", "Wrong network"), headers='<channel id="32645"><display-name>Other</display-name></channel>')})
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(epg_source_ids=[50, 51], channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "32645"}])],
+        {1: channel()}, client([source(), source(51, priority=100)]), now=NOW, wait_for_sources=True,
+    )
+    assert coverage["channels"][0]["source_id"] == 50, coverage
+    assert [row.findtext("title") for row in profiles[0]["source_programmes"][1]] == ["SportsCenter"]
+
+
+@pytest.mark.asyncio
+async def test_one47_uses_same_day_real_end_and_preserves_source_art(monkeypatch):
+    event_channel = channel(
+        name="ONE Fight Night 47 Stamp Vs. Flores @ Sep 04 09:00 PM", tvg_id="",
+        streams=[{"id": 7, "name": "PPV 16 | ONE FIGHT NIGHT 47 STAMP VS. FLORES (9.4 9:00 PM ET) PPV"}],
+    )
+    install_feed(monkeypatch, feed(
+        programme("PPV10.art", "ONE FIGHT NIGHT 47 STAMP V FLORES  ᴸᶦᵛᵉ", children='<icon src="https://art.example/fight.jpg"/>'),
+        programme("PPV(1)-05.v", "ONE Fight Night 47 Stamp v Flores  ᴸᶦᵛᵉ",
+                  start="20260906010000 +0000", stop="20260906040000 +0000"),
+        headers='<channel id="PPV10.art"><display-name>ART - PPV 10</display-name></channel>',
+    ))
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(program_duration=180, ended_title_template="Ended: {title}")], {1: event_channel},
+        client(), now=NOW, wait_for_sources=True,
+    )
+    rows = profiles[0]["source_programmes"][1]
+    assert len(rows) == 1
+    assert rows[0].get("stop") == "20260905050000 +0000"
+    assert coverage["channels"][0]["source_tvg_id"] == "PPV10.art"
+    xml = ET.fromstring(generate_xmltv(profiles, {1: event_channel}))
+    real = [row for row in xml.findall("programme") if "ONE" in (row.findtext("title") or "")]
+    assert len(real) == 1
+    assert real[0].get("stop") == "20260905050000 +0000"
+    assert real[0].find("icon").get("src") == "https://art.example/fight.jpg"
+    assert "Ended:" not in ET.tostring(xml, encoding="unicode")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_name", [
+    "Cage Fury 160 @ Sep 04 09:00 PM", "Cage Fury 160", "Cage Fury 161 @ Sep 04 07:15 PM",
+])
+async def test_event_wrong_time_missing_kickoff_or_edition_stays_unresolved(monkeypatch, event_name):
+    install_feed(monkeypatch, feed(programme("PPV07.art", "CAGE FURY FC 160  ᴸᶦᵛᵉ",
+                                            start="20260904231500 +0000", stop="20260905031500 +0000")))
+    channels = {1: channel(name=event_name, tvg_id="")}
+    profiles, coverage = await guides.prepare_profiles([profile()], channels, client(), now=NOW, wait_for_sources=True)
+    assert profiles[0]["source_programmes"][1] == []
+    assert coverage["channels"][0]["current"] is None
+    if event_name == "Cage Fury 160 @ Sep 04 09:00 PM":
+        assert "event_start_conflict" in coverage["channels"][0]["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_provider_family_explicit_slot_is_static_but_bare_slot_is_not(monkeypatch):
+    install_feed(monkeypatch, feed(programme("ESPN+1.v", "College Football"), headers='<channel id="ESPN+1.v"><display-name>ESPN+ 1</display-name></channel>'))
+    for tvg_id, expected in [("ESPN+1.v", 1), ("", 0)]:
+        profiles, _ = await guides.prepare_profiles([profile()], {1: channel(name="ESPN+ 1", tvg_id=tvg_id)},
+                                                  client(), now=NOW, wait_for_sources=True)
+        assert len(profiles[0]["source_programmes"][1]) == expected
+
+
+@pytest.mark.asyncio
+async def test_neutral_gaps_have_no_event_claim_or_art_and_dst_uses_local_midnights(monkeypatch):
+    install_feed(monkeypatch, b"<tv/>")
+    channels = {1: channel(name="ONE Fight Night 47 @ Sep 07 09:00 PM", tvg_id="")}
+    for now, expected_hours in [(datetime(2026, 3, 8, 12, tzinfo=timezone.utc), 47),
+                                (datetime(2026, 11, 1, 12, tzinfo=timezone.utc), 49)]:
+        profiles, coverage = await guides.prepare_profiles(
+            [profile(include_live_tag=True, include_new_tag=True, ended_title_template="Ended: {title}",
+                     program_poster_url_template="https://art.example/stale.jpg")], channels, client(),
+            now=now, wait_for_sources=True,
+        )
+        assert (profiles[0]["guide_stop"] - profiles[0]["guide_start"]).total_seconds() / 3600 == expected_hours
+        xml = ET.fromstring(generate_xmltv(profiles, channels))
+        row = xml.find("programme")
+        assert row.findtext("title") == "Programming unavailable"
+        assert row.find("live") is None and row.find("new") is None and row.find("icon") is None
+        assert coverage["channels"][0]["real_minutes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_budget_deduplicates_load_and_invalidates_output_on_completion(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    async def read(*_):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"headers": {}, "rows": {"ESPN.us": [programme()]}, "warnings": [], "size": 100}
+    monkeypatch.setattr(guides, "_read_source", read)
+    monkeypatch.setattr(guides, "HTTP_WAIT", 0.02)
+    with patch("services.epg_programmes.get_cache") as cache:
+        profiles, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW)
+        assert coverage["sources"][0]["status"] == "pending"
+        assert profiles[0]["source_programmes"][1] == []
+        await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW)
+        assert calls == 1
+        release.set()
+        await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+        cache.return_value.invalidate_prefix.assert_called_with("dummy_epg_xmltv")
+        profiles, _ = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW)
+        assert len(profiles[0]["source_programmes"][1]) == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_catalogue_continues_once_after_public_wait_expires(monkeypatch):
+    release = asyncio.Event()
+    upstream = client()
+    async def sources():
+        await release.wait()
+        return [source()]
+    upstream.get_epg_sources.side_effect = sources
+    monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
+    install_feed(monkeypatch, feed(programme()))
+    _, first = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW)
+    _, second = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW)
+    assert first["sources"][0]["status"] == "pending"
+    assert second["sources"][0]["status"] == "pending"
+    assert upstream.get_epg_sources.await_count == 1
+    release.set()
+    await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
+    _, ready = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+    assert ready["sources"][0]["status"] == "ready"
+    upstream.get_epg_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_catalogue_reports_error_and_retries_after_backoff(monkeypatch):
+    upstream = client()
+    upstream.get_epg_sources.side_effect = RuntimeError("unreachable")
+    for _ in range(2):
+        _, coverage = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+        assert coverage["sources"][0]["status"] == "error"
+        assert not guides.can_cache(coverage)
+    assert upstream.get_epg_sources.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_current_mapping_lookup_overrides_remembered_identity_and_refreshes(monkeypatch):
+    rows = [{"id": 90, "epg_source": 50, "tvg_id": "222"}, {"id": 91, "epg_source": 50, "tvg_id": "333"}]
+    upstream = client(rows=rows)
+    install_feed(monkeypatch, feed(*(programme(tvg=tvg) for tvg in ("111", "222", "333", "444"))))
+    selected = profile(channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "111"}])
+    channels = {1: channel(epg_data_id=90)}
+    _, first = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    assert first["channels"][0]["source_tvg_id"] == "222"
+    channels[1]["epg_data_id"] = 91
+    _, second = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    assert second["channels"][0]["source_tvg_id"] == "333"
+    rows[1]["tvg_id"] = "444"
+    guides._CATALOGUE_CACHE[(upstream, 91)]["checked"] -= guides.SOURCE_RETRY + 1
+    _, third = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    assert third["channels"][0]["source_tvg_id"] == "444"
+    upstream.get_epg_data.assert_not_awaited()
+    assert selected["channel_mappings"][0]["tvg_id"] == "111"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_field", ["epg_data_id", "epg_data"])
+async def test_changed_unresolved_mapping_never_uses_the_remembered_source(monkeypatch, link_field):
+    upstream = client()
+    async def row(link):
+        await asyncio.Event().wait()
+    upstream.get_epg_data_by_id.side_effect = row
+    monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    selected = profile(channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "111"}])
+    prepared, coverage = await guides.prepare_profiles([selected], {1: channel(**{"epg_data_id": None, link_field: 91}, tvg_id="111")}, upstream, now=NOW)
+    assert prepared[0]["source_programmes"][1] == []
+    assert "mapping_unavailable" in coverage["channels"][0]["warnings"]
+    assert not guides.can_cache(coverage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_field", ["epg_data_id", "epg_data"])
+async def test_current_unselected_mapping_does_not_restore_an_old_binding(monkeypatch, link_field):
+    upstream = client(sources=[source(), source(id=51)], rows=[{"id": 91, "epg_source": 51, "tvg_id": "222"}])
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    selected = profile(channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "111"}])
+    prepared, coverage = await guides.prepare_profiles([selected], {1: channel(**{"epg_data_id": None, link_field: 91}, tvg_id="111")}, upstream, now=NOW, wait_for_sources=True)
+    assert prepared[0]["source_programmes"][1] == []
+    assert "source_not_selected" in coverage["channels"][0]["warnings"]
+    assert selected["channel_mappings"][0]["tvg_id"] == "111"
+
+
+@pytest.mark.asyncio
+async def test_known_current_mapping_survives_a_failed_recheck(monkeypatch):
+    upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "111"}])
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    selected, channels = profile(), {1: channel(epg_data_id=90, tvg_id="")}
+    await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
+    upstream.get_epg_data_by_id.side_effect = RuntimeError("unavailable")
+    prepared, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    assert prepared[0]["source_programmes"][1][0].get("stop") == "20260905050000 +0000"
+    assert not guides.can_cache(coverage)
+
+
+@pytest.mark.asyncio
+async def test_unchanged_catalogue_does_not_invalidate_ready_output():
+    upstream = client()
+    key = (upstream, None)
+    with patch.object(guides, "get_cache") as cache:
+        await guides._load_catalogue(key, upstream, None)
+        cache.return_value.invalidate_prefix.reset_mock()
+        await guides._load_catalogue(key, upstream, None)
+        cache.return_value.invalidate_prefix.assert_not_called()
+        upstream.get_epg_sources.return_value = [source(priority=9)]
+        await guides._load_catalogue(key, upstream, None)
+        cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["primary", "alternate", "embedded"])
+async def test_null_primary_aliases_preserve_current_mapping(monkeypatch, link):
+    upstream = client(rows=[{"id": 90, "epg_source_id": 50, "tvg_id": "111"}])
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    links = {"epg_data_id": 90} if link == "primary" else {"epg_data_id": None, "epg_data": 90 if link == "alternate" else {"id": 90, "epg_source_id": 50, "tvg_id": "111"}}
+    prepared, coverage = await guides.prepare_profiles([profile()], {1: channel(**links, tvg_id="", channel_group_id=None, channel_group={"id": 65})}, upstream, now=NOW, wait_for_sources=True)
+    assert prepared[0]["source_programmes"][1][0].get("channel") == "111"
+    assert coverage["channels"][0]["match"] == "static"
+
+
+@pytest.mark.asyncio
+async def test_custom_dummy_identifier_retains_original_mapping(monkeypatch):
+    sources = [source(), {"id": 100, "source_type": "xmltv", "is_active": True, "url": "http://ecm/api/dummy-epg/xmltv/1"}]
+    rows = [{"id": 90, "epg_source": 100, "tvg_id": "sports-1"}]
+    upstream = client(sources=sources, rows=rows)
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    selected = profile(tvg_id_template="sports-{channel_id}", channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "111"}])
+    channels = {1: channel(epg_data_id=90, tvg_id="sports-1")}
+    assert guides.capture_mappings(selected, channels, rows, sources) == selected["channel_mappings"]
+    prepared, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
+    assert prepared[0]["source_programmes"][1][0].get("channel") == "111"
+    assert coverage["channels"][0]["xmltv_id"] == "sports-1"
+
+
+@pytest.mark.asyncio
+async def test_combined_preparation_keeps_each_profile_schedule(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    upstream = client()
+    prepared, _ = await guides.prepare_profiles([profile(), profile(id=2)], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+    single, _ = await guides.prepare_profiles([profile(id=2)], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+    assert generate_xmltv([prepared[1]], {1: channel()}) == generate_xmltv(single, {1: channel()})
+    combined = ET.fromstring(generate_xmltv(prepared, {1: channel()}))
+    assert len(combined.findall("channel")) == 1
+
+
+@pytest.mark.asyncio
+async def test_inferred_event_keeps_its_source_channel_icon(monkeypatch):
+    icon = "https://images.example/event-logo.png"
+    install_feed(monkeypatch, feed(programme("PPV10.art", "ONE FIGHT NIGHT 47 STAMP V FLORES"), headers=f'<channel id="PPV10.art"><display-name>PPV 10</display-name><icon src="{icon}"/></channel>'))
+    channels = {1: channel(name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="")}
+    prepared, _ = await guides.prepare_profiles([profile()], channels, client(), now=NOW, wait_for_sources=True)
+    assert ET.fromstring(generate_xmltv(prepared, channels)).find("channel/icon").get("src") == icon
+
+
+@pytest.mark.asyncio
+async def test_catalogue_eviction_does_not_drop_the_current_batch(monkeypatch):
+    upstream = client()
+    upstream.get_epg_data_by_id.side_effect = lambda link: {"id": link, "epg_source": 50, "tvg_id": "ESPN.us"}
+    channels = {i: channel(id=i, epg_data_id=i) for i in range(1, 2049)}
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(return_value={"headers": {}, "rows": {}, "warnings": [], "size": 0}))
+    _, coverage = await guides.prepare_profiles([profile()], channels, upstream, now=NOW, wait_for_sources=True)
+    assert coverage["sources"][0]["status"] == "ready"
+    assert len(guides._CATALOGUE_CACHE) <= 2048
+
+
+@pytest.mark.asyncio
+async def test_missing_source_cache_entry_has_a_useful_error(monkeypatch):
+    async def disappear(key, *_):
+        guides._SOURCE_CACHE.pop(key, None)
+        guides._SOURCE_LOADS.pop(key, None)
+    monkeypatch.setattr(guides, "_load_source", disappear)
+    _, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert coverage["sources"][0]["status"] == "error"
+    assert coverage["sources"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_profile_subset_reuses_a_complete_source_selection(monkeypatch):
+    install_feed(monkeypatch, feed(programme(), programme(tvg="TNT.us")))
+    first = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}])
+    second = profile(id=2, channel_group_ids=[], channel_assignments=[{"channel_id": 2}])
+    channels = {1: channel(), 2: channel(id=2, tvg_id="TNT.us")}
+    upstream = client()
+    with patch.object(guides, "_read_source", wraps=guides._read_source) as read:
+        combined, _ = await guides.prepare_profiles([first, second], channels, upstream, now=NOW, wait_for_sources=True)
+        subset, _ = await guides.prepare_profiles([second], channels, upstream, now=NOW, wait_for_sources=True)
+        assert combined[1]["source_programmes"][2]
+        assert subset[0]["source_programmes"][2]
+        assert read.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_is_scoped_to_identity_and_failure_keeps_original_end(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    upstream = client()
+    await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+    key = next(iter(guides._SOURCE_CACHE))
+    guides._SOURCE_CACHE[key]["checked"] -= guides.SOURCE_TTL + 1
+    async def fail(*_, **__):
+        raise ValueError("https://secret.example/key?password=hidden")
+        yield b""
+    monkeypatch.setattr(guides, "stream_xmltv", fail)
+    profiles, coverage = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True)
+    assert profiles[0]["source_programmes"][1], [(key, {tvg: [ET.tostring(row) for row in rows] for tvg, rows in value.get("rows", {}).items()}) for key, value in guides._SOURCE_CACHE.items()]
+    assert profiles[0]["source_programmes"][1][0].get("stop") == "20260905050000 +0000"
+    assert coverage["sources"][0]["status"] == "error"
+    assert "password" not in str(coverage)
+    profiles, _ = await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW + timedelta(hours=4), wait_for_sources=True)
+    assert profiles[0]["source_programmes"][1] == []
+    profiles, _ = await guides.prepare_profiles([profile()], {1: channel(tvg_id="Other", name="Other")}, upstream, now=NOW, wait_for_sources=True)
+    assert profiles[0]["source_programmes"][1] == []
+
+
+@pytest.mark.asyncio
+async def test_profiles_deduplicate_channels_and_report_custom_id_collision(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    channels = {1: channel(), 2: channel(id=2)}
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(id=2), profile(id=1, tvg_id_template="same")], channels, client(), now=NOW, wait_for_sources=True,
+    )
+    xml = ET.fromstring(generate_xmltv(profiles, channels))
+    assert len(xml.findall("channel")) == 1
+    assert len({item.get("id") for item in xml.findall("channel")}) == 1
+    assert any("xmltv_id_collision" in item["warnings"] for item in coverage["channels"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [b"<!DOCTYPE tv><tv/>", b'<!ENTITY x "y"><tv/>', b"<tv/>\x00"])
+async def test_transport_rejects_declarations_across_chunk_boundaries(content):
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for value in content:
+                yield bytes([value])
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=Chunks()))
+    with pytest.raises(Exception, match="DTDs"):
+        async for _ in stream_xmltv(source(), max_download=1024, max_decoded=1024, transport=transport):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_transport_gzip_bounds_and_truncation():
+    class Chunks(httpx.AsyncByteStream):
+        def __init__(self, raw):
+            self.raw = raw
+        async def __aiter__(self):
+            yield self.raw
+    compressed = gzip.compress(b"<tv>" + b" " * 5000 + b"</tv>")
+    for raw, limit, expected in [(compressed, 100, "size limit"), (compressed[:-3], 10000, "incomplete")]:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Chunks(raw)))
+        with pytest.raises(Exception, match=expected):
+            async for _ in stream_xmltv(source(), max_download=10000, max_decoded=limit, transport=transport):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_multiple_sources_share_one_cold_wait_budget(monkeypatch):
+    async def read(*_):
+        await asyncio.sleep(0.2)
+        return {"headers": {}, "rows": {}, "warnings": [], "size": 0}
+    monkeypatch.setattr(guides, "_read_source", read)
+    monkeypatch.setattr(guides, "HTTP_WAIT", 0.03)
+    loop = asyncio.get_running_loop()
+    begin = loop.time()
+    _, coverage = await guides.prepare_profiles(
+        [profile(epg_source_ids=[50, 51, 52, 53])], {1: channel()},
+        client([source(number) for number in [50, 51, 52, 53]]), now=NOW,
+    )
+    assert loop.time() - begin < 0.1
+    assert len(coverage["sources"]) == 4
+    assert all(item["status"] == "pending" for item in coverage["sources"])
+
+
+@pytest.mark.asyncio
+async def test_source_download_concurrency_is_two(monkeypatch):
+    active = maximum = 0
+    async def chunks(*_, **__):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(active, maximum)
+        try:
+            await asyncio.sleep(0.01)
+            yield b"<tv/>"
+        finally:
+            active -= 1
+    monkeypatch.setattr(guides, "stream_xmltv", chunks)
+    await asyncio.gather(*(guides._read_source(source(number), [], START, STOP, NOW) for number in range(4)))
+    assert maximum == 2
+    assert active == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_ambiguous_same_title_kickoffs_do_not_select_arbitrarily(monkeypatch, explicit):
+    install_feed(monkeypatch, feed(
+        programme("PPV10.art", "ONE FIGHT NIGHT 47 STAMP V FLORES"),
+        programme("PPV11.art", "ONE FIGHT NIGHT 47 STAMP V FLORES",
+                  start="20260905011500 +0000", stop="20260905051500 +0000"),
+    ))
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "PPV10.art"}] if explicit else [])],
+        {1: channel(name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="")},
+        client(), now=NOW, wait_for_sources=True,
+    )
+    if explicit:
+        assert len(profiles[0]["source_programmes"][1]) == 1
+        assert profiles[0]["source_programmes"][1][0].get("channel") == "PPV10.art"
+        assert "ambiguous_event" not in coverage["channels"][0]["warnings"]
+    else:
+        assert profiles[0]["source_programmes"][1] == []
+        assert "ambiguous_event" in coverage["channels"][0]["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_long_source_duration_is_diagnosed_and_not_rendered(monkeypatch):
+    install_feed(monkeypatch, feed(programme(stop="20260907050000 +0000")))
+    profiles, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert profiles[0]["source_programmes"][1] == []
+    assert "implausible_schedule" in coverage["channels"][0]["warnings"]
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("No EVENT Today", True), ("Signing Off", True), ("SIGN OFF", True),
+    ("Next EVENT: Hockey on Saturday", True), ("The Signing Off Story", False),
+    ("No Events: A Documentary", False), ("Off-Air with Friends", False),
+])
+def test_placeholder_filter_is_specific(title, expected):
+    assert guides._placeholder(programme(title=title)) is expected
+
+
+@pytest.mark.asyncio
+async def test_source_icons_variants_and_portrait_banner_settings_survive(monkeypatch):
+    from types import SimpleNamespace
+    install_feed(monkeypatch, feed(
+        programme(title="MLB Baseball", children="<sub-title>New York Yankees at Boston Red Sox</sub-title>"),
+        headers='<channel id="ESPN.us"><display-name>ESPN</display-name><icon src="https://logos.example/espn.png"/></channel>',
+    ))
+    with patch("config.get_settings", return_value=SimpleNamespace(
+        event_sync_team_aliases=[], sports_banner_base_url="https://game-thumbs.example",
+        sports_banner_leagues=None,
+    )):
+        profiles, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    xml = ET.fromstring(generate_xmltv(profiles, {1: channel()}))
+    assert xml.find("channel/icon").get("src") == "https://logos.example/espn.png"
+    actual = next(row for row in xml.findall("programme") if row.findtext("title") == "MLB Baseball")
+    assert "/cover?style=4" in actual.find("icon").get("src")
+    assert "fallback=true" in actual.find("icon").get("src")
+    assert "missing_artwork" not in coverage["channels"][0]["warnings"]
+    profiles[0]["pattern_variants"] = [{"name": "ESPN", "title_pattern": "(?<title>ESPN)",
+                                       "program_poster_url_template": "https://custom.example/portrait.jpg"}]
+    actual = next(row for row in ET.fromstring(generate_xmltv(profiles, {1: channel()})).findall("programme")
+                  if row.findtext("title") == "MLB Baseball")
+    assert actual.find("icon").get("src") == "https://custom.example/portrait.jpg"
+
+
+@pytest.mark.asyncio
+async def test_uncached_portraits_are_probed_once_without_delaying_guides(monkeypatch, tmp_path):
+    from services import epg_artwork
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    landscape = "https://tmsimg.com/assets/p12345_b_h3_aa.jpg"
+    install_feed(monkeypatch, feed(programme(children=f'<icon src="{landscape}"/>')))
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def probe(cache, unknown):
+        started.set()
+        await release.wait()
+        for key in unknown:
+            cache.put(key, "v12")
+        cache.save()
+        return len(unknown)
+
+    with patch.object(epg_artwork, "probe_unknown", side_effect=probe) as mock_probe:
+        first, first_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        assert first[0]["source_programmes"][1][0].find("icon").get("src") == landscape
+        assert first_coverage["artwork_pending"] is True
+        second, second_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        assert second_coverage["artwork_pending"] is True
+        assert mock_probe.await_count == 1
+        release.set()
+        await guides._ARTWORK_LOAD
+        assert not guides.can_cache(first_coverage)
+        assert not guides.can_cache(second_coverage)
+        third, third_coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        assert third[0]["source_programmes"][1][0].find("icon").get("src") == "https://tmsimg.com/assets/p12345_b_v12_aa.jpg"
+        assert guides.can_cache(third_coverage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "timeout", "cancelled"])
+async def test_portrait_probe_failures_release_the_task_and_retry_later(monkeypatch, tmp_path, failure):
+    from services import epg_artwork
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(guides, "ARTWORK_WAIT", 0.01)
+    install_feed(monkeypatch, feed(programme(children='<icon src="https://tmsimg.com/assets/p12345_b_h3_aa.jpg"/>')))
+
+    async def probe(cache, unknown):
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        elif failure == "cancelled":
+            raise asyncio.CancelledError
+        else:
+            raise RuntimeError("unreachable")
+
+    with patch.object(epg_artwork, "probe_unknown", side_effect=probe) as mock_probe, patch.object(guides, "get_cache") as cache:
+        first, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        task = guides._ARTWORK_LOAD
+        await asyncio.gather(task, return_exceptions=True)
+        assert guides._ARTWORK_LOAD is None
+        assert not guides.can_cache(coverage)
+        assert first[0]["source_programmes"][1][0].find("icon").get("src").endswith("_h3_aa.jpg")
+        await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        assert mock_probe.await_count == 1
+        assert guides._ARTWORK_LOAD is None
+        cache.return_value.invalidate_prefix.assert_called_with("dummy_epg_xmltv")
+
+
+@pytest.mark.asyncio
+async def test_portrait_probe_batch_is_bounded(monkeypatch, tmp_path):
+    from services import epg_artwork
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    icons = "".join(f'<icon src="https://tmsimg.com/assets/p{10000 + i}_b_h3_aa.jpg"/>' for i in range(guides.MAX_ARTWORK + 2))
+    install_feed(monkeypatch, feed(programme(children=icons)))
+    with patch.object(epg_artwork, "probe_unknown", new_callable=AsyncMock) as probe:
+        await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        await guides._ARTWORK_LOAD
+        assert len(probe.await_args.args[1]) == guides.MAX_ARTWORK
+
+
+@pytest.mark.asyncio
+async def test_missing_portrait_is_remembered_without_repeated_probes(monkeypatch, tmp_path):
+    from services import epg_artwork
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    original = "https://tmsimg.com/assets/p12345_b_h3_aa.jpg"
+    install_feed(monkeypatch, feed(programme(children=f'<icon src="{original}"/>')))
+    with patch.object(epg_artwork, "_probe", new=AsyncMock(return_value=None)) as probe:
+        await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        await guides._ARTWORK_LOAD
+        prepared, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+        assert prepared[0]["source_programmes"][1][0].find("icon").get("src") == original
+        assert guides.can_cache(coverage)
+        probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cache_aggregate_ceiling_evicts_oldest_complete_schedule(monkeypatch):
+    async def read(*_):
+        return {"headers": {}, "rows": {}, "warnings": [], "size": 60}
+    monkeypatch.setattr(guides, "_read_source", read)
+    monkeypatch.setattr(guides, "MAX_CACHE", 100)
+    await guides._load_source("old", source(), [], START, STOP, NOW)
+    await guides._load_source("new", source(51), [], START, STOP, NOW)
+    assert list(guides._SOURCE_CACHE) == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_streamed_transport_enforces_wire_limit_and_sanitizes_errors():
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"<tv>" + b" " * 100 + b"</tv>"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=Chunks()))
+    with pytest.raises(Exception, match="download exceeds"):
+        async for _ in stream_xmltv(source(), max_download=10, max_decoded=1000, transport=transport):
+            pass
+    def failure(request):
+        raise httpx.ConnectError("credential hidden-in-upstream-error", request=request)
+    with pytest.raises(Exception) as caught:
+        async for _ in stream_xmltv(source(), max_download=100, max_decoded=100, transport=httpx.MockTransport(failure)):
+            pass
+    assert "hidden-in-upstream-error" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_streamed_transport_revalidates_redirects():
+    transport = httpx.MockTransport(lambda request: httpx.Response(302, headers={"location": "http://127.0.0.1/private"}))
+    with pytest.raises(Exception, match="blocked"):
+        async for _ in stream_xmltv(source(), max_download=1000, max_decoded=1000, transport=transport):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_precedence_matches_coverage(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    profiles, coverage = await guides.prepare_profiles(
+        [profile(id=2), profile(id=1, epg_source_ids=[], fallback_title_template="Existing guide")],
+        {1: channel()}, client(), now=NOW, wait_for_sources=True,
+    )
+    xml = ET.fromstring(generate_xmltv(profiles, {1: channel()}))
+    assert len(xml.findall("channel")) == 1
+    assert "SportsCenter" not in ET.tostring(xml, encoding="unicode")
+    assert coverage["channels"] == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_source_reports_reason_without_recursion(monkeypatch):
+    loader = AsyncMock()
+    monkeypatch.setattr(guides, "_read_source", loader)
+    profiles, coverage = await guides.prepare_profiles(
+        [profile()], {1: channel()}, client([source(is_active=False)]), now=NOW, wait_for_sources=True,
+    )
+    assert coverage["sources"][0]["status"] == "error"
+    assert "disabled" in coverage["sources"][0]["error"]
+    assert profiles[0]["source_programmes"][1] == []
+    loader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_xml_element_is_bounded_before_its_closing_tag(monkeypatch):
+    install_feed(monkeypatch, b"<tv><programme>" + b"A" * 1000)
+    monkeypatch.setattr(guides, "MAX_RETAINED", 200)
+    with pytest.raises(ValueError, match="element exceeds"):
+        await guides._read_source(source(), [], START, STOP, NOW)
+
+
+@pytest.mark.asyncio
+async def test_failed_cache_entries_have_a_count_limit(monkeypatch):
+    async def fail(*_):
+        raise ValueError("unavailable")
+    monkeypatch.setattr(guides, "_read_source", fail)
+    monkeypatch.setattr(guides, "MAX_CACHE_ENTRIES", 1)
+    await guides._load_source("old", source(), [], START, STOP, NOW)
+    await guides._load_source("new", source(51), [], START, STOP, NOW)
+    assert list(guides._SOURCE_CACHE) == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_wrong_day_event_reports_date_conflict(monkeypatch):
+    install_feed(monkeypatch, feed(programme("PPV(1)-05.v", "ONE FIGHT NIGHT 47 STAMP V FLORES",
+                                            start="20260906010000 +0000", stop="20260906040000 +0000")))
+    profiles, coverage = await guides.prepare_profiles(
+        [profile()], {1: channel(name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="")},
+        client(), now=NOW, wait_for_sources=True,
+    )
+    assert profiles[0]["source_programmes"][1] == []
+    assert "event_date_conflict" in coverage["channels"][0]["warnings"]

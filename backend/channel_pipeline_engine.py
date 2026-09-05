@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import resource
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Optional
@@ -267,6 +268,8 @@ class ChannelPipelineEngine:
         # (get_channel_pipeline_engine), which is what keeps the every-minute
         # tick off the EPG fetches. See _link_unmatched_channels.
         self._epg_link_unmatched: set[int] = set()
+        self._epg_link_signature: tuple = ()
+        self._epg_link_checked_at = 0.0
 
     async def run_pipeline(
         self,
@@ -731,15 +734,8 @@ class ChannelPipelineEngine:
         already committed by this point, and an EPG source that is down or slow
         must not turn a good run red. [13]
 
-        Runs on every live run, including the every-minute auto-creation tick,
-        so the cost is controlled inside: one channel fetch, then a return
-        unless some channel has no guide data that the matcher has not already
-        rejected once. ``self._epg_link_unmatched`` holds those rejects.
-
-        Returns:
-            How many channels were linked. 0 when the setting is off, when every
-            channel already has guide data, when every channel with none has
-            already been matched and rejected, or when the pass failed.
+        Rejected matches are reused for five minutes only while channel, stream
+        and source identity stays unchanged. Existing guide links always win.
         """
         settings = get_settings()
         if not getattr(settings, "epg_auto_link_after_pipeline", True):
@@ -765,21 +761,33 @@ class ChannelPipelineEngine:
 
             unlinked = [c for c in all_channels if c.get("epg_data_id") is None]
             unlinked_ids = {c["id"] for c in unlinked}
-            # Everything below this line is expensive: an EPG-source fetch, an
-            # EPG-data fetch of tens of thousands of entries and a stream fetch,
-            # once a minute forever. Every id in _epg_link_unmatched has already
-            # been through the matcher and scored under the threshold, and the
-            # run that just finished did not touch the EPG data, so re-matching
-            # it reaches the same answer at that price. Narrowing the record to
-            # what is still unlinked is what lets a channel come back: once it
-            # has a link it drops out of the record, and clearing that link
-            # makes it an id the pass has not tried. An empty set is a subset
-            # too, which is the steady state and the cheapest path.
-            if unlinked_ids <= self._epg_link_unmatched:
-                self._epg_link_unmatched = unlinked_ids
+            if not unlinked:
+                self._epg_link_unmatched.clear()
                 return 0
 
             epg_sources = await self.client.get_epg_sources()
+            stream_ids = sorted({
+                sid for channel in unlinked for sid in (channel.get("streams") or [])
+                if isinstance(sid, int)
+            })
+            streams = await self.client.get_streams_by_ids(stream_ids) if stream_ids else []
+            signature = (
+                tuple(sorted((c["id"], c.get("name") or "", c.get("tvg_id") or "",
+                              str(c.get("streams") or [])) for c in unlinked)),
+                tuple(sorted((s.get("id", 0), s.get("name") or "", s.get("tvg_id") or "")
+                             for s in streams)),
+                tuple(sorted((s.get("id", 0), str(s.get("updated_at") or s.get("last_updated") or ""),
+                              str(s.get("status") or ""), bool(s.get("is_active", True)),
+                              str(s.get("priority") or ""), str(s.get("url") or ""))
+                             for s in epg_sources)),
+            )
+            now = time.monotonic()
+            if (unlinked_ids <= self._epg_link_unmatched
+                    and signature == self._epg_link_signature
+                    and now - self._epg_link_checked_at < 300):
+                self._epg_link_unmatched = unlinked_ids
+                return 0
+
             source_order = build_source_priority_order(epg_sources)
             epg_data = await self.client.get_epg_data()
 
@@ -802,16 +810,6 @@ class ChannelPipelineEngine:
                 or entry.get("epg_source") in active_source_ids
             ]
 
-            # Only the target channels' own streams. Sweeping every stream is
-            # ~86 requests on a normal install, and the matcher reads streams
-            # for country detection alone. [12]
-            stream_ids = [
-                sid for channel in unlinked for sid in (channel.get("streams") or [])
-            ]
-            streams = (
-                await self.client.get_streams_by_ids(stream_ids) if stream_ids else []
-            )
-
             session = get_session()
             try:
                 match_results = batch_find_epg_matches(
@@ -825,6 +823,12 @@ class ChannelPipelineEngine:
                 session.close()
 
             threshold = settings.epg_auto_match_threshold
+            import_sources: set[int] = set()
+            entries = {entry.get("id"): entry for entry in epg_data}
+            dummy_sources = {
+                source["id"]: source for source in epg_sources
+                if "/api/dummy-epg/xmltv" in (source.get("url") or "")
+            }
             for match_result in match_results:
                 best = match_result.best_match
                 if best is None or best.confidence < threshold:
@@ -843,11 +847,28 @@ class ChannelPipelineEngine:
                     mutation_source=journal.MUTATION_SOURCE_AUTO_CREATION,
                 )
                 linked_ids.add(match_result.channel_id)
+                source_id = entries.get(best.epg_id, {}).get("epg_source")
+                if source_id in dummy_sources:
+                    import_sources.add(source_id)
 
-            # What the matcher would not place, so the next tick can skip the
-            # fetches above. Only reached on a clean pass: a source that was
-            # down leaves the previous record standing and gets retried.
+            from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+            for source_id in sorted(import_sources):
+                try:
+                    completed = await wait_for_epg_source_refresh(
+                        self.client, source_id, dummy_sources[source_id].get("name", "Guide"),
+                        poll_interval=3, max_wait=120,
+                    )
+                    if not completed:
+                        logger.warning("[AUTO-CREATE-ENGINE] Programme import incomplete for source %s", source_id)
+                except Exception as exc:
+                    logger.warning("[AUTO-CREATE-ENGINE] Programme import failed for source %s: %s",
+                                   source_id, type(exc).__name__)
+
+            # Reuse rejected rows while their inputs stay unchanged. Failed
+            # source or stream reads leave this record untouched for retry.
             self._epg_link_unmatched = unlinked_ids - linked_ids
+            self._epg_link_signature = signature
+            self._epg_link_checked_at = now
 
             logger.info(
                 "[AUTO-CREATE-ENGINE] EPG auto-link: linked %s of %s channel(s) "
@@ -3303,6 +3324,8 @@ class ChannelPipelineEngine:
                     executor, results, epg_sources,
                     dry_run or not planning.allow_internal_side_effects,
                 )
+            if not dry_run and planning.allow_internal_side_effects:
+                await self._refresh_linked_epg(executor, results, epg_sources)
 
             # =================================================================
             # Pass 6: Batch probe streams queued by probe_streams actions
@@ -5218,6 +5241,7 @@ class ChannelPipelineEngine:
         })
 
         # Step 3: Refresh each Dispatcharr EPG source
+        failed_source_ids: set[int] = set()
         for src_id in dummy_source_ids:
             src = source_by_id.get(src_id)
             source_name = src.get("name", f"Source {src_id}") if src else f"Source {src_id}"
@@ -5236,16 +5260,19 @@ class ChannelPipelineEngine:
             if not dry_run:
                 try:
                     from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
-                    await wait_for_epg_source_refresh(
+                    completed = await wait_for_epg_source_refresh(
                         self.client, src_id, source_name,
-                        poll_interval=3, max_wait=120
+                        poll_interval=3, max_wait=120,
                     )
+                    if not completed:
+                        raise RuntimeError("EPG source refresh did not complete successfully")
                 except Exception as e:
                     logger.error(
                         "[AUTO-CREATE-ENGINE] Pass 5: failed to refresh source %s: %s",
                         source_name, e
                     )
                     refresh_error = str(e)
+                    failed_source_ids.add(src_id)
                     # y3m6o.1 review (WARN #3): a failed source refresh means the
                     # dummy guide data may not be current when the deferred
                     # assignments retry — escalate so the run is not green.
@@ -5343,6 +5370,9 @@ class ChannelPipelineEngine:
         from channel_pipeline_schema import Action
         for channel_id, action, stream_ctx, exec_ctx in deferred_snapshot:
             epg_source_id = action.params.get("epg_id")
+            if epg_source_id in failed_source_ids:
+                retry_failed += 1
+                continue
             src = source_by_id.get(epg_source_id)
             source_name = src.get("name", f"Source {epg_source_id}") if src else f"Source {epg_source_id}"
             channel = executor._channel_by_id.get(channel_id, {})
@@ -5449,10 +5479,72 @@ class ChannelPipelineEngine:
                 "would_modify": False
             })
 
+        if not dry_run:
+            await self._refresh_linked_epg(executor, results, epg_sources)
         logger.info(
             "[AUTO-CREATE-ENGINE] Pass 5 complete: %s succeeded, %s failed",
             retry_success, retry_failed
         )
+
+    async def _refresh_linked_epg(self, executor, results: dict, epg_sources: list) -> None:
+        """Import programmes after their channels have acquired guide links."""
+        import weakref
+        from cache import get_cache
+        from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+        cache = get_cache()
+        now = time.monotonic()
+        pending = cache.get("dummy_epg_import_retries", ttl=86400) or {}
+        pending = {key: value for key, value in pending.items()
+                   if now - value["checked"] < 86400 and value["client"]() is not None}
+        sources = {source["id"]: source for source in epg_sources}
+        identities = {(id(self.client), source_id, source.get("url")): source_id
+                      for source_id, source in sources.items() if source.get("is_active", True)}
+        attempted = getattr(executor, "_epg_import_attempts", set())
+        source_ids = (set(executor._epg_import_sources)
+                      | {identities[key] for key in pending if key in identities}) - attempted
+        executor._epg_import_sources.clear()
+        executor._epg_import_attempts = attempted | source_ids
+        for source_id in sorted(source_ids):
+            source = sources.get(source_id, {})
+            key = (id(self.client), source_id, source.get("url"))
+            source_name = source.get("name", f"Source {source_id}")
+            failure = None
+            try:
+                completed = await wait_for_epg_source_refresh(
+                    self.client, source_id, source_name, poll_interval=3, max_wait=120,
+                )
+                if not completed:
+                    raise RuntimeError("EPG programme import did not complete successfully")
+            except (Exception, asyncio.CancelledError) as exc:
+                failure = exc
+            # Merge only this outcome into the current cache after the wait.
+            # No await separates the read and write, so concurrent runs keep
+            # each other's completed or failed source imports.
+            now = time.monotonic()
+            pending = cache.get("dummy_epg_import_retries", ttl=86400) or {}
+            pending = {item: value for item, value in pending.items()
+                       if now - value["checked"] < 86400 and value["client"]() is not None}
+            if failure is None:
+                pending.pop(key, None)
+            else:
+                retry_ids = source_ids if isinstance(failure, asyncio.CancelledError) else {source_id}
+                for retry_id in retry_ids:
+                    retry_key = (id(self.client), retry_id, sources.get(retry_id, {}).get("url"))
+                    pending[retry_key] = {"client": weakref.ref(self.client), "checked": now}
+            source_ids.discard(source_id)
+            while len(pending) > 128:
+                pending.pop(min(pending, key=lambda item: pending[item]["checked"]))
+            if pending:
+                cache.set("dummy_epg_import_retries", pending)
+            else:
+                cache.invalidate("dummy_epg_import_retries")
+            if isinstance(failure, asyncio.CancelledError):
+                raise failure
+            if failure is not None:
+                self._record_failed_phase(
+                    results, phase="refresh_epg_source", entity_id=source_id,
+                    stream_name="Import linked guide programmes", error=str(failure),
+                )
 
     # =========================================================================
     # Pass 4: Reconciliation

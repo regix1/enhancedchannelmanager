@@ -17,10 +17,14 @@ import { DummyEPGProfileModal } from './DummyEPGProfileModal';
 const mocks = vi.hoisted(() => ({
   updateDummyEPGProfile: vi.fn(),
   createDummyEPGProfile: vi.fn(),
+  getEPGSources: vi.fn().mockResolvedValue([]),
+  getDummyEPGCoverage: vi.fn(),
 }));
 
 vi.mock('../services/api', () => ({
   getChannelGroups: vi.fn().mockResolvedValue([]),
+  getEPGSources: mocks.getEPGSources,
+  getDummyEPGCoverage: mocks.getDummyEPGCoverage,
   previewDummyEPGBatch: vi.fn().mockResolvedValue([]),
   updateDummyEPGProfile: mocks.updateDummyEPGProfile,
   createDummyEPGProfile: mocks.createDummyEPGProfile,
@@ -207,7 +211,7 @@ describe('DummyEPGProfileModal per-variant program duration', () => {
     expect(saved.pattern_variants?.[0].program_duration).toBeNull();
   });
 
-  it('warns that the ended templates no longer reach the generated guide', async () => {
+  it('explains that legacy ended templates use the inferred schedule', async () => {
     render(
       <DummyEPGProfileModal
         isOpen
@@ -220,7 +224,91 @@ describe('DummyEPGProfileModal per-variant program duration', () => {
       />
     );
 
-    const hints = await screen.findAllByText(/no longer in the generated guide/i);
+    const hints = await screen.findAllByText(/ended templates use the inferred event duration/i);
     expect(hints.length).toBeGreaterThan(0);
+  });
+});
+
+
+describe('Dummy EPG programme sources and coverage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getEPGSources.mockResolvedValue([
+      { id: 51, name: 'USA 3-day', source_type: 'xmltv', is_active: true, url: 'https://guide.example/private-key' },
+      { id: 49, name: 'Portrait sports', source_type: 'xmltv', is_active: true, url: '/api/epg/artwork-proxy/42' },
+      { id: 46, name: 'Generated guide', source_type: 'xmltv', is_active: true, url: '/api/dummy-epg/xmltv/1' },
+    ]);
+    mocks.updateDummyEPGProfile.mockResolvedValue({});
+    mocks.createDummyEPGProfile.mockResolvedValue({});
+  });
+
+  it('preserves saved sources and leaves remembered mappings to the sparse update', async () => {
+    render(<DummyEPGProfileModal isOpen profile={{
+      ...makeProfile([legacyVariant]), epg_source_ids: [49],
+      channel_mappings: [{ channel_id: 2950, source_id: 42, tvg_id: '32645' }],
+    }} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(await screen.findByRole('checkbox', { name: 'Portrait sports' })).toBeChecked();
+    expect(screen.queryByRole('checkbox', { name: 'Generated guide' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/private-key/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'USA 3-day' }));
+    const saved = await saveAndReadRequest();
+    expect(saved.epg_source_ids).toEqual([49, 51]);
+    expect(saved.channel_mappings).toBeUndefined();
+    expect(saved.pattern_variants).toEqual([legacyVariant]);
+  });
+
+  it('retains imported source identities when creating a copy', async () => {
+    const mapping = { channel_id: 2950, source_id: 42, tvg_id: '32645' };
+    render(<DummyEPGProfileModal isOpen profile={null} importData={{
+      ...makeProfile([legacyVariant]), name: 'Copy', epg_source_ids: [49], channel_mappings: [mapping],
+    }} onClose={vi.fn()} onSave={vi.fn()} />);
+    await screen.findByRole('checkbox', { name: 'Portrait sports' });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Profile' }));
+    await waitFor(() => expect(mocks.createDummyEPGProfile).toHaveBeenCalled());
+    expect(mocks.createDummyEPGProfile.mock.calls[0][0]).toMatchObject({ epg_source_ids: [49], channel_mappings: [mapping] });
+  });
+
+  it('creates a source profile without a name regex and keeps imported flags', async () => {
+    render(<DummyEPGProfileModal isOpen profile={null} importData={{
+      name: 'Linear', epg_source_ids: [51], enabled: false, program_duration: 0,
+    }} onClose={vi.fn()} onSave={vi.fn()} />);
+    await screen.findByRole('checkbox', { name: 'USA 3-day' });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Profile' }));
+    await waitFor(() => expect(mocks.createDummyEPGProfile).toHaveBeenCalled());
+    expect(mocks.createDummyEPGProfile.mock.calls[0][0]).toMatchObject({
+      epg_source_ids: [51], enabled: false, program_duration: 0,
+    });
+  });
+
+  it('shows pending coverage and allows a second check to show current programmes', async () => {
+    const coverage = {
+      generated_at: '2026-09-05T01:00:00Z', window_start: '2026-09-05T00:00:00Z', window_stop: '2026-09-07T00:00:00Z',
+      sources: [{ source_id: 51, status: 'pending', last_success: null, error: null }], channels: [],
+    };
+    mocks.getDummyEPGCoverage.mockResolvedValueOnce(coverage).mockResolvedValueOnce({
+      ...coverage, sources: [{ source_id: 51, status: 'ready', last_success: coverage.generated_at, error: null }],
+      channels: [{ channel_id: 10, xmltv_id: 'ecm-10', source_id: 51, source_tvg_id: 'PPV10.art', match: 'event',
+        current: { start: '2026-09-05T01:00:00Z', stop: '2026-09-05T05:00:00Z', title: 'ONE Fight Night 47' },
+        next: null, real_minutes: 240, gap_minutes: 2640, warnings: [] }],
+    });
+    render(<DummyEPGProfileModal isOpen profile={{ ...makeProfile([legacyVariant]), epg_source_ids: [51] }} onClose={vi.fn()} onSave={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    expect(await screen.findByText(/Sources are still loading/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    expect(await screen.findByText(/ONE Fight Night 47/)).toBeInTheDocument();
+    expect(screen.getByText('240 / 2640')).toBeInTheDocument();
+    expect(mocks.getDummyEPGCoverage).toHaveBeenCalledTimes(2);
+    expect(mocks.updateDummyEPGProfile).not.toHaveBeenCalled();
+  });
+
+  it('shows source-load and coverage errors without clearing saved selection', async () => {
+    mocks.getEPGSources.mockRejectedValueOnce(new Error('secret-url'));
+    mocks.getDummyEPGCoverage.mockRejectedValueOnce(new Error('secret-url'));
+    render(<DummyEPGProfileModal isOpen profile={{ ...makeProfile([legacyVariant]), epg_source_ids: [51] }} onClose={vi.fn()} onSave={vi.fn()} />);
+    expect(await screen.findByText(/Programme sources could not be loaded/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    expect(await screen.findByText(/Guide coverage could not be loaded/)).toBeInTheDocument();
+    expect(screen.queryByText(/secret-url/)).not.toBeInTheDocument();
+    expect((await saveAndReadRequest()).epg_source_ids).toEqual([51]);
   });
 });

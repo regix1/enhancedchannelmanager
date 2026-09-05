@@ -10,10 +10,9 @@ import logging
 import re
 import secrets
 import time
-import xml.etree.ElementTree as ET
 import zlib
+import xml.etree.ElementTree as ET
 from typing import Any, Optional
-from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
@@ -51,12 +50,7 @@ from services.epg_migration import (
     verify_preview_token,
 )
 from tasks.dbas_sync_client import _PinnedSSRFTransport
-from security.ssrf import (
-    SSRFError,
-    check_redirect_depth,
-    get_ssrf_mode,
-    validate_redirect,
-)
+
 
 logger = logging.getLogger(__name__)
 
@@ -401,105 +395,45 @@ async def get_program_poster(program_id: int):
 # ---------------------------------------------------------------------------
 
 async def _poll_epg_refresh_completion(source_id: int, source_name: str, initial_updated):
-    """
-    Background task to poll Dispatcharr until EPG refresh completes.
+    """Report only source refreshes whose completion was observed."""
+    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
 
-    Polls every REFRESH_POLL_INTERVAL_SECONDS for up to EPG_REFRESH_MAX_WAIT_SECONDS.
-    Sends success notification when updated_at changes, warning on timeout.
-    Uses longer timeout than M3U since EPG files can be very large.
-    """
-    from datetime import datetime
-
-    client = get_client()
-    wait_start = datetime.utcnow()
-
+    started = time.monotonic()
     try:
-        while True:
-            elapsed = (datetime.utcnow() - wait_start).total_seconds()
-            if elapsed >= EPG_REFRESH_MAX_WAIT_SECONDS:
-                logger.warning("[EPG-REFRESH] Timeout waiting for '%s' refresh after %.0fs", source_name, elapsed)
-                await send_alert(
-                    title=f"EPG Refresh: {source_name}",
-                    message=f"EPG refresh for '{source_name}' timed out after {int(elapsed)}s - refresh may still be in progress",
-                    notification_type="warning",
-                    source="EPG Refresh",
-                    metadata={"source_id": source_id, "source_name": source_name, "timeout": True},
-                    alert_category="epg_refresh",
-                    entity_id=source_id,
-                )
-                return
-
-            await asyncio.sleep(REFRESH_POLL_INTERVAL_SECONDS)
-
-            try:
-                current_source = await client.get_epg_source(source_id)
-            except Exception as e:
-                # Source may have been deleted during refresh
-                logger.warning("[EPG-REFRESH] Could not fetch source %s during polling: %s", source_id, e)
-                return
-
-            current_updated = current_source.get("updated_at") or current_source.get("last_updated")
-
-            if current_updated and current_updated != initial_updated:
-                wait_duration = (datetime.utcnow() - wait_start).total_seconds()
-                logger.info("[EPG-REFRESH] '%s' refresh complete in %.1fs", source_name, wait_duration)
-
-                journal.log_entry(
-                    category="epg",
-                    action_type="refresh",
-                    entity_id=source_id,
-                    entity_name=source_name,
-                    description=f"Refreshed EPG source '{source_name}' in {wait_duration:.1f}s",
-                )
-
-                # Bust cached /match responses (bd-41pcv): this is the point
-                # where new EPG data has actually landed under the source's
-                # unchanged id — the strongest case for staleness, since a
-                # match run right after a refresh completes must not serve a
-                # pre-refresh cached response.
-                get_cache().invalidate_prefix("epg_match:")
-
-                await send_alert(
-                    title=f"EPG Refresh: {source_name}",
-                    message=f"Successfully refreshed EPG source '{source_name}' in {wait_duration:.1f}s",
-                    notification_type="success",
-                    source="EPG Refresh",
-                    metadata={"source_id": source_id, "source_name": source_name, "duration": wait_duration},
-                    alert_category="epg_refresh",
-                    entity_id=source_id,
-                )
-                return
-            elif elapsed > 30 and not initial_updated:
-                # After 30 seconds, assume complete if no timestamp field available
-                wait_duration = (datetime.utcnow() - wait_start).total_seconds()
-                logger.info("[EPG-REFRESH] '%s' - assuming complete after %.0fs (no timestamp field)", source_name, wait_duration)
-
-                journal.log_entry(
-                    category="epg",
-                    action_type="refresh",
-                    entity_id=source_id,
-                    entity_name=source_name,
-                    description=f"Refreshed EPG source '{source_name}'",
-                )
-
-                # Bust cached /match responses (bd-41pcv) — same reasoning as
-                # the timestamp-changed branch above; this path is taken when
-                # the source has no updated_at field to compare.
-                get_cache().invalidate_prefix("epg_match:")
-
-                await send_alert(
-                    title=f"EPG Refresh: {source_name}",
-                    message=f"EPG source '{source_name}' refresh completed",
-                    notification_type="success",
-                    source="EPG Refresh",
-                    metadata={"source_id": source_id, "source_name": source_name},
-                    alert_category="epg_refresh",
-                    entity_id=source_id,
-                )
-                return
-
-    except Exception as e:
-        logger.exception("[EPG-REFRESH] Error polling for '%s' completion: %s", source_name, e)
+        completed = await wait_for_epg_source_refresh(
+            get_client(), source_id, source_name,
+            poll_interval=REFRESH_POLL_INTERVAL_SECONDS,
+            max_wait=EPG_REFRESH_MAX_WAIT_SECONDS,
+            initial_source={"updated_at": initial_updated},
+            trigger=False,
+        )
+        duration = time.monotonic() - started
+        if not completed:
+            await send_alert(
+                title=f"EPG Refresh: {source_name}",
+                message=f"EPG refresh for '{source_name}' did not complete successfully.",
+                notification_type="warning", source="EPG Refresh",
+                metadata={"source_id": source_id, "source_name": source_name},
+                alert_category="epg_refresh", entity_id=source_id,
+            )
+            return
+        journal.log_entry(
+            category="epg", action_type="refresh", entity_id=source_id,
+            entity_name=source_name,
+            description=f"Refreshed EPG source '{source_name}' in {duration:.1f}s",
+        )
+        get_cache().invalidate_prefix("epg_match:")
+        await send_alert(
+            title=f"EPG Refresh: {source_name}",
+            message=f"Successfully refreshed EPG source '{source_name}' in {duration:.1f}s",
+            notification_type="success", source="EPG Refresh",
+            metadata={"source_id": source_id, "source_name": source_name, "duration": duration},
+            alert_category="epg_refresh", entity_id=source_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("[EPG-REFRESH] Could not verify completion for source %s", source_id)
 
 
 @router.post("/sources/{source_id}/refresh")
@@ -586,8 +520,9 @@ async def get_epg_data(
     page_size: int = Query(100, ge=1, le=1000, description="Results per page"),
     search: Optional[str] = None,
     epg_source: Optional[int] = None,
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum total results across pages"),
 ):
-    """Search EPG data with pagination and filtering."""
+    """Search EPG data with pagination, filtering and an optional total limit."""
     logger.debug("[EPG] GET /api/epg/data - page=%s page_size=%s search=%s epg_source=%s", page, page_size, search, epg_source)
     client = get_client()
     start = time.time()
@@ -597,6 +532,7 @@ async def get_epg_data(
             page_size=page_size,
             search=search,
             epg_source=epg_source,
+            max_results=limit,
         )
         elapsed_ms = (time.time() - start) * 1000
         logger.debug("[EPG] Fetched EPG data in %.1fms", elapsed_ms)
@@ -1138,25 +1074,6 @@ def _prune_guide_migration_jobs() -> None:
         _GUIDE_MIGRATION_JOBS.pop(batch_id, None)
 
 
-def _append_gzip_bounded(
-    decompressor: Any,
-    chunk: bytes,
-    output: bytearray,
-) -> None:
-    pending = chunk
-    while pending:
-        remaining = _XMLTV_HEADER_MAX_DECOMPRESSED - len(output)
-        if remaining <= 0:
-            raise HTTPException(status_code=413, detail="XMLTV channel header is too large.")
-        piece = decompressor.decompress(pending, remaining + 1)
-        if len(piece) > remaining:
-            raise HTTPException(status_code=413, detail="XMLTV channel header is too large.")
-        output.extend(piece)
-        pending = decompressor.unconsumed_tail
-        if not pending:
-            break
-
-
 def _reject_unsafe_xml(content: bytes) -> None:
     lowered = content.lower()
     if b"<!doctype" in lowered or b"<!entity" in lowered:
@@ -1271,99 +1188,23 @@ def _migration_issuer(secret: str) -> str:
 
 async def _load_xmltv_migration_index(source: dict):
     """Download only the XMLTV channel header and return its LCN index."""
-    url = source.get("url")
-    if not url:
-        raise HTTPException(
-            status_code=400,
-            detail=f"XMLTV source {source.get('id')} has no downloadable URL.",
-        )
-    compressed = url.lower().endswith(".gz")
-    downloaded = 0
-    output = bytearray()
-    programme_found = False
-    decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16) if compressed else None
-    try:
-        transport = _PinnedSSRFTransport(verify=True)
-        async with httpx.AsyncClient(
-            timeout=120.0, follow_redirects=False, transport=transport
-        ) as http_client:
-            current_url = url
-            depth = 0
-            while True:
-                async with http_client.stream("GET", current_url) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise HTTPException(
-                                status_code=502,
-                                detail="XMLTV source returned an invalid redirect.",
-                            )
-                        depth += 1
-                        check_redirect_depth(depth)
-                        next_url = urljoin(current_url, location)
-                        validate_redirect(current_url, next_url, get_ssrf_mode())
-                        current_url = next_url
-                        continue
-                    response.raise_for_status()
-                    if response.headers.get("content-encoding", "").lower() == "gzip":
-                        compressed = True
-                        decompressor = decompressor or zlib.decompressobj(
-                            zlib.MAX_WBITS | 16
-                        )
-                    async for chunk in response.aiter_raw():
-                        downloaded += len(chunk)
-                        if downloaded > _XMLTV_HEADER_MAX_DOWNLOAD:
-                            raise HTTPException(
-                                status_code=413,
-                                detail="XMLTV channel header download is too large.",
-                            )
-                        previous_length = len(output)
-                        if compressed and decompressor is not None:
-                            _append_gzip_bounded(decompressor, chunk, output)
-                        else:
-                            if len(output) + len(chunk) > _XMLTV_HEADER_MAX_DECOMPRESSED:
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail="XMLTV channel header is too large.",
-                                )
-                            output.extend(chunk)
-                        if output.find(
-                            b"<programme", max(0, previous_length - len(b"<programme"))
-                        ) >= 0:
-                            programme_found = True
-                            break
-                    if (
-                        compressed
-                        and decompressor is not None
-                        and not programme_found
-                    ):
-                        remaining = _XMLTV_HEADER_MAX_DECOMPRESSED - len(output)
-                        tail = decompressor.flush(remaining + 1)
-                        if len(tail) > remaining:
-                            raise HTTPException(
-                                status_code=413,
-                                detail="XMLTV channel header is too large.",
-                            )
-                        output.extend(tail)
-                break
-    except HTTPException:
-        raise
-    except SSRFError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="XMLTV source URL is blocked by the outbound security policy.",
-        ) from exc
-    except httpx.HTTPError as exc:
-        logger.warning(
-            "[EPG-MIGRATION] XMLTV source id=%s could not be read: %s",
-            source.get("id"),
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not read XMLTV source {source.get('id')}.",
-        ) from exc
+    from services.epg_migration import stream_xmltv
 
+    output = bytearray()
+    stream = stream_xmltv(
+        source,
+        max_download=_XMLTV_HEADER_MAX_DOWNLOAD,
+        max_decoded=_XMLTV_HEADER_MAX_DECOMPRESSED,
+        transport=_PinnedSSRFTransport(verify=True),
+    )
+    try:
+        async for chunk in stream:
+            previous_length = len(output)
+            output.extend(chunk)
+            if output.find(b"<programme", max(0, previous_length - 10)) >= 0:
+                break
+    finally:
+        await stream.aclose()
     return await run_cpu_bound(
         _parse_bounded_xmltv_header, bytes(output), int(source.get("id"))
     )

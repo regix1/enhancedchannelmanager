@@ -374,7 +374,7 @@ class TestGuideMigration:
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
 
         with patch("security.ssrf.socket.getaddrinfo", side_effect=resolve), patch(
-            "routers.epg.get_ssrf_mode", return_value=mode
+            "security.ssrf.get_ssrf_mode", return_value=mode
         ), patch("tasks.dbas_sync_client.get_ssrf_mode", return_value=mode):
             with pytest.raises(HTTPException) as exc:
                 await _load_xmltv_migration_index({"id": 1, "url": url})
@@ -430,15 +430,16 @@ class TestGuideMigration:
                 )
         assert exc.value.status_code == 400
 
-    def test_gzip_decompression_is_bounded_including_unconsumed_tail(self):
-        from routers import epg
+    @pytest.mark.asyncio
+    async def test_gzip_decompression_is_bounded_including_unconsumed_tail(self):
+        from routers.epg import _load_xmltv_migration_index
 
-        payload = gzip.compress(b"A" * 4096)
-        output = bytearray()
-        decompressor = epg.zlib.decompressobj(epg.zlib.MAX_WBITS | 16)
-        with patch("routers.epg._XMLTV_HEADER_MAX_DECOMPRESSED", 64):
+        content = gzip.compress(b"<tv>" + b"A" * 4096 + b"</tv>")
+        fake_http = _FakeEPGHTTPClient({"https://epg.test/large.xml.gz": content})
+        with patch("routers.epg.httpx.AsyncClient", return_value=fake_http), \
+             patch("routers.epg._XMLTV_HEADER_MAX_DECOMPRESSED", 64):
             with pytest.raises(HTTPException) as exc:
-                epg._append_gzip_bounded(decompressor, payload, output)
+                await _load_xmltv_migration_index({"id": 1, "url": "https://epg.test/large.xml.gz"})
         assert exc.value.status_code == 413
 
     @pytest.mark.asyncio
@@ -1488,7 +1489,7 @@ class TestRefreshEPGSource:
         mock_client.refresh_epg_source.return_value = {"status": "refreshing"}
 
         with patch("routers.epg.get_client", return_value=mock_client), \
-             patch("routers.epg.asyncio.create_task"):
+             patch("routers.epg.asyncio.create_task", side_effect=lambda coroutine: coroutine.close()):
             response = await async_client.post("/api/epg/sources/1/refresh")
 
         assert response.status_code == 200
@@ -1506,11 +1507,40 @@ class TestRefreshEPGSource:
 
         with patch("routers.epg.get_client", return_value=mock_client), \
              patch("routers.epg.send_alert", new=AsyncMock()), \
-             patch("routers.epg.asyncio.create_task"):
+             patch("routers.epg.asyncio.create_task", side_effect=lambda coroutine: coroutine.close()):
             response = await async_client.post("/api/epg/sources/999/refresh")
 
         assert response.status_code == 404
         assert "Not found" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("completed", [True, False])
+    async def test_completion_report_uses_shared_checked_result(self, completed):
+        from routers.epg import _poll_epg_refresh_completion
+
+        with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=completed)) as wait, \
+             patch("routers.epg.get_client", return_value=AsyncMock()), \
+             patch("routers.epg.send_alert", new=AsyncMock()) as alert, \
+             patch("routers.epg.journal") as journal, \
+             patch("routers.epg.get_cache") as cache:
+            await _poll_epg_refresh_completion(4, "Sports", "before")
+        assert wait.await_args.kwargs["trigger"] is False
+        assert wait.await_args.kwargs["initial_source"] == {"updated_at": "before"}
+        assert alert.await_args.kwargs["notification_type"] == ("success" if completed else "warning")
+        assert journal.log_entry.called is completed
+        assert cache.return_value.invalidate_prefix.called is completed
+
+    @pytest.mark.asyncio
+    async def test_cancelled_completion_does_not_report_success(self):
+        import asyncio
+        from routers.epg import _poll_epg_refresh_completion
+
+        with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(side_effect=asyncio.CancelledError)), \
+             patch("routers.epg.get_client", return_value=AsyncMock()), \
+             patch("routers.epg.send_alert", new=AsyncMock()) as alert:
+            with pytest.raises(asyncio.CancelledError):
+                await _poll_epg_refresh_completion(4, "Sports", "before")
+        alert.assert_not_awaited()
 
 
 class TestTriggerEPGImport:
@@ -1546,7 +1576,7 @@ class TestGetEPGData:
 
         assert response.status_code == 200
         mock_client.get_epg_data.assert_called_once_with(
-            page=1, page_size=100, search=None, epg_source=None,
+            page=1, page_size=100, search=None, epg_source=None, max_results=None,
         )
 
     @pytest.mark.asyncio
@@ -1562,7 +1592,7 @@ class TestGetEPGData:
 
         assert response.status_code == 200
         mock_client.get_epg_data.assert_called_once_with(
-            page=1, page_size=100, search="ESPN", epg_source=1,
+            page=1, page_size=100, search="ESPN", epg_source=1, max_results=None,
         )
 
     @pytest.mark.asyncio
@@ -1594,6 +1624,56 @@ class TestGetEPGData:
 
         assert response.status_code == 422
         mock_client.get_epg_data.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_forwards_total_limit_with_query_and_source(self, async_client):
+        client = AsyncMock()
+        client.get_epg_data.return_value = [{"id": 731, "epg_source": 49, "tvg_id": "32645", "name": "Sports"}]
+        with patch("routers.epg.get_client", return_value=client):
+            response = await async_client.get("/api/epg/data", params={
+                "search": "Sports", "epg_source": 49, "page": 2, "page_size": 10, "limit": 25,
+            })
+        assert response.status_code == 200, response.text
+        assert response.json() == client.get_epg_data.return_value
+        client.get_epg_data.assert_awaited_once_with(
+            page=2, page_size=10, search="Sports", epg_source=49, max_results=25,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("limit", [0, -1, 1001])
+    async def test_invalid_total_limit_does_not_fetch_catalogue(self, async_client, limit):
+        with patch("routers.epg.get_client") as get_client:
+            response = await async_client.get("/api/epg/data", params={"limit": limit})
+        assert response.status_code == 422
+        get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_catalogue_search_accepts_only_bound_private_service_claim(self, async_client):
+        from types import SimpleNamespace
+        from auth.mcp_service import MCP_CLAIM_HEADER, MCPServiceCredentials, issue_test_claim
+
+        path = "/api/epg/data"
+        credentials = MCPServiceCredentials("private-search-key", "private-search-confirmation")
+        target = f"{path}?search=Sports&epg_source=49&limit=25"
+        claim = issue_test_claim(credentials, "GET", target, None)
+        client = AsyncMock()
+        client.get_epg_data.return_value = []
+        with (
+            patch("main.get_auth_settings", return_value=SimpleNamespace(require_auth=True, setup_complete=True)),
+            patch("main.get_settings", return_value=SimpleNamespace(mcp_api_key="public-listener-key")),
+            patch("main.load_mcp_service_credentials", return_value=credentials),
+            patch("routers.epg.get_client", return_value=client),
+        ):
+            response = await async_client.get(
+                target,
+                headers={"Authorization": "Bearer private-search-key", MCP_CLAIM_HEADER: claim},
+            )
+            refused = await async_client.get(path, headers={"Authorization": "Bearer public-listener-key"})
+        assert response.status_code == 200, response.text
+        assert refused.status_code == 403
+        client.get_epg_data.assert_awaited_once_with(
+            page=1, page_size=100, search="Sports", epg_source=49, max_results=25,
+        )
 
 
 class TestGetEPGDataById:
@@ -1717,6 +1797,20 @@ class TestGetEPGLCN:
         )
         assert resp.status_code == 200
         assert resp.json()["lcn"] == "206"
+
+
+    @pytest.mark.asyncio
+    async def test_large_gzip_source_lcn_is_decompressed(self, async_client):
+        url = "http://epg.example/xmltv.xml.gz"
+        upstream = AsyncMock()
+        upstream.get_epg_sources.return_value = [{"id": 1, "name": "XMLTV", "source_type": "xmltv", "url": url}]
+        content = gzip.compress(_xmltv('<channel id="ESPN.us"><display-name>ESPN</display-name><lcn>123</lcn></channel>'))
+        http_client = _FakeEPGHTTPClient({url: content})
+        http_client.head = AsyncMock(return_value=httpx.Response(200, headers={"content-length": "500000000"}))
+        with patch("routers.epg.get_client", return_value=upstream), patch("routers.epg.httpx.AsyncClient", return_value=http_client):
+            response = await async_client.get("/api/epg/lcn", params={"tvg_id": "ESPN.us"})
+        assert response.status_code == 200, response.text
+        assert str(response.json()["lcn"]) == "123"
 
 
 class TestBatchLCN:

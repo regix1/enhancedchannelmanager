@@ -185,6 +185,7 @@ _DUMMY_EPG_PROFILE_FIELDS = frozenset({
     "categories", "channel_logo_url_template", "program_poster_url_template",
     "tvg_id_template", "include_date_tag", "include_live_tag", "include_new_tag",
     "pattern_builder_examples", "pattern_variants", "channel_group_ids",
+    "epg_source_ids", "channel_mappings",
 })
 
 
@@ -589,6 +590,12 @@ ENDPOINTS: dict[str, Endpoint] = {
         method="POST",
         path="/api/epg/sources/{source_id}/refresh",
     ),
+    "epg_search": Endpoint(
+        name="epg_search",
+        method="GET",
+        path="/api/epg/data",
+        query_params=frozenset({"search", "epg_source", "page", "page_size", "limit"}),
+    ),
     "epg_match": Endpoint(
         name="epg_match",
         method="POST",
@@ -636,7 +643,13 @@ ENDPOINTS: dict[str, Endpoint] = {
         name="dummy_epg_get_profile",
         method="GET",
         path="/api/dummy-epg/profiles/{profile_id}",
-        response_fields=frozenset({"id", "name", "enabled", "channel_group_ids"}),
+        response_fields=frozenset({"id", "name", "enabled", "channel_group_ids", "epg_source_ids", "channel_mappings"}),
+    ),
+    "dummy_epg_coverage": Endpoint(
+        name="dummy_epg_coverage",
+        method="GET",
+        path="/api/dummy-epg/profiles/{profile_id}/coverage",
+        response_fields=frozenset({"generated_at", "window_start", "window_stop", "sources", "channels"}),
     ),
     "dummy_epg_create_profile": Endpoint(
         name="dummy_epg_create_profile",

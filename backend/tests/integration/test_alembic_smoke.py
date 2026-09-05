@@ -1832,6 +1832,12 @@ class TestSmartBootstrapFastPath:
                     "ADD COLUMN measured_bitrate BIGINT"
                 ))
                 conn.execute(text(
+                    "ALTER TABLE dummy_epg_profiles ADD COLUMN epg_source_ids TEXT"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dummy_epg_profiles ADD COLUMN channel_mappings TEXT"
+                ))
+                conn.execute(text(
                     "ALTER TABLE password_reset_tokens "
                     "ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
                 ))
@@ -4147,7 +4153,7 @@ class TestMigration0051:
             else:
                 command.upgrade(cfg, "head")
             database._assert_schema_matches_models(engine)
-            assert database.get_current_schema_revision(engine) == "0051"
+            assert database.get_current_schema_revision(engine) == database.get_alembic_head_revision()
             assert "sync_logos" in _column_names(engine, "sync_targets")
             with engine.connect() as conn:
                 row = conn.execute(text(

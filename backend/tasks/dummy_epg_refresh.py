@@ -5,6 +5,8 @@ Scheduled task to regenerate ECM dummy EPG XMLTV data and refresh
 matching sources in Dispatcharr.
 """
 import asyncio
+import time
+from typing import Callable
 import logging
 from datetime import datetime
 from typing import Optional
@@ -26,36 +28,48 @@ async def wait_for_epg_source_refresh(
     source_name: str,
     poll_interval: int = POLL_INTERVAL_SECONDS,
     max_wait: int = MAX_WAIT_SECONDS,
+    *,
+    initial_source: dict | None = None,
+    trigger: bool = True,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bool:
-    """Poll until a Dispatcharr EPG source finishes refreshing.
-
-    Returns True if refresh completed, False on timeout.
-    Reusable by both DummyEPGRefreshTask and auto-creation Pass 5.
-    """
-    initial_source = await client.get_epg_source(source_id)
+    """Trigger or observe a source refresh, returning only confirmed completion."""
+    if cancelled is not None and cancelled():
+        return False
+    if initial_source is None:
+        initial_source = await client.get_epg_source(source_id)
     initial_updated = initial_source.get("updated_at") or initial_source.get("last_updated")
+    if cancelled is not None and cancelled():
+        return False
+    if trigger:
+        await client.refresh_epg_source(source_id)
 
-    logger.info("[DUMMY-EPG] Triggering refresh for: %s (id=%s)", source_name, source_id)
-    await client.refresh_epg_source(source_id)
-
-    from datetime import datetime as _dt
-    wait_start = _dt.utcnow()
+    started = time.monotonic()
+    running_states = {"fetching", "processing", "parsing", "loading", "pending", "running", "queued", "refreshing"}
+    observed_running = str(initial_source.get("status") or "").strip().lower() in running_states
     while True:
-        elapsed = (_dt.utcnow() - wait_start).total_seconds()
-        if elapsed >= max_wait:
-            logger.warning("[DUMMY-EPG] Timeout waiting for %s after %.0fs", source_name, elapsed)
+        if cancelled is not None and cancelled():
             return False
-
-        await asyncio.sleep(poll_interval)
-
+        remaining = max_wait - (time.monotonic() - started)
+        if remaining <= 0:
+            logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
+            return False
+        await asyncio.sleep(min(max(0, poll_interval), remaining))
+        if cancelled is not None and cancelled():
+            return False
         current_source = await client.get_epg_source(source_id)
+        status = str(current_source.get("status") or "").strip().lower()
         current_updated = current_source.get("updated_at") or current_source.get("last_updated")
-
-        if current_updated and current_updated != initial_updated:
-            logger.info("[DUMMY-EPG] %s refresh complete", source_name)
-            return True
-        elif elapsed > 30:
-            logger.info("[DUMMY-EPG] %s — assuming complete after %.0fs", source_name, elapsed)
+        if status in {"error", "failed", "failure", "cancelled", "canceled"}:
+            logger.warning("[EPG-REFRESH] Source %s ended with status %s", source_id, status)
+            return False
+        if status in running_states:
+            observed_running = True
+            continue
+        succeeded = status in {"success", "completed", "complete", "ok", "done"}
+        changed = bool(current_updated and current_updated != initial_updated)
+        if (succeeded and (changed or observed_running)) or (not status and changed):
+            logger.info("[EPG-REFRESH] Source %s refresh complete", source_id)
             return True
 
 
@@ -84,85 +98,40 @@ class DummyEPGRefreshTask(TaskScheduler):
         super().__init__(schedule_config)
 
     async def _regenerate_xmltv(self) -> int:
-        """Regenerate XMLTV cache for all enabled profiles. Returns profile count."""
+        """Regenerate combined and profile guides from the shared source inputs."""
         from database import get_session
         from models import DummyEPGProfile
         from dummy_epg_engine import generate_xmltv
         from cache import get_cache
+        from concurrency import run_cpu_bound
+        from services.epg_programmes import _fetch_all_channels, can_cache, prepare_profiles
 
         cache = get_cache()
-        cache.invalidate_prefix("dummy_epg_xmltv")
-
         db = get_session()
         try:
             profiles = db.query(DummyEPGProfile).filter(
                 DummyEPGProfile.enabled == True  # noqa: E712
             ).all()
-
             if not profiles:
+                cache.invalidate_prefix("dummy_epg_xmltv")
                 return 0
-
             client = get_client()
-            # Fetch channels from Dispatcharr
-            all_channels = []
-            page = 1
-            while True:
-                resp = await client.get_channels(page=page, page_size=500)
-                results = resp.get("results", [])
-                all_channels.extend(results)
-                if not resp.get("next"):
-                    break
-                page += 1
-            channel_map = {ch["id"]: ch for ch in all_channels}
-
-            # Resolve stream IDs to stream dicts (API returns ints)
-            all_stream_ids = set()
-            for ch in all_channels:
-                for s in ch.get("streams", []):
-                    if isinstance(s, int):
-                        all_stream_ids.add(s)
-            if all_stream_ids:
-                try:
-                    stream_details = await client.get_streams_by_ids(list(all_stream_ids))
-                    stream_by_id = {s["id"]: s for s in stream_details}
-                    for ch in channel_map.values():
-                        raw = ch.get("streams", [])
-                        if raw and isinstance(raw[0], int):
-                            ch["streams"] = [
-                                stream_by_id.get(sid, {"id": sid, "name": f"Stream {sid}"})
-                                for sid in raw
-                            ]
-                except Exception as e:
-                    logger.warning("[%s] Failed to resolve stream names: %s", self.task_id, e)
-
-            # Resolve group IDs to channel assignments
-            def _resolve(group_ids):
-                group_set = set(group_ids)
-                return [
-                    {"channel_id": ch_id, "channel_name": ch.get("name", "")}
-                    for ch_id, ch in channel_map.items()
-                    if (ch.get("channel_group_id") or ch.get("channel_group")) in group_set
-                ]
-
-            # Generate combined XMLTV
-            profile_data = []
-            for profile in profiles:
-                p_dict = profile.to_dict()
-                p_dict["channel_assignments"] = _resolve(p_dict.get("channel_group_ids", []))
-                p_dict["channel_map"] = channel_map
-                profile_data.append(p_dict)
-
-            xml_string = generate_xmltv(profile_data, channel_map)
-            cache.set("dummy_epg_xmltv_all", xml_string)
-
-            # Also cache per-profile
-            for profile in profiles:
-                p_dict = profile.to_dict()
-                p_dict["channel_assignments"] = _resolve(p_dict.get("channel_group_ids", []))
-                p_dict["channel_map"] = channel_map
-                per_xml = generate_xmltv([p_dict], channel_map)
-                cache.set(f"dummy_epg_xmltv_{profile.id}", per_xml)
-
+            channel_map = await _fetch_all_channels(client)
+            profile_data, _coverage = await prepare_profiles(
+                [profile.to_dict() for profile in profiles], channel_map, client,
+                wait_for_sources=True,
+            )
+            xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
+            per_profile = {}
+            for profile in profile_data:
+                per_profile[profile["id"]] = await run_cpu_bound(
+                    generate_xmltv, [profile], channel_map,
+                )
+            cache.invalidate_prefix("dummy_epg_xmltv")
+            if can_cache(_coverage):
+                cache.set("dummy_epg_xmltv_all", xml_string)
+                for profile_id, per_xml in per_profile.items():
+                    cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
             logger.info("[%s] Regenerated XMLTV for %s profiles", self.task_id, len(profiles))
             return len(profiles)
         finally:
@@ -250,34 +219,15 @@ class DummyEPGRefreshTask(TaskScheduler):
             )
 
             try:
-                initial_source = await client.get_epg_source(source_id)
-                initial_updated = initial_source.get("updated_at") or initial_source.get("last_updated")
-
-                logger.info("[%s] Triggering refresh for: %s (id=%s)", self.task_id, source_name, source_id)
-                await client.refresh_epg_source(source_id)
-
-                # Poll until refresh completes
-                self._set_progress(current_item=f"Waiting for {source_name}...")
-                wait_start = datetime.utcnow()
-
-                while not self._cancel_requested:
-                    elapsed = (datetime.utcnow() - wait_start).total_seconds()
-                    if elapsed >= MAX_WAIT_SECONDS:
-                        logger.warning("[%s] Timeout waiting for %s", self.task_id, source_name)
-                        break
-
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
-                    current_source = await client.get_epg_source(source_id)
-                    current_updated = current_source.get("updated_at") or current_source.get("last_updated")
-
-                    if current_updated and current_updated != initial_updated:
-                        logger.info("[%s] %s refresh complete", self.task_id, source_name)
-                        break
-                    elif elapsed > 30:
-                        logger.info("[%s] %s - assuming complete after %.0fs", self.task_id, source_name, elapsed)
-                        break
-
+                completed = await wait_for_epg_source_refresh(
+                    client, source_id, source_name,
+                    poll_interval=POLL_INTERVAL_SECONDS, max_wait=MAX_WAIT_SECONDS,
+                    cancelled=lambda: self._cancel_requested,
+                )
+                if self._cancel_requested:
+                    break
+                if not completed:
+                    raise RuntimeError("EPG source refresh did not complete successfully")
                 success_count += 1
                 refreshed.append(source_name)
                 self._increment_progress(success_count=1)
@@ -313,7 +263,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             msg += f", {failed_count} failed"
 
         return TaskResult(
-            success=True,
+            success=failed_count == 0 or success_count > 0,
             message=msg,
             started_at=started_at,
             completed_at=datetime.utcnow(),

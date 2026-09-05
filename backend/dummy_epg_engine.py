@@ -5,10 +5,11 @@ Generates XMLTV XML from channel/stream names using regex pattern matching,
 substitution pairs, and template rendering.
 """
 
+import copy
 import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytz
 
@@ -615,6 +616,65 @@ def generate_channel_xml(
     def _render_url(template: str, groups: dict) -> str:
         return render_url_template(template, groups)
 
+    if profile.get("epg_source_ids"):
+        from services.epg_programmes import programme_times
+
+        start = profile.get("guide_start")
+        stop = profile.get("guide_stop")
+        if start is None or stop is None:
+            midnight = datetime(now.year, now.month, now.day)
+            start = tz.localize(midnight).astimezone(timezone.utc)
+            stop = tz.localize(midnight + timedelta(days=2)).astimezone(timezone.utc)
+        source_channel = profile.get("source_channels", {}).get(channel_id)
+        if source_channel is not None:
+            for icon in source_channel.findall("icon"):
+                channel_el.append(copy.deepcopy(icon))
+        template_groups = {**base_groups, **(groups or {})}
+        if groups:
+            template_groups.update({
+                key: value for key, value in compute_event_times(
+                    groups, event_timezone, output_timezone, program_duration
+                ).items() if not isinstance(value, datetime)
+            })
+        logo_url = _render_url(get_template("channel_logo_url_template"), template_groups)
+        if logo_url:
+            for icon in list(channel_el.findall("icon")):
+                channel_el.remove(icon)
+            ET.SubElement(channel_el, "icon", src=logo_url)
+        cursor = start
+        for original in profile.get("source_programmes", {}).get(channel_id, []):
+            try:
+                begin, end = programme_times(original)
+            except ValueError:
+                continue
+            begin, end = max(cursor, begin, start), min(end, stop)
+            if end <= begin:
+                continue
+            if begin > cursor:
+                programmes.append(_make_programme(
+                    cursor, begin, channel_id_str, "Programming unavailable",
+                    "No confirmed programme listing is available for this time.",
+                    [], "", False, False, False,
+                ))
+            programme = copy.deepcopy(original)
+            programme.set("channel", channel_id_str)
+            programme.set("start", _xmltv_datetime(begin))
+            programme.set("stop", _xmltv_datetime(end))
+            poster_url = _render_url(get_template("program_poster_url_template"), template_groups)
+            if poster_url:
+                for icon in list(programme.findall("icon")):
+                    programme.remove(icon)
+                ET.SubElement(programme, "icon", src=poster_url)
+            programmes.append(programme)
+            cursor = end
+        if cursor < stop:
+            programmes.append(_make_programme(
+                cursor, stop, channel_id_str, "Programming unavailable",
+                "No confirmed programme listing is available for this time.",
+                [], "", False, False, False,
+            ))
+        return channel_el, programmes
+
     if groups is not None:
         # Matched -- compute times and render templates
         time_vars = compute_event_times(
@@ -751,6 +811,19 @@ def generate_channel_xml(
     return channel_el, programmes
 
 
+def get_xmltv_id(assignment: dict, channel: dict, profile: dict) -> str:
+    """Render the stable outward identifier used by every guide view."""
+    if assignment.get("tvg_id_override"):
+        return assignment["tvg_id_override"]
+    channel_id = assignment["channel_id"]
+    number = channel.get("channel_number")
+    return render_template(profile.get("tvg_id_template", "ecm-{channel_id}"), {
+        "channel_id": str(channel_id),
+        "channel_number": str(int(number)) if number is not None else str(channel_id),
+        "channel_name": channel.get("name", "Unknown"),
+    })
+
+
 def generate_xmltv(
     profiles: list[dict],
     channel_data: dict[int, dict],
@@ -772,7 +845,9 @@ def generate_xmltv(
     all_channels = []
     all_programmes = []
 
-    for profile in profiles:
+    seen_channels = set()
+    seen_ids = set()
+    for profile in sorted(profiles, key=lambda item: (item.get("id") is None, item.get("id") or 0)):
         if not profile.get("enabled", True):
             continue
 
@@ -786,29 +861,20 @@ def generate_xmltv(
                 )
                 continue
 
+            if ch_id in seen_channels:
+                continue
             ch_info = channel_data[ch_id]
             ch_name = ch_info.get("name", "Unknown")
             ch_number = ch_info.get("channel_number")
             streams = ch_info.get("streams", [])
 
-            # Determine tvg_id
-            tvg_id_override = assignment.get("tvg_id_override")
-            if tvg_id_override:
-                tvg_id = tvg_id_override
-            else:
-                # Keyed on the channel id, which is never reissued, rather
-                # than the channel number, which is handed out from 1 again
-                # every time channels are rebuilt. A recycled id makes the
-                # guide client attach the previous holder's programmes to
-                # whatever event now carries that number. [78]
-                tvg_id_template = profile.get("tvg_id_template", "ecm-{channel_id}")
-                tvg_id_groups = {
-                    "channel_id": str(ch_id),
-                    "channel_number": str(int(ch_number)) if ch_number is not None else str(ch_id),
-                    "channel_name": ch_name,
-                }
-                tvg_id = render_template(tvg_id_template, tvg_id_groups)
+            tvg_id = get_xmltv_id(assignment, ch_info, profile)
 
+            seen_channels.add(ch_id)
+            if tvg_id in seen_ids:
+                logger.warning("[DUMMY-EPG] Duplicate XMLTV ID for channel %s, skipping", ch_id)
+                continue
+            seen_ids.add(tvg_id)
             channel_el, programmes = generate_channel_xml(
                 ch_id, ch_name, ch_number, tvg_id, profile, streams
             )

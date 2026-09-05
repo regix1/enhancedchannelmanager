@@ -4652,11 +4652,10 @@ class TestChannelPipelineEngineAutoLink:
         self.client.get_streams.assert_not_called()
 
     def test_a_channel_the_matcher_rejected_is_not_matched_again(self):
-        """A channel nothing can match costs one channel fetch per run, not a
-        full EPG sweep every minute forever.
+        """Unchanged channel, source and stream identity avoids another row scan.
 
         20 is under the threshold of 80, so the first pass records channel 7 and
-        the second one stops at the channel fetch.
+        the next pass reuses that rejection during the five-minute interval.
         """
         self._link(matches=[_epg_match(7, "ESPN", 55, 20)])
         self.client.get_epg_data.reset_mock()
@@ -4666,6 +4665,53 @@ class TestChannelPipelineEngineAutoLink:
         assert linked == 0
         self.client.get_epg_data.assert_not_called()
         mock_batch.assert_not_called()
+
+    @pytest.mark.parametrize("change", ["channel", "tvg", "stream", "source", "expiry"])
+    def test_rejected_match_retries_when_its_inputs_change(self, change):
+        self.client.get_epg_sources.return_value = [{"id": 1, "updated_at": "old"}]
+        self.client.get_streams_by_ids.return_value = [{"id": 101, "name": "ESPN"}]
+        self._link(matches=[])
+        if change == "channel":
+            self.client.get_channels.return_value["results"][0]["name"] = "ESPN 2"
+        elif change == "tvg":
+            self.client.get_channels.return_value["results"][0]["tvg_id"] = "espn2.us"
+        elif change == "stream":
+            self.client.get_streams_by_ids.return_value[0]["name"] = "ESPN 2"
+        elif change == "source":
+            self.client.get_epg_sources.return_value[0]["updated_at"] = "new"
+        else:
+            self.engine._epg_link_checked_at -= 301
+        linked, matcher = self._link(matches=[_epg_match(7, "ESPN", 55, 95)])
+        assert linked == 1
+        matcher.assert_called_once()
+
+    def test_automatic_dummy_links_import_each_source_once(self):
+        self.client.get_channels.return_value = {
+            "count": 2,
+            "results": [
+                {"id": 7, "name": "Event 7", "epg_data_id": None, "streams": []},
+                {"id": 8, "name": "Event 8", "epg_data_id": None, "streams": []},
+            ],
+        }
+        self.client.get_epg_sources.return_value = [{
+            "id": 46, "name": "Guide", "url": "http://ecm/api/dummy-epg/xmltv",
+        }]
+        self.client.get_epg_data.return_value = [
+            {"id": 55, "epg_source": 46}, {"id": 56, "epg_source": 46},
+        ]
+        programmes = []
+
+        async def import_linked(*args, **kwargs):
+            programmes.extend(call.args[0] for call in self.client.update_channel.await_args_list)
+            return True
+
+        with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=import_linked) as refresh:
+            linked, _ = self._link(matches=[
+                _epg_match(7, "Event 7", 55, 95), _epg_match(8, "Event 8", 56, 95),
+            ])
+        assert linked == 2
+        assert programmes == [7, 8]
+        refresh.assert_awaited_once()
 
     def test_one_rejected_channel_does_not_suppress_the_pass_for_a_new_one(self):
         """A channel the pass has never tried reopens the match, and the

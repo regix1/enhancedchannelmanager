@@ -22,6 +22,85 @@ _PREVIEW_KEY_DOMAIN = b"ecm:guide-migration:preview-token:v1"
 _PREVIEW_INSTANCE_DOMAIN = b"ecm:guide-migration:instance:v1"
 
 
+async def stream_xmltv(
+    source: dict, *, max_download: int, max_decoded: int,
+    timeout: float = 120.0, transport=None,
+):
+    """Yield bounded, validated XML chunks without retaining the document."""
+    import asyncio
+    import zlib
+    from urllib.parse import urljoin
+
+    import httpx
+    from fastapi import HTTPException
+    from security.ssrf import SSRFError, check_redirect_depth, get_ssrf_mode, validate_redirect
+    from tasks.dbas_sync_client import _PinnedSSRFTransport
+
+    url = source.get("url")
+    if not url:
+        raise HTTPException(400, "XMLTV source has no downloadable URL.")
+    downloaded = decoded = 0
+    guard = b""
+    compressed = str(url).lower().split("?", 1)[0].endswith(".gz")
+    decompressor = None
+    try:
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=False,
+                transport=transport or _PinnedSSRFTransport(verify=True),
+            ) as http_client:
+                current_url = url
+                depth = 0
+                while True:
+                    async with http_client.stream("GET", current_url) as response:
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise HTTPException(502, "XMLTV source returned an invalid redirect.")
+                            depth += 1
+                            check_redirect_depth(depth)
+                            next_url = urljoin(current_url, location)
+                            validate_redirect(current_url, next_url, get_ssrf_mode())
+                            current_url = next_url
+                            continue
+                        response.raise_for_status()
+                        compressed = compressed or response.headers.get("content-encoding", "").lower() == "gzip"
+                        if compressed:
+                            decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                        async for chunk in response.aiter_raw():
+                            downloaded += len(chunk)
+                            if downloaded > max_download:
+                                raise HTTPException(413, "XMLTV download exceeds its size limit.")
+                            pending = chunk
+                            while pending:
+                                if decompressor is None:
+                                    piece, pending = pending[:65536], pending[65536:]
+                                else:
+                                    piece = decompressor.decompress(pending, min(65536, max_decoded - decoded + 1))
+                                    pending = decompressor.unconsumed_tail
+                                decoded += len(piece)
+                                if decoded > max_decoded:
+                                    raise HTTPException(413, "XMLTV decoded content exceeds its size limit.")
+                                probe = (guard + piece).lower()
+                                if b"<!doctype" in probe or b"<!entity" in probe or b"\x00" in probe:
+                                    raise HTTPException(422, "XMLTV DTDs, entities and non-UTF encodings are not supported.")
+                                guard = probe[-16:]
+                                if piece:
+                                    yield piece
+                            if decompressor is not None and decompressor.unused_data:
+                                raise HTTPException(422, "XMLTV gzip has trailing content.")
+                        if decompressor is not None and not decompressor.eof:
+                            raise HTTPException(422, "XMLTV gzip is incomplete.")
+                    break
+    except HTTPException:
+        raise
+    except SSRFError as exc:
+        raise HTTPException(400, "XMLTV source URL is blocked by the outbound security policy.") from exc
+    except (httpx.HTTPError, TimeoutError, zlib.error) as exc:
+        raise HTTPException(502, "Could not read the configured XMLTV source.") from exc
+
+
 class PreviewTokenError(ValueError):
     """A preview token is invalid, expired, or for another actor/instance."""
 

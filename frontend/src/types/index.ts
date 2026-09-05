@@ -1854,6 +1854,36 @@ export interface PatternVariant {
 }
 
 // Dummy EPG profile configuration
+export interface DummyEPGMapping {
+  channel_id: number;
+  source_id: number;
+  tvg_id: string;
+}
+
+export interface DummyEPGCoverage {
+  generated_at: string;
+  window_start: string;
+  window_stop: string;
+  sources: {
+    source_id: number;
+    status: string;
+    last_success: string | null;
+    error: string | null;
+  }[];
+  channels: {
+    channel_id: number;
+    xmltv_id: string;
+    source_id: number | null;
+    source_tvg_id: string | null;
+    match: string;
+    current: { start: string; stop: string; title: string } | null;
+    next: { start: string; stop: string; title: string } | null;
+    real_minutes: number;
+    gap_minutes: number;
+    warnings: string[];
+  }[];
+}
+
 export interface DummyEPGProfile {
   id: number;
   name: string;
@@ -1885,6 +1915,8 @@ export interface DummyEPGProfile {
   pattern_builder_examples: string | null;
   pattern_variants: PatternVariant[];
   channel_group_ids: number[];
+  epg_source_ids?: number[];
+  channel_mappings?: DummyEPGMapping[];
   last_generated_at: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -1923,6 +1955,8 @@ export interface DummyEPGProfileCreateRequest {
   pattern_builder_examples?: string;
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
+  epg_source_ids?: number[];
+  channel_mappings?: DummyEPGMapping[];
 }
 
 // Request to update a profile (partial)
@@ -1956,6 +1990,8 @@ export interface DummyEPGProfileUpdateRequest {
   pattern_builder_examples?: string | null;
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
+  epg_source_ids?: number[];
+  channel_mappings?: DummyEPGMapping[];
 }
 
 // Preview request (no DB)

@@ -3,6 +3,8 @@ import type {
   DummyEPGProfile,
   DummyEPGProfileCreateRequest,
   DummyEPGPreviewResult,
+  DummyEPGCoverage,
+  EPGSource,
   SubstitutionPair,
   PatternVariant,
   ChannelGroup,
@@ -17,12 +19,8 @@ import { VariantTabs } from './patternBuilder/VariantTabs';
 import './ModalBase.css';
 import './DummyEPGProfileModal.css';
 
-// The guide no longer ends an event at its scheduled stop time, so the ended
-// templates only reach the preview. Shown under both the profile-level pair
-// and the per-variant overrides so an operator cannot type into a field that
-// looks like it changes the guide.
 const ENDED_TEMPLATE_HINT =
-  'These show in the preview but no longer in the generated guide. An event that runs past its scheduled length now keeps its own title until the next programme.';
+  'Without programme sources, ended templates use the inferred event duration. This is a scheduled end, not confirmation that playback has finished.';
 
 const TIMEZONES = [
   { value: '', label: '-- None --' },
@@ -145,6 +143,14 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const [channelGroupIds, setChannelGroupIds] = useState<number[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [groupSearchTerm, setGroupSearchTerm] = useState('');
+  const [epgSources, setEpgSources] = useState<EPGSource[]>([]);
+  const [epgSourceIds, setEpgSourceIds] = useState<number[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [sourcesError, setSourcesError] = useState(false);
+  const [coverage, setCoverage] = useState<DummyEPGCoverage | null>(null);
+  const [coverageLoading, setCoverageLoading] = useState(false);
+  const [coverageError, setCoverageError] = useState(false);
+  const coverageRequest = useRef(0);
 
   // Substitution Pairs (profile-level)
   const [substitutionPairs, setSubstitutionPairs] = useState<SubstitutionPair[]>([]);
@@ -232,6 +238,22 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
     }
   }, [isOpen]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    setSourcesLoading(true);
+    setSourcesError(false);
+    coverageRequest.current += 1;
+    setCoverage(null);
+    setCoverageError(false);
+    setCoverageLoading(false);
+    api.getEPGSources()
+      .then(sources => { if (active) setEpgSources(sources); })
+      .catch(() => { if (active) setSourcesError(true); })
+      .finally(() => { if (active) setSourcesLoading(false); });
+    return () => { active = false; coverageRequest.current += 1; };
+  }, [isOpen, profile?.id]);
+
   // Load profile data when modal opens
   useEffect(() => {
     if (isOpen) {
@@ -239,6 +261,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setName(profile.name);
         setEnabled(profile.enabled);
         setChannelGroupIds(profile.channel_group_ids || []);
+        setEpgSourceIds(profile.epg_source_ids || []);
         setSubstitutionPairs(profile.substitution_pairs || []);
         setNameSource(profile.name_source);
         setStreamIndex(profile.stream_index);
@@ -262,7 +285,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
         setEventTimezone(profile.event_timezone || 'US/Eastern');
         setOutputTimezone(profile.output_timezone || '');
-        setProgramDuration(profile.program_duration || 180);
+        setProgramDuration(profile.program_duration ?? 180);
         setCategories(profile.categories || '');
         setTvgIdTemplate(profile.tvg_id_template || 'ecm-{channel_id}');
         setIncludeDateTag(profile.include_date_tag || false);
@@ -278,8 +301,9 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         // Import mode: pre-fill from Dispatcharr source data
         const d = importData;
         setName(d.name || '');
-        setEnabled(true);
+        setEnabled(d.enabled ?? true);
         setChannelGroupIds(d.channel_group_ids || []);
+        setEpgSourceIds(d.epg_source_ids || []);
         setSubstitutionPairs(d.substitution_pairs || []);
         setNameSource(d.name_source || 'channel');
         setStreamIndex(d.stream_index || 1);
@@ -295,7 +319,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
           channel_logo_url_template: d.channel_logo_url_template ?? null,
           program_poster_url_template: d.program_poster_url_template ?? null,
         };
-        setVariants([importedVariant]);
+        setVariants(d.pattern_variants?.length ? d.pattern_variants : [importedVariant]);
         setActiveVariantIndex(0);
 
         setUpcomingTitleTemplate(d.upcoming_title_template || '');
@@ -306,7 +330,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setFallbackDescriptionTemplate(d.fallback_description_template || '');
         setEventTimezone(d.event_timezone || 'US/Eastern');
         setOutputTimezone(d.output_timezone || '');
-        setProgramDuration(d.program_duration || 180);
+        setProgramDuration(d.program_duration ?? 180);
         setCategories(d.categories || '');
         setTvgIdTemplate(d.tvg_id_template || 'ecm-{channel_id}');
         setIncludeDateTag(d.include_date_tag || false);
@@ -323,6 +347,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setName('');
         setEnabled(true);
         setChannelGroupIds([]);
+        setEpgSourceIds([]);
         setSubstitutionPairs([]);
         setNameSource('channel');
         setStreamIndex(1);
@@ -451,11 +476,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
     // Validate all variant patterns
     for (const v of variants) {
-      if (!v.title_pattern?.trim()) {
+      if (!v.title_pattern?.trim() && epgSourceIds.length === 0) {
         setError(`Variant "${v.name}" needs a Title Pattern`);
         return;
       }
-      if (!validateRegex(v.title_pattern)) {
+      if (v.title_pattern && !validateRegex(v.title_pattern)) {
         setError(`Variant "${v.name}" has an invalid Title Pattern regex`);
         return;
       }
@@ -516,6 +541,8 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         pattern_builder_examples: v0.pattern_builder_examples || undefined,
         pattern_variants: variants,
         channel_group_ids: channelGroupIds,
+        epg_source_ids: epgSourceIds,
+        ...(!profile && importData?.channel_mappings ? { channel_mappings: importData.channel_mappings } : {}),
       };
 
       if (profile) {
@@ -630,6 +657,99 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                       );
                     })}
                 </div>
+              </div>
+            )}
+
+            <div className="modal-section-divider"><span>Programme Sources</span></div>
+            <p className="modal-section-description">
+              Select existing XMLTV sources for real schedules. Their configured priority breaks ties between equivalent mappings.
+              Uncovered time stays neutral. With no sources selected, the existing name templates generate the guide.
+            </p>
+            {sourcesLoading ? <p role="status">Loading programme sources…</p> : sourcesError ? (
+              <p role="alert">Programme sources could not be loaded. Your saved selection is preserved; reopen this profile to retry.</p>
+            ) : (
+              <div className="dep-group-list" aria-label="Programme sources">
+                {epgSources.filter(source => source.source_type === 'xmltv' && !source.url?.includes('/dummy-epg/xmltv')).map(source => (
+                  <label key={source.id} className={`dep-group-item ${epgSourceIds.includes(source.id) ? 'selected' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={epgSourceIds.includes(source.id)}
+                      disabled={!source.is_active && !epgSourceIds.includes(source.id)}
+                      onChange={() => setEpgSourceIds(ids => ids.includes(source.id) ? ids.filter(id => id !== source.id) : [...ids, source.id])}
+                    />
+                    <span className="dep-group-name">{source.name}{!source.is_active ? ' (disabled)' : ''}</span>
+                  </label>
+                ))}
+                {!epgSources.some(source => source.source_type === 'xmltv' && !source.url?.includes('/dummy-epg/xmltv')) && (
+                  <p>No XMLTV programme sources are available.</p>
+                )}
+              </div>
+            )}
+            {epgSourceIds.filter(id => !epgSources.some(source => source.id === id)).length > 0 && !sourcesLoading && !sourcesError && (
+              <div>
+                <p role="status">Some selected sources are unavailable. Remove them to save a new selection.</p>
+                {epgSourceIds.filter(id => !epgSources.some(source => source.id === id)).map(id => (
+                  <label key={id} className="dep-group-item selected">
+                    <input type="checkbox" checked onChange={() => setEpgSourceIds(ids => ids.filter(item => item !== id))} />
+                    <span className="dep-group-name">Unavailable source {id}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {(profile?.channel_mappings?.length ?? importData?.channel_mappings?.length ?? 0) > 0 && (
+              <p className="form-hint">Original source mappings are remembered automatically when you save. Editing templates keeps these mappings.</p>
+            )}
+            {profile && (
+              <div className="dep-coverage">
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={coverageLoading}
+                  onClick={async () => {
+                    const request = ++coverageRequest.current;
+                    setCoverageLoading(true);
+                    setCoverageError(false);
+                    try {
+                      const result = await api.getDummyEPGCoverage(profile.id);
+                      if (coverageRequest.current === request) setCoverage(result);
+                    } catch {
+                      if (coverageRequest.current === request) setCoverageError(true);
+                    } finally {
+                      if (coverageRequest.current === request) setCoverageLoading(false);
+                    }
+                  }}
+                >{coverageLoading ? 'Checking coverage…' : 'Check saved guide coverage'}</button>
+                <p className="form-hint">Coverage uses the saved profile. Save source or group changes before checking.</p>
+                {coverageLoading && <p role="status">Loading saved guide coverage…</p>}
+                {coverageError && <p role="alert">Guide coverage could not be loaded. Try checking again.</p>}
+                {coverage && !coverageError && (
+                  <div aria-live="polite">
+                    {coverage.sources.map(source => (
+                      <p key={source.source_id}>
+                        {epgSources.find(item => item.id === source.source_id)?.name ?? `Source ${source.source_id}`}: {source.status}
+                        {source.error ? ` — ${source.error}` : ''}
+                      </p>
+                    ))}
+                    {coverage.sources.some(source => source.status === 'pending') && <p>Sources are still loading. Check again shortly; gaps remain neutral.</p>}
+                    {coverage.channels.length === 0 ? <p>No channels are assigned to this saved profile.</p> : (
+                      <div className="dep-coverage-table">
+                        <table>
+                          <thead><tr><th>Channel</th><th>Mapping</th><th>Current / Next</th><th>Real / Gap minutes</th></tr></thead>
+                          <tbody>{coverage.channels.map(channel => (
+                            <tr key={channel.channel_id}>
+                              <td>{channel.xmltv_id}</td>
+                              <td>{channel.match}<br />{channel.source_id === null ? 'No source match' : epgSources.find(item => item.id === channel.source_id)?.name ?? `Source ${channel.source_id}`}
+                                {channel.warnings.map(warning => <p key={warning}>{warning}</p>)}
+                              </td>
+                              <td>{channel.current?.title ?? 'No real programme now'}<br />{channel.current && <span>{new Date(channel.current.start).toLocaleString()} – {new Date(channel.current.stop).toLocaleString()}<br /></span>}{channel.next ? `Next: ${channel.next.title} (${new Date(channel.next.start).toLocaleString()})` : 'No next programme'}</td>
+                              <td>{channel.real_minutes} / {channel.gap_minutes}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -885,7 +1005,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     placeholder="Use profile default"
                     rows={2}
                   />
-                  <p className="form-hint">{ENDED_TEMPLATE_HINT}</p>
+                  <p className="form-hint">{epgSourceIds.length ? "Ended templates apply only when no programme sources are selected. Real schedules use their original times, and uncovered time stays neutral." : ENDED_TEMPLATE_HINT}</p>
                 </div>
                 <div className="modal-form-group">
                   <label>Fallback Title Override</label>
@@ -957,7 +1077,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     placeholder="The {league} match between {team1} and {team2} ran from {starttime} to {endtime}."
                     rows={2}
                   />
-                  <p className="form-hint">{ENDED_TEMPLATE_HINT}</p>
+                  <p className="form-hint">{epgSourceIds.length ? "Ended templates apply only when no programme sources are selected. Real schedules use their original times, and uncovered time stays neutral." : ENDED_TEMPLATE_HINT}</p>
                 </div>
               </div>
             </CollapsibleSection>
@@ -1110,10 +1230,10 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 <input
                   id="depProgramDuration"
                   type="number"
-                  min="1"
+                  min="0"
                   max="1440"
                   value={programDuration}
-                  onChange={(e) => setProgramDuration(parseInt(e.target.value) || 180)}
+                  onChange={(e) => setProgramDuration(e.target.value === '' ? 180 : Number(e.target.value))}
                 />
                 <p className="form-hint">Default duration for each program</p>
               </div>

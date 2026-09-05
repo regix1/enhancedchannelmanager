@@ -378,6 +378,212 @@ class TestEpgGridChannelResolution:
         assert "ITV" not in text
         assert "No EPG schedule data available." not in text
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("details", [None, False])
+    async def test_default_output_and_read_paths_remain_unchanged(self, details):
+        from _endpoint_contracts import ENDPOINTS
+
+        mock_client = _client(side_effect=[
+            [{"channel_uuid": "uuid-1", "title": "News", "start": "06:00", "stop": "07:00"}],
+            [{"id": 42, "uuid": "uuid-1", "name": "BBC One"}],
+        ])
+        arguments = {} if details is None else {"details": details}
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", arguments)
+        assert result[0][0].text == "EPG Schedule (1 programs):\n  [BBC One] News (06:00 - 07:00)"
+        calls = mock_client.call_endpoint.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args == (ENDPOINTS["epg_grid"],)
+        assert calls[0].kwargs == {}
+        assert calls[1].args == (ENDPOINTS["channels_list"],)
+        assert calls[1].kwargs == {"query": {"page": 1, "page_size": 500}}
+        assert all(call.args[0].method == "GET" for call in calls)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("association", [
+        {"channel_id": 42},
+        {"channel_id": "42"},
+        {"channel_uuid": "uuid-1"},
+        {"epg_data_id": 32645},
+        {"epg": 32645},
+        {"channel": {"id": 42, "uuid": "uuid-1", "tvg_id": "ESPN.us"}},
+        {"epg_data": {"id": 32645, "epg_source": 49, "tvg_id": "32645"}},
+    ])
+    async def test_details_preserve_original_association_values(self, association):
+        row = {**association, "id": 900, "title": "Live game",
+               "start_time": "2026-09-05T06:00:00Z", "end_time": "2026-09-05T09:00:00Z"}
+        channel = {"id": 42, "uuid": "uuid-1", "epg_data_id": 32645,
+                   "epg_data": {"id": 32645, "tvg_id": "32645"},
+                   "tvg_id": "ESPN.us", "name": "ESPN"}
+        mock_client = _client(side_effect=[[row], {"results": [channel]}])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        parsed = json.loads(result[0][0].text)
+        assert parsed["programs"] == [row]
+        assert parsed["channels"] == [channel]
+        assert set(association) <= set(parsed["association_fields"])
+        assert parsed["programs_total"] == 1
+        assert parsed["programs_truncated"] is False
+        assert parsed["channels_truncated"] is False
+        assert parsed["channels_error"] is False
+
+    @pytest.mark.asyncio
+    async def test_details_bound_rows_references_and_values(self):
+        grid = [{"channel_ids": list(range(40)), "title": "x" * 300} for _ in range(40)]
+        channels = [{"id": i, "uuid": f"uuid-{i}", "name": "ESPN"} for i in range(1002)]
+        mock_client = _client(side_effect=[grid, {"results": channels}])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True, "limit": 100000})
+        parsed = json.loads(result[0][0].text)
+        assert len(parsed["programs"]) == 25
+        assert parsed["programs_total"] == 40
+        assert parsed["programs_truncated"] is True
+        assert len(parsed["channels"]) == 1000
+        assert parsed["channels_truncated"] is True
+        assert parsed["values_truncated"] is True
+        assert parsed["programs"][0] == {"channel_ids": list(range(25)), "title": "x" * 256}
+        assert len(result[0][0].text) < 100000
+
+    @pytest.mark.asyncio
+    async def test_details_project_identity_without_private_or_nested_values(self):
+        row = {
+            "channel": {"id": 42, "name": "ESPN", "password": "nested-secret",
+                        "epg_source": {"id": 49, "token": "nested-token"}},
+            "epg_listing": {"secret": "unknown-object"},
+            "channel_secret": "association-secret", "title": "Game",
+            "description": "private-description", "icon": "https://private/icon",
+            "channel_name": "https://private/key", "channel_uuids": ["uuid-1", {"secret": "array-secret"}],
+            "uuid": "Bearer private-token",
+        }
+        channel = {"id": 42, "name": "ESPN", "epg_data": {"id": 3, "secret": "source-secret"},
+                   "logo": "https://private/logo", "password": "channel-password"}
+        mock_client = _client(side_effect=[[row], [channel]])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        text = result[0][0].text
+        parsed = json.loads(text)
+        assert parsed["programs"] == [{
+            "channel": {"id": 42, "name": "ESPN"}, "title": "Game", "channel_uuids": ["uuid-1"],
+        }]
+        assert parsed["channels"] == [{"id": 42, "name": "ESPN", "epg_data": {"id": 3}}]
+        assert "epg_listing" in parsed["association_fields"]
+        assert "epg_listing" not in parsed["programs"][0]
+        assert parsed["values_omitted"] is True
+        for value in ("secret", "token", "private", "https://", "password", "description", "icon", "logo"):
+            assert value not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("private", [" \tBearer private-token", " \nBasic private-token", "  //guide.invalid/list?token=private-token", " \twww.guide.invalid/private-token"])
+    async def test_details_omit_whitespace_prefixed_private_values(self, private):
+        mock_client = _client(side_effect=[
+            [{"uuid": private, "title": "  Game  "}],
+            [{"id": 42, "tvg_id": private}],
+        ])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        text = result[0][0].text
+        parsed = json.loads(text)
+        assert "private-token" not in text
+        assert parsed["programs"] == [{"title": "  Game  "}]
+        assert parsed["channels"] == [{"id": 42}]
+        assert parsed["values_omitted"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("row", [
+        {"channel": {"logo": "private-value", "slug": "private-value"}},
+        {"epg_listing": {"id": "private-value"}},
+        {"channel-uuid": "private-value"},
+        {"channel uuid": "private-value"},
+        {"channel_" + "x" * 65: "private-value"},
+        {"channel_secret": "private-value"},
+    ])
+    async def test_details_report_allowlist_only_omissions(self, row):
+        mock_client = _client(side_effect=[[row], []])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        text = result[0][0].text
+        assert "private-value" not in text
+        assert json.loads(text)["values_omitted"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group", ["channels", "programs"])
+    async def test_details_bound_total_encoded_output(self, group):
+        programs, channels = [{"id": 1, "title": "Game"}], []
+        if group == "channels":
+            values = ["x" * 256] * 25
+            channels = [{"id": i, "epg": values, "epg_data": values} for i in range(200)]
+        else:
+            fields = ("id", "uuid", "channel_id", "epg_data_id", "epg_source", "epg_source_id", "tvg_id", "name")
+            nested = {key: ["🏟" * 256] * 25 for key in fields}
+            programs = [{"id": i, "epg_data": nested} for i in range(25)]
+        mock_client = _client(side_effect=[programs, channels])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True, "limit": 25})
+        text = result[0][0].text
+        assert len(text.encode("utf-8")) <= 1024 * 1024
+        parsed = json.loads(text)
+        assert parsed[group + "_truncated"] is True
+        assert 0 < len(parsed[group]) < len(channels if group == "channels" else programs)
+        assert parsed["programs_returned"] == len(parsed["programs"])
+        assert parsed["channels_returned"] == len(parsed["channels"])
+        original = channels if group == "channels" else programs
+        assert parsed[group] == original[:len(parsed[group])]
+
+    @pytest.mark.asyncio
+    async def test_details_keep_all_normal_channel_references(self):
+        channels = [{"id": i, "uuid": f"uuid-{i}", "epg_data_id": 1000 + i, "tvg_id": f"channel-{i}", "name": f"Channel {i}"} for i in range(64)]
+        mock_client = _client(side_effect=[[{"id": 1, "title": "Game"}], channels])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        parsed = json.loads(result[0][0].text)
+        assert parsed["channels"] == channels
+        assert parsed["channels_truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_details_preserve_filter_semantics_and_report_empty_selection(self):
+        mock_client = _client(side_effect=[
+            [{"channel_id": "42", "title": "Game"}],
+            [{"id": 42, "uuid": "uuid-1", "name": "ESPN"}],
+        ])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True, "channel_id": 42})
+        parsed = json.loads(result[0][0].text)
+        assert parsed["programs"] == []
+        assert parsed["programs_total"] == 0
+        assert parsed["channels"][0]["id"] == 42
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("limit", [0, -1])
+    async def test_details_reject_nonpositive_limit_before_reading(self, limit):
+        mock_client = _client()
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True, "limit": limit})
+        assert "limit must be positive" in result[0][0].text
+        mock_client.call_endpoint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_details_report_partial_channel_lookup_failure(self):
+        mock_client = _client(side_effect=[
+            [{"epg_data_id": 3, "title": "Game"}],
+            {"results": [{"id": 42, "uuid": "uuid-1", "name": "ESPN"}], "next": "next-page"},
+            RuntimeError("https://private/token"),
+        ])
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        parsed = json.loads(result[0][0].text)
+        assert parsed["channels_error"] is True
+        assert parsed["channels"] == [{"id": 42, "uuid": "uuid-1", "name": "ESPN"}]
+        assert parsed["programs"] == [{"epg_data_id": 3, "title": "Game"}]
+        assert "private" not in result[0][0].text
+
+    @pytest.mark.asyncio
+    async def test_details_keep_upstream_failure_as_redacted_error(self):
+        mock_client = _client(side_effect=RuntimeError("https://private/token"))
+        with patch("tools.epg.get_ecm_client", return_value=mock_client):
+            result = await _register("epg").call_tool("get_epg_grid", {"details": True})
+        assert result[0][0].text == "Error getting EPG grid."
+        assert mock_client.call_endpoint.call_count == 1
+
 
 # ===========================================================================
 # lq38l.13 #4 — get_auto_creation_rule renders create_channel descriptor

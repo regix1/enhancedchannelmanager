@@ -1,12 +1,13 @@
 """
 Dummy EPG router — profile CRUD, channel assignments, preview, and XMLTV output.
 """
+import asyncio
 import logging
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy.orm import Session
 
 from cache import get_cache
@@ -61,6 +62,13 @@ class PatternVariantModel(BaseModel):
     program_duration: Optional[int] = Field(default=None, ge=0, le=1440)
 
 
+class ChannelMapping(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    channel_id: Annotated[int, Field(strict=True, gt=0)]
+    source_id: Annotated[int, Field(strict=True, gt=0)]
+    tvg_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class ProfileCreateRequest(BaseModel):
     name: str
     enabled: bool = True
@@ -93,6 +101,8 @@ class ProfileCreateRequest(BaseModel):
     pattern_builder_examples: Optional[str] = None
     pattern_variants: Optional[list[PatternVariantModel]] = None
     channel_group_ids: Optional[list[int]] = None
+    epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
+    channel_mappings: Optional[list[ChannelMapping]] = None
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -125,6 +135,8 @@ class ProfileUpdateRequest(BaseModel):
     pattern_builder_examples: Optional[str] = None
     pattern_variants: Optional[list[PatternVariantModel]] = None
     channel_group_ids: Optional[list[int]] = None
+    epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
+    channel_mappings: Optional[list[ChannelMapping]] = None
 
 
 class ImportYAMLRequest(BaseModel):
@@ -253,6 +265,70 @@ def _lint_dummy_epg_profile_request(req) -> None:
         )
 
 
+async def _configure_sources(profile, fields: dict, *, snapshot: dict | None = None) -> None:
+    """Validate source selection and remember explicit external guide bindings."""
+    from services.epg_programmes import _resolve_group_assignments, capture_mappings, resolve_sources
+
+    selected = fields.get("epg_source_ids", profile.get_epg_source_ids()) or []
+    mappings = fields.get("channel_mappings", profile.get_channel_mappings()) or []
+    if len(selected) != len(set(selected)):
+        raise HTTPException(status_code=422, detail="Programme source IDs must be unique")
+    if len({item["channel_id"] for item in mappings}) != len(mappings):
+        raise HTTPException(status_code=422, detail="Only one source mapping is allowed per channel")
+    if not selected:
+        if fields.get("channel_mappings"):
+            raise HTTPException(status_code=422, detail="Channel mappings require selected programme sources")
+        profile.set_epg_source_ids([])
+        profile.set_channel_mappings([])
+        return
+
+    client = get_client()
+    try:
+        snapshot = snapshot if snapshot is not None else {}
+        if "sources" not in snapshot:
+            snapshot["sources"] = await client.get_epg_sources()
+        sources = snapshot["sources"]
+        canonical = resolve_sources(selected, sources)
+        allowed = set(selected) | {source["id"] for source in canonical}
+        if "channel_mappings" in fields and any(item["source_id"] not in allowed for item in mappings):
+            raise ValueError("Channel mappings must belong to selected programme sources")
+        mappings = [item for item in mappings if item["source_id"] in allowed]
+        profile.set_epg_source_ids(selected)
+        profile.set_channel_mappings(mappings)
+        if "channels" not in snapshot:
+            snapshot["channels"] = await _fetch_all_channels()
+        channel_map = snapshot["channels"]
+        assignments = _resolve_group_assignments(profile.get_channel_group_ids(), channel_map)
+        links = set()
+        for assignment in assignments:
+            channel = channel_map[assignment["channel_id"]]
+            link = channel.get("epg_data_id") or channel.get("epg_data")
+            if isinstance(link, int) and not isinstance(link, bool):
+                links.add(link)
+        rows = snapshot.setdefault("rows", {})
+        slots = asyncio.Semaphore(4)
+        async def read_row(link):
+            async with slots:
+                rows[link] = await client.get_epg_data_by_id(link)
+        await asyncio.gather(*(read_row(link) for link in links if link not in rows))
+        profile.set_channel_mappings(capture_mappings(profile.to_dict(), channel_map, list(rows.values()), sources))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not verify programme sources and channel mappings") from None
+
+
+def _source_changes(profile, fields: dict) -> bool:
+    return (
+        ("epg_source_ids" in fields and (fields["epg_source_ids"] or []) != profile.get_epg_source_ids())
+        or ("channel_mappings" in fields and (fields["channel_mappings"] or []) != profile.get_channel_mappings())
+        or (fields.get("channel_group_ids") is not None and fields["channel_group_ids"] != profile.get_channel_group_ids())
+        or (fields.get("enabled") is True and not profile.enabled)
+    )
+
+
 @router.post("/profiles")
 async def create_profile(req: ProfileCreateRequest, db: Session = Depends(get_session)):
     """Create a new Dummy EPG profile."""
@@ -304,6 +380,7 @@ async def create_profile(req: ProfileCreateRequest, db: Session = Depends(get_se
         if req.channel_group_ids is not None:
             profile.set_channel_group_ids(req.channel_group_ids)
 
+        await _configure_sources(profile, req.model_dump(exclude_unset=True))
         db.add(profile)
         db.commit()
         db.refresh(profile)
@@ -342,6 +419,31 @@ async def get_profile(profile_id: int, db: Session = Depends(get_session)):
     finally:
         db.close()
 
+@router.get("/profiles/{profile_id}/coverage")
+async def get_profile_coverage(profile_id: int, db: Session = Depends(get_session)):
+    """Inspect the same source decisions used to render a saved profile."""
+    from models import DummyEPGProfile
+    from services.epg_programmes import prepare_profiles
+
+    try:
+        profile = db.query(DummyEPGProfile).filter(DummyEPGProfile.id == profile_id).first()
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        channel_map = await _fetch_all_channels()
+        p_dict = profile.to_dict()
+        p_dict["channel_assignments"] = _resolve_group_assignments(
+            p_dict.get("channel_group_ids", []), channel_map
+        )
+        p_dict["channel_map"] = channel_map
+        _, coverage = await prepare_profiles([p_dict], channel_map, get_client())
+        return coverage
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not inspect guide coverage") from None
+    finally:
+        db.close()
+
 
 @router.patch("/profiles/{profile_id}")
 async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session = Depends(get_session)):
@@ -374,6 +476,8 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
         sub_pairs = update_data.pop("substitution_pairs", None)
         pattern_variants = update_data.pop("pattern_variants", None)
         channel_group_ids = update_data.pop("channel_group_ids", None)
+        source_fields = {key: update_data.pop(key) for key in ("epg_source_ids", "channel_mappings") if key in update_data}
+        configure = _source_changes(profile, {**source_fields, "channel_group_ids": channel_group_ids, "enabled": req.enabled})
 
         for field, value in update_data.items():
             setattr(profile, field, value)
@@ -384,6 +488,8 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
             profile.set_pattern_variants([v.model_dump() if hasattr(v, "model_dump") else v for v in pattern_variants])
         if channel_group_ids is not None:
             profile.set_channel_group_ids(channel_group_ids)
+        if configure:
+            await _configure_sources(profile, source_fields)
 
         db.commit()
         db.refresh(profile)
@@ -558,55 +664,13 @@ def _build_preview_config(req) -> dict:
 
 
 def _resolve_group_assignments(channel_group_ids: list, channel_map: dict) -> list:
-    """Resolve group IDs to channel assignment dicts from channel_map."""
-    group_ids = set(channel_group_ids)
-    assignments = []
-    for ch_id, ch in channel_map.items():
-        if ch.get("channel_group_id") in group_ids:
-            assignments.append({"channel_id": ch_id, "channel_name": ch.get("name", "")})
-    return assignments
+    from services.epg_programmes import _resolve_group_assignments as resolve_groups
+    return resolve_groups(channel_group_ids, channel_map)
 
 
 async def _fetch_all_channels() -> dict:
-    """Fetch all channels from Dispatcharr (paginated) and return {id: channel_dict}.
-
-    Stream IDs (ints) in each channel's 'streams' field are resolved to
-    full stream dicts so that generate_channel_xml can access stream names.
-    """
-    client = get_client()
-    all_channels = []
-    page = 1
-    while True:
-        resp = await client.get_channels(page=page, page_size=500)
-        results = resp.get("results", [])
-        all_channels.extend(results)
-        if not resp.get("next"):
-            break
-        page += 1
-
-    channel_map = {ch["id"]: ch for ch in all_channels}
-
-    # Resolve stream IDs to stream dicts (API returns ints)
-    all_stream_ids = set()
-    for ch in all_channels:
-        for s in ch.get("streams", []):
-            if isinstance(s, int):
-                all_stream_ids.add(s)
-    if all_stream_ids:
-        try:
-            stream_details = await client.get_streams_by_ids(list(all_stream_ids))
-            stream_by_id = {s["id"]: s for s in stream_details}
-            for ch in channel_map.values():
-                raw = ch.get("streams", [])
-                if raw and isinstance(raw[0], int):
-                    ch["streams"] = [
-                        stream_by_id.get(sid, {"id": sid, "name": f"Stream {sid}"})
-                        for sid in raw
-                    ]
-        except Exception as e:
-            logger.warning("[DUMMY-EPG] Failed to resolve stream names: %s", e)
-
-    return channel_map
+    from services.epg_programmes import _fetch_all_channels as fetch_channels
+    return await fetch_channels(get_client())
 
 
 @router.get("/xmltv")
@@ -639,9 +703,12 @@ async def get_xmltv_all(db: Session = Depends(get_session)):
             p_dict["channel_map"] = channel_map
             profile_data.append(p_dict)
 
+        from services.epg_programmes import can_cache, prepare_profiles
+        profile_data, coverage = await prepare_profiles(profile_data, channel_map, get_client())
         # Offload XML generation off event loop (bd-w3z4h)
         xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
-        cache.set("dummy_epg_xmltv_all", xml_string)
+        if can_cache(coverage):
+            cache.set("dummy_epg_xmltv_all", xml_string)
 
         logger.info("[DUMMY-EPG] Generated XMLTV for %s enabled profiles", len(profiles))
         return Response(content=xml_string, media_type="application/xml")
@@ -682,9 +749,12 @@ async def get_xmltv_profile(profile_id: int, db: Session = Depends(get_session))
         p_dict["channel_map"] = channel_map
         profile_data = [p_dict]
 
+        from services.epg_programmes import can_cache, prepare_profiles
+        profile_data, coverage = await prepare_profiles(profile_data, channel_map, get_client())
         # Offload XML generation off event loop (bd-w3z4h)
         xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
-        cache.set(cache_key, xml_string)
+        if can_cache(coverage):
+            cache.set(cache_key, xml_string)
 
         logger.info("[DUMMY-EPG] Generated XMLTV for profile %s", profile_id)
         return Response(content=xml_string, media_type="application/xml")
@@ -706,25 +776,17 @@ async def force_regenerate(
     body: GenerateProfilesRequest | None = None,
     db: Session = Depends(get_session),
 ):
-    """Force regeneration of all XMLTV cache."""
-    logger.debug("[DUMMY-EPG] POST /generate")
+    """Regenerate the combined guide and requested profile caches."""
     try:
         from models import DummyEPGProfile
         from dummy_epg_engine import generate_xmltv
+        from services.epg_programmes import can_cache, prepare_profiles
 
-        # Invalidate all XMLTV cache
         cache.invalidate_prefix("dummy_epg_xmltv")
-
-        query = db.query(DummyEPGProfile).filter(
+        profiles = db.query(DummyEPGProfile).filter(
             DummyEPGProfile.enabled == True  # noqa: E712
-        )
-        if body is not None:
-            query = query.filter(DummyEPGProfile.id.in_(body.profile_ids))
-        profiles = query.all()
-
+        ).all()
         channel_map = await _fetch_all_channels()
-
-        # Build profile data — resolve group IDs to channel assignments
         profile_data = []
         for profile in profiles:
             p_dict = profile.to_dict()
@@ -733,26 +795,29 @@ async def force_regenerate(
             )
             p_dict["channel_map"] = channel_map
             profile_data.append(p_dict)
-
-        # Offload XML generation off event loop (bd-w3z4h)
+        profile_data, coverage = await prepare_profiles(
+            profile_data, channel_map, get_client()
+        )
         xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
-        cache.set("dummy_epg_xmltv_all", xml_string)
+        if can_cache(coverage):
+            cache.set("dummy_epg_xmltv_all", xml_string)
 
-        # Also cache per-profile (each offloaded)
-        for profile in profiles:
-            p_dict = profile.to_dict()
-            p_dict["channel_assignments"] = _resolve_group_assignments(
-                p_dict.get("channel_group_ids", []), channel_map
-            )
-            p_dict["channel_map"] = channel_map
+        selected = set(body.profile_ids) if body is not None else {profile.id for profile in profiles}
+        generated = 0
+        for p_dict in profile_data:
+            if p_dict["id"] not in selected:
+                continue
             per_xml = await run_cpu_bound(generate_xmltv, [p_dict], channel_map)
-            cache.set(f"dummy_epg_xmltv_{profile.id}", per_xml)
-
-        logger.info("[DUMMY-EPG] Force-regenerated XMLTV for %s enabled profiles", len(profiles))
-        return {"status": "ok", "profiles_generated": len(profiles)}
-    except Exception as e:
-        logger.warning("[DUMMY-EPG] Failed to force-regenerate XMLTV: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+            if can_cache(coverage):
+                cache.set(f"dummy_epg_xmltv_{p_dict['id']}", per_xml)
+            generated += 1
+        if can_cache(coverage):
+            return {"status": "ok", "profiles_generated": generated}
+        status = "error" if any(source.get("status") in {"error", "stale"} for source in coverage.get("sources", [])) else "pending"
+        return {"status": status, "profiles_generated": generated, "coverage": coverage}
+    except Exception:
+        logger.exception("[DUMMY-EPG] Failed to regenerate XMLTV")
+        raise HTTPException(status_code=500, detail="Could not regenerate the guide") from None
     finally:
         db.close()
 
@@ -855,6 +920,7 @@ async def import_dummy_epg_profiles_yaml(request: ImportYAMLRequest):
         try:
             imported = []
             errors = []
+            snapshot = {}
 
             for i, profile_data in enumerate(data["profiles"]):
                 profile_name = profile_data.get("name", f"Profile {i}")
@@ -886,22 +952,41 @@ async def import_dummy_epg_profiles_yaml(request: ImportYAMLRequest):
                     DummyEPGProfile.name == profile_data["name"]
                 ).first()
 
+                if existing and not request.overwrite:
+                    errors.append({
+                        "profile_index": i,
+                        "profile_name": profile_name,
+                        "errors": ["Profile with this name already exists"],
+                    })
+                    continue
+
+                try:
+                    validated = ProfileUpdateRequest.model_validate(profile_data)
+                    fields = validated.model_dump(exclude_unset=True)
+                    _lint_dummy_epg_profile_request(validated)
+                    candidate = DummyEPGProfile(name=profile_data["name"])
+                    if existing:
+                        _apply_profile_fields(candidate, existing.to_dict())
+                    _apply_profile_fields(candidate, fields)
+                    if not existing or _source_changes(existing, fields):
+                        await _configure_sources(candidate, fields, snapshot=snapshot)
+                    fields["epg_source_ids"] = candidate.get_epg_source_ids()
+                    fields["channel_mappings"] = candidate.get_channel_mappings()
+                except (ValueError, HTTPException):
+                    errors.append({
+                        "profile_index": i,
+                        "profile_name": profile_name,
+                        "errors": ["Profile fields or programme source mappings are invalid or unavailable"],
+                    })
+                    continue
+
                 if existing:
-                    if request.overwrite:
-                        _apply_profile_fields(existing, profile_data)
-                        imported.append({"name": existing.name, "action": "updated"})
-                    else:
-                        errors.append({
-                            "profile_index": i,
-                            "profile_name": profile_name,
-                            "errors": ["Profile with this name already exists"],
-                        })
-                        continue
+                    _apply_profile_fields(existing, fields)
+                    imported.append({"name": existing.name, "action": "updated"})
                 else:
-                    profile = DummyEPGProfile(name=profile_data["name"])
-                    _apply_profile_fields(profile, profile_data)
-                    db.add(profile)
-                    imported.append({"name": profile.name, "action": "created"})
+                    _apply_profile_fields(candidate, fields)
+                    db.add(candidate)
+                    imported.append({"name": candidate.name, "action": "created"})
 
             db.commit()
             cache.invalidate_prefix("dummy_epg_xmltv")
@@ -945,6 +1030,10 @@ def _apply_profile_fields(profile, data: dict):
         profile.set_pattern_variants(data["pattern_variants"])
     if "channel_group_ids" in data and data["channel_group_ids"] is not None:
         profile.set_channel_group_ids(data["channel_group_ids"])
+    if "epg_source_ids" in data:
+        profile.set_epg_source_ids(data["epg_source_ids"] or [])
+    if "channel_mappings" in data:
+        profile.set_channel_mappings(data["channel_mappings"] or [])
 
 
 # =============================================================================
