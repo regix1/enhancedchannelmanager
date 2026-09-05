@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy.orm import Session
@@ -773,6 +773,7 @@ class GenerateProfilesRequest(BaseModel):
 
 @router.post("/generate")
 async def force_regenerate(
+    background: BackgroundTasks,
     body: GenerateProfilesRequest | None = None,
     db: Session = Depends(get_session),
 ):
@@ -782,10 +783,14 @@ async def force_regenerate(
         from dummy_epg_engine import generate_xmltv
         from services.epg_programmes import can_cache, prepare_profiles
 
-        cache.invalidate_prefix("dummy_epg_xmltv")
         profiles = db.query(DummyEPGProfile).filter(
             DummyEPGProfile.enabled == True  # noqa: E712
         ).all()
+        if any(profile.to_dict().get("epg_source_ids") for profile in profiles):
+            from task_engine import get_engine
+            background.add_task(get_engine().run_task, "dummy_epg_refresh")
+            return {"status": "pending", "profiles_generated": 0, "task_id": "dummy_epg_refresh"}
+        cache.invalidate_prefix("dummy_epg_xmltv")
         channel_map = await _fetch_all_channels()
         profile_data = []
         for profile in profiles:

@@ -522,11 +522,12 @@ def install_safety_policy(mcp) -> None:
                 "run_channel_pipeline", "run_auto_creation",
                 "apply_normalization_to_channels", "clear_emby_logos",
             }
-            resolved = (
-                _stored_resolution(supplied)
-                if supplied and server_planned
-                else await _resolve_targets(_name, arguments, _run)
-            )
+            with claim_context(_name, SAFETY_INVENTORY[_name].value, confirmed=False):
+                resolved = (
+                    _stored_resolution(supplied)
+                    if supplied and server_planned
+                    else await _resolve_targets(_name, arguments, _run)
+                )
             if resolved is None:
                 return present("Confirmation token was already used or is unknown; request a new preview.")
             resolved_count = _resolved_count(resolved, server_planned=server_planned)

@@ -586,6 +586,186 @@ class TestEpgGridChannelResolution:
 
 
 # ===========================================================================
+# get_epg_grid filters imported guide rows by the selected channel's LINKED
+# guide row (channel.epg_data_id -> EPG row -> tvg_id), the same join the
+# frontend guide already makes. Imported programmes carry only tvg_id, and a
+# channel's portable tvg_id is not the imported identity.
+# ===========================================================================
+
+AMC_CHANNEL = {
+    "id": 2966, "uuid": "2db2a597-1bce-4df9-97de-7f529e64f4cd",
+    "epg_data_id": 10740401, "tvg_id": "AMC.us", "name": "AMC",
+}
+AMC_LINKED_ROW = {"id": 10740401, "epg_source": 46, "tvg_id": "ecm-2966", "name": "AMC"}
+IMPORTED_PROGRAMMES = [
+    {"id": 5590631, "tvg_id": "ecm-2966", "title": "Lethal Weapon 2",
+     "start_time": "2026-09-05T13:00:00Z", "end_time": "2026-09-05T15:30:00Z"},
+    {"id": 5590632, "tvg_id": "ecm-2966", "title": "Lethal Weapon 3",
+     "start_time": "2026-09-05T15:30:00Z", "end_time": "2026-09-05T18:00:00Z"},
+]
+
+
+def _guide_transport(programs, channels, epg_rows):
+    """Local HTTP double for the backend reads behind get_epg_grid.
+
+    Records every (method, path) and answers ONLY the exact read routes:
+    the grid, the channel list, one channel, and one EPG row. An EPG row
+    mapped to ``None`` fails with 500; anything else is 404, so any
+    catalogue, source, probe or write call shows up as a failed request.
+    """
+    import httpx
+
+    requests = []
+
+    def respond(request):
+        requests.append((request.method, request.url.path))
+        if request.method != "GET":
+            return httpx.Response(405, json={"detail": "Method Not Allowed"})
+        segments = request.url.path.strip("/").split("/")
+        if segments == ["api", "epg", "grid"]:
+            return httpx.Response(200, json=programs)
+        if segments == ["api", "channels"]:
+            return httpx.Response(200, json={
+                "count": len(channels), "next": None, "results": channels,
+            })
+        if len(segments) == 3 and segments[:2] == ["api", "channels"] and segments[2].isdigit():
+            match = [c for c in channels if c["id"] == int(segments[2])]
+            if match:
+                return httpx.Response(200, json=match[0])
+            return httpx.Response(404, json={"detail": "Not found."})
+        if len(segments) == 4 and segments[:3] == ["api", "epg", "data"] and segments[3].isdigit():
+            row = epg_rows.get(int(segments[3]))
+            if row is None:
+                return httpx.Response(500, json={"detail": "Internal server error"})
+            return httpx.Response(200, json=row)
+        return httpx.Response(404, json={"detail": "Not found."})
+
+    return requests, respond
+
+
+async def _grid_over_http(respond, arguments) -> str:
+    """Run get_epg_grid through the real ECMClient/Endpoint path against the
+    local transport, so path and verb are what the backend would see."""
+    import httpx
+    from ecm_client import ECMClient
+
+    async with httpx.AsyncClient(
+        base_url="http://example.test", transport=httpx.MockTransport(respond)
+    ) as http:
+        with patch("ecm_client._get_client", return_value=http), patch(
+            "tools.epg.get_ecm_client", return_value=ECMClient()
+        ):
+            result = await _register("epg").call_tool("get_epg_grid", arguments)
+    return result[0][0].text
+
+
+class TestEpgGridImportedGuideIdentity:
+    @pytest.mark.asyncio
+    async def test_selected_channel_uses_its_linked_guide_row_identity(self):
+        requests, respond = _guide_transport(
+            IMPORTED_PROGRAMMES, [AMC_CHANNEL], {10740401: AMC_LINKED_ROW}
+        )
+        parsed = json.loads(
+            await _grid_over_http(respond, {"channel_id": 2966, "details": True})
+        )
+        assert [p["id"] for p in parsed["programs"]] == [5590631, 5590632]
+        assert parsed["programs_total"] == 2
+        assert parsed["programs_truncated"] is False
+        assert [p["tvg_id"] for p in parsed["programs"]] == ["ecm-2966", "ecm-2966"]
+        # The channel keeps its portable TVG; the linked row's identity is
+        # read, never written back or guessed.
+        assert parsed["channels"] == [AMC_CHANNEL]
+        assert requests.count(("GET", "/api/epg/data/10740401")) == 1
+        assert all(method == "GET" for method, _path in requests)
+        assert set(requests) <= {
+            ("GET", "/api/epg/grid"),
+            ("GET", "/api/channels"),
+            ("GET", "/api/channels/2966"),
+            ("GET", "/api/epg/data/10740401"),
+        }
+
+        summary = await _grid_over_http(respond, {"channel_id": 2966})
+        assert "EPG Schedule (2 programs):" in summary
+        assert "Lethal Weapon 2 (2026-09-05T13:00:00Z - 2026-09-05T15:30:00Z)" in summary
+        assert "Lethal Weapon 3 (2026-09-05T15:30:00Z - 2026-09-05T18:00:00Z)" in summary
+
+    @pytest.mark.asyncio
+    async def test_portable_tvg_match_with_a_different_linked_row_does_not_steal_programmes(self):
+        lookalike = {
+            "id": 2967, "uuid": "6f0b3c1e-2f7a-4c1d-9a4e-0d2b7c9e1f33",
+            "epg_data_id": 10740402, "tvg_id": "ecm-2966", "name": "AMC East",
+        }
+        rows = {
+            10740401: AMC_LINKED_ROW,
+            10740402: {"id": 10740402, "epg_source": 46, "tvg_id": "AMC2.us", "name": "AMC East"},
+        }
+        requests, respond = _guide_transport(
+            IMPORTED_PROGRAMMES, [AMC_CHANNEL, lookalike], rows
+        )
+        lookalike_view = json.loads(
+            await _grid_over_http(respond, {"channel_id": 2967, "details": True})
+        )
+        assert lookalike_view["programs"] == []
+        assert lookalike_view["programs_total"] == 0
+        assert ("GET", "/api/epg/data/10740402") in requests
+
+        owner_view = json.loads(
+            await _grid_over_http(respond, {"channel_id": 2966, "details": True})
+        )
+        assert [p["id"] for p in owner_view["programs"]] == [5590631, 5590632]
+        assert ("GET", "/api/epg/data/10740401") in requests
+        assert all(method == "GET" for method, _path in requests)
+
+    @pytest.mark.asyncio
+    async def test_uuid_and_numeric_rows_filter_without_a_guide_row_read(self):
+        programs = [
+            {"id": 1, "channel_uuid": AMC_CHANNEL["uuid"], "title": "By uuid", "start": "1", "stop": "2"},
+            {"id": 2, "channel_id": 2966, "title": "By channel_id", "start": "3", "stop": "4"},
+            {"id": 3, "channel": 2966, "title": "By channel", "start": "5", "stop": "6"},
+            {"id": 4, "channel_uuid": "0c9d2a4b-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "title": "Other", "start": "7", "stop": "8"},
+        ]
+        requests, respond = _guide_transport(programs, [AMC_CHANNEL], {})
+        parsed = json.loads(
+            await _grid_over_http(respond, {"channel_id": 2966, "details": True})
+        )
+        assert [p["id"] for p in parsed["programs"]] == [1, 2, 3]
+        assert not any(path.startswith("/api/epg/data/") for _method, path in requests)
+
+    @pytest.mark.asyncio
+    async def test_channel_without_a_linked_row_falls_back_to_its_portable_tvg(self):
+        unlinked = {
+            "id": 2968, "uuid": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+            "epg_data_id": None, "tvg_id": "ecm-2968", "name": "Portable Only",
+        }
+        programs = [
+            {"id": 7, "tvg_id": "ecm-2968", "title": "Portable guide",
+             "start_time": "2026-09-05T13:00:00Z", "end_time": "2026-09-05T14:00:00Z"},
+            *IMPORTED_PROGRAMMES,
+        ]
+        requests, respond = _guide_transport(
+            programs, [AMC_CHANNEL, unlinked], {10740401: AMC_LINKED_ROW}
+        )
+        parsed = json.loads(
+            await _grid_over_http(respond, {"channel_id": 2968, "details": True})
+        )
+        assert [p["id"] for p in parsed["programs"]] == [7]
+        assert not any(path.startswith("/api/epg/data/") for _method, path in requests)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("row", [None, ["unexpected"], {"id": 10740401}])
+    async def test_failed_or_malformed_linked_row_read_is_an_error_not_an_empty_guide(self, row):
+        requests, respond = _guide_transport(
+            IMPORTED_PROGRAMMES, [AMC_CHANNEL], {10740401: row}
+        )
+        text = await _grid_over_http(respond, {"channel_id": 2966, "details": True})
+        assert text.startswith("Error getting EPG grid")
+        assert "programs_total" not in text
+        assert "No EPG schedule data available." not in text
+        assert requests.count(("GET", "/api/epg/data/10740401")) == 1
+        assert all(method == "GET" for method, _path in requests)
+
+
+# ===========================================================================
 # lq38l.13 #4 — get_auto_creation_rule renders create_channel descriptor
 # ===========================================================================
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -421,6 +422,82 @@ def _engine_with_client(channels: list, secondary_batch: list):
         execution_id=EXECUTION_ID,
     )
     return engine, executor, client
+
+
+# The saved live-sports rule's provider-scoped secondaries as
+# (group_id, m3u_account_id, stream_count). Nine nonempty scopes total
+# 14,594 streams; group 1330 is a valid but empty scope.
+EVENT_SCOPES = (
+    (961, 2, 869),
+    (2442, 18, 161),
+    (2462, 2, 4597),
+    (1558, 18, 3483),
+    (1525, 18, 153),
+    (1526, 18, 480),
+    (1542, 18, 273),
+    (1557, 18, 4467),
+    (754, 2, 111),
+    (1330, 18, 0),
+)
+EVENT_SCOPE_TOTAL = 14594
+
+
+def _scope_streams(gid: int, account: int, count: int) -> list[dict]:
+    """Stable, unique stream rows for one scope (ids never collide across
+    groups because every group id is distinct)."""
+    return [
+        {
+            "id": gid * 10000 + i,
+            "name": f"Group {gid} {i:04d}: Home {i:04d} vs. Away {i:04d} "
+                    f"@ 11 Jul 06:00 PM ET",
+            "m3u_account": account,
+        }
+        for i in range(count)
+    ]
+
+
+def _scope_pages(scopes) -> dict:
+    """(channel-group name, m3u_account_id) -> that scope's whole stream list."""
+    return {
+        (f"Group {gid}", account): _scope_streams(gid, account, count)
+        for gid, account, count in scopes
+    }
+
+
+def _scope_config(scopes) -> dict:
+    return {
+        "master_group_id": 65,
+        "secondary_group_ids": [gid for gid, _account, _count in scopes],
+        "secondary": [
+            {"group_id": gid, "m3u_account_id": account}
+            for gid, account, _count in scopes
+        ],
+    }
+
+
+def _scoped_client(pages: dict) -> MagicMock:
+    """A Dispatcharr double whose get_streams pages through ``pages`` the way
+    the real client does: page/page_size slicing, ``next`` set while more
+    rows remain, and the provider filter part of the lookup key."""
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(
+        side_effect=lambda gid: f"Group {gid}"
+    )
+
+    async def _get_streams(page=1, page_size=100, search=None,
+                           channel_group_name=None, m3u_account=None):
+        rows = pages.get((channel_group_name, m3u_account), [])
+        start = (page - 1) * page_size
+        has_next = start + page_size < len(rows)
+        return {
+            "count": len(rows),
+            "next": "next" if has_next else None,
+            "results": rows[start:start + page_size],
+        }
+
+    client.get_streams = AsyncMock(side_effect=_get_streams)
+    client.update_channel = AsyncMock(return_value={})
+    return client
 
 
 class TestEnginePhase:
@@ -1113,6 +1190,88 @@ class TestProviderScopedFetch:
         _run(engine._fetch_event_sync_secondary_streams(config, {1: "ProvB"}))
         assert client.get_streams.call_args_list[0].kwargs.get(
             "m3u_account") is None
+
+
+class TestFullScopeSecondaryFetch:
+    """Every run restarts each scope at page 1, so a stable scope that is
+    larger than the fetch guard never reaches its tail groups on any run.
+    The guard must cover the saved rule's whole 14,594-stream scope, and a
+    scope beyond the guard must stop at the bound without claiming the rest
+    will arrive later."""
+
+    def test_stable_full_scope_is_fetched_completely_on_repeat_runs(self):
+        pages = _scope_pages(EVENT_SCOPES)
+        # Unattachable rows (no name / no id) sit in front of the first
+        # scope's page 1; they are skipped and never counted as valid.
+        pages[("Group 961", 2)] = [
+            {"id": None, "name": "no id", "m3u_account": 2},
+            {"id": 9619999, "name": "", "m3u_account": 2},
+        ] + pages[("Group 961", 2)]
+        client = _scoped_client(pages)
+        engine = ChannelPipelineEngine(client)
+        config = _scope_config(EVENT_SCOPES)
+        account_names = {2: "Account 2", 18: "Account 18"}
+        expected_ids = {
+            row["id"]
+            for gid, account, count in EVENT_SCOPES
+            for row in _scope_streams(gid, account, count)
+        }
+        assert len(expected_ids) == EVENT_SCOPE_TOTAL
+
+        first = _run(engine._fetch_event_sync_secondary_streams(
+            config, account_names))
+        calls_per_run = len(client.get_streams.call_args_list)
+        second = _run(engine._fetch_event_sync_secondary_streams(
+            config, account_names))
+
+        for streams in (first, second):
+            assert len(streams) == EVENT_SCOPE_TOTAL
+            assert {s.stream_id for s in streams} == expected_ids
+            # The last two ESPN groups are the tail of the scope order.
+            assert {s.group_id for s in streams} >= {1557, 754}
+            assert {s.provider_id for s in streams} == {2, 18}
+            assert {s.provider for s in streams} == {"Account 2", "Account 18"}
+        # Same stable pages, same result: the second run walks exactly the
+        # page sequence the first one did, starting at page 1 again.
+        calls = client.get_streams.call_args_list
+        assert len(calls) == 2 * calls_per_run
+        assert ([c.kwargs for c in calls[:calls_per_run]]
+                == [c.kwargs for c in calls[calls_per_run:]])
+        assert calls[0].kwargs["page"] == 1
+        assert calls[calls_per_run].kwargs["page"] == 1
+        # Every scope, including the empty one, was requested with its own
+        # provider filter and nothing else.
+        assert {
+            (c.kwargs["channel_group_name"], c.kwargs["m3u_account"])
+            for c in calls
+        } == {(f"Group {gid}", account) for gid, account, _count in EVENT_SCOPES}
+        client.update_channel.assert_not_called()
+
+    def test_scope_above_the_guard_stops_at_the_bound_and_says_so(self, caplog):
+        scopes = ((2462, 2, 19800), (1557, 18, 500), (754, 2, 111))
+        client = _scoped_client(_scope_pages(scopes))
+        engine = ChannelPipelineEngine(client)
+
+        with caplog.at_level(logging.WARNING):
+            streams = _run(engine._fetch_event_sync_secondary_streams(
+                _scope_config(scopes), {2: "Account 2", 18: "Account 18"}))
+
+        assert len(streams) == 20000
+        assert {s.group_id for s in streams} == {2462, 1557}
+        # The fetch stops at the guard: the group after the bound is never
+        # requested (no unlimited fetch), and the warning reports an
+        # incomplete scan rather than promising a later run will finish it.
+        requested_groups = {
+            c.kwargs["channel_group_name"]
+            for c in client.get_streams.call_args_list
+        }
+        assert "Group 754" not in requested_groups
+        truncation = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "truncated" in r.getMessage()
+        ]
+        assert truncation, [r.getMessage() for r in caplog.records]
+        assert all("picked up" not in message for message in truncation)
 
 
 class TestParseMasterFromStream:

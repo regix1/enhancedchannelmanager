@@ -80,6 +80,20 @@ def test_normal_channel_automation_remains_allowed():
     assert is_mcp_route_allowed("POST", "/api/settings")
 
 
+def test_epg_row_read_is_a_declared_read_only_service_capability():
+    """The EPG grid tool joins a channel to its linked guide row through the
+    existing single-row GET; that read is declared in the sidecar contract
+    and allowed for the service principal, with no write verb admitted."""
+    entry = _endpoint_contracts()["epg_entry"]
+    assert (entry.method, entry.path) == ("GET", "/api/epg/data/{data_id}")
+    assert not entry.request_fields
+    assert not entry.query_params
+    assert is_mcp_route_allowed("GET", "/api/epg/data/{data_id}")
+    assert ("GET", "/api/epg/data/{data_id}") not in MCP_HUMAN_ONLY_ROUTES
+    for method in ("POST", "PATCH", "PUT", "DELETE"):
+        assert not is_mcp_route_allowed(method, "/api/epg/data/{data_id}")
+
+
 @pytest.mark.asyncio
 async def test_mcp_cannot_run_dbas_backup_directly():
     from routers.tasks import TaskRunRequest, run_task

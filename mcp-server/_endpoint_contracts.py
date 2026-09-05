@@ -624,6 +624,12 @@ ENDPOINTS: dict[str, Endpoint] = {
         path="/api/epg/grid",
         query_params=frozenset({"start", "end"}),
     ),
+    "epg_entry": Endpoint(
+        name="epg_entry",
+        method="GET",
+        path="/api/epg/data/{data_id}",
+        # One linked guide row; get_epg_grid joins channel.epg_data_id to it.
+    ),
     "dummy_epg_list_profiles": Endpoint(
         name="dummy_epg_list_profiles",
         method="GET",

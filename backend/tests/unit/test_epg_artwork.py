@@ -347,6 +347,32 @@ class TestMatchupBanner:
         assert "//ncaaf" not in _run(rw, MATCHUP)
 
 
+    def test_title_only_matchups_use_the_existing_portrait_cover(self, tmp_path):
+        xml = ('<programme><title>College Football : Texas A&amp;M at Ohio State</title>'
+               '<desc>Game coverage</desc></programme>')
+        expected = (f"{GT}/ncaaf/texas-a-m/ohio-state/cover"
+                    "?style=4&amp;logo=true&amp;fallback=true")
+        for size in (None, 1, 7, 64, 513):
+            rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+            out = _run(rw, xml, size)
+            assert expected in out
+            assert rw.bannered == 1
+
+    def test_title_only_matchups_respect_custom_leagues_and_non_sports(self, tmp_path):
+        leagues = compile_leagues([{"match": "Curling", "league": "curling"}])
+        assert matchup_banner(GT, "Curling : Team One vs. Team Two", "", leagues) == (
+            f"{GT}/curling/team-one/team-two/cover?style=4&logo=true&fallback=true")
+        assert matchup_banner(GT, "Divorce Court : Michelle vs. Alonzo", "") is None
+        assert matchup_banner(GT, "College Football Preview", "") is None
+
+    def test_an_existing_custom_cover_keeps_its_style(self, tmp_path):
+        custom = f"{GT}/ncaaf/alabama/south-carolina/cover?style=2&amp;logo=false&amp;fallback=true"
+        xml = MATCHUP.replace("<desc", f'<icon src="{custom}" /><desc')
+        out = _run(ArtworkRewriter(_cache(tmp_path), banner_base=GT), xml)
+        assert custom in out
+        assert out.count("<icon") == 1
+
+
 class TestWhichProgrammesCount:
     """Which titles are read as a matchup, and which must never be.
 

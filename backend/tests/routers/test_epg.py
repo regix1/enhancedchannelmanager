@@ -1766,6 +1766,21 @@ class TestGetEPGDataById:
         assert response.status_code == 200
         mock_client.get_epg_data_by_id.assert_called_once_with(42)
 
+    @pytest.mark.asyncio
+    async def test_returns_linked_row_identity_verbatim(self, async_client):
+        """The MCP grid filter joins channel.epg_data_id to this row's
+        tvg_id, so the imported identity must pass through untouched."""
+        row = {"id": 10740401, "epg_source": 46, "tvg_id": "ecm-2966", "name": "AMC"}
+        mock_client = AsyncMock()
+        mock_client.get_epg_data_by_id.return_value = row
+
+        with patch("routers.epg.get_client", return_value=mock_client):
+            response = await async_client.get("/api/epg/data/10740401")
+
+        assert response.status_code == 200
+        assert response.json() == row
+        mock_client.get_epg_data_by_id.assert_called_once_with(10740401)
+
 
 class TestGetEPGGrid:
     """Tests for GET /api/epg/grid."""

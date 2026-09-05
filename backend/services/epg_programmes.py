@@ -25,8 +25,14 @@ from services.event_sync_matcher import (
 SOURCE_TTL = 900
 SOURCE_RETRY = 60
 HTTP_WAIT = 5.0
-MAX_DOWNLOAD = 512 * 1024 * 1024
-MAX_DECODED = 2 * 1024 * 1024 * 1024
+# Large programme feeds are parsed incrementally; selected rows keep their own smaller limit.
+MAX_DOWNLOAD = 4 * 1024 * 1024 * 1024
+MAX_DECODED = 4 * 1024 * 1024 * 1024
+SOURCE_TIMEOUT = 1200.0
+SOURCE_READ_TIMEOUT = 300.0
+# The hourly refresh may take its full bounded read time to replace a completed scan.
+SOURCE_MAX_AGE = 3600 + SOURCE_TIMEOUT
+MAX_QUERIES = 4096
 MAX_RETAINED = 64 * 1024 * 1024
 MAX_CACHE = 128 * 1024 * 1024
 MAX_CACHE_ENTRIES = 128
@@ -220,12 +226,26 @@ def _query(profile: dict, channel: dict, mapping: dict | None, now: datetime) ->
     identities = {value for value in identities if not value.startswith("ecm-")}
     if mapping:
         identities.add(mapping["tvg_id"])
-    return {
+    query = {
         "channel_id": channel["id"], "mapping": mapping, "ids": sorted(identities),
         "name": " ".join(channel.get("name", "").casefold().split()),
         "event": parsed,
-        "dynamic": parsed.start is not None or bool(re.search(r"\b(?:ppv|espn\s*\+|espnplus)(?:\b|(?=\s|$))", source_name, re.I)),
+        "dynamic": parsed.start is not None or bool(re.search(r"\b(?:ppv|espn\s*(?:\+|plus))(?:\b|(?=\s|$))", source_name, re.I)),
     }
+    identity = {key: value for key, value in query.items() if key != "channel_id"}
+    if mapping:
+        identity["mapping"] = {key: value for key, value in mapping.items() if key != "channel_id"}
+    if parsed.start is not None:
+        # Dated matches use the parsed event, even after promotion changes its display name and TVG.
+        identity.pop("name")
+        identity.pop("ids")
+        identity["event"] = {
+            "title": " ".join((parsed.title or "").casefold().split()),
+            "start": parsed.start.astimezone(timezone.utc).isoformat(),
+            "teams": [" ".join(team.casefold().split()) for team in parsed.teams] if parsed.teams else None,
+        }
+    query["key"] = hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+    return query
 
 
 def _identity(query: dict, source_id: int, tvg_id: str, header: ET.Element | None) -> int | None:
@@ -237,9 +257,13 @@ def _identity(query: dict, source_id: int, tvg_id: str, header: ET.Element | Non
         if not tvg_id.isdigit():
             return 1
     if not query["dynamic"] and header is not None:
-        for name in header.findall("display-name"):
-            if " ".join((name.text or "").casefold().split()) == query["name"] and query["name"]:
-                return 2
+        from stream_normalization import strip_country_prefix
+        names = [" ".join((name.text or "").casefold().split()) for name in header.findall("display-name")]
+        if query["name"] and query["name"] in names:
+            return 2
+        for name in names:
+            if re.match(r"^us\s*[-:|/]\s*", name) and strip_country_prefix(name) == query["name"]:
+                return 3
     return None
 
 
@@ -252,12 +276,23 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     headers, rows, warnings = {}, {}, set()
     ended = {}
     channel_warnings = {}
+    diagnostics = {"root": "absent", "xml_complete": False, "transport_complete": False}
+    import codecs
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    prefix = b""
+    invalid_utf8 = forbidden = False
     retained = count = pending_size = 0
     event_headers = any(query["dynamic"] and query["event"].start is not None for query in queries)
 
     def consume(chunk: bytes | None) -> None:
-        nonlocal root, retained, count, pending_size
+        nonlocal root, retained, count, pending_size, prefix, invalid_utf8, forbidden
         if chunk is not None:
+            prefix = (prefix + chunk)[:1024]
+            forbidden |= re.search(rb"[\x01-\x08\x0b\x0c\x0e-\x1f]", chunk) is not None
+            try:
+                decoder.decode(chunk)
+            except UnicodeDecodeError:
+                invalid_utf8 = True
             pending_size += len(chunk)
             if pending_size > MAX_RETAINED:
                 raise ValueError("XMLTV element exceeds the retained size limit.")
@@ -268,6 +303,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
         for event, element in parser.read_events():
             if event == "start" and root is None:
                 root = element
+                diagnostics["root"] = "tv" if root.tag == "tv" else "other"
                 if root.tag != "tv":
                     raise ValueError("XMLTV root must be tv.")
             if event != "end":
@@ -287,6 +323,9 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                     begin, end = programme_times(element)
                 except ValueError:
                     warnings.add("invalid_schedule")
+                    for query in queries:
+                        if _identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None:
+                            channel_warnings.setdefault(query["key"], set()).add("invalid_schedule")
                 else:
                     if now - timedelta(hours=24) < end <= now and end - begin <= timedelta(hours=24) and not _placeholder(element):
                         for query in queries:
@@ -297,9 +336,10 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                             if _score_parsed_pair(parsed, _event(element, begin), window_minutes=30,
                                                   threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index).band != BAND_ATTACH:
                                 continue
-                            previous = ended.get(query["channel_id"])
+                            identity = query["key"]
+                            previous = ended.get(identity)
                             if previous and previous[1] != begin:
-                                channel_warnings.setdefault(query["channel_id"], set()).add("ambiguous_event")
+                                channel_warnings.setdefault(query["key"], set()).add("ambiguous_event")
                             if previous and previous[2] >= end:
                                 continue
                             saved = copy.deepcopy(element)
@@ -308,10 +348,13 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                                 retained -= len(ET.tostring(previous[3]))
                             else:
                                 count += 1
-                            ended[query["channel_id"]] = (tvg_id, begin, end, saved)
+                            ended[identity] = (tvg_id, begin, end, saved)
                     if end > now and end > start and begin < stop and not _placeholder(element):
                         if end - begin > timedelta(hours=24) or begin < start - timedelta(days=1):
                             warnings.add("implausible_schedule")
+                            for query in queries:
+                                if _identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None:
+                                    channel_warnings.setdefault(query["key"], set()).add("implausible_schedule")
                         else:
                             wanted = any(_identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None
                                          for query in queries)
@@ -329,7 +372,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                                             threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index,
                                         ).band == BAND_ATTACH:
                                             reason = "event_date_conflict" if delta >= 43200 else "event_start_conflict"
-                                            channel_warnings.setdefault(query["channel_id"], set()).add(reason)
+                                            channel_warnings.setdefault(query["key"], set()).add(reason)
                                         continue
                                     if _score_parsed_pair(parsed, event_title, window_minutes=30,
                                                           threshold=EVENT_ATTACH_FLOOR,
@@ -350,11 +393,41 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
             if retained > MAX_RETAINED or count > MAX_PROGRAMMES:
                 raise ValueError("Selected XMLTV schedules exceed the retained size limit.")
 
-    async with _SOURCE_SLOTS:
-        async with asyncio.timeout(120):
-            async for chunk in stream_xmltv(source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED):
-                await asyncio.to_thread(consume, chunk)
-            await asyncio.to_thread(consume, None)
+    try:
+        async with _SOURCE_SLOTS:
+            failure = None
+            async with asyncio.timeout(SOURCE_TIMEOUT):
+                async for chunk in stream_xmltv(
+                    source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
+                    timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
+                ):
+                    # Read at most one more chunk after a parser failure to distinguish EOF.
+                    if failure is not None:
+                        raise failure
+                    try:
+                        await asyncio.to_thread(consume, chunk)
+                    except (ET.ParseError, ValueError, LookupError) as exc:
+                        failure = exc
+                if failure is not None:
+                    raise failure
+                await asyncio.to_thread(consume, None)
+                diagnostics["xml_complete"] = True
+    except (Exception, asyncio.CancelledError) as exc:
+        if isinstance(exc, ET.ParseError):
+            diagnostics.update(parser_code=max(0, exc.code), parser_line=max(0, exc.position[0]),
+                               parser_column=max(0, exc.position[1]))
+            declared = re.search(br'<\?xml[^>]*encoding\s*=\s*["\']([^"\']+)', prefix, re.I)
+            utf8 = declared is None or declared[1].lower() in {b"utf-8", b"utf8", b"us-ascii"}
+            diagnostics["failure"] = (
+                "forbidden_character" if forbidden else "invalid_utf8" if invalid_utf8 and utf8
+                else "incomplete_xml" if exc.code in {3, 5, 6} else "malformed_xml"
+            )
+        elif diagnostics["root"] == "other":
+            diagnostics["failure"] = "wrong_root"
+        else:
+            diagnostics.setdefault("failure", "unknown")
+        exc.diagnostics = diagnostics
+        raise
     if root is None:
         raise ValueError("XMLTV document is empty.")
     for tvg_id in list(headers):
@@ -362,6 +435,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
             retained -= len(ET.tostring(headers[tvg_id]))
             del headers[tvg_id]
     return {"headers": headers, "rows": rows, "ended": ended, "warnings": sorted(warnings), "size": retained,
+            "diagnostics": diagnostics,
             "channel_warnings": {channel: sorted(values) for channel, values in channel_warnings.items()}}
 
 
@@ -408,7 +482,7 @@ def _error_reason(exc: Exception) -> str:
                 reason = f"HTTP status {status}."
         elif isinstance(exc, httpx.RequestError):
             reason = "Connection failed."
-        elif isinstance(exc, ET.ParseError):
+        elif isinstance(exc, ET.ParseError) or type(exc) is LookupError:
             reason = "Malformed XML."
         elif isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
             reason = "Invalid JSON response."
@@ -437,22 +511,30 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
     previous = _SOURCE_CACHE.get(key, {})
     try:
         loaded = await _read_source(source, queries, start, stop, now)
-        loaded.update({"success": datetime.now(timezone.utc), "checked": time.monotonic(), "error": None,
-                       "selection": previous.get("selection")})
+        loaded.update({
+            "success": datetime.now(timezone.utc), "checked": time.monotonic(), "error": None,
+            "selection": {"queries": frozenset(query["key"] for query in queries),
+                          "start": start, "stop": stop},
+            "demand": _SOURCE_CACHE.get(key, {}).get("demand", {}),
+        })
         _SOURCE_CACHE[key] = loaded
-    except asyncio.CancelledError:
-        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled."}
+    except asyncio.CancelledError as exc:
+        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled.",
+                              "diagnostics": getattr(exc, "diagnostics", {})}
         raise
     except Exception as exc:
-        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc)}
+        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc),
+                              "diagnostics": getattr(exc, "diagnostics", {})}
     finally:
+        _SOURCE_LOADS.pop(key, None)
         total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
         for oldest in sorted(_SOURCE_CACHE, key=lambda item: _SOURCE_CACHE[item].get("checked", 0)):
             if total <= MAX_CACHE and len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
                 break
+            if oldest in _SOURCE_LOADS:
+                continue
             total -= _SOURCE_CACHE[oldest].get("size", 0)
             del _SOURCE_CACHE[oldest]
-        _SOURCE_LOADS.pop(key, None)
         get_cache().invalidate_prefix("dummy_epg_xmltv")
 
 
@@ -477,9 +559,10 @@ async def _probe_artwork(unknown: dict) -> None:
 
 
 def can_cache(coverage: dict) -> bool:
-    """Only cache output whose source and artwork preparation has settled."""
-    return not coverage.get("artwork_pending") and all(
-        source.get("status") == "ready" for source in coverage.get("sources", [])
+    """Cache completed composition while source refreshes run independently."""
+    sources = coverage.get("sources", [])
+    return not coverage.get("artwork_pending") and (
+        not sources or any(source.get("status") == "ready" or source.get("last_success") for source in sources)
     )
 
 
@@ -521,13 +604,24 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
     parsed = query["event"]
     for source in sources:
         entry = entries.get(source["id"], {})
-        warnings.update(entry.get("warnings", []))
-        warnings.update(entry.get("channel_warnings", {}).get(query["channel_id"], []))
-        ended = entry.get("ended", {}).get(query["channel_id"])
+        selection = entry.get("selection")
+        if selection is not None and query["key"] not in selection.get("queries", ()):
+            warnings.add("schedule_pending")
+            continue
+        warnings.update(entry.get("channel_warnings", {}).get(query["key"], []))
+        identities = {tvg_id: _identity(query, source["id"], tvg_id, entry.get("headers", {}).get(tvg_id))
+                      for tvg_id in entry.get("rows", {}).keys() | entry.get("headers", {}).keys()}
+        rank = min((value for value in identities.values() if value is not None), default=None)
+        ambiguous = rank is not None and rank >= 2 and sum(value == rank for value in identities.values()) > 1
+        if ambiguous:
+            warnings.add("ambiguous_identity")
+        ended = entry.get("ended", {}).get(query["key"])
         if ended:
             witnesses.append((ended[1], ended[2], source["id"], ended[0], ended[3]))
         for tvg_id, programmes in entry.get("rows", {}).items():
-            identity = _identity(query, source["id"], tvg_id, entry.get("headers", {}).get(tvg_id))
+            identity = identities[tvg_id]
+            if not query["dynamic"] and (ambiguous or identity != rank):
+                continue
             for programme in programmes:
                 begin, end = programme_times(programme)
                 match = identity
@@ -622,6 +716,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
     global _ARTWORK_LOAD
     from dummy_epg_engine import get_xmltv_id
     artwork, artwork_cache = {}, None
+    realtime = now is None
     now = now or datetime.now(timezone.utc)
     deadline = time.monotonic() + HTTP_WAIT
     enriched, coverage = [], {"generated_at": now.isoformat(), "window_start": None, "window_stop": None,
@@ -731,45 +826,55 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             job["queries"].extend(query for query in queries if not query.get("blocked"))
             job["start"], job["stop"] = min(start, job["start"]), max(stop, job["stop"])
     for source_id, job in jobs.items():
-        fingerprint = json.dumps([job["source"], job["queries"], job["start"], job["stop"]], sort_keys=True, default=str)
+        fingerprint = json.dumps({"id": source_id, "url": job["source"].get("url")}, sort_keys=True, default=str)
         key = hashlib.sha256(fingerprint.encode()).hexdigest()
-        selection = {
-            "source": hashlib.sha256(json.dumps(job["source"], sort_keys=True, default=str).encode()).hexdigest(),
-            "queries": frozenset(json.dumps(query, sort_keys=True, default=str) for query in job["queries"]),
-            "start": job["start"], "stop": job["stop"],
-        }
-        if key not in _SOURCE_CACHE:
-            for cached_key, cached in list(_SOURCE_CACHE.items()):
-                scope = cached.get("selection") or {}
-                fresh = (time.monotonic() - cached.get("checked", float("-inf"))
-                         < (SOURCE_RETRY if cached.get("error") else SOURCE_TTL))
-                if ((fresh or cached_key in _SOURCE_LOADS) and scope.get("source") == selection["source"]
-                        and selection["queries"].issubset(scope.get("queries", ()))
-                        and scope["start"] <= selection["start"] and scope["stop"] >= selection["stop"]):
-                    key = cached_key
-                    break
         job["key"] = key
-        entry = _SOURCE_CACHE.get(key, {})
+        entry = _SOURCE_CACHE.setdefault(key, {})
+        demand = {identity: request for identity, request in entry.get("demand", {}).items() if request["stop"] > now}
+        # Query changes join the next permitted scan; they cannot bypass source backoff.
+        for query in job["queries"]:
+            identity = query["key"]
+            if identity in demand or len(demand) < MAX_QUERIES:
+                demand[identity] = {"query": query, "start": job["start"], "stop": job["stop"]}
+        entry["demand"] = demand
         age = time.monotonic() - entry.get("checked", float("-inf"))
-        if age >= (SOURCE_RETRY if entry.get("error") else SOURCE_TTL) and key not in _SOURCE_LOADS:
-            _SOURCE_CACHE[key] = {**entry, "selection": selection}
+        if (wait_for_sources and demand and age >= (SOURCE_RETRY if entry.get("error") else SOURCE_TTL)
+                and key not in _SOURCE_LOADS):
             _SOURCE_LOADS[key] = asyncio.create_task(_load_source(
-                key, job["source"], job["queries"], job["start"], job["stop"], now))
+                key, job["source"], [request["query"] for request in demand.values()],
+                min(request["start"] for request in demand.values()),
+                max(request["stop"] for request in demand.values()), now,
+            ))
     pending = [_SOURCE_LOADS[job["key"]] for job in jobs.values() if job["key"] in _SOURCE_LOADS]
-    if pending:
-        await asyncio.wait(pending, timeout=130 * max(1, (len(pending) + 1) // 2) if wait_for_sources
-                           else max(0, deadline - time.monotonic()))
+    if pending and wait_for_sources:
+        await asyncio.wait(pending, timeout=(SOURCE_TIMEOUT + 10) * max(1, (len(pending) + 1) // 2))
+    for key in list(_SOURCE_CACHE):
+        if len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
+            break
+        if key not in _SOURCE_LOADS and not _SOURCE_CACHE[key].get("success"):
+            _SOURCE_CACHE.pop(key, None)
+    if realtime:
+        now = datetime.now(timezone.utc)
+        coverage["generated_at"] = now.isoformat()
     entries = {}
     for source_id, job in jobs.items():
         entry = _SOURCE_CACHE.get(job["key"], {})
         entries[source_id] = entry
         success = entry.get("success")
-        status = "pending" if job["key"] in _SOURCE_LOADS else "error" if entry.get("error") or not success else "ready"
-        if success and (datetime.now(timezone.utc) - success).total_seconds() > 3600:
+        selection = entry.get("selection") or {}
+        covered = (all(query["key"] in selection.get("queries", ()) for query in job["queries"])
+                   and selection.get("start", job["stop"]) <= job["start"]
+                   and selection.get("stop", job["start"]) >= job["stop"])
+        status = ("pending" if job["key"] in _SOURCE_LOADS else "error" if entry.get("error")
+                  else "ready" if success and covered else "pending" if entry else "error")
+        if success and (datetime.now(timezone.utc) - success).total_seconds() > SOURCE_MAX_AGE:
             status = "stale"
         coverage["sources"].append({"source_id": source_id, "status": status,
                                     "last_success": success.isoformat() if success else None,
-                                    "error": entry.get("error") or ("No complete XMLTV schedule is available." if status == "error" else None)})
+                                    "error": entry.get("error") or ("No complete XMLTV schedule is available." if status == "error" else None),
+                                    "diagnostics": entry.get("diagnostics", {})})
+        if entry.get("warnings"):
+            coverage["sources"][-1]["warnings"] = entry["warnings"]
     if source_error:
         coverage["sources"] = [{"source_id": source, "status": catalogue_status, "last_success": None, "error": source_error}
                                for source in sorted(selected_ids)]

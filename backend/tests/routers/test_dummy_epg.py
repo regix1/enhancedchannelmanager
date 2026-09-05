@@ -806,6 +806,22 @@ class TestForceRegenerate:
         mock_cache.invalidate_prefix.assert_called_with("dummy_epg_xmltv")
         assert mock_cache.set.call_count >= 1
 
+    @pytest.mark.asyncio
+    async def test_source_generation_uses_existing_background_task(self, async_client, test_session):
+        profile = _create_profile(test_session)
+        profile.set_epg_source_ids([42])
+        test_session.commit()
+        engine = MagicMock()
+        engine.run_task = AsyncMock()
+        with patch("task_engine.get_engine", return_value=engine), patch(
+            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})
+        ) as fetch_channels:
+            response = await async_client.post("/api/dummy-epg/generate")
+        assert response.status_code == 200
+        assert response.json() == {"status": "pending", "profiles_generated": 0, "task_id": "dummy_epg_refresh"}
+        engine.run_task.assert_awaited_once_with("dummy_epg_refresh")
+        fetch_channels.assert_not_awaited()
+
 
 # =============================================================================
 # Auth posture — the XMLTV reads answer without credentials
@@ -998,7 +1014,13 @@ class TestProgrammeSources:
             denied = await async_client.get(f"/api/dummy-epg/profiles/{profile.id}/coverage")
         assert denied.status_code == 401
         prepare.assert_not_awaited()
-        coverage = {"generated_at": "2026-09-05T05:00:00Z", "window_start": "2026-09-05T00:00:00Z", "window_stop": "2026-09-07T00:00:00Z", "sources": [{"source_id": 51, "status": "pending", "last_success": None, "error": None}], "channels": []}
+        coverage = {"generated_at": "2026-09-05T05:00:00Z", "window_start": "2026-09-05T00:00:00Z", "window_stop": "2026-09-07T00:00:00Z", "sources": [
+            {"source_id": 51, "status": "pending", "last_success": None, "error": None},
+            {"source_id": 42, "status": "error", "last_success": None, "error": "Malformed XML.", "diagnostics": {
+                "wire_bytes": 512, "decoded_bytes": 4096, "http_status": 200, "content_type": "absent", "content_encoding": "gzip",
+                "compression": "gzip", "transport_complete": True, "xml_complete": False, "root": "tv",
+                "parser_code": 4, "parser_line": 1, "parser_column": 3902, "failure": "invalid_utf8"}},
+        ], "channels": []}
         before = profile.to_dict()
         with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})), patch("routers.dummy_epg.get_client", return_value=AsyncMock()) as client, patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([before], coverage))) as prepare:
             response = await async_client.get(f"/api/dummy-epg/profiles/{profile.id}/coverage")
@@ -1209,10 +1231,10 @@ class TestProgrammeSources:
         from datetime import datetime, timedelta, timezone
         from xml.etree import ElementTree as ET
         from services import epg_programmes as guides
+        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
 
         for name in ("_CATALOGUE_CACHE", "_CATALOGUE_LOADS", "_SOURCE_CACHE", "_SOURCE_LOADS"):
             monkeypatch.setattr(guides, name, {})
-        monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
         profile = _create_profile(test_session)
         profile.set_epg_source_ids([42])
         profile.set_channel_group_ids([68])
@@ -1242,30 +1264,32 @@ class TestProgrammeSources:
         client = AsyncMock()
         client.get_epg_sources.side_effect = catalogue
         monkeypatch.setattr(guides, "_read_source", read)
-        with patch("routers.dummy_epg.get_client", return_value=client), patch(
-            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)
-        ), patch("routers.dummy_epg.cache") as cache:
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [profile]
+        engine = MagicMock()
+        engine.run_task = AsyncMock()
+        with patch("task_engine.get_engine", return_value=engine), patch(
+            "tasks.dummy_epg_refresh.get_client", return_value=client
+        ), patch("database.get_session", return_value=db), patch(
+            "services.epg_programmes._fetch_all_channels", AsyncMock(return_value=channels)
+        ), patch("cache.get_cache") as cache, patch("routers.dummy_epg.cache", cache.return_value):
+            response = await async_client.post("/api/dummy-epg/generate")
+            assert response.json() == {"status": "pending", "profiles_generated": 0, "task_id": "dummy_epg_refresh"}
+            cache.return_value.set.assert_not_called()
+            refresh = asyncio.create_task(DummyEPGRefreshTask()._regenerate_xmltv())
             try:
-                response = await asyncio.wait_for(async_client.post("/api/dummy-epg/generate"), timeout=2)
-                assert response.status_code == 200, response.text
-                assert response.json()["status"] == "pending"
-                assert response.json()["coverage"]["sources"][0]["status"] == "pending"
-                assert started.is_set()
-                cache.set.assert_not_called()
+                await asyncio.wait_for(started.wait(), timeout=2)
+                cache.return_value.set.assert_not_called()
                 release.set()
-                await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()), *list(guides._SOURCE_LOADS.values()))
-                response = await async_client.post("/api/dummy-epg/generate")
-                assert response.json() == {"status": "ok", "profiles_generated": 1}
-                published = {call.args[0]: call.args[1] for call in cache.set.call_args_list}
+                assert await refresh == 1
+                published = {call.args[0]: call.args[1] for call in cache.return_value.set.call_args_list}
                 assert "Fixture schedule" in published["dummy_epg_xmltv_all"]
                 assert "Fixture schedule" in published[f"dummy_epg_xmltv_{profile.id}"]
+                engine.run_task.assert_awaited_once_with("dummy_epg_refresh")
                 client.get_epg_sources.assert_awaited_once()
             finally:
                 release.set()
-                await asyncio.gather(
-                    *list(guides._CATALOGUE_LOADS.values()), *list(guides._SOURCE_LOADS.values()),
-                    return_exceptions=True,
-                )
+                await refresh
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("source_status", "artwork_pending", "status"), [

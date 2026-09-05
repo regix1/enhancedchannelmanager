@@ -300,6 +300,41 @@ class TestEPGSourceNewParams:
         assert body == {"name": "New Name"}
 
 
+class TestEpgEntryEndpointContract:
+    """get_epg_grid resolves a channel's linked guide row through the
+    existing backend single-row read; that read is declared as one exact
+    GET contract with no body or query surface."""
+
+    def test_epg_entry_is_the_exact_backend_row_read(self):
+        from _endpoint_contracts import ENDPOINTS, Endpoint
+
+        assert ENDPOINTS["epg_entry"] == Endpoint(
+            name="epg_entry", method="GET", path="/api/epg/data/{data_id}",
+        )
+
+    @pytest.mark.asyncio
+    async def test_epg_entry_call_reaches_the_row_path_with_get(self):
+        import httpx
+        from _endpoint_contracts import ENDPOINTS
+        from ecm_client import ECMClient
+
+        requests = []
+
+        def respond(request):
+            requests.append((request.method, request.url.path, str(request.url.query, "ascii")))
+            return httpx.Response(200, json={"id": 10740401, "tvg_id": "ecm-2966"})
+
+        async with httpx.AsyncClient(
+            base_url="http://example.test", transport=httpx.MockTransport(respond)
+        ) as http:
+            with patch("ecm_client._get_client", return_value=http):
+                row = await ECMClient().call_endpoint(
+                    ENDPOINTS["epg_entry"], path_args={"data_id": 10740401},
+                )
+        assert row == {"id": 10740401, "tvg_id": "ecm-2966"}
+        assert requests == [("GET", "/api/epg/data/10740401", "")]
+
+
 # ---------------------------------------------------------------------------
 # create_channel_pipeline_rule / update_channel_pipeline_rule +
 # deprecated create_auto_creation_rule / update_auto_creation_rule aliases

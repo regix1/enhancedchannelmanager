@@ -3129,6 +3129,16 @@ async def test_confirmed_idle_channel_is_removed_without_deleting_stream(retirem
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("minutes", [15, 45, 60])
+async def test_hourly_schedule_retains_fresh_stream_retirement_evidence(retirement, minutes):
+    from services import epg_programmes
+    retirement["source"]["last_success"] = (retirement["now"] - timedelta(minutes=minutes)).isoformat()
+    states, result = await _retire(retirement)
+    assert states[900] == "idle" and result["channels_removed"] == 1
+    assert epg_programmes.prepare_profiles.await_args.kwargs["wait_for_sources"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["guide_missing", "guide_error", "guide_stale", "guide_active", "old_observation", "missing_stream", "ended_label", "old_stream_active", "mixed_providers", "unknown_identity", "wrong_start"])
 async def test_event_retirement_holds_unknown_or_conflicting_evidence(retirement, case):
     setup = retirement
@@ -3137,7 +3147,8 @@ async def test_event_retirement_holds_unknown_or_conflicting_evidence(retirement
     elif case == "guide_error":
         setup["source"]["status"] = "error"
     elif case == "guide_stale":
-        setup["source"]["last_success"] = (setup["now"] - timedelta(hours=1)).isoformat()
+        from services.epg_programmes import SOURCE_MAX_AGE
+        setup["source"]["last_success"] = (setup["now"] - timedelta(seconds=SOURCE_MAX_AGE + 1)).isoformat()
     elif case == "guide_active":
         setup["witness"]["stop"] = (setup["now"] + timedelta(hours=1)).isoformat()
         setup["streams"][0]["name"] = "Ended"

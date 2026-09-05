@@ -665,7 +665,9 @@ def register(mcp: FastMCP):
         """Get the EPG schedule grid — what's on TV now and upcoming.
 
         Args:
-            channel_id: Optional channel ID to filter for a specific channel (filtered client-side)
+            channel_id: Optional channel ID to filter for a specific channel (filtered client-side;
+                imported programmes that carry only tvg_id are matched through the channel's
+                linked guide row, falling back to its own tvg_id when no row is linked)
             limit: Maximum number of programs to return (default 20; details caps this at 25)
             details: Return bounded identity/title/time fields and up to 1000 channel
                 references as JSON. Omit channel_id to inspect unrecognized associations.
@@ -691,11 +693,33 @@ def register(mcp: FastMCP):
             references = {} if details else None
             uuid_map = await _build_channel_uuid_map(client, references)
 
+            selected: dict = {}
             if channel_id is not None:
+                # Imported programmes key the channel by tvg_id only, and that
+                # is the LINKED guide row's tvg_id (channel.epg_data_id -> EPG
+                # row), not the channel's portable tvg_id — the same join the
+                # frontend guide makes. Read only when such rows exist, so
+                # uuid/numeric-keyed grids need no guide-row fetch.
+                guide_tvg_id = None
+                if any(p.get("tvg_id") for p in programs):
+                    selected = await client.call_endpoint(
+                        ENDPOINTS["channels_get"], path_args={"channel_id": channel_id}
+                    )
+                    if selected.get("epg_data_id"):
+                        row = await client.call_endpoint(
+                            ENDPOINTS["epg_entry"],
+                            path_args={"data_id": selected["epg_data_id"]},
+                        )
+                        if not isinstance(row, dict) or not row.get("tvg_id"):
+                            raise ValueError("Unexpected EPG row")
+                        guide_tvg_id = row["tvg_id"]
+                    else:
+                        guide_tvg_id = selected.get("tvg_id")
                 programs = [
                     p for p in programs
                     if (uuid_map.get(p.get("channel_uuid"), {}).get("id") == channel_id)
                     or channel_id in (p.get("channel_id"), p.get("channel"))
+                    or (guide_tvg_id is not None and p.get("tvg_id") == guide_tvg_id)
                 ]
 
             if details:
@@ -807,6 +831,7 @@ def register(mcp: FastMCP):
                     or p.get("channel_name")
                     or p.get("channel")
                     or p.get("channel_uuid")
+                    or selected.get("name")
                     or "Unknown"
                 )
                 title = p.get("title", "Unknown")

@@ -1458,3 +1458,139 @@ def test_preview_pipeline_drops_url_the_guide_will_not_emit():
     assert result["matched"] is True
     # away and home resolved, league never appears in the pattern.
     assert result["rendered"]["channel_logo_url"] == ""
+
+
+def test_source_event_gaps_keep_the_title_without_claiming_a_schedule():
+    from dummy_epg_engine import generate_channel_xml
+    from services.epg_programmes import programme_times
+
+    name, event_start = _event_name_today()
+    start = event_start.replace(hour=0)
+    stop = start + timedelta(days=2)
+    profile = {
+        **_variant_profile(1, []),
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "epg_source_ids": [42],
+        "guide_start": start,
+        "guide_stop": stop,
+        "source_programmes": {1: []},
+        "include_live_tag": True,
+        "include_new_tag": True,
+        "ended_title_template": "Ended: {title}",
+        "program_poster_url_template":
+            "http://192.0.2.10:3100/mlb/cubs/reds/cover?style=4&logo=true&fallback=true",
+    }
+    _, programmes = generate_channel_xml(1, name, 100, "event.1", profile)
+    hint = next(row for row in programmes if row.findtext("title") == "Big Game")
+    begin, end = programme_times(hint)
+    assert begin == event_start
+    assert end == event_start + timedelta(days=1)
+    assert "unconfirmed" in hint.findtext("desc").lower()
+    assert hint.find("icon").get("src") == profile["program_poster_url_template"]
+    assert all(row.find("live") is None and row.find("new") is None for row in programmes)
+    assert all(not row.findtext("title").startswith("Ended") for row in programmes)
+    assert profile["source_programmes"] == {1: []}
+    assert programme_times(programmes[-1])[1] == stop
+
+
+def test_source_event_hint_spans_midnight_and_preserves_real_programmes():
+    from dummy_epg_engine import generate_channel_xml
+    from services.epg_programmes import programme_times
+
+    _, anchor = _event_name_today()
+    event_start = anchor.replace(hour=23)
+    start = event_start.replace(hour=0)
+    real = ET.fromstring(
+        f'<programme start="{event_start:%Y%m%d%H%M%S %z}" '
+        f'stop="{event_start + timedelta(hours=1):%Y%m%d%H%M%S %z}">'
+        '<title>Confirmed event</title><icon src="https://example.com/real.jpg"/>'
+        '<live/></programme>'
+    )
+    before = ET.tostring(real)
+    profile = {
+        **_variant_profile(60, []),
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "epg_source_ids": [42],
+        "guide_start": start,
+        "guide_stop": start + timedelta(days=2),
+        "source_programmes": {1: [real]},
+    }
+    name = f"Night Game {event_start:%m/%d/%Y %H:%M}"
+    _, programmes = generate_channel_xml(1, name, 100, "event.1", profile)
+    overnight = next(row for row in programmes
+                     if programme_times(row)[0] <= event_start + timedelta(hours=5)
+                     < programme_times(row)[1])
+    assert overnight.findtext("title") == "Night Game"
+    assert overnight.find("live") is None
+    confirmed = next(row for row in programmes if row.findtext("title") == "Confirmed event")
+    assert confirmed.find("live") is not None
+    assert confirmed.find("icon").get("src") == "https://example.com/real.jpg"
+    assert programme_times(confirmed) == (event_start, event_start + timedelta(hours=1))
+    assert ET.tostring(real) == before
+    assert len(profile["source_programmes"][1]) == 1
+    for left, right in zip(programmes, programmes[1:]):
+        assert programme_times(left)[1] == programme_times(right)[0]
+
+
+def test_source_event_hint_stays_on_its_date_and_ignores_bare_or_invalid_slots():
+    from dummy_epg_engine import generate_channel_xml
+    from services.epg_programmes import programme_times
+
+    _, anchor = _event_name_today()
+    start = anchor.replace(hour=0)
+    profile = {
+        **_variant_profile(180, []),
+        "title_pattern": _TITLE_PATTERN,
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "epg_source_ids": [42],
+        "guide_start": start,
+        "guide_stop": start + timedelta(days=2),
+    }
+    future = anchor + timedelta(days=1)
+    name = f"Tomorrow Game {future:%m/%d/%Y %H:%M}"
+    _, programmes = generate_channel_xml(1, name, 100, "event.1", profile)
+    assert programmes[0].findtext("title") == "Programming unavailable"
+    hint = next(row for row in programmes if row.findtext("title") == "Tomorrow Game")
+    assert programme_times(hint)[0] == future
+    old = anchor - timedelta(days=2)
+    for name in ("ESPN PLUS 001", "PPV 002", "Ordinary Channel",
+                 "Bad date 02/30/2026 20:00", f"Old Game {old:%m/%d/%Y %H:%M}"):
+        _, programmes = generate_channel_xml(1, name, 100, "event.1", profile)
+        assert all(row.findtext("title") == "Programming unavailable" for row in programmes)
+
+
+def test_source_event_hint_uses_the_matching_variant_portrait_and_style():
+    from dummy_epg_engine import generate_channel_xml
+
+    _, event_start = _event_name_today()
+    template = ("http://192.0.2.10:3100/{league|lowercase}/{away|lowercase}/"
+                "{home|lowercase}/cover?style=2&logo=false&fallback=true")
+    variant = {
+        "title_pattern": r"^(?P<league>MLB) (?P<away>.+?) vs (?P<home>.+?) \d{2}/",
+        "time_pattern": _TIME_PATTERN,
+        "date_pattern": _DATE_PATTERN,
+        "title_template": "{away} at {home}",
+        "program_poster_url_template": template,
+    }
+    profile = {
+        **_variant_profile(0, [variant]),
+        "epg_source_ids": [42],
+        "guide_start": event_start,
+        "guide_stop": event_start + timedelta(hours=12),
+        "program_poster_url_template": "https://example.com/default.jpg",
+    }
+    _, programmes = generate_channel_xml(
+        1, f"MLB Cubs vs Reds {event_start:%m/%d/%Y %H:%M}", 100, "event.1", profile,
+    )
+    assert len(programmes) == 1
+    assert programmes[0].findtext("title") == "Cubs at Reds"
+    assert programmes[0].find("icon").get("src") == (
+        "http://192.0.2.10:3100/mlb/cubs/reds/cover?style=2&logo=false&fallback=true"
+    )
+    assert programmes[0].find("live") is None
+    assert programmes[0].find("new") is None

@@ -1,11 +1,20 @@
 """Registry-level safety contract for every ECM MCP tool (04c0u.7)."""
 
+import base64
+import hashlib
+import hmac
+import json
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+import auth_claim
+from auth_claim import SidecarBackendAuth, request_claim_headers
+from ecm_client import ECMClient
 from tools import register_all_tools
 from tools._guardrails import derive_token, token_matches
 from tools._safety_policy import (
@@ -30,6 +39,111 @@ def _token(text: str) -> str:
     match = re.search(r"confirmation_token: ([^\s]+)", text)
     assert match, text
     return match.group(1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["reorder_streams", "update_channel"])
+@pytest.mark.parametrize("outcome", ["success", "error", "drift", "expiry"])
+async def test_preflight_requests_are_signed(tmp_path: Path, tool_name: str, outcome: str):
+    projection = tmp_path / "mcp-service.json"
+    projection.write_text(json.dumps({
+        "backend_key": "b" * 48,
+        "confirmation_key": "c" * 48,
+    }))
+    projection.chmod(0o600)
+    mcp = _registry()
+    current = {"id": 4, "name": "News", "streams": [7, 8]}
+    observed = []
+    arguments = {"channel_id": 4}
+    arguments["stream_ids" if tool_name == "reorder_streams" else "streams"] = [8, 7]
+
+    async def backend(request: httpx.Request) -> httpx.Response:
+        body = await request.aread()
+        active = auth_claim._context.get()
+        assert active is not None
+        assert active.tool_name == tool_name
+        assert active.classification == "destructive"
+        if request.method == "GET":
+            assert active.confirmed is False
+        assert request.headers["Authorization"] == f"Bearer {'b' * 48}"
+        assert "listener-only-key" not in str(request.headers)
+        version, timestamp, nonce, encoded = request.headers["X-ECM-MCP-Claim"].split(".", 3)
+        canonical = (
+            json.dumps(json.loads(body), sort_keys=True, separators=(",", ":")).encode()
+            if body else b"null"
+        )
+        signed = b"\0".join((
+            timestamp.encode(), nonce.encode(), request.method.encode(),
+            request.url.raw_path, hashlib.sha256(canonical).hexdigest().encode(),
+        ))
+        expected = hmac.new(b"c" * 48, signed, hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        assert version == "v1"
+        assert hmac.compare_digest(supplied, expected)
+        observed.append((request.method, request.url.raw_path, body))
+        if outcome == "error":
+            return httpx.Response(503, json={"detail": "Temporarily unavailable"})
+        if request.method == "GET":
+            assert request.url.raw_path == b"/api/channels/4"
+            assert body == b""
+            return httpx.Response(200, json=current)
+        expected_path = (
+            b"/api/channels/4/reorder-streams" if tool_name == "reorder_streams"
+            else b"/api/channels/4"
+        )
+        assert request.method == ("POST" if tool_name == "reorder_streams" else "PATCH")
+        assert request.url.raw_path == expected_path
+        field = "stream_ids" if tool_name == "reorder_streams" else "streams"
+        assert json.loads(body) == {field: [8, 7]}
+        return httpx.Response(200, json={**current, "streams": [8, 7]})
+
+    with (
+        patch("config.MCP_SERVICE_FILE", projection),
+        patch("config.get_mcp_api_key", return_value="listener-only-key"),
+    ):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(backend),
+            base_url="http://backend",
+            auth=SidecarBackendAuth(),
+        ) as http:
+            with (
+                patch("ecm_client._get_client", return_value=http),
+                patch("tools.channels.get_ecm_client", return_value=ECMClient()),
+            ):
+                assert request_claim_headers("GET", "/api/channels/4") == {}
+                if outcome == "error":
+                    with pytest.raises(RuntimeError, match="Temporarily unavailable"):
+                        await mcp.call_tool(tool_name, arguments)
+                    assert request_claim_headers("GET", "/api/channels/4") == {}
+                    assert [method for method, _, _ in observed] == ["GET"]
+                    return
+                preview = await mcp.call_tool(tool_name, arguments)
+                assert [method for method, _, _ in observed] == ["GET"]
+                assert request_claim_headers("GET", "/api/channels/4") == {}
+                token = _token(_text(preview))
+                confirmed = {**arguments, "confirmation_token": token}
+                if outcome == "drift":
+                    current["streams"] = [7, 9]
+                if outcome == "expiry":
+                    from tools._safety_policy import CONFIRMATION_TTL_SECONDS
+
+                    expired_at = int(token.split(".")[1]) + CONFIRMATION_TTL_SECONDS + 1
+                    with patch("tools._safety_policy.time.time", return_value=expired_at):
+                        result = await mcp.call_tool(tool_name, confirmed)
+                else:
+                    result = await mcp.call_tool(tool_name, confirmed)
+                assert request_claim_headers("GET", "/api/channels/4") == {}
+                if outcome != "success":
+                    assert ("drift" if outcome == "drift" else "expired") in _text(result).lower()
+                    assert all(method == "GET" for method, _, _ in observed)
+                    return
+                assert "Error" not in _text(result)
+                verb = "POST" if tool_name == "reorder_streams" else "PATCH"
+                assert [method for method, _, _ in observed] == ["GET", "GET", "GET", verb]
+                result = await mcp.call_tool(tool_name, confirmed)
+                assert "already used" in _text(result)
+                assert sum(method != "GET" for method, _, _ in observed) == 1
+                assert request_claim_headers("GET", "/api/channels/4") == {}
 
 
 def test_server_plan_cap_uses_authoritative_counts_at_499_and_500():

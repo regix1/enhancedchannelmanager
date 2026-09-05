@@ -209,8 +209,8 @@ def matchup_banner(base: str, title: str, sub_title: str,
                    leagues: tuple[tuple[re.Pattern, str], ...] = MATCHUP_LEAGUES) -> str | None:
     """game-thumbs URL for one matchup, or None when it is not a matchup.
 
-    ``title`` names the league and ``sub_title`` the two teams; both arrive
-    still XML-escaped, as they sit in the feed.
+    ``title`` names the league. Teams can be in ``sub_title`` or after a
+    colon in ``title``; both arrive XML-escaped, as they sit in the feed.
     """
     plain_title = unescape(title)
     league = next(
@@ -219,7 +219,10 @@ def matchup_banner(base: str, title: str, sub_title: str,
     )
     if league is None:
         return None
-    teams = _MATCHUP.match(unescape(sub_title).strip())
+    matchup = unescape(sub_title).strip()
+    if not matchup and ":" in plain_title:
+        matchup = plain_title.rpartition(":")[2].strip()
+    teams = _MATCHUP.match(matchup)
     if teams is None:
         return None
     away, home = _slug(teams.group("away")), _slug(teams.group("home"))
@@ -270,9 +273,17 @@ class ArtworkRewriter:
         prog = m.group(0)
         title = _TITLE.search(prog)
         sub_title = _SUB_TITLE.search(prog)
-        if title is None or sub_title is None:
+        if title is None:
             return prog
-        url = matchup_banner(self.banner_base, title.group(1), sub_title.group(1),
+        existing = _ICON_EL.search(prog)
+        if existing is not None:
+            src = re.search(r"""\bsrc=(["'])(.*?)\1""", existing.group(0))
+            if src is not None:
+                path = unescape(src.group(2)).split("?", 1)[0]
+                if path.startswith(self.banner_base + "/") and path.endswith("/cover"):
+                    return prog
+        url = matchup_banner(self.banner_base, title.group(1),
+                             sub_title.group(1) if sub_title is not None else "",
                              self.leagues)
         if url is None:
             return prog

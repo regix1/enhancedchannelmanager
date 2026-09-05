@@ -62,6 +62,7 @@ _MCP_DECLARED_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ('GET', '/api/dummy-epg/profiles/{profile_id}/coverage'),
     ('GET', '/api/epg/audit-duplicates'),
     ('GET', '/api/epg/data'),
+    ('GET', '/api/epg/data/{data_id}'),
     ('GET', '/api/epg/grid'),
     ('GET', '/api/epg/sources'),
     ('GET', '/api/epg/sources/{source_id}/sd-lineups'),
@@ -206,7 +207,6 @@ _MCP_DECLARED_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/channels/import-csv"),
     ("GET", "/api/channels/bulk-commit/{job_id}"),
     ("GET", "/api/emby/clear-logos/{job_id}"),
-    ("GET", "/api/epg/data/{data_id}"),
     ("POST", "/api/channel-pipeline/rules/analyze/from-bundle"),
     ("PATCH", "/api/m3u/accounts/{account_id}/group-settings"),
     # Full settings round-trip used by M3U group-auto-sync tooling. The

@@ -24,7 +24,8 @@ _PREVIEW_INSTANCE_DOMAIN = b"ecm:guide-migration:instance:v1"
 
 async def stream_xmltv(
     source: dict, *, max_download: int, max_decoded: int,
-    timeout: float = 120.0, transport=None,
+    timeout: float = 120.0, transport=None, read_timeout: float = 30.0,
+    diagnostics: dict | None = None,
 ):
     """Yield bounded, validated XML chunks without retaining the document."""
     import asyncio
@@ -43,11 +44,14 @@ async def stream_xmltv(
     guard = b""
     compressed = str(url).lower().split("?", 1)[0].endswith(".gz")
     decompressor = None
+    if diagnostics is not None:
+        diagnostics.update(wire_bytes=0, decoded_bytes=0, transport_complete=False)
     try:
         async with asyncio.timeout(timeout):
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0, connect=10.0),
+                timeout=httpx.Timeout(read_timeout, connect=10.0),
                 follow_redirects=False,
+                headers={"Accept-Encoding": "gzip, identity"},
                 transport=transport or _PinnedSSRFTransport(verify=True),
             ) as http_client:
                 current_url = url
@@ -64,12 +68,26 @@ async def stream_xmltv(
                             validate_redirect(current_url, next_url, get_ssrf_mode())
                             current_url = next_url
                             continue
+                        encoding = response.headers.get("content-encoding", "").strip().lower()
+                        compressed = (compressed or encoding in {"gzip", "x-gzip"}
+                                      or str(current_url).lower().split("?", 1)[0].endswith(".gz"))
+                        if diagnostics is not None:
+                            mime = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                            diagnostics.update(
+                                http_status=response.status_code,
+                                content_type=("absent" if not mime else "xml" if mime in {"application/xml", "text/xml"} or mime.endswith("+xml")
+                                              else "gzip" if mime in {"application/gzip", "application/x-gzip"}
+                                              else "html" if mime == "text/html" else "text" if mime.startswith("text/") else "other"),
+                                content_encoding=encoding if encoding in {"gzip", "identity"} else "other" if encoding else "absent",
+                                compression="gzip" if compressed else "identity",
+                            )
                         response.raise_for_status()
-                        compressed = compressed or response.headers.get("content-encoding", "").lower() == "gzip"
                         if compressed:
                             decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
                         async for chunk in response.aiter_raw():
                             downloaded += len(chunk)
+                            if diagnostics is not None:
+                                diagnostics["wire_bytes"] = downloaded
                             if downloaded > max_download:
                                 raise HTTPException(413, "XMLTV download exceeds its size limit.")
                             pending = chunk
@@ -80,6 +98,8 @@ async def stream_xmltv(
                                     piece = decompressor.decompress(pending, min(65536, max_decoded - decoded + 1))
                                     pending = decompressor.unconsumed_tail
                                 decoded += len(piece)
+                                if diagnostics is not None:
+                                    diagnostics["decoded_bytes"] = decoded
                                 if decoded > max_decoded:
                                     raise HTTPException(413, "XMLTV decoded content exceeds its size limit.")
                                 probe = (guard + piece).lower()
@@ -90,7 +110,11 @@ async def stream_xmltv(
                                     yield piece
                             if decompressor is not None and decompressor.unused_data:
                                 raise HTTPException(422, "XMLTV gzip has trailing content.")
+                        if diagnostics is not None:
+                            diagnostics["transport_complete"] = True
                         if decompressor is not None and not decompressor.eof:
+                            if diagnostics is not None:
+                                diagnostics["failure"] = "incomplete_gzip"
                             raise HTTPException(422, "XMLTV gzip is incomplete.")
                     break
     except HTTPException:
@@ -98,6 +122,8 @@ async def stream_xmltv(
     except SSRFError as exc:
         raise HTTPException(400, "XMLTV source URL is blocked by the outbound security policy.") from exc
     except (httpx.HTTPError, TimeoutError, zlib.error) as exc:
+        if diagnostics is not None and isinstance(exc, httpx.RemoteProtocolError) and downloaded:
+            diagnostics["failure"] = "incomplete_body"
         raise HTTPException(502, "Could not read the configured XMLTV source.") from exc
 
 

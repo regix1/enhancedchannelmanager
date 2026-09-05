@@ -223,6 +223,111 @@ class TestHappyPath:
         assert first.json() == second.json()
 
 
+# The saved live-sports rule's provider-scoped secondaries as
+# (group_id, m3u_account_id, stream_count): nine nonempty scopes totalling
+# 14,594 streams plus one valid empty group. Mirrors the engine fixture in
+# tests/unit/test_event_sync_attach_execution.py so preview and run are
+# measured against the same scope.
+EVENT_SCOPES = (
+    (961, 2, 869),
+    (2442, 18, 161),
+    (2462, 2, 4597),
+    (1558, 18, 3483),
+    (1525, 18, 153),
+    (1526, 18, 480),
+    (1542, 18, 273),
+    (1557, 18, 4467),
+    (754, 2, 111),
+    (1330, 18, 0),
+)
+EVENT_SCOPE_TOTAL = 14594
+
+
+class TestFullScopeFetch:
+    """The preview shares the run's secondary fetch guard and restarts every
+    scope at page 1, so a guard smaller than the saved scope makes the
+    preview report truncation and hide the last two ESPN groups on every
+    call. The whole scope must flow through the real parser/resolver."""
+
+    @pytest.mark.asyncio
+    async def test_full_saved_scope_previews_every_stream_without_truncation(
+        self, async_client
+    ):
+        pages = {
+            (f"Group {gid}", account): [
+                {
+                    "id": gid * 10000 + i,
+                    "name": f"Group {gid} {i:04d}: Home {i:04d} vs. Away "
+                            f"{i:04d} @ 11 Jul 06:00 PM ET",
+                    "m3u_account": account,
+                }
+                for i in range(count)
+            ]
+            for gid, account, count in EVENT_SCOPES
+        }
+        expected_ids = {row["id"] for rows in pages.values() for row in rows}
+        assert len(expected_ids) == EVENT_SCOPE_TOTAL
+
+        client = _mock_client()
+        client.get_m3u_accounts = AsyncMock(return_value=[
+            {"id": 2, "name": "Account 2"}, {"id": 18, "name": "Account 18"},
+        ])
+        client._channel_group_name_for_id = AsyncMock(
+            side_effect=lambda gid: GROUP_NAMES.get(gid, f"Group {gid}")
+        )
+        # Provider-scoped secondaries are pre-flighted per (provider, group).
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={
+            (account, gid): {"auto_channel_sync": False}
+            for gid, account, _count in EVENT_SCOPES
+        })
+
+        async def _get_streams(page=1, page_size=100, search=None,
+                               channel_group_name=None, m3u_account=None):
+            rows = pages.get((channel_group_name, m3u_account), [])
+            start = (page - 1) * page_size
+            has_next = start + page_size < len(rows)
+            return {
+                "count": len(rows),
+                "next": "next" if has_next else None,
+                "results": rows[start:start + page_size],
+            }
+
+        client.get_streams = AsyncMock(side_effect=_get_streams)
+
+        config = _config(
+            secondary_group_ids=[gid for gid, _account, _count in EVENT_SCOPES],
+            secondary=[
+                {"group_id": gid, "m3u_account_id": account}
+                for gid, account, _count in EVENT_SCOPES
+            ],
+        )
+        health_check = AsyncMock(return_value=set())
+        with patch("services.event_sync_stream_health.find_dead_streams",
+                   health_check):
+            resp = await _preview(
+                async_client, client, {"event_sync_config": config}
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["preflight"]["ok"] is True
+        assert data["truncated"] is False
+        assert data["summary"]["secondary_streams"] == EVENT_SCOPE_TOTAL
+        assert {s["stream_id"] for s in data["streams"]} == expected_ids
+        assert {s["group_id"] for s in data["streams"]} >= {1557, 754}
+        assert {s["provider"] for s in data["streams"]} == {
+            "Account 2", "Account 18",
+        }
+        # Every scope was fetched with its own provider filter; the preview
+        # only read metadata (no probe, no write).
+        assert {
+            (c.kwargs["channel_group_name"], c.kwargs["m3u_account"])
+            for c in client.get_streams.call_args_list
+        } == {(f"Group {gid}", account) for gid, account, _count in EVENT_SCOPES}
+        health_check.assert_not_awaited()
+        _assert_zero_writes(client)
+
+
 class TestPreflightSurfacing:
     @pytest.mark.asyncio
     async def test_preflight_failure_does_not_block_preview(self, async_client):

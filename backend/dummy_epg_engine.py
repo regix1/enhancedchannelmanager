@@ -618,6 +618,7 @@ def generate_channel_xml(
 
     if profile.get("epg_source_ids"):
         from services.epg_programmes import programme_times
+        from services.event_sync_matcher import parse_event_name
 
         start = profile.get("guide_start")
         stop = profile.get("guide_stop")
@@ -630,12 +631,42 @@ def generate_channel_xml(
             for icon in source_channel.findall("icon"):
                 channel_el.append(copy.deepcopy(icon))
         template_groups = {**base_groups, **(groups or {})}
-        if groups:
+        event = parse_event_name(
+            substituted_name, [matched_variant or profile],
+            event_timezone=event_timezone, now=start,
+        )
+        if groups and event.start is not None:
+            local_start = event.start.astimezone(tz)
             template_groups.update({
                 key: value for key, value in compute_event_times(
-                    groups, event_timezone, output_timezone, program_duration
+                    {**groups, "year": str(local_start.year),
+                     "minute": str(local_start.minute)},
+                    event_timezone, output_timezone, program_duration
                 ).items() if not isinstance(value, datetime)
             })
+        hint_title = _render(get_template("title_template"), template_groups) if groups else ""
+        hint_start = event.start if hint_title else None
+        hint_stop = hint_start + timedelta(days=1) if hint_start is not None else None
+        poster_url = _render_url(get_template("program_poster_url_template"), template_groups)
+
+        def append_gap(begin: datetime, end: datetime) -> None:
+            cuts = {begin, end}
+            if hint_start is not None:
+                cuts.update(point for point in (hint_start, hint_stop) if begin < point < end)
+            boundaries = sorted(cuts)
+            for left, right in zip(boundaries, boundaries[1:]):
+                hint = hint_start is not None and hint_start <= left < hint_stop
+                # A channel name identifies an event, not its current playback or end.
+                programmes.append(_make_programme(
+                    left, right, channel_id_str,
+                    hint_title if hint else "Programming unavailable",
+                    ("Event schedule is unconfirmed. The channel name supplies the start; "
+                     "the current broadcast and end time are unknown.") if hint else
+                    "No confirmed programme listing is available for this time.",
+                    categories if hint else [], poster_url if hint else "",
+                    False, False, False,
+                ))
+
         logo_url = _render_url(get_template("channel_logo_url_template"), template_groups)
         if logo_url:
             for icon in list(channel_el.findall("icon")):
@@ -651,16 +682,11 @@ def generate_channel_xml(
             if end <= begin:
                 continue
             if begin > cursor:
-                programmes.append(_make_programme(
-                    cursor, begin, channel_id_str, "Programming unavailable",
-                    "No confirmed programme listing is available for this time.",
-                    [], "", False, False, False,
-                ))
+                append_gap(cursor, begin)
             programme = copy.deepcopy(original)
             programme.set("channel", channel_id_str)
             programme.set("start", _xmltv_datetime(begin))
             programme.set("stop", _xmltv_datetime(end))
-            poster_url = _render_url(get_template("program_poster_url_template"), template_groups)
             if poster_url:
                 for icon in list(programme.findall("icon")):
                     programme.remove(icon)
@@ -668,11 +694,7 @@ def generate_channel_xml(
             programmes.append(programme)
             cursor = end
         if cursor < stop:
-            programmes.append(_make_programme(
-                cursor, stop, channel_id_str, "Programming unavailable",
-                "No confirmed programme listing is available for this time.",
-                [], "", False, False, False,
-            ))
+            append_gap(cursor, stop)
         return channel_el, programmes
 
     if groups is not None:

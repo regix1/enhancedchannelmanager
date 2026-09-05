@@ -5031,7 +5031,7 @@ class ActionExecutor:
         from datetime import timedelta
         from database import get_session
         from models import ChannelPipelineRule, DummyEPGProfile
-        from services.epg_programmes import prepare_profiles, SOURCE_TTL, _placeholder
+        from services.epg_programmes import prepare_profiles, SOURCE_MAX_AGE, _placeholder
         from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
         from services.event_sync_stream_health import _load_stats, _min_stream_bitrate_bps
 
@@ -5090,7 +5090,7 @@ class ActionExecutor:
             channel["_event_streams_complete"] = bool(ids) and all(sid in by_id for sid in ids)
         profile["name_source"] = "channel"
         try:
-            _, coverage = await prepare_profiles([profile], channels, self.client, now=now)
+            _, coverage = await prepare_profiles([profile], channels, self.client, now=now, wait_for_sources=False)
         except Exception:
             return eligible, states
         sources = {row["source_id"]: row for row in coverage["sources"]}
@@ -5133,7 +5133,7 @@ class ActionExecutor:
                     continue
                 source = sources.get(witness["source_id"], {})
                 success = datetime.fromisoformat(source.get("last_success") or "")
-                if source.get("status") != "ready" or not 0 <= (now - success).total_seconds() <= SOURCE_TTL:
+                if source.get("status") != "ready" or not 0 <= (now - success).total_seconds() <= SOURCE_MAX_AGE:
                     continue
             except (KeyError, TypeError, ValueError):
                 continue

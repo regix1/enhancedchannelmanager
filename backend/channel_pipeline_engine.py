@@ -130,10 +130,11 @@ def build_channel_profile_membership(
     return membership
 
 # Upper bound on secondary streams fetched per event_sync rule — a fetch
-# guard, not a decision knob (per-stream decisions are independent, so
-# truncation only defers later streams to the next idempotent run; it is
-# logged loudly).
-EVENT_SYNC_MAX_SECONDARY_STREAMS = 5000
+# guard, not a decision knob. Every run restarts each scope at page 1, so a
+# scope above the bound is scanned incompletely on EVERY run (the tail groups
+# are never reached); it is logged loudly. Sized to cover the largest saved
+# rule scope (14,594 streams across nine provider-scoped groups).
+EVENT_SYNC_MAX_SECONDARY_STREAMS = 20000
 _EVENT_SYNC_FETCH_PAGE_SIZE = 500
 
 
@@ -3404,8 +3405,8 @@ class ChannelPipelineEngine:
         the exact input shape the shared resolver (and therefore the preview
         endpoint) consumes. Groups whose channel-group name cannot be
         resolved are skipped loudly (mirrors the preview endpoint). The fetch
-        is bounded by ``EVENT_SYNC_MAX_SECONDARY_STREAMS`` as a guard; the
-        run is idempotent, so a truncated run picks up the rest next run.
+        is bounded by ``EVENT_SYNC_MAX_SECONDARY_STREAMS`` as a guard; a scope
+        above it is scanned incompletely (each run restarts at page 1).
         """
         from fastapi.concurrency import run_in_threadpool
 
@@ -3500,8 +3501,8 @@ class ChannelPipelineEngine:
                     truncated = True
                     logger.warning(
                         "[EVENT-SYNC] Secondary stream fetch truncated at "
-                        "%s streams (guard) — remaining streams will be "
-                        "picked up by the next idempotent run",
+                        "%s streams (guard) — scan is incomplete; groups "
+                        "after this point are not fetched on any run",
                         EVENT_SYNC_MAX_SECONDARY_STREAMS,
                     )
                     break
@@ -3564,7 +3565,7 @@ class ChannelPipelineEngine:
                         logger.warning(
                             "[EVENT-SYNC] Secondary stream fetch truncated at "
                             "%s streams (guard, incl. master-group self-attach)"
-                            " — remaining streams picked up next run",
+                            " — scan is incomplete on every run",
                             EVENT_SYNC_MAX_SECONDARY_STREAMS,
                         )
                         break
