@@ -135,10 +135,45 @@ class DummyEPGRefreshTask(TaskScheduler):
                 cache.set("dummy_epg_xmltv_all", xml_string)
                 for profile_id, per_xml in per_profile.items():
                     cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
+            if can_cache(_coverage):
+                await self._apply_empty_channel_visibility(profile_data, channel_map, _coverage, client)
             logger.info("[%s] Regenerated XMLTV for %s profiles", self.task_id, len(profiles))
             return len(profiles)
         finally:
             db.close()
+
+    async def _apply_empty_channel_visibility(self, profile_data, channel_map, coverage, client) -> None:
+        """Hide the channels of an opted-in group while they have no programmes.
+
+        A numbered event slot carries something only when an event is on it, and the
+        rest of the day it sits in the lineup announcing that it does not. Hiding is
+        the reversible form of removing it: the channel, its streams and its guide
+        binding all stay, so the slot reappears complete the moment its row fills,
+        with the id it always had. Deleting and recreating would churn that id daily
+        and lose the binding with it.
+
+        Scoped per group and off by default, because an empty guide row means
+        different things in different places: a slot between events is finished with,
+        a cable channel with a gap in its listings is still the channel you watch.
+        """
+        wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
+        if not wanted:
+            return
+        minutes = {row["channel_id"]: row.get("real_minutes") or 0 for row in coverage.get("channels", [])}
+        changed = 0
+        for channel_id, channel in channel_map.items():
+            if channel.get("channel_group_id") not in wanted or channel_id not in minutes:
+                continue
+            hide = minutes[channel_id] <= 0
+            if bool(channel.get("hidden_from_output")) is hide:
+                continue
+            try:
+                await client.update_channel(channel_id, {"hidden_from_output": hide})
+                changed += 1
+            except Exception as e:
+                logger.warning("[%s] Could not set visibility on channel %s: %s", self.task_id, channel_id, e)
+        if changed:
+            logger.info("[%s] Updated visibility on %s channel(s) with no programmes", self.task_id, changed)
 
     async def execute(self) -> TaskResult:
         """Execute the dummy EPG refresh pipeline."""

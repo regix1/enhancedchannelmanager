@@ -115,6 +115,7 @@ class ProfileCreateRequest(BaseModel):
     channel_group_ids: Optional[list[int]] = None
     epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
     channel_mappings: Optional[list[ChannelMapping]] = None
+    hide_empty_group_ids: Optional[list[int]] = None
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -149,6 +150,7 @@ class ProfileUpdateRequest(BaseModel):
     channel_group_ids: Optional[list[int]] = None
     epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
     channel_mappings: Optional[list[ChannelMapping]] = None
+    hide_empty_group_ids: Optional[list[int]] = None
 
 
 class ImportYAMLRequest(BaseModel):
@@ -391,6 +393,8 @@ async def create_profile(req: ProfileCreateRequest, db: Session = Depends(get_se
             profile.set_pattern_variants([v.model_dump() for v in req.pattern_variants])
         if req.channel_group_ids is not None:
             profile.set_channel_group_ids(req.channel_group_ids)
+        if req.hide_empty_group_ids is not None:
+            profile.set_hide_empty_group_ids(req.hide_empty_group_ids)
 
         await _configure_sources(profile, req.model_dump(exclude_unset=True))
         db.add(profile)
@@ -488,6 +492,7 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
         sub_pairs = update_data.pop("substitution_pairs", None)
         pattern_variants = update_data.pop("pattern_variants", None)
         channel_group_ids = update_data.pop("channel_group_ids", None)
+        hide_empty_group_ids = update_data.pop("hide_empty_group_ids", None)
         source_fields = {key: update_data.pop(key) for key in ("epg_source_ids", "channel_mappings") if key in update_data}
         configure = _source_changes(profile, {**source_fields, "channel_group_ids": channel_group_ids, "enabled": req.enabled})
 
@@ -500,6 +505,8 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
             profile.set_pattern_variants([v.model_dump() if hasattr(v, "model_dump") else v for v in pattern_variants])
         if channel_group_ids is not None:
             profile.set_channel_group_ids(channel_group_ids)
+        if hide_empty_group_ids is not None:
+            profile.set_hide_empty_group_ids(hide_empty_group_ids)
         if configure:
             await _configure_sources(profile, source_fields)
 

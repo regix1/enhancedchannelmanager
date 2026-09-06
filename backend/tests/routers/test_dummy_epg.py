@@ -5,7 +5,7 @@ Tests: Profile CRUD (with group-based channel assignment), preview, and XMLTV ou
 Mocks: _fetch_all_channels, get_client, preview_pipeline, generate_xmltv, cache.
 """
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from models import DummyEPGProfile
 
@@ -1399,6 +1399,73 @@ class TestProgrammeSources:
         assert response.status_code == 200, response.text
         assert response.json() == {"status": status, "profiles_generated": 1, "coverage": coverage}
         cache.set.assert_not_called()
+
+
+class TestHideEmptyChannels:
+    """A numbered event slot should leave the lineup while it carries nothing, and
+    come back complete when it does — without churning its id or guide binding."""
+
+    @staticmethod
+    def _task():
+        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+        return DummyEPGRefreshTask()
+
+    @staticmethod
+    def _channels():
+        return {
+            10: {"id": 10, "channel_group_id": 900, "hidden_from_output": False},
+            11: {"id": 11, "channel_group_id": 900, "hidden_from_output": True},
+            12: {"id": 12, "channel_group_id": 901, "hidden_from_output": False},
+        }
+
+    @staticmethod
+    def _coverage():
+        return {"channels": [
+            {"channel_id": 10, "real_minutes": 0},
+            {"channel_id": 11, "real_minutes": 120},
+            {"channel_id": 12, "real_minutes": 0},
+        ]}
+
+    @pytest.mark.asyncio
+    async def test_an_opted_in_group_hides_the_empty_and_restores_the_filled(self):
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
+        )
+        assert client.update_channel.await_args_list == [
+            call(10, {"hidden_from_output": True}),
+            call(11, {"hidden_from_output": False}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_group_nobody_opted_in_is_left_alone(self):
+        """Channel 12 is empty too, and must stay visible: a gap in a cable
+        channel's listings is not the same statement as an idle event slot."""
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
+        )
+        assert call(12, {"hidden_from_output": True}) not in client.update_channel.await_args_list
+
+    @pytest.mark.asyncio
+    async def test_no_opted_in_group_touches_nothing(self):
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": []}], self._channels(), self._coverage(), client,
+        )
+        client.update_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_update_does_not_stop_the_rest(self):
+        client = MagicMock()
+        client.update_channel = AsyncMock(side_effect=[RuntimeError("boom"), None])
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
+        )
+        assert client.update_channel.await_count == 2
 
 
 class TestXmltvCacheOutlivesRefreshInterval:

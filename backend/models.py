@@ -2767,6 +2767,10 @@ class DummyEPGProfile(Base):
     channel_group_ids = Column(Text, nullable=True)
     epg_source_ids = Column(Text, nullable=True)
     channel_mappings = Column(Text, nullable=True)
+    # Groups whose channels hide while their guide row is empty. Opt-in per group:
+    # a numbered event slot carries nothing between events and should not sit in the
+    # lineup saying so, but a cable channel with a temporary gap must stay put.
+    hide_empty_group_ids = Column(Text, nullable=True)
 
     # Timestamps
     last_generated_at = Column(DateTime, nullable=True)
@@ -2815,6 +2819,19 @@ class DummyEPGProfile(Base):
     def set_channel_group_ids(self, ids: list) -> None:
         """Set channel_group_ids from list."""
         self.channel_group_ids = json.dumps(ids) if ids else None
+
+    def get_hide_empty_group_ids(self) -> list:
+        """Groups whose channels hide while they have no programmes."""
+        if not self.hide_empty_group_ids:
+            return []
+        try:
+            return json.loads(self.hide_empty_group_ids)
+        except (ValueError, TypeError):
+            return []
+
+    def set_hide_empty_group_ids(self, ids: list) -> None:
+        """Set hide_empty_group_ids from list."""
+        self.hide_empty_group_ids = json.dumps(ids) if ids else None
 
     def get_epg_source_ids(self) -> list:
         """Return configured programme source IDs."""
@@ -2871,6 +2888,7 @@ class DummyEPGProfile(Base):
             "channel_group_ids": self.get_channel_group_ids(),
             "epg_source_ids": self.get_epg_source_ids(),
             "channel_mappings": self.get_channel_mappings(),
+            "hide_empty_group_ids": self.get_hide_empty_group_ids(),
             "last_generated_at": self.last_generated_at.isoformat() + "Z" if self.last_generated_at else None,
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
             "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,
