@@ -5045,7 +5045,7 @@ class ActionExecutor:
 
         return summary
 
-    async def _event_lifecycle(self, rule_id, config, units, now):
+    async def _event_lifecycle(self, rule_id, config, units, now, dead_stream_ids=frozenset()):
         """Read one bounded evidence batch for event creation and retirement."""
         import asyncio
         import copy
@@ -5155,6 +5155,17 @@ class ActionExecutor:
             parsed_channel = parsed_units.get(cid) or parse_event_name(
                 channel.get("name") or "", now=now, event_timezone=profile.get("event_timezone") or "US/Eastern",
             )
+            # Nothing lists ESPN+ or PPV, so those channels never get a witness and
+            # nothing below can retire them. A channel whose every stream is dead is
+            # not waiting on evidence though: the provider has dropped the stream, or
+            # it has struck out or measured under the floor on a reading taken since
+            # this event started. It cannot play, whatever the right end time was, so
+            # this decides nothing the guide has an opinion about.
+            if (parsed_channel.start is not None and parsed_channel.start <= now
+                    and channel["streams"]
+                    and all(stream["id"] in dead_stream_ids for stream in channel["streams"])):
+                states[cid] = "idle"
+                continue
             if not witness and parsed_channel.start is not None and parsed_channel.start <= now:
                 for stream in channel["streams"]:
                     stat = stats.get(stream["id"], {})
@@ -5496,6 +5507,7 @@ class ActionExecutor:
                     *(unit for key, unit in lifecycle_units.items() if key not in sampled_keys),
                 ),
                 now,
+                dead,
             )
             plan = build_promotion_plan(
                 config, resolution.resolved, existing_name_to_id, now=now,

@@ -3129,6 +3129,31 @@ async def test_confirmed_idle_channel_is_removed_without_deleting_stream(retirem
 
 
 @pytest.mark.asyncio
+async def test_event_with_no_guide_listing_retires_when_every_stream_is_dead(retirement):
+    """Nothing lists ESPN+ or PPV, so those channels never get a witness."""
+    setup = retirement
+    setup["witness"].clear()
+    _, states = await setup["executor"]._event_lifecycle(
+        setup["rule"].id, setup["config"], (), setup["now"], {7301},
+    )
+    assert states[900] == "idle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dead", [set(), {7301}])
+async def test_a_live_stream_keeps_its_channel_whether_or_not_a_sibling_died(retirement, dead):
+    setup = retirement
+    setup["witness"].clear()
+    setup["executor"]._channel_by_id[900]["streams"] = [7301, 7302]
+    setup["streams"].append({"id": 7302, "name": STREAM_FURY, "is_stale": False,
+                             "updated_at": (setup["now"] - timedelta(minutes=1)).isoformat()})
+    _, states = await setup["executor"]._event_lifecycle(
+        setup["rule"].id, setup["config"], (), setup["now"], dead,
+    )
+    assert states[900] != "idle"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("minutes", [15, 45, 60])
 async def test_hourly_schedule_retains_fresh_stream_retirement_evidence(retirement, minutes):
     from services import epg_programmes
