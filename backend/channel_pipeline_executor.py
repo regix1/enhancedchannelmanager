@@ -5155,35 +5155,29 @@ class ActionExecutor:
             parsed_channel = parsed_units.get(cid) or parse_event_name(
                 channel.get("name") or "", now=now, event_timezone=profile.get("event_timezone") or "US/Eastern",
             )
-            if not witness and parsed_channel.start is not None and parsed_channel.start <= now:
-                for stream in channel["streams"]:
-                    stat = stats.get(stream["id"], {})
-                    try:
-                        probed = datetime.fromisoformat((stat.get("last_probed") or "").replace("Z", "+00:00"))
-                        if probed.tzinfo is None:
-                            probed = probed.replace(tzinfo=timezone.utc)
-                        measured = stat.get("measured_bitrate")
-                        parsed = parsed_streams[stream["id"]]
-                        same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
-                        if (same and stream.get("is_stale") is not True and floor > 0
-                                and isinstance(measured, (int, float)) and measured >= floor
-                                and max(parsed_channel.start, now - timedelta(minutes=5)) <= probed <= now):
-                            states[cid] = "active"
-                    except (TypeError, ValueError):
-                        pass
-                continue
-            if not witness:
-                continue
-            try:
-                start = datetime.fromisoformat(witness["start"])
-                stop = datetime.fromisoformat(witness["stop"])
-                if parsed_channel.start is None or abs((parsed_channel.start - start).total_seconds()) > 1800:
+            if witness:
+                try:
+                    start = datetime.fromisoformat(witness["start"])
+                    stop = datetime.fromisoformat(witness["stop"])
+                    if parsed_channel.start is None or abs((parsed_channel.start - start).total_seconds()) > 1800:
+                        continue
+                    source = sources.get(witness["source_id"], {})
+                    success = datetime.fromisoformat(source.get("last_success") or "")
+                    if source.get("status") != "ready" or not 0 <= (now - success).total_seconds() <= SOURCE_MAX_AGE:
+                        continue
+                except (KeyError, TypeError, ValueError):
                     continue
-                source = sources.get(witness["source_id"], {})
-                success = datetime.fromisoformat(source.get("last_success") or "")
-                if source.get("status") != "ready" or not 0 <= (now - success).total_seconds() <= SOURCE_MAX_AGE:
-                    continue
-            except (KeyError, TypeError, ValueError):
+            elif parsed_channel.start is not None:
+                # No EPG source lists ESPN+ or PPV events, so those channels never get a
+                # witness and used to sit in the group forever playing a slot that had
+                # moved on. The block this profile already publishes for the event says
+                # the same thing a witness would, so read the window from it and put the
+                # channel through the identical stream evidence below: it still retires
+                # only once every stream has been seen since the window closed and shows
+                # it changed, and a stream still carrying this event still blocks it.
+                start = parsed_channel.start
+                stop = start + timedelta(minutes=profile.get("program_duration") or 180)
+            else:
                 continue
             positive, transitioned = False, True
             for stream in channel["streams"]:

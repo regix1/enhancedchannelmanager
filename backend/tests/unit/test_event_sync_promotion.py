@@ -3129,6 +3129,29 @@ async def test_confirmed_idle_channel_is_removed_without_deleting_stream(retirem
 
 
 @pytest.mark.asyncio
+async def test_event_with_no_guide_listing_retires_once_its_own_block_closes(retirement):
+    """No EPG source lists ESPN+ or PPV, so those channels never get a witness."""
+    setup = retirement
+    setup["witness"].clear()
+    # 8pm ET is 4 hours before the fixture's now, so the profile's 180 minute block closed an hour ago.
+    setup["executor"]._channel_by_id[900]["name"] = "Fury Vs. Usyk @ Jul 11 08:00 PM"
+    states, result = await _retire(setup)
+    assert states[900] == "idle"
+    assert result["channels_removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_event_with_no_guide_listing_is_held_while_its_stream_still_carries_it(retirement):
+    setup = retirement
+    setup["witness"].clear()
+    setup["executor"]._channel_by_id[900]["name"] = "Fury Vs. Usyk @ Jul 11 08:00 PM"
+    setup["streams"][0]["name"] = "Fury Vs. Usyk @ Jul 11 08:00 PM"
+    states, result = await _retire(setup)
+    assert states[900] != "idle"
+    assert result["channels_removed"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("minutes", [15, 45, 60])
 async def test_hourly_schedule_retains_fresh_stream_retirement_evidence(retirement, minutes):
     from services import epg_programmes
