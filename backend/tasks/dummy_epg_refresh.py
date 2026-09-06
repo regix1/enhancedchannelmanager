@@ -161,6 +161,15 @@ class DummyEPGRefreshTask(TaskScheduler):
         wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
         if not wanted:
             return
+        # Only a fully scanned composition may decide visibility. A source that has
+        # not answered yet yields channels with no programmes and NO warning to say
+        # why — `schedule_pending` needs a selection to be missing from, and a cold
+        # source has no selection at all — so an empty row is indistinguishable from
+        # an idle slot until every source reports ready.
+        sources = coverage.get("sources") or ()
+        if not sources or any(source.get("status") != "ready" for source in sources):
+            logger.info("[%s] Sources still loading — leaving channel visibility alone", self.task_id)
+            return
         rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():

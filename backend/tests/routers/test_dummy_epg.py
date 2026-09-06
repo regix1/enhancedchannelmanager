@@ -1420,7 +1420,7 @@ class TestHideEmptyChannels:
 
     @staticmethod
     def _coverage():
-        return {"channels": [
+        return {"sources": [{"source_id": 51, "status": "ready"}], "channels": [
             {"channel_id": 10, "real_minutes": 0},
             {"channel_id": 11, "real_minutes": 120},
             {"channel_id": 12, "real_minutes": 0},
@@ -1432,7 +1432,7 @@ class TestHideEmptyChannels:
         Acting on that hides the whole group until the next good run."""
         client = MagicMock()
         client.update_channel = AsyncMock()
-        coverage = {"channels": [
+        coverage = {"sources": [{"source_id": 51, "status": "ready"}], "channels": [
             {"channel_id": 10, "real_minutes": 0, "warnings": ["schedule_pending"]},
             {"channel_id": 11, "real_minutes": 0, "warnings": ["mapping_unavailable"]},
         ]}
@@ -1446,7 +1446,8 @@ class TestHideEmptyChannels:
         """missing_artwork says nothing about whether the source was asked."""
         client = MagicMock()
         client.update_channel = AsyncMock()
-        coverage = {"channels": [{"channel_id": 10, "real_minutes": 0, "warnings": ["missing_artwork"]}]}
+        coverage = {"sources": [{"source_id": 51, "status": "ready"}],
+                    "channels": [{"channel_id": 10, "real_minutes": 0, "warnings": ["missing_artwork"]}]}
         await self._task()._apply_empty_channel_visibility(
             [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
         )
@@ -1463,6 +1464,23 @@ class TestHideEmptyChannels:
             call(10, {"hidden_from_output": True}),
             call(11, {"hidden_from_output": False}),
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sources", [
+        [],
+        [{"source_id": 51, "status": "pending"}],
+        [{"source_id": 51, "status": "ready"}, {"source_id": 4, "status": "stale"}],
+    ])
+    async def test_a_source_still_loading_decides_no_visibility(self, sources):
+        """A cold source yields empty channels with NO warning to say why, so an
+        empty row cannot be told from an idle slot until every source is ready."""
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        coverage = {"sources": sources, "channels": [{"channel_id": 10, "real_minutes": 0}]}
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
+        )
+        client.update_channel.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_group_nobody_opted_in_is_left_alone(self):
