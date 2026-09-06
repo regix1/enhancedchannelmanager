@@ -92,6 +92,8 @@ MAX_HEALTH_PROBES_PER_RUN = 200
 _URL_LOOKUP_BATCH = 500
 
 _FAILED_PROBE_STATUSES = frozenset({"failed", "timeout"})
+# Probes needed before a failure is a verdict rather than one bad moment.
+_CONFIRMED_FAILURES = 2
 
 
 async def find_dead_streams(
@@ -424,18 +426,27 @@ def _is_struck(stat: dict | None, threshold: int) -> bool:
 
 
 def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
-    """Did this stream's stored probe verdict say it did not answer?
+    """Did this stream's stored probe verdict say it did not answer, twice?
 
     The sibling of :func:`_is_struck`, asking the other half of the stored
-    row: one failure recorded as ``failed`` or ``timeout`` counts even
-    though the strike counter has not reached its threshold. [6]
+    row: failures recorded as ``failed`` or ``timeout`` count even though the
+    strike counter has not reached its operator threshold. [6]
 
-    It counts only when the probe itself happened at or after the event
+    A single reading does not, though, because one probe is one moment. The
+    same slot answered on one probe and failed on the next within the same
+    afternoon, in both directions — so a lone failure is as likely to be the
+    provider blinking as the event being over, and this verdict now deletes
+    the channel. Requiring the next probe to agree costs one cycle and is the
+    smallest thing that distinguishes a blink from an ending.
+
+    They count only when the probe itself happened at or after the event
     started, for the reason :func:`_probed_after_kickoff` gives. [59]
     """
     if stat is None:
         return False
     if stat.get("probe_status") not in _FAILED_PROBE_STATUSES:
+        return False
+    if int(stat.get("consecutive_failures") or 0) < _CONFIRMED_FAILURES:
         return False
     return _probed_after_kickoff(stat, started_at)
 

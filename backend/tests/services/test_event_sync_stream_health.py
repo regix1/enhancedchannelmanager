@@ -166,10 +166,22 @@ class TestVerdictFromStoredHealth:
             assert await find_dead_streams(
                 [7, 8], event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7}
 
-    async def test_a_stored_failure_after_the_event_started_is_dead(self):
-        """One recorded failure is below the strike threshold, and once the
-        event is on air that is still a stream that did not answer."""
+    async def test_a_single_failure_waits_for_the_next_probe_to_agree(self):
+        """One probe is one moment. The same slot answered on one probe and
+        failed on the next inside an afternoon, so a lone failure is as
+        likely to be the provider blinking as the event ending — and this
+        verdict now deletes the channel."""
         stats = {7: _stat(7, failures=1, status="failed")}
+        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
+                   _stats_returning(stats)), \
+             patch("config.get_settings", return_value=_settings(3)):
+            assert await find_dead_streams(
+                [7], event_start_by_stream={7: _KICKOFF}) == set()
+
+    async def test_a_confirmed_failure_after_the_event_started_is_dead(self):
+        """Two failures in a row are still below the strike threshold, and
+        once the event is on air that is a stream that did not answer."""
+        stats = {7: _stat(7, failures=2, status="failed")}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
              patch("config.get_settings", return_value=_settings(3)):
@@ -196,7 +208,7 @@ class TestVerdictFromStoredHealth:
         probed again, so counting it now would decide the event on evidence
         nothing will ever refresh. [59]
         """
-        stats = {7: _stat(7, failures=1, status="failed",
+        stats = {7: _stat(7, failures=2, status="failed",
                           probed_at=_KICKOFF - timedelta(hours=1))}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
@@ -298,7 +310,7 @@ class TestVerdictFromSampledThroughput:
         """The third shape: nothing ever arrives and the socket does not
         even close, so there is no sample to take and the stored verdict is
         all there is."""
-        stats = {7: _stat(7, status="timeout", measured=None)}
+        stats = {7: _stat(7, failures=2, status="timeout", measured=None)}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
              patch("config.get_settings", return_value=_settings(3)):
@@ -309,7 +321,7 @@ class TestVerdictFromSampledThroughput:
         """The mirror, and the one this whole change exists for: three of
         the channels carrying their event at 5.65 to 7.87 Mbps are stored
         as ``failed``, because ffprobe could not parse what they sent."""
-        stats = {7: _stat(7, failures=1, status="failed",
+        stats = {7: _stat(7, failures=2, status="failed",
                           measured=6_140_000)}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
@@ -387,7 +399,7 @@ class TestVerdictFromSampledThroughput:
         streams, so a declaration at or above the floor stays no answer and
         the stored verdict still decides. Here that verdict is a failure
         after kickoff, so the stream is dead despite declaring 8 Mbps. [40]"""
-        stats = {7: _stat(7, status="failed", measured=None,
+        stats = {7: _stat(7, failures=2, status="failed", measured=None,
                           declared=8_000_000)}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
@@ -435,7 +447,7 @@ class TestVerdictFromSampledThroughput:
         ffprobe verdict off along with it. The sample is what stops being
         consulted, and everything the gate did before it existed carries
         on."""
-        stats = {7: _stat(7, failures=1, status="failed",
+        stats = {7: _stat(7, failures=2, status="failed",
                           measured=6_140_000)}
         with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_returning(stats)), \
