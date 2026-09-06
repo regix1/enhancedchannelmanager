@@ -7,6 +7,7 @@ landscape URL it had, and a match split across a chunk boundary is still
 found — the rewrite streams, so boundaries land mid-URL routinely.
 """
 import httpx
+import pytest
 
 from services.epg_artwork import (
     ArtworkCache,
@@ -341,6 +342,38 @@ class TestMatchupBanner:
         """Gracenote writes the visiting side first in both spellings."""
         assert matchup_banner(GT, "NHL Hockey", "Rangers vs. Bruins") == (
             f"{GT}/nhl/rangers/bruins/cover?style=4&logo=true&fallback=true")
+
+    @pytest.mark.parametrize(("sub_title", "away", "home"), [
+        ("Louisiana-Monroe at Mississippi State", "ul-monroe-warhawks", "mississippi-state"),
+        ("Mississippi State vs. Louisiana-Monroe", "mississippi-state", "ul-monroe-warhawks"),
+    ])
+    def test_ul_monroe_uses_its_football_team_slug(self, sub_title, away, home):
+        assert matchup_banner(GT, "College Football", sub_title) == (
+            f"{GT}/ncaaf/{away}/{home}/cover?style=4&logo=true&fallback=true")
+
+    @pytest.mark.parametrize(("title", "sub_title", "league", "away"), [
+        ("College Basketball", "Louisiana-Monroe at Mississippi State", "ncaab", "louisiana-monroe"),
+        ("College Football", "Monroe at Mississippi State", "ncaaf", "monroe"),
+        ("College Football", "Monroe Mustangs at Mississippi State", "ncaaf", "monroe-mustangs"),
+        ("College Football", "Louisiana-Monroe State at Mississippi State", "ncaaf", "louisiana-monroe-state"),
+    ])
+    def test_other_monroe_teams_keep_their_slugs(self, title, sub_title, league, away):
+        assert matchup_banner(GT, title, sub_title) == (
+            f"{GT}/{league}/{away}/mississippi-state/cover?style=4&logo=true&fallback=true")
+
+    def test_ul_monroe_banner_survives_streaming_xml(self, tmp_path):
+        xml = ('<programme><title>College Football</title>'
+               '<sub-title>Louisiana-Monroe at Mississippi State</sub-title>'
+               '<desc>The UL Monroe Warhawks face the Mississippi State Bulldogs.</desc>'
+               '</programme>')
+        expected = (f'{GT}/ncaaf/ul-monroe-warhawks/mississippi-state/cover'
+                    '?style=4&amp;logo=true&amp;fallback=true')
+        for size in (None, 1, 7, 64):
+            rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+            out = _run(rw, xml, size)
+            assert f'<icon src="{expected}" />' in out
+            assert out.count("<icon") == 1
+            assert rw.bannered == 1
 
     def test_a_trailing_slash_on_the_base_is_not_doubled(self, tmp_path):
         rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT + "/")

@@ -228,6 +228,11 @@ def matchup_banner(base: str, title: str, sub_title: str,
     away, home = _slug(teams.group("away")), _slug(teams.group("home"))
     if not away or not home:
         return None
+    if league == "ncaaf":
+        if away == "louisiana-monroe":
+            away = "ul-monroe-warhawks"
+        if home == "louisiana-monroe":
+            home = "ul-monroe-warhawks"
     # fallback=true is not optional: a team game-thumbs cannot resolve answers
     # 400 with a JSON body without it, and the guide draws that as a broken
     # image. With it, an unresolved side still yields a usable banner.
