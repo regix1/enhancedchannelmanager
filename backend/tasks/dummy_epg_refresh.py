@@ -156,15 +156,24 @@ class DummyEPGRefreshTask(TaskScheduler):
         different things in different places: a slot between events is finished with,
         a cable channel with a gap in its listings is still the channel you watch.
         """
+        from services.epg_programmes import PROVISIONAL_WARNINGS
+
         wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
         if not wanted:
             return
-        minutes = {row["channel_id"]: row.get("real_minutes") or 0 for row in coverage.get("channels", [])}
+        rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():
-            if channel.get("channel_group_id") not in wanted or channel_id not in minutes:
+            if channel.get("channel_group_id") not in wanted or channel_id not in rows:
                 continue
-            hide = minutes[channel_id] <= 0
+            row = rows[channel_id]
+            # "Nobody asked the source yet" is not "there is nothing on". Composing
+            # before a scan lands makes every slot look empty, and acting on that
+            # hides the whole group until the next good run — the same mistake as
+            # publishing a guide of empty channels, in visibility form.
+            if any(warning in PROVISIONAL_WARNINGS for warning in row.get("warnings") or ()):
+                continue
+            hide = (row.get("real_minutes") or 0) <= 0
             if bool(channel.get("hidden_from_output")) is hide:
                 continue
             try:

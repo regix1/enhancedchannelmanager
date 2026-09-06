@@ -1427,6 +1427,32 @@ class TestHideEmptyChannels:
         ]}
 
     @pytest.mark.asyncio
+    async def test_a_slot_nobody_asked_the_source_about_is_left_alone(self):
+        """A composition taken before the scan lands reads every slot as empty.
+        Acting on that hides the whole group until the next good run."""
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        coverage = {"channels": [
+            {"channel_id": 10, "real_minutes": 0, "warnings": ["schedule_pending"]},
+            {"channel_id": 11, "real_minutes": 0, "warnings": ["mapping_unavailable"]},
+        ]}
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
+        )
+        client.update_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_warning_that_is_not_about_lookup_still_hides(self):
+        """missing_artwork says nothing about whether the source was asked."""
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        coverage = {"channels": [{"channel_id": 10, "real_minutes": 0, "warnings": ["missing_artwork"]}]}
+        await self._task()._apply_empty_channel_visibility(
+            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
+        )
+        client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": True})
+
+    @pytest.mark.asyncio
     async def test_an_opted_in_group_hides_the_empty_and_restores_the_filled(self):
         client = MagicMock()
         client.update_channel = AsyncMock()
