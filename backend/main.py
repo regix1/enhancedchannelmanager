@@ -1788,13 +1788,30 @@ async def startup_event():
     # refuses a second concurrent run, so this cannot collide with the schedule
     # firing at the same moment.
     async def _rebuild_guide_on_startup():
+        from cache import get_cache
+        from routers.dummy_epg import XMLTV_CACHE_TTL
+        from services.epg_programmes import SOURCE_TTL
+        from task_engine import get_engine
+
         await asyncio.sleep(15)  # Wait for services to be ready
-        try:
-            from task_engine import get_engine
-            await get_engine().run_task("dummy_epg_refresh")
-            logger.info("[MAIN] Startup: rebuilt the dummy EPG guide")
-        except Exception as e:
-            logger.warning("[MAIN] Startup guide rebuild failed: %s", e)
+        # One pass is not enough on a busy container: the sources can still be
+        # loading when it composes, and it then publishes a guide of empty
+        # channels. The refresh only caches a composition can_cache accepts, so
+        # an empty cache IS the "still incomplete" signal, with no second
+        # opinion about completeness to disagree with the first. Retry no sooner
+        # than the source backoff, which is the floor on rescanning anyway.
+        for attempt in range(1, 4):
+            try:
+                await get_engine().run_task("dummy_epg_refresh")
+            except Exception as e:
+                logger.warning("[MAIN] Startup guide rebuild failed: %s", e)
+                return
+            if get_cache().get("dummy_epg_xmltv_all", ttl=XMLTV_CACHE_TTL) is not None:
+                logger.info("[MAIN] Startup: rebuilt the dummy EPG guide on attempt %s", attempt)
+                return
+            logger.info("[MAIN] Startup: guide still incomplete after attempt %s, waiting for the source backoff", attempt)
+            await asyncio.sleep(SOURCE_TTL)
+        logger.warning("[MAIN] Startup: guide still incomplete, leaving it to the hourly refresh")
 
     asyncio.create_task(_rebuild_guide_on_startup())
 
