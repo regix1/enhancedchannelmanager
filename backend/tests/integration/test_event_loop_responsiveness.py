@@ -288,3 +288,44 @@ class TestRequestTimeoutMiddleware:
                 r for r in app.router.routes
                 if getattr(r, "path", None) != "/api/auto-creation/_test_stall_enfsy"
             ]
+
+
+class TestPipelinePlanBuilderExemption:
+    """The plan builder is synchronous by contract — the confirmation token it
+    returns has to describe a plan that already exists — and evaluating the
+    rules against a large stream catalogue exceeds the request budget. It
+    504'd, and because the token is mandatory that left no way to run a scoped
+    pipeline at all.
+    """
+
+    def test_plan_builder_is_exempt(self):
+        """The one synchronous planning path clears the budget."""
+        import main as main_module
+
+        assert (
+            "/api/channel-pipeline/run/prepare"
+            in main_module._TIMEOUT_EXEMPT_PREFIXES
+        )
+
+    def test_exemption_is_the_single_path_not_the_router(self):
+        """bd-enfsy again: exempting the prefix would put every pipeline CRUD
+        handler back outside the budget, which is the regression that note
+        warns about. Only the plan builder may clear it.
+        """
+        import main as main_module
+
+        for prefix in main_module._TIMEOUT_EXEMPT_PREFIXES:
+            assert prefix != "/api/channel-pipeline/"
+            assert prefix != "/api/auto-creation/"
+
+        # Sibling routes under the same router stay subject to the timeout.
+        for path in (
+            "/api/channel-pipeline/rules",
+            "/api/channel-pipeline/run",
+            "/api/channel-pipeline/run/commit",
+            "/api/channel-pipeline/event-sync-preview",
+        ):
+            assert not any(
+                path.startswith(prefix)
+                for prefix in main_module._TIMEOUT_EXEMPT_PREFIXES
+            ), f"{path} must stay under the request budget"

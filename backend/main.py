@@ -482,6 +482,16 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     # supervisor lives in routers/channel_pipeline.py), so the prefix is back
     # under the timeout — every CRUD and the now-fast enqueue must respect
     # the budget.
+    #
+    # The plan builder is the exception the note above does not cover: it is
+    # still synchronous, because the confirmation token it returns has to
+    # describe a plan that exists by the time the caller reads it. Building
+    # that plan evaluates the rules against the whole stream catalogue, which
+    # on a large provider exceeds the budget and 504s — leaving no way to run
+    # a scoped pipeline at all, since the token is mandatory. It writes
+    # nothing, and the plan it materialises is already capped at 500
+    # operations, so the run it authorises stays bounded.
+    "/api/channel-pipeline/run/prepare",
 )
 
 
