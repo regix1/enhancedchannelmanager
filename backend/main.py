@@ -492,6 +492,11 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     # nothing, and the plan it materialises is already capped at 500
     # operations, so the run it authorises stays bounded.
     "/api/channel-pipeline/run/prepare",
+    # Applying that plan is the other half and takes longer than building it: the
+    # event lifecycle re-probes every started stream so its retirement verdict is
+    # under five minutes old, and a probe costs the operator's probe timeout. The
+    # 504 landed on the commit, so the plan was consumed and nothing ran.
+    "/api/channel-pipeline/run/commit",
     # Probing is measuring: the caller waits for the throughput figure, so this
     # cannot become a background task without changing what it returns. The
     # operator's own probe timeout is what bounds it, and at the shipped 30s it
