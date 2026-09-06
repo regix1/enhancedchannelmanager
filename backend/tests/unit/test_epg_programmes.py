@@ -32,6 +32,14 @@ async def test_source_error_retains_wrapped_timeout_reason(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_source_read_leaves_the_published_guide_alone(monkeypatch):
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=httpx.ReadTimeout("upstream")))
+    with patch.object(guides, "get_cache") as cache:
+        await guides._load_source("selected", source(), [], START, STOP, NOW)
+        cache.return_value.invalidate_prefix.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure,expected", [
     (httpx.ConnectTimeout("private"), "Request timed out while connecting."),
     (TimeoutError("private"), "Request timed out."),
@@ -595,6 +603,10 @@ async def test_unchanged_catalogue_does_not_invalidate_ready_output():
         upstream.get_epg_sources.return_value = [source(priority=9)]
         await guides._load_catalogue(key, upstream, None)
         cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+        cache.return_value.invalidate_prefix.reset_mock()
+        upstream.get_epg_sources.side_effect = httpx.ReadTimeout("upstream")
+        await guides._load_catalogue(key, upstream, None)
+        cache.return_value.invalidate_prefix.assert_not_called()
 
 
 @pytest.mark.asyncio

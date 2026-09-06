@@ -623,7 +623,10 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
                 continue
             total -= _SOURCE_CACHE[oldest].get("size", 0)
             del _SOURCE_CACHE[oldest]
-        get_cache().invalidate_prefix("dummy_epg_xmltv")
+        # A read that failed carries no schedules to recompose from, so dropping the
+        # published guide for it trades a working guide for an emptier one.
+        if not _SOURCE_CACHE.get(key, {}).get("error"):
+            get_cache().invalidate_prefix("dummy_epg_xmltv")
 
 
 async def _probe_artwork(unknown: dict) -> None:
@@ -686,7 +689,7 @@ async def _load_catalogue(key: tuple, client, link: int | None) -> dict:
                 break
             del _CATALOGUE_CACHE[oldest]
         current = _CATALOGUE_CACHE.get(key, {})
-        if previous.get("value") != current.get("value") or previous.get("error") != current.get("error"):
+        if previous.get("value") != current.get("value"):
             get_cache().invalidate_prefix("dummy_epg_xmltv")
     return current
 
