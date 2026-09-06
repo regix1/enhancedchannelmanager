@@ -1394,14 +1394,20 @@ def _score_parsed_pair(
         )
 
     delta = abs((parsed_a.start - parsed_b.start).total_seconds()) / 60.0
-    verdict, team_score = _team_pair_verdict(
-        parsed_a.teams, parsed_b.teams, alias_index
-    )
-    fuzzy = _fuzzy_title_score(parsed_a.title, parsed_b.title)
 
     if window_minutes is not None and delta > window_minutes:
-        # Time-window blocking: not a candidate pair at all. Diagnostic
-        # fields (verdict, fuzzy) are still populated for the preview UI.
+        # Time-window blocking: not a candidate pair at all, so reject here
+        # rather than after the team and fuzzy-title work below.
+        #
+        # That ordering is the dominant cost of an event-sync run. The
+        # resolver compares every secondary stream against every master, and
+        # a provider that publishes one stream per scheduled event weeks
+        # ahead puts the overwhelming majority of those pairs outside the
+        # window — each one previously paid for a team verdict and a fuzzy
+        # title score whose only use was to be discarded on the next line.
+        # Nothing reads verdict/fuzzy off a rejected pair, so the rejection
+        # itself is unchanged; only the debug line above sees the difference.
+        #
         # ``window_minutes is None`` disables the gate entirely (per-rule
         # opt-in, bead krkm4): every parsed master becomes a candidate and
         # ranking falls to title/team score alone — the time delta is still
@@ -1409,9 +1415,14 @@ def _score_parsed_pair(
         # rail, and numeric-identity rail below stay in force, so borderline
         # collisions land in the review queue rather than auto-attaching.
         return _result(
-            0.0, BAND_REJECT, verdict, fuzzy, team_score, delta,
+            0.0, BAND_REJECT, TEAM_VERDICT_ABSENT, 0.0, None, delta,
             (REJECT_OUTSIDE_TIME_WINDOW,),
         )
+
+    verdict, team_score = _team_pair_verdict(
+        parsed_a.teams, parsed_b.teams, alias_index
+    )
+    fuzzy = _fuzzy_title_score(parsed_a.title, parsed_b.title)
 
     if verdict == TEAM_VERDICT_CONFLICT:
         # HARD REJECT — mirrors the M1 callsign rail. Score forced to 0.0.
