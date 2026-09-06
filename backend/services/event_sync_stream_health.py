@@ -354,11 +354,34 @@ def _dead_once_started(
     could not be taken because nothing ever answered, or one written
     before the column existed. [10]
     """
+    if stat is not None and _black_since_kickoff(stat, started_at):
+        return True
     if stat is not None and _probed_after_kickoff(stat, started_at):
         sampled = _sample_says_dead(stat, floor_bps)
         if sampled is not None:
             return sampled
     return _is_struck(stat, threshold) or _probe_failed(stat, started_at)
+
+
+def _black_since_kickoff(stat: dict, started_at: datetime) -> bool:
+    """Did a look at the picture, taken during this event, find nothing on it?
+
+    Throughput cannot answer this one. A provider looping an offline card
+    sends real bytes at a real rate, so it reads at or above the floor and
+    :func:`_sample_says_dead` calls it alive — which is why this has to run
+    ahead of the sample rather than after it. The scan stamps every verdict
+    it takes, black or clear, so a slot that was dark before kickoff and is
+    carrying its event now overwrites its own flag; a reading with no stamp
+    predates the column and says nothing.
+    """
+    if not stat.get("is_black_screen"):
+        return False
+    # The health table keeps naive UTC and serializes it with a Z.
+    raw = stat.get("black_screen_checked_at")
+    if not raw:
+        return False
+    checked_at = datetime.fromisoformat(raw.rstrip("Z")).replace(tzinfo=timezone.utc)
+    return checked_at >= started_at
 
 
 def _sample_says_dead(stat: dict | None, floor_bps: int) -> bool | None:

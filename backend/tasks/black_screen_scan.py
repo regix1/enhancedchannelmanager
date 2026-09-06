@@ -219,6 +219,10 @@ class BlackScreenScanTask(TaskScheduler):
                             stats = db.query(StreamStats).filter_by(stream_id=stream_id).first()
                             if stats:
                                 stats.is_black_screen = is_black
+                                # Stamp every verdict, not just a black one: retirement has to
+                                # know how old this reading is, and a slot that went black before
+                                # kickoff and is now carrying its event must be able to say so.
+                                stats.black_screen_checked_at = datetime.utcnow()
                                 db.commit()
                         finally:
                             db.close()

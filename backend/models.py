@@ -253,6 +253,7 @@ class StreamStats(Base):
     dismissed_at = Column(DateTime, nullable=True)  # When failure was dismissed (acknowledged)
     consecutive_failures = Column(Integer, default=0, nullable=False)  # Strike rule: consecutive probe failures
     is_black_screen = Column(Boolean, default=False, nullable=False)  # Black screen detected during probe
+    black_screen_checked_at = Column(DateTime, nullable=True)  # When that verdict was taken; the flag alone has no age
     is_low_fps = Column(Boolean, default=False, nullable=False)  # Low FPS detected during probe (< 20 FPS)
 
     __table_args__ = (
@@ -282,6 +283,7 @@ class StreamStats(Base):
             "dismissed_at": self.dismissed_at.isoformat() + "Z" if self.dismissed_at else None,
             "consecutive_failures": self.consecutive_failures or 0,
             "is_black_screen": self.is_black_screen or False,
+            "black_screen_checked_at": self.black_screen_checked_at.isoformat() + "Z" if self.black_screen_checked_at else None,
             "is_low_fps": self.is_low_fps or False,
         }
 

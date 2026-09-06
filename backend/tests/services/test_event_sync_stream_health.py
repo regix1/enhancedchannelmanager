@@ -42,6 +42,38 @@ def _stat(stream_id, *, failures=0, status="success", probed_at=None,
     }
 
 
+def _black(stream_id, *, checked_at=None, is_black=True, measured=5_000_000):
+    """A stat whose throughput reads healthy, as an offline card's does."""
+    stat = _stat(stream_id, measured=measured)
+    stat["is_black_screen"] = is_black
+    if checked_at is not None:
+        stat["black_screen_checked_at"] = checked_at.replace(tzinfo=None).isoformat() + "Z"
+    return stat
+
+
+@pytest.mark.parametrize("checked_at,expected", [
+    (_KICKOFF + timedelta(minutes=20), True),
+    (_KICKOFF, True),
+    (_KICKOFF - timedelta(minutes=20), False),
+    (None, False),
+])
+def test_a_black_picture_taken_during_the_event_outranks_healthy_throughput(checked_at, expected):
+    from services.event_sync_stream_health import _dead_once_started
+
+    stat = _black(1, checked_at=checked_at)
+    assert _dead_once_started(stat, _KICKOFF, 3, 2_000_000) is expected
+
+
+def test_a_cleared_picture_leaves_the_throughput_to_decide():
+    from services.event_sync_stream_health import _dead_once_started
+
+    checked = _KICKOFF + timedelta(minutes=20)
+    assert _dead_once_started(_black(1, checked_at=checked, is_black=False), _KICKOFF, 3, 2_000_000) is False
+    assert _dead_once_started(
+        _black(1, checked_at=checked, is_black=False, measured=10_000), _KICKOFF, 3, 2_000_000,
+    ) is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2])
 async def test_probe_batch_respects_total_and_account_limits(limit):
