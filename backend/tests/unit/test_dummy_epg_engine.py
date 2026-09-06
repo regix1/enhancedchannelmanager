@@ -1594,3 +1594,80 @@ def test_source_event_hint_uses_the_matching_variant_portrait_and_style():
     )
     assert programmes[0].find("live") is None
     assert programmes[0].find("new") is None
+
+
+class TestGeneratedProgrammesGetMatchupBanners:
+    """A variant that captures only a title renders no poster URL, so its
+    event carried no image while the composed programme beside it did. The
+    generated document goes through the same rewriter the composed path uses.
+    """
+
+    BASE = "http://thumbs.test:3100"
+
+    def _profile(self):
+        return {
+            "id": 1, "name": "Events", "enabled": True,
+            "name_source": "stream", "stream_index": 1,
+            "title_pattern": r"^(?P<title>.+?)\s*@",
+            "time_pattern": r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[AaPp])",
+            "date_pattern": r"@\s*(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})",
+            "title_template": "{title}",
+            "event_timezone": "US/Eastern",
+            "program_duration": 180,
+            "tvg_id_template": "ecm-{channel_id}",
+            "channel_assignments": [{"channel_id": 7}],
+        }
+
+    def _channels(self, stream_name):
+        return {7: {"id": 7, "name": "Event 7", "channel_number": 900,
+                    "streams": [{"id": 1, "name": stream_name}]}}
+
+    def _with_banner_settings(self, monkeypatch):
+        import config
+
+        real = config.get_settings()
+
+        class _S:
+            def __getattr__(self, item):
+                return getattr(real, item)
+            sports_banner_base_url = self.BASE
+            sports_banner_leagues = None
+
+        monkeypatch.setattr(config, "get_settings", lambda: _S())
+
+    def test_matchup_title_gains_a_banner(self, monkeypatch, tmp_path):
+        """A configured league with two teams gets an icon it did not have."""
+        import config
+        import dummy_epg_engine
+
+        monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+        self._with_banner_settings(monkeypatch)
+        name = "MLB: Washington vs Los Angeles Dodgers @ Sep 04 10:00 PM"
+        xml = dummy_epg_engine.generate_xmltv(
+            [self._profile()], self._channels(name)
+        )
+        assert "<icon" in xml, xml[:400]
+        assert "/mlb/washington/los-angeles-dodgers/cover" in xml
+
+    def test_non_matchup_title_is_left_alone(self, monkeypatch, tmp_path):
+        """No configured league in the title means no icon, not a broken one."""
+        import config
+        import dummy_epg_engine
+
+        monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+        self._with_banner_settings(monkeypatch)
+        name = "Cage Fury 160 @ Sep 04 09:00 PM"
+        xml = dummy_epg_engine.generate_xmltv(
+            [self._profile()], self._channels(name)
+        )
+        assert "<icon" not in xml
+
+    def test_no_banner_base_configured_changes_nothing(self, tmp_path):
+        """An unconfigured banner host must not alter the document."""
+        import dummy_epg_engine
+
+        name = "MLB: Washington vs Los Angeles Dodgers @ Sep 04 10:00 PM"
+        xml = dummy_epg_engine.generate_xmltv(
+            [self._profile()], self._channels(name)
+        )
+        assert "<icon" not in xml

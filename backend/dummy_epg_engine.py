@@ -912,7 +912,36 @@ def generate_xmltv(
     # Serialize to string
     xml_declaration = '<?xml version="1.0" encoding="UTF-8"?>\n'
     tree_str = ET.tostring(tv, encoding="unicode", xml_declaration=False)
-    return xml_declaration + tree_str
+    return xml_declaration + _banner_matchups(tree_str)
+
+
+def _banner_matchups(document: str) -> str:
+    """Give generated programmes the same sports banners composed ones get.
+
+    ``program_poster_url_template`` only renders when the matching variant
+    captured every placeholder the URL needs, so an event whose variant
+    captures a single ``title`` gets no image at all — a generated
+    "MLB: Washington vs Los Angeles Dodgers" carried none while the composed
+    programme beside it did. ``services.epg_programmes`` already runs the
+    programmes it selects through this rewriter, so routing generated ones
+    through it too settles both on one artwork rule instead of two.
+
+    Safe over the whole document: the rewriter returns a programme untouched
+    when it already carries a banner, and when the title names no configured
+    league. A poster a variant rendered itself therefore survives.
+    """
+    from config import CONFIG_DIR, get_settings
+    from services.epg_artwork import ArtworkCache, ArtworkRewriter, compile_leagues
+
+    settings = get_settings()
+    if not settings.sports_banner_base_url:
+        return document
+    rewriter = ArtworkRewriter(
+        ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json"),
+        banner_base=settings.sports_banner_base_url,
+        leagues=compile_leagues(settings.sports_banner_leagues),
+    )
+    return rewriter.feed(document) + rewriter.finish()
 
 
 def preview_pipeline(
