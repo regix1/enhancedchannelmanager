@@ -492,6 +492,12 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     # nothing, and the plan it materialises is already capped at 500
     # operations, so the run it authorises stays bounded.
     "/api/channel-pipeline/run/prepare",
+    # Probing is measuring: the caller waits for the throughput figure, so this
+    # cannot become a background task without changing what it returns. The
+    # operator's own probe timeout is what bounds it, and at the shipped 30s it
+    # equals this budget, so a stream that uses its full allowance always 504s
+    # and a dead one, which is exactly the case worth measuring, always does.
+    "/api/stream-stats/probe/",
 )
 
 
