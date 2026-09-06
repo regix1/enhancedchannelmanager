@@ -1776,6 +1776,23 @@ async def startup_event():
 
     asyncio.create_task(_check_stale_groups_on_startup())
 
+    # The composed guide and the source schedules it draws on live in this
+    # process, so a restart leaves every channel reading "Programming
+    # unavailable" until the hourly refresh rescans. Rebuild it now rather than
+    # serve holes for up to an hour after each deploy. The engine already
+    # refuses a second concurrent run, so this cannot collide with the schedule
+    # firing at the same moment.
+    async def _rebuild_guide_on_startup():
+        await asyncio.sleep(15)  # Wait for services to be ready
+        try:
+            from task_engine import get_engine
+            await get_engine().run_task("dummy_epg_refresh")
+            logger.info("[MAIN] Startup: rebuilt the dummy EPG guide")
+        except Exception as e:
+            logger.warning("[MAIN] Startup guide rebuild failed: %s", e)
+
+    asyncio.create_task(_rebuild_guide_on_startup())
+
     # Start the daily update-availability check (bead
     # enhancedchannelmanager-nhkd4). This replaces the header's client-side
     # "Update available" pill with a reconciling notification-centre entry.
