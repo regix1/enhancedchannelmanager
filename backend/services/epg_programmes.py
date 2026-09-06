@@ -39,6 +39,8 @@ MAX_CACHE_ENTRIES = 128
 MAX_PROGRAMMES = 200000
 MAX_ARTWORK = 128
 ARTWORK_WAIT = 120
+# Channel warnings that mean "not looked up yet", as opposed to "nothing scheduled".
+PROVISIONAL_WARNINGS = frozenset({"schedule_pending", "mapping_unavailable"})
 _ARTWORK_LOAD: asyncio.Task | None = None
 _ARTWORK_CHECKED = float("-inf")
 _CATALOGUE_CACHE: dict = {}
@@ -645,11 +647,20 @@ async def _probe_artwork(unknown: dict) -> None:
 
 
 def can_cache(coverage: dict) -> bool:
-    """Cache completed composition while source and portrait refreshes run independently."""
+    """Cache completed composition while source and portrait refreshes run independently.
+
+    A channel warned "schedule_pending" or "mapping_unavailable" is empty because the
+    source was never asked for it, not because it has nothing on. Serving that is fine;
+    storing it is not, because the entry outlives the scan that would have filled it in.
+    """
     sources = coverage.get("sources", [])
-    return not sources or any(
-        source.get("status") == "ready" or source.get("last_success") for source in sources
-    )
+    if not sources:
+        return True
+    if not any(source.get("status") == "ready" or source.get("last_success") for source in sources):
+        return False
+    return not any(warning in PROVISIONAL_WARNINGS
+                   for channel in coverage.get("channels", ())
+                   for warning in channel.get("warnings", ()))
 
 
 async def _load_catalogue(key: tuple, client, link: int | None) -> dict:

@@ -127,8 +127,11 @@ class DummyEPGRefreshTask(TaskScheduler):
                 per_profile[profile["id"]] = await run_cpu_bound(
                     generate_xmltv, [profile], channel_map,
                 )
-            cache.invalidate_prefix("dummy_epg_xmltv")
+            # Only drop the published guide once this run has one to put in its place.
+            # A scan that timed out composes a guide of empty channels, and discarding
+            # the last good one for that leaves nothing to serve until the next run.
             if can_cache(_coverage):
+                cache.invalidate_prefix("dummy_epg_xmltv")
                 cache.set("dummy_epg_xmltv_all", xml_string)
                 for profile_id, per_xml in per_profile.items():
                     cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)

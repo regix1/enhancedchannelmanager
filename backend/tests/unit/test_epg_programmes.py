@@ -1314,6 +1314,13 @@ def test_complete_partial_output_is_cacheable(artwork_pending):
         assert not guides.can_cache({"sources": [{"status": status}], "artwork_pending": artwork_pending})
 
 
+@pytest.mark.parametrize("warning", ["schedule_pending", "mapping_unavailable"])
+def test_channels_the_scan_never_covered_are_not_cacheable(warning):
+    ready = [{"status": "ready"}]
+    assert guides.can_cache({"sources": ready, "channels": [{"warnings": ["missing_artwork"]}]})
+    assert not guides.can_cache({"sources": ready, "channels": [{"warnings": []}, {"warnings": [warning]}]})
+
+
 @pytest.mark.asyncio
 async def test_dated_event_filler_does_not_become_schedule_evidence(monkeypatch):
     install_feed(monkeypatch, feed())
