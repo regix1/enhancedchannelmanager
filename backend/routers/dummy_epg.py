@@ -26,6 +26,18 @@ router = APIRouter(prefix="/api/dummy-epg", tags=["Dummy EPG"])
 
 cache = get_cache()
 
+# How long a generated guide stays servable. This is a staleness ceiling, NOT a
+# freshness policy: every input change already calls invalidate_prefix
+# ("dummy_epg_xmltv"), so a surviving entry is by definition still valid.
+#
+# It has to exceed the Dummy EPG Refresh interval. That task composes the guide
+# from the configured EPG sources and warms this cache; composing it inside a
+# request instead can take longer than the gateway's request timeout, so a
+# request that misses the cache does not return a guide at all. With a TTL
+# below the refresh interval the entry expired between runs and every request
+# in the gap rebuilt and timed out.
+XMLTV_CACHE_TTL = 86400
+
 
 # =============================================================================
 # Pydantic models
@@ -679,7 +691,7 @@ async def get_xmltv_all(db: Session = Depends(get_session)):
     logger.debug("[DUMMY-EPG] GET /xmltv")
     try:
         # Check cache first
-        cached = cache.get("dummy_epg_xmltv_all", ttl=300)
+        cached = cache.get("dummy_epg_xmltv_all", ttl=XMLTV_CACHE_TTL)
         if cached is not None:
             logger.debug("[DUMMY-EPG] Returning cached XMLTV (all profiles)")
             return Response(content=cached, media_type="application/xml")
@@ -725,7 +737,7 @@ async def get_xmltv_profile(profile_id: int, db: Session = Depends(get_session))
     logger.debug("[DUMMY-EPG] GET /xmltv/%s", profile_id)
     try:
         cache_key = f"dummy_epg_xmltv_{profile_id}"
-        cached = cache.get(cache_key, ttl=300)
+        cached = cache.get(cache_key, ttl=XMLTV_CACHE_TTL)
         if cached is not None:
             logger.debug("[DUMMY-EPG] Returning cached XMLTV for profile %s", profile_id)
             return Response(content=cached, media_type="application/xml")

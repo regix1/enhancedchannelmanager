@@ -706,12 +706,14 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
             witnesses.append((ended[1], ended[2], source["id"], ended[0], ended[3]))
         for tvg_id, programmes in entry.get("rows", {}).items():
             identity = identities[tvg_id]
-            if not query["dynamic"] and (ambiguous or identity != rank):
+            if not query["dynamic"] and (rank is None or ambiguous or identity != rank):
                 continue
             for programme in programmes:
                 begin, end = programme_times(programme)
                 match = identity
                 if query["dynamic"] and parsed.start is not None:
+                    if abs((parsed.start - begin).total_seconds()) > 1800:
+                        continue
                     pair = _score_parsed_pair(parsed, _event(programme, begin), window_minutes=30,
                                               threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index)
                     if pair.band != BAND_ATTACH:

@@ -801,6 +801,63 @@ async def test_ambiguous_same_title_kickoffs_do_not_select_arbitrarily(monkeypat
         assert "ambiguous_event" in coverage["channels"][0]["warnings"]
 
 
+@pytest.mark.parametrize("seconds", [-1801, -1800, 0, 1800, 1801])
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("ended", [False, True])
+def test_composition_scores_only_possible_event_times(monkeypatch, seconds, explicit, ended):
+    mapping = {"channel_id": 1, "source_id": 50, "tvg_id": "PPV10.art"} if explicit else None
+    query = guides._query(profile(), channel(
+        name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="",
+    ), mapping, NOW)
+    begin = (query["event"].start + timedelta(seconds=seconds)).astimezone(timezone(timedelta(hours=-4)))
+    end = begin + timedelta(minutes=10) if ended else NOW + timedelta(hours=4)
+    row = programme("PPV10.art", "ONE FIGHT NIGHT 47 STAMP V FLORES",
+                    start=begin.strftime("%Y%m%d%H%M%S %z"), stop=end.strftime("%Y%m%d%H%M%S %z"))
+    with patch.object(guides, "_event", wraps=guides._event) as parse, \
+            patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        rows, coverage = guides._compose(query, [source()], {50: {"rows": {"PPV10.art": [row]}}},
+                                         START, STOP, NOW)
+    if abs(seconds) <= 1800:
+        assert score.call_count == parse.call_count == 1
+        assert coverage["event"]["start"] == begin.astimezone(timezone.utc).isoformat()
+        assert coverage["event"]["stop"] == end.astimezone(timezone.utc).isoformat()
+        assert bool(rows) is not ended
+        assert (coverage["current"] is None) is ended
+    else:
+        assert rows == []
+        assert coverage["event"] is None
+        assert coverage["current"] is coverage["next"] is None
+        assert score.call_count == parse.call_count == 0
+
+
+@pytest.mark.parametrize("title", ["ONE Fight Night 48 Stamp vs. Flores", "ONE Fight Night 47 Stamp vs. Jones"])
+def test_composition_keeps_event_conflict_checks_with_explicit_binding(title):
+    query = guides._query(profile(), channel(
+        name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="",
+    ), {"channel_id": 1, "source_id": 50, "tvg_id": "PPV10.art"}, NOW)
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        rows, coverage = guides._compose(query, [source()],
+                                         {50: {"rows": {"PPV10.art": [programme("PPV10.art", title)]}}},
+                                         START, STOP, NOW)
+    assert score.call_count == 1
+    assert rows == []
+    assert coverage["event"] is None
+    assert coverage["match"] == "unresolved"
+
+
+def test_composition_skips_schedules_without_static_identity():
+    query = guides._query(profile(), channel(), None, NOW)
+    entry = {"rows": {"Unrelated.us": [programme("Unrelated.us")]},
+             "headers": {"Unrelated.us": ET.fromstring('<channel id="Unrelated.us"><display-name>Unrelated</display-name></channel>')},
+             "channel_warnings": {query["key"]: ["schedule_pending"]}}
+    with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
+        rows, coverage = guides._compose(query, [source()], {50: entry}, START, STOP, NOW)
+    assert rows == []
+    assert coverage["current"] is coverage["next"] is coverage["event"] is None
+    assert coverage["warnings"] == ["schedule_pending"]
+    assert times.call_count == 0
+
+
 @pytest.mark.asyncio
 async def test_long_source_duration_is_diagnosed_and_not_rendered(monkeypatch):
     install_feed(monkeypatch, feed(programme(stop="20260907050000 +0000")))

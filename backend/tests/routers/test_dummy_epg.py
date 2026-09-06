@@ -1399,3 +1399,52 @@ class TestProgrammeSources:
         assert response.status_code == 200, response.text
         assert response.json() == {"status": status, "profiles_generated": 1, "coverage": coverage}
         cache.set.assert_not_called()
+
+
+class TestXmltvCacheOutlivesRefreshInterval:
+    """A guide that misses the cache is composed from the configured EPG
+    sources inside the request, which can take longer than the gateway's
+    request timeout — so the miss returns no guide at all rather than a slow
+    one. Dummy EPG Refresh warms the cache on an interval; the served TTL has
+    to outlive that interval or every request in the gap rebuilds and times
+    out. A 300s TTL against an hourly refresh left ~55 minutes of each hour
+    unservable.
+    """
+
+    # The interval Dummy EPG Refresh ships with. The TTL has to clear it with
+    # room for a late or skipped run.
+    REFRESH_INTERVAL_SECONDS = 3600
+
+    def test_ttl_constant_outlives_the_refresh_interval(self):
+        """The constant itself, so the bound is visible without a request."""
+        from routers.dummy_epg import XMLTV_CACHE_TTL
+
+        assert XMLTV_CACHE_TTL > self.REFRESH_INTERVAL_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_combined_read_uses_the_long_ttl(self, async_client, test_session):
+        """GET /xmltv reads with a TTL that survives between refreshes."""
+        _create_profile(test_session, name="TTL Combined")
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = '<?xml version="1.0"?><tv/>'
+
+        with patch("routers.dummy_epg.cache", mock_cache):
+            response = await async_client.get("/api/dummy-epg/xmltv")
+
+        assert response.status_code == 200, response.text
+        ttl = mock_cache.get.call_args.kwargs["ttl"]
+        assert ttl > self.REFRESH_INTERVAL_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_profile_read_uses_the_long_ttl(self, async_client, test_session):
+        """The per-profile URL Dispatcharr polls needs the same bound."""
+        profile = _create_profile(test_session, name="TTL Profile")
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = '<?xml version="1.0"?><tv/>'
+
+        with patch("routers.dummy_epg.cache", mock_cache):
+            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+
+        assert response.status_code == 200, response.text
+        ttl = mock_cache.get.call_args.kwargs["ttl"]
+        assert ttl > self.REFRESH_INTERVAL_SECONDS
