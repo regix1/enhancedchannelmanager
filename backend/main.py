@@ -1875,6 +1875,17 @@ async def shutdown_event():
     """Clean up on shutdown."""
     logger.info("[MAIN] Enhanced Channel Manager shutting down")
 
+    # Reaching this handler at all is the signal: SIGTERM ran it, an OOM kill
+    # could not have. The next boot reads this to tell a deploy apart from the
+    # crash the run-on-refresh breaker exists to catch. Written first so a later
+    # cleanup failure cannot lose it.
+    try:
+        from config import CONFIG_DIR
+        from task_engine import CLEAN_SHUTDOWN_MARKER
+        (CONFIG_DIR / CLEAN_SHUTDOWN_MARKER).touch()
+    except Exception as e:
+        logger.warning("[MAIN] Could not record the clean-shutdown marker: %s", e)
+
     # Stop HTTPS server
     try:
         from tls.https_server import stop_https_server

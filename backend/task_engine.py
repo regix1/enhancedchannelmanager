@@ -287,19 +287,32 @@ def _abandon_orphaned_auto_creation_executions(session=None) -> int:
     if owns_session:
         session = get_session()
     try:
+        stopped_cleanly = _consume_clean_shutdown_marker()
         abandoned_count = session.query(ChannelPipelineExecution).filter(
             ChannelPipelineExecution.status == "running"
         ).update({
             "status": "abandoned",
             "completed_at": datetime.utcnow(),
             "error_message": (
+                "Abandoned: run was interrupted by an orderly shutdown."
+                if stopped_cleanly else
                 "Abandoned: run was interrupted by a system restart "
                 "(likely an out-of-memory kill). See GH #473."
             ),
         }, synchronize_session=False)
         session.commit()
 
-        if abandoned_count > 0:
+        if abandoned_count > 0 and stopped_cleanly:
+            # The breaker is a crash sentinel: it exists so a run that OOMs does
+            # not restart, OOM again and repeat. A deploy interrupts runs the same
+            # way but is not that, and tripping on it stops event retirement
+            # silently until somebody notices and clears it by hand.
+            logger.info(
+                "[TASK-ENGINE] Abandoned %s auto-creation execution(s) interrupted by "
+                "an orderly shutdown — leaving the run-on-refresh breaker closed",
+                abandoned_count,
+            )
+        elif abandoned_count > 0:
             logger.warning(
                 "[TASK-ENGINE] Abandoned %s orphaned auto-creation execution(s) "
                 "left 'running' by a hard restart — tripping the run-on-refresh "
@@ -317,6 +330,33 @@ def _abandon_orphaned_auto_creation_executions(session=None) -> int:
     finally:
         if owns_session:
             session.close()
+
+
+CLEAN_SHUTDOWN_MARKER = "clean_shutdown"
+
+
+def _consume_clean_shutdown_marker() -> bool:
+    """Did the previous process stop in an orderly way, and forget it either way.
+
+    SIGTERM — a deploy, ``docker restart``, an operator stopping the container —
+    runs the shutdown handler, which leaves this file behind. An OOM kill is
+    SIGKILL and cannot run anything, so it cannot leave one. That asymmetry is
+    the only thing separating the restart the breaker is FOR from the restart it
+    keeps catching by accident.
+
+    Consumed whether or not anything was abandoned, so a marker can only ever
+    excuse the one restart that wrote it and never a later crash.
+    """
+    try:
+        from config import CONFIG_DIR
+
+        marker = CONFIG_DIR / CLEAN_SHUTDOWN_MARKER
+        if marker.exists():
+            marker.unlink()
+            return True
+    except Exception as e:  # pragma: no cover — best-effort, must not block boot
+        logger.warning("[TASK-ENGINE] Could not read the clean-shutdown marker: %s", e)
+    return False
 
 
 def _trip_run_on_refresh_circuit_breaker() -> None:

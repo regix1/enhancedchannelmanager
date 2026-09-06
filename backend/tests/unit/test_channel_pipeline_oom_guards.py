@@ -126,6 +126,53 @@ class TestCrashSentinel:
         # breaker tripped
         mock_save.assert_called_once()
 
+    def test_an_orderly_shutdown_abandons_the_run_without_tripping_the_breaker(
+        self, test_session, tmp_path
+    ):
+        """A deploy interrupts runs exactly as an OOM kill does, but it is not the
+        thing the breaker exists for. SIGTERM runs the shutdown handler and leaves
+        a marker; SIGKILL cannot, so the marker is what separates them."""
+        from models import ChannelPipelineExecution
+        from task_engine import CLEAN_SHUTDOWN_MARKER, _abandon_orphaned_auto_creation_executions
+
+        (tmp_path / CLEAN_SHUTDOWN_MARKER).touch()
+        running = ChannelPipelineExecution(
+            mode="execute", triggered_by="m3u_refresh",
+            started_at=datetime.utcnow(), status="running",
+        )
+        test_session.add(running)
+        test_session.commit()
+        running_id = running.id
+
+        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings") as mock_save,              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+            abandoned = _abandon_orphaned_auto_creation_executions(session=test_session)
+
+        assert abandoned == 1
+        test_session.expire_all()
+        assert test_session.get(ChannelPipelineExecution, running_id).status == "abandoned"
+        mock_save.assert_not_called()
+        assert not (tmp_path / CLEAN_SHUTDOWN_MARKER).exists()
+
+    def test_a_marker_excuses_one_restart_and_not_the_next(self, test_session, tmp_path):
+        """Consumed whether or not it was needed, so a stale marker can never
+        excuse a later crash."""
+        from models import ChannelPipelineExecution
+        from task_engine import CLEAN_SHUTDOWN_MARKER, _abandon_orphaned_auto_creation_executions
+
+        (tmp_path / CLEAN_SHUTDOWN_MARKER).touch()
+        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings"),              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+            _abandon_orphaned_auto_creation_executions(session=test_session)
+
+        crashed = ChannelPipelineExecution(
+            mode="execute", triggered_by="m3u_refresh",
+            started_at=datetime.utcnow(), status="running",
+        )
+        test_session.add(crashed)
+        test_session.commit()
+        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings") as mock_save,              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+            _abandon_orphaned_auto_creation_executions(session=test_session)
+        mock_save.assert_called_once()
+
     def test_sentinel_idempotent(self, test_session):
         from models import ChannelPipelineExecution
         from task_engine import _abandon_orphaned_auto_creation_executions
