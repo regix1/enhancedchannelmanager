@@ -302,6 +302,8 @@ def _abandon_orphaned_auto_creation_executions(session=None) -> int:
         }, synchronize_session=False)
         session.commit()
 
+        streak = _record_hard_restart_streak(abandoned_count > 0 and not stopped_cleanly)
+
         if abandoned_count > 0 and stopped_cleanly:
             # The breaker is a crash sentinel: it exists so a run that OOMs does
             # not restart, OOM again and repeat. A deploy interrupts runs the same
@@ -312,12 +314,23 @@ def _abandon_orphaned_auto_creation_executions(session=None) -> int:
                 "an orderly shutdown — leaving the run-on-refresh breaker closed",
                 abandoned_count,
             )
+        elif abandoned_count > 0 and streak < HARD_RESTART_TRIP_STREAK:
+            # One hard restart is not a loop, and it is what a `--force-recreate`
+            # deploy looks like whenever the outgoing image predates the marker
+            # write: old shutdown code leaves no marker, new boot code demands
+            # one. Wait for the restart to repeat before disabling auto-creation.
+            logger.warning(
+                "[TASK-ENGINE] Abandoned %s auto-creation execution(s) left 'running' "
+                "by a hard restart (%s of %s) — leaving the run-on-refresh breaker "
+                "closed until a second one confirms a crash loop",
+                abandoned_count, streak, HARD_RESTART_TRIP_STREAK,
+            )
         elif abandoned_count > 0:
             logger.warning(
                 "[TASK-ENGINE] Abandoned %s orphaned auto-creation execution(s) "
-                "left 'running' by a hard restart — tripping the run-on-refresh "
-                "circuit breaker (bd-exo4j / GH #473)",
-                abandoned_count,
+                "left 'running' by %s consecutive hard restarts — tripping the "
+                "run-on-refresh circuit breaker (bd-exo4j / GH #473)",
+                abandoned_count, streak,
             )
             _trip_run_on_refresh_circuit_breaker()
 
@@ -357,6 +370,34 @@ def _consume_clean_shutdown_marker() -> bool:
     except Exception as e:  # pragma: no cover — best-effort, must not block boot
         logger.warning("[TASK-ENGINE] Could not read the clean-shutdown marker: %s", e)
     return False
+
+
+HARD_RESTART_TRIP_STREAK = 2
+
+
+def _record_hard_restart_streak(hard_restart: bool) -> int:
+    """Advance or clear the consecutive-hard-restart count, returning the new value.
+
+    Persisted beside the breaker flag so it survives the restart it counts. A
+    settings failure reports 1, which leaves the breaker closed — bookkeeping
+    that did not work is not evidence of a crash loop.
+    """
+    try:
+        from config import (
+            get_settings,
+            save_settings,
+            settings_file_allows_startup_writes,
+        )
+        settings = get_settings()
+        previous = int(getattr(settings, "auto_creation_hard_restart_streak", 0) or 0)
+        streak = previous + 1 if hard_restart else 0
+        if streak != previous and settings_file_allows_startup_writes():
+            settings.auto_creation_hard_restart_streak = streak
+            save_settings(settings)
+        return streak
+    except Exception as e:  # pragma: no cover — best-effort, must not block boot
+        logger.warning("[TASK-ENGINE] Could not record the hard-restart streak: %s", e)
+        return 1
 
 
 def _trip_run_on_refresh_circuit_breaker() -> None:

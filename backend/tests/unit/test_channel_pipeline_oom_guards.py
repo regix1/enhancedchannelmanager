@@ -97,7 +97,7 @@ class TestBoundedExecutionLog:
 # Part B — crash-loop guard
 # ---------------------------------------------------------------------------
 class TestCrashSentinel:
-    def test_sentinel_marks_running_abandoned_and_trips_breaker(self, test_session):
+    def test_sentinel_abandons_the_run_without_tripping_on_a_first_hard_restart(self, test_session):
         from models import ChannelPipelineExecution
         from task_engine import _abandon_orphaned_auto_creation_executions
 
@@ -114,8 +114,11 @@ class TestCrashSentinel:
         test_session.commit()
         running_id, completed_id = running.id, completed.id
 
-        with patch("config.save_settings") as mock_save, \
-             patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+        settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
+                             auto_creation_hard_restart_streak=0)
+        with patch("config.save_settings"), \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
             abandoned = _abandon_orphaned_auto_creation_executions(session=test_session)
 
         assert abandoned == 1
@@ -123,8 +126,32 @@ class TestCrashSentinel:
         assert test_session.get(ChannelPipelineExecution, running_id).status == "abandoned"
         assert test_session.get(ChannelPipelineExecution, running_id).completed_at is not None
         assert test_session.get(ChannelPipelineExecution, completed_id).status == "completed"
-        # breaker tripped
-        mock_save.assert_called_once()
+        # A `--force-recreate` deploy looks exactly like this whenever the outgoing
+        # image predates the marker write, so one is counted, not acted on.
+        assert settings.auto_creation_hard_restart_streak == 1
+        assert settings.auto_creation_run_on_refresh_disabled is False
+
+    def test_a_second_consecutive_hard_restart_trips_the_breaker(self, test_session):
+        """Two interrupted boots with no clean shutdown between them is the crash
+        loop the breaker exists for."""
+        from models import ChannelPipelineExecution
+        from task_engine import _abandon_orphaned_auto_creation_executions
+
+        test_session.add(ChannelPipelineExecution(
+            mode="execute", triggered_by="m3u_refresh",
+            started_at=datetime.utcnow(), status="running",
+        ))
+        test_session.commit()
+
+        settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
+                             auto_creation_hard_restart_streak=1)
+        with patch("config.save_settings"), \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
+            assert _abandon_orphaned_auto_creation_executions(session=test_session) == 1
+
+        assert settings.auto_creation_hard_restart_streak == 2
+        assert settings.auto_creation_run_on_refresh_disabled is True
 
     def test_an_orderly_shutdown_abandons_the_run_without_tripping_the_breaker(
         self, test_session, tmp_path
@@ -144,13 +171,19 @@ class TestCrashSentinel:
         test_session.commit()
         running_id = running.id
 
-        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings") as mock_save,              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+        settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
+                             auto_creation_hard_restart_streak=0)
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings") as mock_save, \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
             abandoned = _abandon_orphaned_auto_creation_executions(session=test_session)
 
         assert abandoned == 1
         test_session.expire_all()
         assert test_session.get(ChannelPipelineExecution, running_id).status == "abandoned"
         mock_save.assert_not_called()
+        assert settings.auto_creation_hard_restart_streak == 0
         assert not (tmp_path / CLEAN_SHUTDOWN_MARKER).exists()
 
     def test_a_marker_excuses_one_restart_and_not_the_next(self, test_session, tmp_path):
@@ -159,8 +192,13 @@ class TestCrashSentinel:
         from models import ChannelPipelineExecution
         from task_engine import CLEAN_SHUTDOWN_MARKER, _abandon_orphaned_auto_creation_executions
 
+        settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
+                             auto_creation_hard_restart_streak=0)
         (tmp_path / CLEAN_SHUTDOWN_MARKER).touch()
-        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings"),              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings"), \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
             _abandon_orphaned_auto_creation_executions(session=test_session)
 
         crashed = ChannelPipelineExecution(
@@ -169,9 +207,15 @@ class TestCrashSentinel:
         )
         test_session.add(crashed)
         test_session.commit()
-        with patch("config.CONFIG_DIR", tmp_path),              patch("config.save_settings") as mock_save,              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=False)):
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings"), \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
             _abandon_orphaned_auto_creation_executions(session=test_session)
-        mock_save.assert_called_once()
+        # The marker was spent by the first boot, so the second is counted as the
+        # hard restart it is — one short of the streak that trips the breaker.
+        assert settings.auto_creation_hard_restart_streak == 1
+        assert settings.auto_creation_run_on_refresh_disabled is False
 
     def test_sentinel_idempotent(self, test_session):
         from models import ChannelPipelineExecution

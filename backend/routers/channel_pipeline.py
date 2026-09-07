@@ -2004,6 +2004,10 @@ async def reset_run_on_refresh_circuit_breaker(_admin=RequireAdminIfEnabled):
     was_disabled = bool(getattr(settings, "auto_creation_run_on_refresh_disabled", False))
     if was_disabled:
         settings.auto_creation_run_on_refresh_disabled = False
+        # Clear the streak that tripped it too. Left at its tripping value, the
+        # very next hard restart would re-trip immediately and the operator's
+        # reset would look like it never took.
+        settings.auto_creation_hard_restart_streak = 0
         save_settings(settings)
         logger.warning(
             "[AUTO-CREATE] Run-on-refresh circuit breaker CLEARED by operator — "

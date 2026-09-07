@@ -772,6 +772,13 @@ class DispatcharrSettings(BaseModel):
     # POST /api/auto-creation/reset-circuit-breaker. Internal bookkeeping, not a
     # user-facing preference.
     auto_creation_run_on_refresh_disabled: bool = False
+    # Consecutive boots that found a run left 'running' AND no clean-shutdown
+    # marker. The marker alone cannot carry this decision: it is consumed on
+    # every boot, so a second start before the next shutdown finds nothing and a
+    # deploy reads as a crash. A crash LOOP is what the breaker is for, and a
+    # loop shows up as this count reaching two. Reset by any boot that starts
+    # from a clean shutdown or finds nothing interrupted.
+    auto_creation_hard_restart_streak: int = 0
     # ADR-011 (bd-ka7j9): refresh watermark decoupling M3U refresh from
     # auto-creation. M3U refresh no longer hard-chains auto-creation as a
     # side-effect; instead it advances ``last_m3u_refresh_completed_at`` on
