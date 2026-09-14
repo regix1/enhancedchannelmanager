@@ -8,7 +8,7 @@ import asyncio
 import time
 from typing import Callable
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dispatcharr_client import get_client
@@ -20,6 +20,46 @@ logger = logging.getLogger(__name__)
 # Polling configuration for waiting for refresh completion
 POLL_INTERVAL_SECONDS = 5
 MAX_WAIT_SECONDS = 300
+STREAM_FLOW_MAX_AGE = timedelta(hours=2)
+
+
+def _current_programme_availability(profiles, channel_map, wanted, now):
+    """Return whether each opted-in channel has a real current guide title."""
+    from dummy_epg_engine import generate_channel_xml, get_xmltv_id
+    from services.epg_programmes import _placeholder, programme_times
+
+    owners = {}
+    for profile in profiles:
+        for assignment in profile.get("channel_assignments") or []:
+            owners.setdefault(assignment.get("channel_id"), (profile, assignment))
+
+    available = {}
+    for channel_id, channel in channel_map.items():
+        if channel.get("channel_group_id") not in wanted or channel_id not in owners:
+            continue
+        profile, assignment = owners[channel_id]
+        try:
+            _, programmes = generate_channel_xml(
+                channel_id,
+                channel.get("name", ""),
+                channel.get("channel_number"),
+                get_xmltv_id(assignment, channel, profile),
+                profile,
+                channel.get("streams") or [],
+            )
+            available[channel_id] = any(
+                begin <= now < end and not _placeholder(programme)
+                for programme in programmes
+                for begin, end in (programme_times(programme),)
+            )
+        except Exception as e:
+            logger.warning(
+                "[dummy_epg_refresh] Could not evaluate current programme on "
+                "channel %s: %s",
+                channel_id,
+                e,
+            )
+    return available
 
 
 async def wait_for_epg_source_refresh(
@@ -157,6 +197,7 @@ class DummyEPGRefreshTask(TaskScheduler):
         a cable channel with a gap in its listings is still the channel you watch.
         """
         from services.epg_programmes import PROVISIONAL_WARNINGS
+        from services.event_sync_stream_health import collect_stream_flow
 
         wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
         if not wanted:
@@ -170,10 +211,27 @@ class DummyEPGRefreshTask(TaskScheduler):
         if not sources or any(source.get("status") != "ready" for source in sources):
             logger.info("[%s] Sources still loading — leaving channel visibility alone", self.task_id)
             return
+        now = datetime.now(timezone.utc)
+        available = await asyncio.to_thread(
+            _current_programme_availability, profile_data, channel_map, wanted, now,
+        )
+        stream_ids = {
+            stream.get("id") if isinstance(stream, dict) else stream
+            for channel in channel_map.values()
+            if channel.get("channel_group_id") in wanted
+            for stream in channel.get("streams") or []
+        }
+        flow = await collect_stream_flow(
+            stream_ids,
+            client=client,
+            checked_after=now - STREAM_FLOW_MAX_AGE,
+            probe_missing=True,
+        )
         rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():
-            if channel.get("channel_group_id") not in wanted or channel_id not in rows:
+            if (channel.get("channel_group_id") not in wanted
+                    or channel_id not in rows or channel_id not in available):
                 continue
             row = rows[channel_id]
             # "Nobody asked the source yet" is not "there is nothing on". Composing
@@ -182,7 +240,21 @@ class DummyEPGRefreshTask(TaskScheduler):
             # publishing a guide of empty channels, in visibility form.
             if any(warning in PROVISIONAL_WARNINGS for warning in row.get("warnings") or ()):
                 continue
-            hide = (row.get("real_minutes") or 0) <= 0
+            streams = channel.get("streams") or []
+            stream_states = [
+                False if isinstance(stream, dict) and stream.get("is_stale") is True
+                else flow.get(stream.get("id") if isinstance(stream, dict) else stream)
+                for stream in streams
+            ]
+            if not stream_states:
+                flowing = False
+            elif any(state is True for state in stream_states):
+                flowing = True
+            elif all(state is False for state in stream_states):
+                flowing = False
+            else:
+                flowing = None
+            hide = not available[channel_id] if flowing is None else not flowing
             if bool(channel.get("hidden_from_output")) is hide:
                 continue
             try:
@@ -191,7 +263,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             except Exception as e:
                 logger.warning("[%s] Could not set visibility on channel %s: %s", self.task_id, channel_id, e)
         if changed:
-            logger.info("[%s] Updated visibility on %s channel(s) with no programmes", self.task_id, changed)
+            logger.info("[%s] Updated visibility on %s idle event channel(s)", self.task_id, changed)
 
     async def execute(self) -> TaskResult:
         """Execute the dummy EPG refresh pipeline."""

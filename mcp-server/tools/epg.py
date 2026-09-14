@@ -969,6 +969,7 @@ def register(mcp: FastMCP):
                 f"  title_template={p.get('title_template')!r}",
                 f"  event_timezone={p.get('event_timezone')}, program_duration={p.get('program_duration')}min",
                 f"  channel_group_ids={groups} ({len(groups)} group(s) assigned)",
+                f"  hide_empty_group_ids={p.get('hide_empty_group_ids') or []}",
                 f"  epg_source_ids={p.get('epg_source_ids') or []}",
                 f"  channel_mappings={p.get('channel_mappings') or []}",
             ]
@@ -1027,6 +1028,7 @@ def register(mcp: FastMCP):
         channel_group_ids: list[int] | None = None,
         epg_source_ids: list[int] | None = None,
         channel_mappings: list[dict] | None = None,
+        hide_empty_group_ids: list[int] | None = None,
     ) -> str:
         """Create a new Dummy EPG profile (bd-omxy5).
 
@@ -1072,6 +1074,9 @@ def register(mcp: FastMCP):
             channel_group_ids: Channel group IDs this profile applies to.
             epg_source_ids: Existing XMLTV source IDs to compose real schedules; [] keeps name templates.
             channel_mappings: Original channel_id/source_id/tvg_id bindings, preserved automatically on sparse edits.
+            hide_empty_group_ids: Selected event-slot groups whose channels hide
+                when recent stream-flow evidence says they are idle. The current
+                programme is the fallback when no recent measurement exists.
         """
         try:
             client = get_ecm_client()
@@ -1109,6 +1114,7 @@ def register(mcp: FastMCP):
                 "channel_group_ids": channel_group_ids,
                 "epg_source_ids": epg_source_ids,
                 "channel_mappings": channel_mappings,
+                "hide_empty_group_ids": hide_empty_group_ids,
             }
             for key, value in optional.items():
                 if value is not None:
@@ -1156,6 +1162,7 @@ def register(mcp: FastMCP):
         channel_group_ids: list[int] | None = None,
         epg_source_ids: list[int] | None = None,
         channel_mappings: list[dict] | None = None,
+        hide_empty_group_ids: list[int] | None = None,
     ) -> str:
         """Update a Dummy EPG profile — only provided fields change (bd-omxy5).
 
@@ -1189,6 +1196,7 @@ def register(mcp: FastMCP):
                 "pattern_builder_examples": pattern_builder_examples,
                 "pattern_variants": pattern_variants, "channel_group_ids": channel_group_ids,
                 "epg_source_ids": epg_source_ids, "channel_mappings": channel_mappings,
+                "hide_empty_group_ids": hide_empty_group_ids,
             }
             body = {k: v for k, v in fields.items() if v is not None}
 

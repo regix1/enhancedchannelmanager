@@ -279,6 +279,21 @@ def _lint_dummy_epg_profile_request(req) -> None:
         )
 
 
+def _validate_hide_empty_groups(channel_group_ids, hide_empty_group_ids) -> None:
+    """Keep automatic visibility scoped to groups owned by this profile."""
+    if hide_empty_group_ids is None:
+        return
+    invalid = sorted(set(hide_empty_group_ids) - set(channel_group_ids or []))
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "hide_empty_group_ids must be selected in channel_group_ids; "
+                f"invalid group ids: {invalid}"
+            ),
+        )
+
+
 async def _configure_sources(profile, fields: dict, *, snapshot: dict | None = None) -> None:
     """Validate source selection and remember explicit external guide bindings."""
     from services.epg_programmes import _resolve_group_assignments, capture_mappings, resolve_sources
@@ -351,6 +366,7 @@ async def create_profile(req: ProfileCreateRequest, db: Session = Depends(get_se
         from models import DummyEPGProfile
         # Lint regex patterns before any DB work (bd-eio04.7).
         _lint_dummy_epg_profile_request(req)
+        _validate_hide_empty_groups(req.channel_group_ids, req.hide_empty_group_ids)
         # Check for duplicate name
         existing = db.query(DummyEPGProfile).filter(
             DummyEPGProfile.name == req.name
@@ -495,6 +511,12 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
         hide_empty_group_ids = update_data.pop("hide_empty_group_ids", None)
         source_fields = {key: update_data.pop(key) for key in ("epg_source_ids", "channel_mappings") if key in update_data}
         configure = _source_changes(profile, {**source_fields, "channel_group_ids": channel_group_ids, "enabled": req.enabled})
+        effective_groups = (
+            channel_group_ids
+            if channel_group_ids is not None
+            else profile.get_channel_group_ids()
+        )
+        _validate_hide_empty_groups(effective_groups, hide_empty_group_ids)
 
         for field, value in update_data.items():
             setattr(profile, field, value)
@@ -507,6 +529,11 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
             profile.set_channel_group_ids(channel_group_ids)
         if hide_empty_group_ids is not None:
             profile.set_hide_empty_group_ids(hide_empty_group_ids)
+        elif channel_group_ids is not None:
+            profile.set_hide_empty_group_ids([
+                group_id for group_id in profile.get_hide_empty_group_ids()
+                if group_id in channel_group_ids
+            ])
         if configure:
             await _configure_sources(profile, source_fields)
 
@@ -992,6 +1019,10 @@ async def import_dummy_epg_profiles_yaml(request: ImportYAMLRequest):
                     if existing:
                         _apply_profile_fields(candidate, existing.to_dict())
                     _apply_profile_fields(candidate, fields)
+                    _validate_hide_empty_groups(
+                        candidate.get_channel_group_ids(),
+                        candidate.get_hide_empty_group_ids(),
+                    )
                     if not existing or _source_changes(existing, fields):
                         await _configure_sources(candidate, fields, snapshot=snapshot)
                     fields["epg_source_ids"] = candidate.get_epg_source_ids()
@@ -1054,6 +1085,8 @@ def _apply_profile_fields(profile, data: dict):
         profile.set_pattern_variants(data["pattern_variants"])
     if "channel_group_ids" in data and data["channel_group_ids"] is not None:
         profile.set_channel_group_ids(data["channel_group_ids"])
+    if "hide_empty_group_ids" in data and data["hide_empty_group_ids"] is not None:
+        profile.set_hide_empty_group_ids(data["hide_empty_group_ids"])
     if "epg_source_ids" in data:
         profile.set_epg_source_ids(data["epg_source_ids"] or [])
     if "channel_mappings" in data:

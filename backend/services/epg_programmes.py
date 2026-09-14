@@ -195,7 +195,8 @@ def _placeholder(programme: ET.Element) -> bool:
     title = " ".join((programme.findtext("title") or "").split())
     return bool(re.fullmatch(
         r"(?:no events?(?: today| scheduled)?|signing off|sign off|off[- ]air|"
-        r"no programming(?: scheduled)?|next event: .+ on .+)", title, re.IGNORECASE,
+        r"no programming(?: scheduled)?|program(?:ming)? unavailable|"
+        r"next event: .+ on .+)", title, re.IGNORECASE,
     ))
 
 

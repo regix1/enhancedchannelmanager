@@ -39,6 +39,21 @@ templates](dummy-epg-templates.md)), and Event Sync integration.
 > removed), but any new dummy EPG should be authored as a Dummy EPG
 > Profile.
 
+## Hide idle event slots automatically
+
+For PPV, ESPN+, and similar numbered event-slot groups, select the group under
+**Automatic visibility** in the profile editor. The scheduled Dummy EPG Refresh
+then keeps the slot hidden while its stream has no measured flow and restores
+it when flow resumes. A recent black-screen result or failed probe also counts
+as idle. If ECM has no recent measurement, the programme airing now is the
+fallback; placeholder titles such as `Programming unavailable` do not keep a
+slot visible.
+
+This setting hides the Dispatcharr channel from output; it does not delete the
+channel, stream, guide binding, logo, or programme artwork. Apply it only to
+event-slot groups. Ordinary channel groups are not selected automatically and
+remain visible through guide gaps.
+
 ## What a profile actually produces
 
 A profile watches the channels in its selected **channel groups**, applies

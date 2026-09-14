@@ -1512,6 +1512,8 @@ def _make_yaml_export(**overrides):
                     "event_timezone": "US/Eastern",
                     "program_duration": 180,
                     "tvg_id_template": "ecm-{channel_number}",
+                    "channel_group_ids": [65],
+                    "hide_empty_group_ids": [65],
                     "channel_assignments": [
                         {"channel_id": 1, "channel_name": "ESPN", "tvg_id_override": None},
                     ],
@@ -1640,7 +1642,9 @@ class TestRestoreYaml:
         assert test_session.query(DummyEPGChannelAssignment).count() == 1
         # The export fixture carries the old number-keyed template, which restore
         # repoints onto the channel id.
-        assert test_session.query(DummyEPGProfile).one().tvg_id_template == "ecm-{channel_id}"
+        restored_profile = test_session.query(DummyEPGProfile).one()
+        assert restored_profile.tvg_id_template == "ecm-{channel_id}"
+        assert restored_profile.get_hide_empty_group_ids() == [65]
 
     @pytest.mark.asyncio
     async def test_restore_keeps_customized_tvg_id_template(self, async_client, test_session):

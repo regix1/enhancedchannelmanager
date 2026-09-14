@@ -1915,6 +1915,7 @@ export interface DummyEPGProfile {
   pattern_builder_examples: string | null;
   pattern_variants: PatternVariant[];
   channel_group_ids: number[];
+  hide_empty_group_ids?: number[];
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
   last_generated_at: string | null;
@@ -1955,6 +1956,7 @@ export interface DummyEPGProfileCreateRequest {
   pattern_builder_examples?: string;
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
+  hide_empty_group_ids?: number[];
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
 }
@@ -1990,6 +1992,7 @@ export interface DummyEPGProfileUpdateRequest {
   pattern_builder_examples?: string | null;
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
+  hide_empty_group_ids?: number[];
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
 }

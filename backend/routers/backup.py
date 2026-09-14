@@ -6621,6 +6621,7 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 pattern_builder_examples=item.get("pattern_builder_examples"),
                 pattern_variants=json.dumps(item["pattern_variants"]) if item.get("pattern_variants") else None,
                 channel_group_ids=json.dumps(item["channel_group_ids"]) if item.get("channel_group_ids") else None,
+                hide_empty_group_ids=json.dumps(item["hide_empty_group_ids"]) if item.get("hide_empty_group_ids") else None,
             )
             session.add(profile)
             session.flush()

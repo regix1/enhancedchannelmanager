@@ -794,6 +794,7 @@ class TestDummyEpgProfile:
             "  title_template='{title}'\n"
             "  event_timezone=US/Eastern, program_duration=180min\n"
             "  channel_group_ids=[65] (1 group(s) assigned)\n"
+            "  hide_empty_group_ids=[]\n"
             "  epg_source_ids=[49]\n"
             "  channel_mappings=[]\n"
             "  substitution_pairs: 1 configured"
@@ -822,6 +823,7 @@ class TestDummyEpgProfile:
             "tvg_id_template": "ecm-{channel_id}", "include_date_tag": False,
             "include_live_tag": False, "include_new_tag": False,
             "pattern_builder_examples": [], "channel_group_ids": [65],
+            "hide_empty_group_ids": [65],
             "epg_source_ids": [49, 50],
             "channel_mappings": [{"channel_id": 1, "source_id": 42, "tvg_id": "11207"}],
             "substitution_pairs": [{"find": "a\\\\b", "replace": "é", "is_regex": False}],

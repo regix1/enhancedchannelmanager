@@ -81,12 +81,14 @@ class TestCreateDummyEpgProfile:
                 "title_pattern": r"^(.*?) - ",
                 "substitution_pairs": [{"find": "HD", "replace": ""}],
                 "channel_group_ids": [5, 7],
+                "hide_empty_group_ids": [7],
             })
 
         body = client.call_endpoint.call_args.kwargs["body"]
         assert body["title_pattern"] == r"^(.*?) - "
         assert body["substitution_pairs"] == [{"find": "HD", "replace": ""}]
         assert body["channel_group_ids"] == [5, 7]
+        assert body["hide_empty_group_ids"] == [7]
 
 
 class TestUpdateDummyEpgProfile:
@@ -101,6 +103,22 @@ class TestUpdateDummyEpgProfile:
 
         body = client.call_endpoint.call_args.kwargs["body"]
         assert body == {"enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_forwards_an_explicit_idle_visibility_clear(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = {"name": "Sports"}
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            await mcp.call_tool(
+                "update_dummy_epg_profile",
+                {"profile_id": 1, "hide_empty_group_ids": []},
+            )
+
+        assert client.call_endpoint.call_args.kwargs["body"] == {
+            "hide_empty_group_ids": [],
+        }
 
     @pytest.mark.asyncio
     async def test_no_changes_short_circuits(self):

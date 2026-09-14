@@ -461,6 +461,25 @@
   color: var(--text-muted);
 }
 
+.dep-idle-visibility {
+  border: 0;
+  margin: 1rem 0 0;
+  padding: 0;
+  min-inline-size: 0;
+}
+
+.dep-idle-visibility legend {
+  color: var(--text-primary);
+  font-size: var(--type-body-size);
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  padding: 0;
+}
+
+.dep-idle-visibility .modal-section-description {
+  margin-bottom: 0.5rem;
+}
+
 .dep-coverage {
   margin-block: 1rem;
 }

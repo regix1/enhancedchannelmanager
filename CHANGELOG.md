@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- PPV and ESPN+ event-slot groups can now opt into automatic visibility driven by recent measured stream throughput and black-screen results. Idle or failed slots hide without deleting their channels, streams, guide bindings, or artwork, then reappear automatically when flow resumes. The current guide is used only when no fresh flow measurement exists, `Program unavailable` and `Programming unavailable` count as placeholders, and ordinary channel groups remain unchanged unless explicitly selected.
+
 - PPV and ESPN+ event channels now accept provider schedules carrying explicit `start:YYYY-MM-DD HH:MM:SS` timestamps and retire when their currently attached streams are conclusively dead, including bare or temporarily unparseable current playlist names. Saved PPV poster variants also survive the provider switching its slot delimiter between `|` and `:`. Preview and execution share the same bounded health evidence, while future events and streams without sufficient evidence remain protected. Stream probes have outer stage deadlines so a stalled relay or statistics write cannot freeze the scheduled event refresh indefinitely.
 
 ## [0.18.1] — 2026-08-30

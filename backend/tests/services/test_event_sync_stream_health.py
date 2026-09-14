@@ -17,6 +17,7 @@ import pytest
 
 from services.event_sync_stream_health import (
     MAX_HEALTH_PROBES_PER_RUN,
+    collect_stream_flow,
     find_dead_streams,
     find_working_streams,
 )
@@ -72,6 +73,99 @@ def test_a_cleared_picture_leaves_the_throughput_to_decide():
     assert _dead_once_started(
         _black(1, checked_at=checked, is_black=False, measured=10_000), _KICKOFF, 3, 2_000_000,
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_current_flow_uses_recent_sample_black_picture_and_probe_failure():
+    checked_after = _KICKOFF - timedelta(minutes=30)
+    stats = {
+        1: _stat(1, measured=5_000_000),
+        2: _stat(2, measured=100_000),
+        3: _black(3, checked_at=_KICKOFF, measured=5_000_000),
+        4: _stat(4, status="timeout"),
+        5: _stat(5, measured=5_000_000, probed_at=checked_after - timedelta(seconds=1)),
+    }
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value=stats),
+    ), patch(
+        "services.event_sync_stream_health._min_stream_bitrate_bps",
+        return_value=2_000_000,
+    ):
+        assert await collect_stream_flow(
+            stats,
+            client=MagicMock(),
+            checked_after=checked_after,
+        ) == {1: True, 2: False, 3: False, 4: False, 5: None}
+
+
+@pytest.mark.asyncio
+async def test_current_flow_accepts_a_new_black_scan_when_the_probe_is_old():
+    checked_after = _KICKOFF - timedelta(minutes=30)
+    stat = _black(
+        1,
+        checked_at=_KICKOFF,
+        measured=5_000_000,
+    )
+    stat["last_probed"] = (checked_after - timedelta(hours=1)).replace(
+        tzinfo=None,
+    ).isoformat() + "Z"
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={1: stat}),
+    ), patch(
+        "services.event_sync_stream_health._min_stream_bitrate_bps",
+        return_value=2_000_000,
+    ):
+        assert await collect_stream_flow(
+            [1], client=MagicMock(), checked_after=checked_after,
+        ) == {1: False}
+
+
+@pytest.mark.asyncio
+async def test_current_flow_probes_only_streams_without_a_recent_measurement():
+    checked_after = _KICKOFF - timedelta(minutes=30)
+    initial = {1: _stat(1, measured=5_000_000)}
+    refreshed = {2: _stat(2, measured=100_000)}
+    load = AsyncMock(side_effect=[initial, refreshed])
+    probe = AsyncMock(return_value={2})
+    client = MagicMock()
+    with patch("services.event_sync_stream_health._load_stats", load), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ), patch(
+        "services.event_sync_stream_health._min_stream_bitrate_bps",
+        return_value=2_000_000,
+    ):
+        assert await collect_stream_flow(
+            [1, 2],
+            client=client,
+            checked_after=checked_after,
+            probe_missing=True,
+        ) == {1: True, 2: False}
+    probe.assert_awaited_once_with(client, [2], 2_000_000)
+
+
+@pytest.mark.asyncio
+async def test_current_flow_does_not_duplicate_an_active_scheduled_probe():
+    checked_after = _KICKOFF - timedelta(minutes=30)
+    probe = AsyncMock()
+    prober = MagicMock(_probing_in_progress=True)
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={}),
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ), patch(
+        "services.event_sync_stream_health._min_stream_bitrate_bps",
+        return_value=2_000_000,
+    ), patch("stream_prober.get_prober", return_value=prober):
+        assert await collect_stream_flow(
+            [1],
+            client=MagicMock(),
+            checked_after=checked_after,
+            probe_missing=True,
+        ) == {1: None}
+    probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -216,6 +216,29 @@ class TestCreateProfile:
         assert data["channel_group_ids"] == [5, 10, 15]
 
     @pytest.mark.asyncio
+    async def test_creates_profile_with_idle_visibility_groups(self, async_client):
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Event Slots",
+                "channel_group_ids": [5, 10],
+                "hide_empty_group_ids": [10],
+            })
+
+        assert response.status_code == 200
+        assert response.json()["hide_empty_group_ids"] == [10]
+
+    @pytest.mark.asyncio
+    async def test_rejects_idle_visibility_outside_selected_groups(self, async_client):
+        response = await async_client.post("/api/dummy-epg/profiles", json={
+            "name": "Wrong Scope",
+            "channel_group_ids": [5],
+            "hide_empty_group_ids": [10],
+        })
+
+        assert response.status_code == 422
+        assert "invalid group ids: [10]" in response.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_rejects_duplicate_name(self, async_client, test_session):
         """Returns 409 when name already exists."""
         _create_profile(test_session, name="Existing")
@@ -341,6 +364,35 @@ class TestUpdateProfile:
 
         assert response.status_code == 200
         assert response.json()["channel_group_ids"] == [10, 20]
+
+    @pytest.mark.asyncio
+    async def test_removing_group_also_removes_its_idle_visibility(self, async_client, test_session):
+        profile = _create_profile(test_session)
+        profile.set_channel_group_ids([5, 10])
+        profile.set_hide_empty_group_ids([5, 10])
+        test_session.commit()
+
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.patch(
+                f"/api/dummy-epg/profiles/{profile.id}",
+                json={"channel_group_ids": [10]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["hide_empty_group_ids"] == [10]
+
+    @pytest.mark.asyncio
+    async def test_rejects_idle_visibility_outside_saved_groups(self, async_client, test_session):
+        profile = _create_profile(test_session)
+        profile.set_channel_group_ids([5])
+        test_session.commit()
+
+        response = await async_client.patch(
+            f"/api/dummy-epg/profiles/{profile.id}",
+            json={"hide_empty_group_ids": [10]},
+        )
+
+        assert response.status_code == 422
 
     @pytest.mark.asyncio
     async def test_rejects_duplicate_name(self, async_client, test_session):
@@ -1075,6 +1127,8 @@ class TestProgrammeSources:
         import yaml
 
         profile = _create_profile(test_session, program_poster_url_template="/mlb/{away}/{home}/cover?style=4&fallback=true")
+        profile.set_channel_group_ids([65])
+        profile.set_hide_empty_group_ids([65])
         profile.set_epg_source_ids([51])
         profile.set_channel_mappings([{"channel_id": 2950, "source_id": 51, "tvg_id": "32645"}])
         test_session.commit()
@@ -1086,6 +1140,7 @@ class TestProgrammeSources:
             exported = await async_client.get("/api/dummy-epg/profiles/export/yaml")
             document = yaml.safe_load(exported.text)
             original = document["profiles"][0]
+            assert original["hide_empty_group_ids"] == [65]
             assert original["epg_source_ids"] == [51]
             assert original["channel_mappings"][0]["tvg_id"] == "32645"
             original["name"] = "Copy"
@@ -1097,6 +1152,7 @@ class TestProgrammeSources:
         saved = test_session.query(DummyEPGProfile).filter_by(name="Copy").one().to_dict()
         assert saved["channel_mappings"] == original["channel_mappings"]
         assert saved["epg_source_ids"] == [51]
+        assert saved["hide_empty_group_ids"] == [65]
         assert saved["program_poster_url_template"] == original["program_poster_url_template"]
 
 
@@ -1106,6 +1162,7 @@ class TestProgrammeSources:
         profile = _create_profile(test_session)
         profile.set_epg_source_ids([51])
         profile.set_channel_group_ids([65])
+        profile.set_hide_empty_group_ids([65])
         profile.set_channel_mappings([{"channel_id": 10, "source_id": 51, "tvg_id": "111"}])
         test_session.commit()
         fields = profile.to_dict()
@@ -1116,6 +1173,7 @@ class TestProgrammeSources:
             response = await async_client.post("/api/dummy-epg/profiles/import/yaml", json={"overwrite": True, "yaml_content": yaml.safe_dump({"profiles": [fields]})})
         assert response.status_code == 200, response.text
         assert response.json()["errors"] == []
+        assert profile.to_dict()["hide_empty_group_ids"] == [65]
         assert len(response.json()["imported"]) == 1
         assert profile.title_template == "Updated {title}"
         assert profile.get_channel_mappings() == fields["channel_mappings"]
@@ -1413,9 +1471,12 @@ class TestHideEmptyChannels:
     @staticmethod
     def _channels():
         return {
-            10: {"id": 10, "channel_group_id": 900, "hidden_from_output": False},
-            11: {"id": 11, "channel_group_id": 900, "hidden_from_output": True},
-            12: {"id": 12, "channel_group_id": 901, "hidden_from_output": False},
+            10: {"id": 10, "channel_group_id": 900, "hidden_from_output": False,
+                 "streams": [{"id": 110}]},
+            11: {"id": 11, "channel_group_id": 900, "hidden_from_output": True,
+                 "streams": [{"id": 111}]},
+            12: {"id": 12, "channel_group_id": 901, "hidden_from_output": False,
+                 "streams": [{"id": 112}]},
         }
 
     @staticmethod
@@ -1425,6 +1486,21 @@ class TestHideEmptyChannels:
             {"channel_id": 11, "real_minutes": 120},
             {"channel_id": 12, "real_minutes": 0},
         ]}
+
+    async def _apply(self, coverage, client, *, available=None, flow=None, profiles=None):
+        current = available if available is not None else {10: False, 11: True, 12: False}
+        measured = flow if flow is not None else {110: None, 111: None, 112: None}
+        with patch(
+            "tasks.dummy_epg_refresh._current_programme_availability",
+            return_value=current,
+        ), patch(
+            "services.event_sync_stream_health.collect_stream_flow",
+            AsyncMock(return_value=measured),
+        ):
+            await self._task()._apply_empty_channel_visibility(
+                profiles or [{"hide_empty_group_ids": [900]}],
+                self._channels(), coverage, client,
+            )
 
     @pytest.mark.asyncio
     async def test_a_slot_nobody_asked_the_source_about_is_left_alone(self):
@@ -1436,9 +1512,7 @@ class TestHideEmptyChannels:
             {"channel_id": 10, "real_minutes": 0, "warnings": ["schedule_pending"]},
             {"channel_id": 11, "real_minutes": 0, "warnings": ["mapping_unavailable"]},
         ]}
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
-        )
+        await self._apply(coverage, client)
         client.update_channel.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1448,18 +1522,14 @@ class TestHideEmptyChannels:
         client.update_channel = AsyncMock()
         coverage = {"sources": [{"source_id": 51, "status": "ready"}],
                     "channels": [{"channel_id": 10, "real_minutes": 0, "warnings": ["missing_artwork"]}]}
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
-        )
+        await self._apply(coverage, client, available={10: False})
         client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": True})
 
     @pytest.mark.asyncio
     async def test_an_opted_in_group_hides_the_empty_and_restores_the_filled(self):
         client = MagicMock()
         client.update_channel = AsyncMock()
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
-        )
+        await self._apply(self._coverage(), client)
         assert client.update_channel.await_args_list == [
             call(10, {"hidden_from_output": True}),
             call(11, {"hidden_from_output": False}),
@@ -1477,9 +1547,7 @@ class TestHideEmptyChannels:
         client = MagicMock()
         client.update_channel = AsyncMock()
         coverage = {"sources": sources, "channels": [{"channel_id": 10, "real_minutes": 0}]}
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), coverage, client,
-        )
+        await self._apply(coverage, client)
         client.update_channel.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1488,17 +1556,15 @@ class TestHideEmptyChannels:
         channel's listings is not the same statement as an idle event slot."""
         client = MagicMock()
         client.update_channel = AsyncMock()
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
-        )
+        await self._apply(self._coverage(), client)
         assert call(12, {"hidden_from_output": True}) not in client.update_channel.await_args_list
 
     @pytest.mark.asyncio
     async def test_no_opted_in_group_touches_nothing(self):
         client = MagicMock()
         client.update_channel = AsyncMock()
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": []}], self._channels(), self._coverage(), client,
+        await self._apply(
+            self._coverage(), client, profiles=[{"hide_empty_group_ids": []}],
         )
         client.update_channel.assert_not_awaited()
 
@@ -1506,10 +1572,23 @@ class TestHideEmptyChannels:
     async def test_a_failed_update_does_not_stop_the_rest(self):
         client = MagicMock()
         client.update_channel = AsyncMock(side_effect=[RuntimeError("boom"), None])
-        await self._task()._apply_empty_channel_visibility(
-            [{"hide_empty_group_ids": [900]}], self._channels(), self._coverage(), client,
-        )
+        await self._apply(self._coverage(), client)
         assert client.update_channel.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fresh_flow_overrides_guide_while_fresh_failure_hides(self):
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+        await self._apply(
+            self._coverage(),
+            client,
+            available={10: True, 11: False},
+            flow={110: False, 111: True},
+        )
+        assert client.update_channel.await_args_list == [
+            call(10, {"hidden_from_output": True}),
+            call(11, {"hidden_from_output": False}),
+        ]
 
 
 class TestXmltvCacheOutlivesRefreshInterval:

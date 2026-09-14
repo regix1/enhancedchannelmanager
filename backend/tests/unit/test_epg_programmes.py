@@ -880,8 +880,10 @@ async def test_long_source_duration_is_diagnosed_and_not_rendered(monkeypatch):
 
 @pytest.mark.parametrize("title,expected", [
     ("No EVENT Today", True), ("Signing Off", True), ("SIGN OFF", True),
+    ("Program Unavailable", True), ("Programming unavailable", True),
     ("Next EVENT: Hockey on Saturday", True), ("The Signing Off Story", False),
     ("No Events: A Documentary", False), ("Off-Air with Friends", False),
+    ("Programming Unavailable: The Documentary", False),
 ])
 def test_placeholder_filter_is_specific(title, expected):
     assert guides._placeholder(programme(title=title)) is expected

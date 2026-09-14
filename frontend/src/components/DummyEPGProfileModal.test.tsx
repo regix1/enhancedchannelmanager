@@ -15,6 +15,7 @@ import type {
 import { DummyEPGProfileModal } from './DummyEPGProfileModal';
 
 const mocks = vi.hoisted(() => ({
+  getChannelGroups: vi.fn().mockResolvedValue([]),
   updateDummyEPGProfile: vi.fn(),
   createDummyEPGProfile: vi.fn(),
   getEPGSources: vi.fn().mockResolvedValue([]),
@@ -22,7 +23,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../services/api', () => ({
-  getChannelGroups: vi.fn().mockResolvedValue([]),
+  getChannelGroups: mocks.getChannelGroups,
   getEPGSources: mocks.getEPGSources,
   getDummyEPGCoverage: mocks.getDummyEPGCoverage,
   previewDummyEPGBatch: vi.fn().mockResolvedValue([]),
@@ -128,6 +129,7 @@ async function saveAndReadRequest(): Promise<DummyEPGProfileCreateRequest> {
 describe('DummyEPGProfileModal per-variant program duration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getChannelGroups.mockResolvedValue([]);
     mocks.updateDummyEPGProfile.mockResolvedValue({});
     mocks.createDummyEPGProfile.mockResolvedValue({});
   });
@@ -233,6 +235,7 @@ describe('DummyEPGProfileModal per-variant program duration', () => {
 describe('Dummy EPG programme sources and coverage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getChannelGroups.mockResolvedValue([]);
     mocks.getEPGSources.mockResolvedValue([
       { id: 51, name: 'USA 3-day', source_type: 'xmltv', is_active: true, url: 'https://guide.example/private-key' },
       { id: 49, name: 'Portrait sports', source_type: 'xmltv', is_active: true, url: '/api/epg/artwork-proxy/42' },
@@ -240,6 +243,30 @@ describe('Dummy EPG programme sources and coverage', () => {
     ]);
     mocks.updateDummyEPGProfile.mockResolvedValue({});
     mocks.createDummyEPGProfile.mockResolvedValue({});
+  });
+
+  it('saves automatic idle hiding only for selected event groups', async () => {
+    mocks.getChannelGroups.mockResolvedValue([
+      { id: 65, name: 'Live Events', channel_count: 7 },
+      { id: 2479, name: 'ESPN+ Slots', channel_count: 100 },
+    ]);
+    render(<DummyEPGProfileModal isOpen profile={{
+      ...makeProfile([legacyVariant]),
+      channel_group_ids: [65, 2479],
+      hide_empty_group_ids: [2479],
+    }} onClose={vi.fn()} onSave={vi.fn()} />);
+
+    expect(await screen.findByRole('checkbox', {
+      name: 'Hide idle channels in ESPN+ Slots',
+    })).toBeChecked();
+    const liveEvents = screen.getByRole('checkbox', {
+      name: 'Hide idle channels in Live Events',
+    });
+    expect(liveEvents).not.toBeChecked();
+    fireEvent.click(liveEvents);
+
+    const saved = await saveAndReadRequest();
+    expect(saved.hide_empty_group_ids).toEqual([2479, 65]);
   });
 
   it('preserves saved sources and leaves remembered mappings to the sparse update', async () => {

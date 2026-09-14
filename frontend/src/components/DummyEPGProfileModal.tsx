@@ -141,6 +141,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   // Channel Groups
   const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>([]);
   const [channelGroupIds, setChannelGroupIds] = useState<number[]>([]);
+  const [hideEmptyGroupIds, setHideEmptyGroupIds] = useState<number[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [groupSearchTerm, setGroupSearchTerm] = useState('');
   const [epgSources, setEpgSources] = useState<EPGSource[]>([]);
@@ -261,6 +262,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setName(profile.name);
         setEnabled(profile.enabled);
         setChannelGroupIds(profile.channel_group_ids || []);
+        setHideEmptyGroupIds(
+          (profile.hide_empty_group_ids || []).filter(id =>
+            (profile.channel_group_ids || []).includes(id)
+          )
+        );
         setEpgSourceIds(profile.epg_source_ids || []);
         setSubstitutionPairs(profile.substitution_pairs || []);
         setNameSource(profile.name_source);
@@ -303,6 +309,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setName(d.name || '');
         setEnabled(d.enabled ?? true);
         setChannelGroupIds(d.channel_group_ids || []);
+        setHideEmptyGroupIds(
+          (d.hide_empty_group_ids || []).filter(id =>
+            (d.channel_group_ids || []).includes(id)
+          )
+        );
         setEpgSourceIds(d.epg_source_ids || []);
         setSubstitutionPairs(d.substitution_pairs || []);
         setNameSource(d.name_source || 'channel');
@@ -347,6 +358,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setName('');
         setEnabled(true);
         setChannelGroupIds([]);
+        setHideEmptyGroupIds([]);
         setEpgSourceIds([]);
         setSubstitutionPairs([]);
         setNameSource('channel');
@@ -541,6 +553,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         pattern_builder_examples: v0.pattern_builder_examples || undefined,
         pattern_variants: variants,
         channel_group_ids: channelGroupIds,
+        hide_empty_group_ids: hideEmptyGroupIds,
         epg_source_ids: epgSourceIds,
         ...(!profile && importData?.channel_mappings ? { channel_mappings: importData.channel_mappings } : {}),
       };
@@ -624,7 +637,10 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 <div className="dep-group-actions-row">
                   <span className="dep-group-count">{channelGroupIds.length} group{channelGroupIds.length !== 1 ? 's' : ''} selected</span>
                   {channelGroupIds.length > 0 && (
-                    <button type="button" className="dep-group-clear-btn" onClick={() => setChannelGroupIds([])}>
+                    <button type="button" className="dep-group-clear-btn" onClick={() => {
+                      setChannelGroupIds([]);
+                      setHideEmptyGroupIds([]);
+                    }}>
                       Clear all
                     </button>
                   )}
@@ -644,6 +660,9 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                             type="checkbox"
                             checked={isSelected}
                             onChange={() => {
+                              if (isSelected) {
+                                setHideEmptyGroupIds(ids => ids.filter(id => id !== group.id));
+                              }
                               setChannelGroupIds(prev =>
                                 isSelected
                                   ? prev.filter(id => id !== group.id)
@@ -658,6 +677,43 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     })}
                 </div>
               </div>
+            )}
+
+            {channelGroupIds.length > 0 && (
+              <fieldset className="dep-idle-visibility" aria-describedby="depIdleVisibilityHelp">
+                <legend>Automatic visibility</legend>
+                <p id="depIdleVisibilityHelp" className="modal-section-description">
+                  For event-slot groups only. Recent measured stream flow decides visibility when available;
+                  the current programme is the fallback. Channels, streams, and guide links stay intact and
+                  reappear automatically when an event starts.
+                </p>
+                <div className="dep-group-selector">
+                  <div className="dep-group-list" aria-label="Groups with automatic idle hiding">
+                    {channelGroupIds.map(groupId => {
+                      const group = channelGroups.find(item => item.id === groupId);
+                      if (!group) return null;
+                      const hidesIdle = hideEmptyGroupIds.includes(groupId);
+                      return (
+                        <label
+                          key={groupId}
+                          className={`dep-group-item ${hidesIdle ? 'selected' : ''}`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={hidesIdle}
+                            onChange={() => setHideEmptyGroupIds(ids =>
+                              hidesIdle
+                                ? ids.filter(id => id !== groupId)
+                                : [...ids, groupId]
+                            )}
+                          />
+                          <span className="dep-group-name">Hide idle channels in {group.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </fieldset>
             )}
 
             <div className="modal-section-divider"><span>Programme Sources</span></div>

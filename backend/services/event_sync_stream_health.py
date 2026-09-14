@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_HEALTH_PROBES_PER_RUN",
+    "collect_stream_flow",
     "find_dead_streams",
     "find_working_streams",
 ]
@@ -285,6 +286,73 @@ async def find_working_streams(stream_ids) -> set[int]:
     }
 
 
+async def collect_stream_flow(
+    stream_ids,
+    *,
+    client,
+    checked_after: datetime,
+    probe_missing: bool = False,
+) -> dict[int, bool | None]:
+    """Return fresh measured-flow verdicts for a bounded stream set.
+
+    ``True`` means sampled throughput reached the configured floor. ``False``
+    means a fresh sample was low, the picture was black, or the probe failed.
+    ``None`` means there is no recent measurement. Hiding is reversible, so a
+    single fresh failed probe may suppress an idle slot; destructive event
+    retirement keeps its stricter repeated-failure rule.
+    """
+    ids = sorted({sid for sid in stream_ids if sid is not None})
+    if not ids:
+        return {}
+    floor = _min_stream_bitrate_bps()
+    try:
+        stats = await _load_stats(ids)
+    except Exception as e:
+        logger.warning(
+            "[STREAM-HEALTH] stream flow lookup failed (%s) — visibility falls "
+            "back to the current guide",
+            e,
+        )
+        stats = {}
+
+    states = {
+        sid: _fresh_flow_state(stats.get(sid), checked_after, floor)
+        for sid in ids
+    }
+    missing = [sid for sid, state in states.items() if state is None]
+    if probe_missing and missing and client is not None:
+        try:
+            from stream_prober import get_prober
+
+            current_prober = get_prober()
+        except Exception:
+            current_prober = None
+        if current_prober is not None and getattr(
+            current_prober, "_probing_in_progress", False,
+        ):
+            logger.info(
+                "[STREAM-HEALTH] A scheduled probe is already running; %d "
+                "stream(s) keep their current guide fallback",
+                len(missing),
+            )
+            return states
+        await _probe_and_collect_failures(client, missing, floor)
+        try:
+            refreshed = await _load_stats(missing)
+        except Exception as e:
+            logger.warning(
+                "[STREAM-HEALTH] refreshed stream flow lookup failed (%s) — "
+                "visibility falls back to the current guide",
+                e,
+            )
+        else:
+            for sid in missing:
+                states[sid] = _fresh_flow_state(
+                    refreshed.get(sid), checked_after, floor,
+                )
+    return states
+
+
 async def _load_stats(stream_ids: list[int]) -> dict[int, dict]:
     """Health records for these stream ids, keyed by stream id."""
     from fastapi.concurrency import run_in_threadpool
@@ -336,6 +404,29 @@ def _min_stream_bitrate_bps() -> int:
             "would switch the throughput check off silently", e,
         )
         return 2000 * 1000
+
+
+def _fresh_flow_state(
+    stat: dict | None,
+    checked_after: datetime,
+    floor_bps: int,
+) -> bool | None:
+    """Interpret only a recent observation of bytes or their absence."""
+    if stat is None:
+        return None
+    try:
+        if _black_since_kickoff(stat, checked_after):
+            return False
+        if not _probed_after_kickoff(stat, checked_after):
+            return None
+        sampled = _sample_says_dead(stat, floor_bps)
+        if sampled is not None:
+            return not sampled
+        if stat.get("probe_status") in _FAILED_PROBE_STATUSES:
+            return False
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _dead_once_started(
