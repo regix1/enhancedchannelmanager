@@ -2771,6 +2771,10 @@ class DummyEPGProfile(Base):
     # a numbered event slot carries nothing between events and should not sit in the
     # lineup saying so, but a cable channel with a temporary gap must stay put.
     hide_empty_group_ids = Column(Text, nullable=True)
+    # Ordered event-name stream groups checked against the current real guide.
+    # A working match is placed before the channel's existing streams; existing
+    # streams outside these groups remain attached as fallbacks.
+    stream_match_group_ids = Column(Text, nullable=True)
 
     # Timestamps
     last_generated_at = Column(DateTime, nullable=True)
@@ -2833,6 +2837,19 @@ class DummyEPGProfile(Base):
         """Set hide_empty_group_ids from list."""
         self.hide_empty_group_ids = json.dumps(ids) if ids else None
 
+    def get_stream_match_group_ids(self) -> list:
+        """Ordered event-name groups used to find streams for guide slots."""
+        if not self.stream_match_group_ids:
+            return []
+        try:
+            return json.loads(self.stream_match_group_ids)
+        except (ValueError, TypeError):
+            return []
+
+    def set_stream_match_group_ids(self, ids: list) -> None:
+        """Set the ordered guide-match stream groups."""
+        self.stream_match_group_ids = json.dumps(ids) if ids else None
+
     def get_epg_source_ids(self) -> list:
         """Return configured programme source IDs."""
         try:
@@ -2889,6 +2906,7 @@ class DummyEPGProfile(Base):
             "epg_source_ids": self.get_epg_source_ids(),
             "channel_mappings": self.get_channel_mappings(),
             "hide_empty_group_ids": self.get_hide_empty_group_ids(),
+            "stream_match_group_ids": self.get_stream_match_group_ids(),
             "last_generated_at": self.last_generated_at.isoformat() + "Z" if self.last_generated_at else None,
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
             "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,

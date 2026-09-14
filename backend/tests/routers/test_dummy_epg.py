@@ -222,10 +222,12 @@ class TestCreateProfile:
                 "name": "Event Slots",
                 "channel_group_ids": [5, 10],
                 "hide_empty_group_ids": [10],
+                "stream_match_group_ids": [1558, 1557],
             })
 
         assert response.status_code == 200
         assert response.json()["hide_empty_group_ids"] == [10]
+        assert response.json()["stream_match_group_ids"] == [1558, 1557]
 
     @pytest.mark.asyncio
     async def test_rejects_idle_visibility_outside_selected_groups(self, async_client):
@@ -1129,6 +1131,7 @@ class TestProgrammeSources:
         profile = _create_profile(test_session, program_poster_url_template="/mlb/{away}/{home}/cover?style=4&fallback=true")
         profile.set_channel_group_ids([65])
         profile.set_hide_empty_group_ids([65])
+        profile.set_stream_match_group_ids([1558, 1557])
         profile.set_epg_source_ids([51])
         profile.set_channel_mappings([{"channel_id": 2950, "source_id": 51, "tvg_id": "32645"}])
         test_session.commit()
@@ -1141,6 +1144,7 @@ class TestProgrammeSources:
             document = yaml.safe_load(exported.text)
             original = document["profiles"][0]
             assert original["hide_empty_group_ids"] == [65]
+            assert original["stream_match_group_ids"] == [1558, 1557]
             assert original["epg_source_ids"] == [51]
             assert original["channel_mappings"][0]["tvg_id"] == "32645"
             original["name"] = "Copy"
@@ -1153,6 +1157,7 @@ class TestProgrammeSources:
         assert saved["channel_mappings"] == original["channel_mappings"]
         assert saved["epg_source_ids"] == [51]
         assert saved["hide_empty_group_ids"] == [65]
+        assert saved["stream_match_group_ids"] == [1558, 1557]
         assert saved["program_poster_url_template"] == original["program_poster_url_template"]
 
 

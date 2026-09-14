@@ -116,6 +116,7 @@ class ProfileCreateRequest(BaseModel):
     epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
     channel_mappings: Optional[list[ChannelMapping]] = None
     hide_empty_group_ids: Optional[list[int]] = None
+    stream_match_group_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -151,6 +152,7 @@ class ProfileUpdateRequest(BaseModel):
     epg_source_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
     channel_mappings: Optional[list[ChannelMapping]] = None
     hide_empty_group_ids: Optional[list[int]] = None
+    stream_match_group_ids: Optional[list[Annotated[int, Field(strict=True, gt=0)]]] = None
 
 
 class ImportYAMLRequest(BaseModel):
@@ -411,6 +413,8 @@ async def create_profile(req: ProfileCreateRequest, db: Session = Depends(get_se
             profile.set_channel_group_ids(req.channel_group_ids)
         if req.hide_empty_group_ids is not None:
             profile.set_hide_empty_group_ids(req.hide_empty_group_ids)
+        if req.stream_match_group_ids is not None:
+            profile.set_stream_match_group_ids(req.stream_match_group_ids)
 
         await _configure_sources(profile, req.model_dump(exclude_unset=True))
         db.add(profile)
@@ -509,6 +513,7 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
         pattern_variants = update_data.pop("pattern_variants", None)
         channel_group_ids = update_data.pop("channel_group_ids", None)
         hide_empty_group_ids = update_data.pop("hide_empty_group_ids", None)
+        stream_match_group_ids = update_data.pop("stream_match_group_ids", None)
         source_fields = {key: update_data.pop(key) for key in ("epg_source_ids", "channel_mappings") if key in update_data}
         configure = _source_changes(profile, {**source_fields, "channel_group_ids": channel_group_ids, "enabled": req.enabled})
         effective_groups = (
@@ -534,6 +539,8 @@ async def update_profile(profile_id: int, req: ProfileUpdateRequest, db: Session
                 group_id for group_id in profile.get_hide_empty_group_ids()
                 if group_id in channel_group_ids
             ])
+        if stream_match_group_ids is not None:
+            profile.set_stream_match_group_ids(stream_match_group_ids)
         if configure:
             await _configure_sources(profile, source_fields)
 
@@ -1087,6 +1094,8 @@ def _apply_profile_fields(profile, data: dict):
         profile.set_channel_group_ids(data["channel_group_ids"])
     if "hide_empty_group_ids" in data and data["hide_empty_group_ids"] is not None:
         profile.set_hide_empty_group_ids(data["hide_empty_group_ids"])
+    if "stream_match_group_ids" in data and data["stream_match_group_ids"] is not None:
+        profile.set_stream_match_group_ids(data["stream_match_group_ids"])
     if "epg_source_ids" in data:
         profile.set_epg_source_ids(data["epg_source_ids"] or [])
     if "channel_mappings" in data:

@@ -82,6 +82,7 @@ class TestCreateDummyEpgProfile:
                 "substitution_pairs": [{"find": "HD", "replace": ""}],
                 "channel_group_ids": [5, 7],
                 "hide_empty_group_ids": [7],
+                "stream_match_group_ids": [1558, 1557],
             })
 
         body = client.call_endpoint.call_args.kwargs["body"]
@@ -89,6 +90,7 @@ class TestCreateDummyEpgProfile:
         assert body["substitution_pairs"] == [{"find": "HD", "replace": ""}]
         assert body["channel_group_ids"] == [5, 7]
         assert body["hide_empty_group_ids"] == [7]
+        assert body["stream_match_group_ids"] == [1558, 1557]
 
 
 class TestUpdateDummyEpgProfile:
@@ -118,6 +120,22 @@ class TestUpdateDummyEpgProfile:
 
         assert client.call_endpoint.call_args.kwargs["body"] == {
             "hide_empty_group_ids": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_forwards_an_explicit_stream_match_group_clear(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = {"name": "Sports"}
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            await mcp.call_tool(
+                "update_dummy_epg_profile",
+                {"profile_id": 1, "stream_match_group_ids": []},
+            )
+
+        assert client.call_endpoint.call_args.kwargs["body"] == {
+            "stream_match_group_ids": [],
         }
 
     @pytest.mark.asyncio

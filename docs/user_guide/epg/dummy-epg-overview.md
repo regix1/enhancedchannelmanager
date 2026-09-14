@@ -54,6 +54,15 @@ channel, stream, guide binding, logo, or programme artwork. Apply it only to
 event-slot groups. Ordinary channel groups are not selected automatically and
 remain visible through guide gaps.
 
+For providers that publish event names on different numbered slots, set the
+profile's `stream_match_group_ids` through the MCP profile tool, API, or YAML
+export in preferred order. Every five minutes ECM compares those groups' current
+event names and start times with the real programme on each mapped guide slot,
+probes the matching candidates, and puts working matches first. Streams already
+on the channel from groups you did not select stay attached after them as
+fallbacks. When the programme changes or ends, the old guide-matched stream is
+removed; the stable channel, RTV mapping, and fallback stream remain.
+
 ## What a profile actually produces
 
 A profile watches the channels in its selected **channel groups**, applies
