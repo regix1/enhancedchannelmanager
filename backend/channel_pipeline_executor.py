@@ -5045,6 +5045,172 @@ class ActionExecutor:
 
         return summary
 
+    async def _event_health(
+        self,
+        rule_id,
+        config,
+        units,
+        resolved,
+        now,
+        *,
+        probe_missing,
+    ):
+        """Read bounded health evidence for promotion and owned attachments."""
+        from database import get_session
+        from models import ChannelPipelineRule, DummyEPGProfile
+        from services.event_sync_matcher import parse_event_name
+        from services.event_sync_promote import event_has_started
+        from services.event_sync_stream_health import find_dead_streams
+
+        unit_ids = {
+            row.stream.stream_id
+            for unit in units for row in unit.rows
+            if row.stream.stream_id is not None
+        }
+        stream_ids = set(unit_ids)
+        stale_ids = {
+            row.stream.stream_id
+            for row in resolved
+            if row.stream.is_stale and row.stream.stream_id is not None
+        }
+        started = {
+            row.stream.stream_id: unit.rows[0].result.parsed.start
+            for unit in units
+            if event_has_started(
+                unit.rows[0].result.parsed,
+                now,
+                since=(
+                    now - timedelta(hours=24)
+                    if config.get("retire_finished_events") else None
+                ),
+            )
+            for row in unit.rows
+            if row.stream.stream_id is not None
+        }
+        probe_first = {
+            row.stream.stream_id
+            for unit in units
+            if unit.existing_channel_id is None
+            for row in unit.rows
+            if row.stream.stream_id is not None
+        }
+
+        if config.get("retire_finished_events") and rule_id is not None:
+            try:
+                session = get_session()
+                try:
+                    rule = session.get(ChannelPipelineRule, rule_id)
+                    owned = rule.get_managed_channel_ids() if rule else []
+                    profile_id = config.get("dummy_epg_profile_id")
+                    profile = (
+                        session.get(DummyEPGProfile, profile_id)
+                        if profile_id is not None else None
+                    )
+                finally:
+                    session.close()
+
+                channels = [
+                    self._channel_by_id[channel_id]
+                    for channel_id in (owned or [])
+                    if channel_id in self._channel_by_id
+                    and self._channel_by_id[channel_id].get(
+                        "channel_group_id"
+                    ) == config["promote_target_group_id"]
+                ]
+                if profile is not None and profile.enabled and len(channels) <= 256:
+                    attached = {
+                        stream.get("id") if isinstance(stream, dict) else stream
+                        for channel in channels
+                        for stream in channel.get("streams", [])
+                    }
+                    attached.discard(None)
+                    if len(stream_ids | attached) <= 1000:
+                        stream_ids.update(attached)
+                        rows_by_id = {}
+                        for row in resolved:
+                            stream_id = row.stream.stream_id
+                            if stream_id is not None:
+                                rows_by_id.setdefault(stream_id, []).append(row)
+
+                        event_timezone = profile.event_timezone or "US/Eastern"
+                        for channel in channels:
+                            parsed_channel = parse_event_name(
+                                channel.get("name") or "",
+                                now=now,
+                                event_timezone=event_timezone,
+                            )
+                            channel_start = parsed_channel.start
+                            if channel_start is None or channel_start > now:
+                                continue
+                            for stream in channel.get("streams", []):
+                                stream_id = (
+                                    stream.get("id")
+                                    if isinstance(stream, dict) else stream
+                                )
+                                current_rows = rows_by_id.get(stream_id, [])
+                                if not current_rows:
+                                    continue
+                                current_starts = {
+                                    row.result.parsed.start
+                                    for row in current_rows
+                                    if row.result.parsed.start is not None
+                                }
+                                if any(start > now for start in current_starts):
+                                    stale_ids.discard(stream_id)
+                                    started.pop(stream_id, None)
+                                    continue
+                                if len(current_starts) > 1:
+                                    continue
+                                current_start = (
+                                    next(iter(current_starts))
+                                    if current_starts else None
+                                )
+                                if (current_start is not None
+                                        and stream_id not in started):
+                                    continue
+                                evidence_start = max(
+                                    start for start in (channel_start, current_start)
+                                    if start is not None
+                                )
+                                previous_start = started.get(stream_id)
+                                if (previous_start is None
+                                        or evidence_start > previous_start):
+                                    started[stream_id] = evidence_start
+                    else:
+                        logger.warning(
+                            "[EVENT-SYNC] Rule id=%s: owned attachment health "
+                            "augmentation exceeded the 1000-stream bound; "
+                            "unproven attachments remain unknown",
+                            rule_id,
+                        )
+                elif len(channels) > 256:
+                    logger.warning(
+                        "[EVENT-SYNC] Rule id=%s: owned attachment health "
+                        "augmentation exceeded the 256-channel bound; "
+                        "unproven attachments remain unknown",
+                        rule_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[EVENT-SYNC] Rule id=%s: owned attachment health "
+                    "augmentation failed (%s); unproven attachments remain "
+                    "unknown",
+                    rule_id,
+                    e,
+                )
+
+        return await find_dead_streams(
+            stream_ids,
+            client=self.client,
+            probe_missing=probe_missing,
+            stale_stream_ids=stale_ids,
+            event_start_by_stream=started,
+            **({
+                "probe_before": now - timedelta(minutes=5),
+                "probe_first": probe_first,
+            } if config.get("retire_finished_events") else {}),
+        )
+
     async def _event_lifecycle(self, rule_id, config, units, now, dead_stream_ids=frozenset()):
         """Read one bounded evidence batch for event creation and retirement."""
         import asyncio
@@ -5334,7 +5500,6 @@ class ActionExecutor:
         from channel_number_prefix import channel_name_to_id
         from services.event_sync_promote import (
             build_promotion_plan,
-            event_has_started,
             PROMOTE_ACTION_CREATE,
         )
         from services.event_sync_review import (
@@ -5342,7 +5507,6 @@ class ActionExecutor:
             stream_name_hash,
         )
         from services.event_sync_stream_health import (
-            find_dead_streams,
             find_working_streams,
             stale_streams_to_detach,
         )
@@ -5435,46 +5599,13 @@ class ActionExecutor:
                 }
                 for unit in all_units
             }
-            # A probe verdict only counts against a stream once its event
-            # has begun; before that a failure can just mean there is
-            # nothing to serve yet. The unit's own parsed start answers it,
-            # the same instant skip_past_events and promote_lead_hours
-            # read. [7]
-            event_start_by_stream = {
-                row.stream.stream_id: unit.rows[0].result.parsed.start
-                for unit in health_units
-                if event_has_started(
-                    unit.rows[0].result.parsed, now,
-                    since=now - timedelta(hours=24) if config.get("retire_finished_events") else None,
-                )
-                for row in unit.rows
-                if row.stream.stream_id is not None
-            }
-            dead = await find_dead_streams(
-                [
-                    row.stream.stream_id
-                    for unit in health_units for row in unit.rows
-                ],
-                client=self.client,
+            dead = await self._event_health(
+                rule_id,
+                config,
+                health_units,
+                resolution.resolved,
+                now,
                 probe_missing=not exec_ctx.dry_run,
-                stale_stream_ids=set(stale_rows),
-                event_start_by_stream=event_start_by_stream,
-                # Retirement re-reads every started stream within five
-                # minutes, so the streams already on a promoted channel are
-                # re-probed every run and, in id order, fill the per-run
-                # cap ahead of the one event that still has no channel. The
-                # lifecycle needs that event's fresh reading to let it
-                # through; the owned streams keep their units, their
-                # source-end evidence and the viewer guard without a probe.
-                **({"probe_before": now - timedelta(minutes=5),
-                    "probe_first": {
-                        row.stream.stream_id
-                        for unit in health_units
-                        if unit.existing_channel_id is None
-                        for row in unit.rows
-                        if row.stream.stream_id is not None
-                    }}
-                   if config.get("retire_finished_events") else {}),
             )
             if dead:
                 plan = build_promotion_plan(

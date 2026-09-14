@@ -1195,7 +1195,7 @@ class TestPromotionPreview:
         assert resp.status_code == 200
         data = resp.json()
         _assert_zero_writes(client)
-        assert check.await_args.kwargs.get("probe_missing") is None
+        assert check.await_args.kwargs["probe_missing"] is False
         promo = data["promotion"]
         assert promo["would_promote"] == 0
         assert promo["skipped_all_dead"] == 1

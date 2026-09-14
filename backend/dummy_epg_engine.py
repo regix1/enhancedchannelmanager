@@ -451,6 +451,21 @@ def _extract_event_groups(name: str, source: dict) -> tuple[dict | None, dict | 
     matched_variant: dict | None = None
     if variants:
         groups, matched_variant = extract_groups_from_variants(name, variants)
+        if groups is None and " start:" in name.lower():
+            # Some PPV providers alternate the slot separator between ``|``
+            # and ``:`` without changing the rest of the explicit-timestamp
+            # record. Give the saved variant its pipe form before falling back
+            # so its artwork and template overrides remain attached.
+            alias = re.sub(
+                r"^([^@:|(]{0,40}?(?<!\d)\d{1,2})\s*:\s*",
+                r"\1 | ",
+                name,
+                count=1,
+            )
+            if alias != name:
+                groups, matched_variant = extract_groups_from_variants(
+                    alias, variants
+                )
     if groups is None:
         groups = extract_groups(
             name,

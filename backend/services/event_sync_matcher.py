@@ -311,6 +311,27 @@ _DATE_PATTERN_NUMERIC = (
     + r"(?P<month>\d{1,2})[./](?P<day>\d{1,2})\s+" + _TIME_CAPTURE
 )
 
+# Explicit provider timestamps are authoritative and need no inferred date.
+# This is tried after operator patterns so their title extraction keeps
+# precedence, while a provider-format change cannot make a full schedule
+# disappear merely because the saved pattern set predates this format.
+_EXPLICIT_START_PATTERN = {
+    "name": "slot-title-explicit-start",
+    "title_pattern": (
+        r"^(?:[^@:|(]{0,40}?(?<!\d)\d{1,2}\s*[:|]\s*)?"
+        r"\s*(?P<title>.+?)\s+start:\s*"
+        r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"
+        r"[T\s]\d{1,2}:\d{2}(?::\d{2})?.*$"
+    ),
+    "time_pattern": None,
+    "date_pattern": (
+        r"\bstart:\s*(?P<year>\d{4})[-/\s]"
+        r"(?P<month>\d{1,2})[-/\s](?P<day>\d{1,2})"
+        r"[T\s](?P<hour>\d{1,2}):(?P<minute>\d{2})"
+        r"(?::\d{2})?"
+    ),
+}
+
 DEFAULT_EVENT_PATTERNS: tuple[dict, ...] = (
     {
         "name": "slot-title-day-first-date",
@@ -634,6 +655,8 @@ def parse_event_name(
     matchable. Default False preserves the never-guess behavior exactly.
     """
     variants = patterns if patterns is not None else DEFAULT_EVENT_PATTERNS
+    if patterns is not None:
+        variants = (*variants, _EXPLICIT_START_PATTERN)
     tz = pytz.timezone(event_timezone)
     if now is None:
         now = datetime.now(tz)

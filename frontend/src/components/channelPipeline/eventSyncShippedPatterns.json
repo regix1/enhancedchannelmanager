@@ -40,6 +40,17 @@
       "date_pattern": "(?:@|\\||\\()\\s*(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[A-Za-z]*\\.?,?\\s+)?(?P<month>\\d{1,2})[./](?P<day>\\d{1,2})\\s+(?P<hour>\\d{1,2}):(?P<minute>\\d{2})(?:\\s*(?P<ampm>[AaPp])\\.?[Mm]?\\.?)?(?:\\s*E[SD]?T)?"
     },
     {
+      "id": "slot-title-explicit-start",
+      "builtin": false,
+      "label": "Title with explicit start timestamp",
+      "description": "Optional slot prefix, then title, then an authoritative provider timestamp such as start:2026-09-13 18:35:00. Accepts hyphenated or space-separated dates and colon or pipe slot delimiters.",
+      "example": "MLB 04 | Orioles x Blue Jays start:2026-09-12 20:07:00 stop:2026-09-13 03:20:20",
+      "expected_title": "Orioles x Blue Jays",
+      "expected_start": "2026-09-12T20:07:00-04:00",
+      "title_pattern": "^(?:[^@:|(]{0,40}?(?<!\\d)\\d{1,2}\\s*[:|]\\s*)?\\s*(?P<title>.+?)\\s+start:\\s*\\d{4}[-/\\s]\\d{1,2}[-/\\s]\\d{1,2}[T\\s]\\d{1,2}:\\d{2}(?::\\d{2})?.*$",
+      "date_pattern": "\\bstart:\\s*(?P<year>\\d{4})[-/\\s](?P<month>\\d{1,2})[-/\\s](?P<day>\\d{1,2})[T\\s](?P<hour>\\d{1,2}):(?P<minute>\\d{2})(?::\\d{2})?"
+    },
+    {
       "id": "title-day-first-date-no-at",
       "builtin": false,
       "label": "Title Day-first date (no \"@\")",

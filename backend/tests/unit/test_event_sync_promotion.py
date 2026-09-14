@@ -3140,6 +3140,123 @@ async def test_event_with_no_guide_listing_retires_when_every_stream_is_dead(ret
 
 
 @pytest.mark.asyncio
+async def test_bare_managed_slot_retires_through_the_live_promotion_path(retirement):
+    from channel_pipeline_executor import ExecutionContext
+    from channel_pipeline_engine import ChannelPipelineEngine
+    from services.event_sync_matcher import ParsedEvent
+    from types import SimpleNamespace
+
+    setup = retirement
+    setup["witness"].clear()
+    bare_name = "ESPN PLUS 01:"
+    setup["streams"][0].update({
+        "name": bare_name,
+        "m3u_account": 2,
+        "channel_group_id": SECONDARY_B,
+    })
+    setup["stats"][7301] = {
+        "probe_status": "success",
+        "measured_bitrate": 1000,
+        "last_probed": setup["now"].isoformat(),
+    }
+    row = _resolved(
+        bare_name,
+        DISPOSITION_PARSE_FAILED,
+        ParsedEvent(
+            raw_name=bare_name,
+            title=None,
+            start=None,
+            teams=None,
+            matched_pattern=None,
+        ),
+        stream_id=7301,
+        provider_id=2,
+        group_id=SECONDARY_B,
+    )
+    executor = ActionExecutor(
+        setup["client"], list(setup["state"].channels.values()),
+        managed_channel_ids=[900],
+    )
+    with patch("channel_pipeline_executor.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        clock.fromisoformat.side_effect = datetime.fromisoformat
+        promotion = await executor._execute_event_sync_promotion(
+            setup["rule"].id,
+            setup["rule"].name,
+            setup["config"],
+            SimpleNamespace(resolved=[row]),
+            ExecutionContext(),
+        )
+
+    result = {
+        "channels_removed": 0,
+        "channels_moved": 0,
+        "dry_run_results": [],
+        "execution_log": [],
+    }
+    with patch("channel_pipeline_engine.get_session",
+               side_effect=setup["session_factory"]):
+        await ChannelPipelineEngine(setup["client"])._reconcile_orphans(
+            [setup["rule"]],
+            {setup["rule"].id: promotion["channel_ids"]},
+            executor,
+            None,
+            result,
+            False,
+        )
+
+    assert promotion["event_states"] == [
+        {"channel_id": 900, "status": "idle"},
+    ]
+    assert result["channels_removed"] == 1
+    assert 900 not in setup["state"].channels
+    assert setup["streams"][0]["id"] == 7301
+
+
+@pytest.mark.asyncio
+async def test_bare_managed_slot_preview_matches_the_live_retirement(retirement, async_client):
+    setup = retirement
+    setup["witness"].clear()
+    bare_name = "ESPN PLUS 01:"
+    setup["state"].secondary_streams[SECONDARY_B_NAME] = [{
+        "id": 7301,
+        "name": bare_name,
+        "m3u_account": 2,
+        "is_stale": False,
+    }]
+    setup["streams"][0].update({
+        "name": bare_name,
+        "m3u_account": 2,
+        "channel_group_id": SECONDARY_B,
+    })
+    setup["stats"][7301] = {
+        "probe_status": "success",
+        "measured_bitrate": 1000,
+        "last_probed": setup["now"].isoformat(),
+    }
+
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session",
+               side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session",
+               side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post(
+            "/api/channel-pipeline/event-sync-preview",
+            json={"rule_id": setup["rule"].id},
+        )
+
+    assert response.status_code == 200, response.text
+    promotion = response.json()["promotion"]
+    assert promotion["event_states"] == [
+        {"channel_id": 900, "status": "idle"},
+    ]
+    assert len(promotion["retirements"]) == 1
+    setup["client"].delete_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("dead", [set(), {7301}])
 async def test_a_live_stream_keeps_its_channel_whether_or_not_a_sibling_died(retirement, dead):
     setup = retirement

@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 import database
+import stream_prober
 from models import StreamStats
 from stream_prober import StreamProber
 
@@ -112,6 +113,58 @@ class TestProbeMeasuresWhateverFfprobeDid:
 
         assert saved["video_bitrate"] is None
         assert saved["measured_bitrate"] == SAMPLED_BPS
+
+
+class TestProbeCompletionBound:
+    @pytest.mark.asyncio
+    async def test_a_hung_ffprobe_stage_becomes_a_timeout(
+        self, test_session, monkeypatch
+    ):
+        prober = create_prober(measured=0)
+
+        async def never_returns(*_args):
+            await asyncio.Event().wait()
+
+        prober._run_ffprobe = AsyncMock(side_effect=never_returns)
+        monkeypatch.setattr(stream_prober, "PROBE_STAGE_MAX_SECONDS", 0.01)
+
+        with patch("stream_prober.get_session", return_value=test_session):
+            result = await asyncio.wait_for(
+                prober.probe_stream(903, STREAM_URL, "Stream 903"),
+                timeout=0.2,
+            )
+
+        assert result["probe_status"] == "timeout"
+        assert result["measured_bitrate"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_hung_stats_push_cannot_hold_the_probe_forever(
+        self, test_session, monkeypatch
+    ):
+        prober = create_prober()
+        prober._run_ffprobe = AsyncMock(return_value={})
+
+        async def never_returns(*_args):
+            await asyncio.Event().wait()
+
+        prober._push_stats_to_dispatcharr = AsyncMock(
+            side_effect=never_returns
+        )
+        monkeypatch.setattr(
+            stream_prober,
+            "PROBE_STATS_PUSH_TIMEOUT_SECONDS",
+            0.01,
+            raising=False,
+        )
+
+        with patch("stream_prober.get_session", return_value=test_session):
+            result = await asyncio.wait_for(
+                prober.probe_stream(903, STREAM_URL, "Stream 903"),
+                timeout=0.2,
+            )
+
+        assert result["probe_status"] == "success"
+        prober._push_stats_to_dispatcharr.assert_awaited_once()
 
 
 class TestAFailedProbeDropsAStaleNumber:

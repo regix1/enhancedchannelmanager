@@ -95,6 +95,8 @@ def operator_safe_detail(exc: BaseException) -> Optional[str]:
 # Default configuration
 DEFAULT_PROBE_TIMEOUT = 30  # seconds
 BITRATE_SAMPLE_DURATION = 8  # seconds to sample stream for bitrate measurement
+PROBE_STAGE_MAX_SECONDS = 120.0
+PROBE_STATS_PUSH_TIMEOUT_SECONDS = 30.0
 
 # Restrict ffprobe/ffmpeg to safe network protocols only — blocks file://, data://,
 # concat:, subfile:, etc. URLs fed to these invocations come from Dispatcharr stream
@@ -1181,7 +1183,15 @@ class StreamProber:
         error_message: Optional[str] = None
         try:
             logger.debug("[STREAM-PROBE] Running ffprobe for stream %s", stream_id)
-            result = await self._run_ffprobe(url)
+            ffprobe_budget = (
+                (self.probe_timeout + 5) * (self.probe_retry_count + 1)
+                + self.probe_retry_delay * self.probe_retry_count
+                + 5
+            )
+            result = await asyncio.wait_for(
+                self._run_ffprobe(url),
+                timeout=min(PROBE_STAGE_MAX_SECONDS, max(1.0, ffprobe_budget)),
+            )
             logger.info("[STREAM-PROBE] Stream %s ffprobe succeeded", stream_id)
         except asyncio.TimeoutError:
             logger.warning("[STREAM-PROBE] Stream %s probe timed out after %ss", stream_id, self.probe_timeout)
@@ -1214,17 +1224,55 @@ class StreamProber:
 
         # Container headers do not establish whether bytes keep arriving.
         logger.debug("[STREAM-PROBE] Measuring bitrate for stream %s", stream_id)
-        measured_bitrate = await self._measure_stream_bitrate(url)
+        try:
+            measured_bitrate = await asyncio.wait_for(
+                self._measure_stream_bitrate(url),
+                timeout=min(
+                    PROBE_STAGE_MAX_SECONDS,
+                    max(1.0, self.bitrate_sample_duration + 20),
+                ),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[STREAM-PROBE] Bitrate measurement exceeded its outer "
+                "budget for stream %s",
+                stream_id,
+            )
+            measured_bitrate = None
 
         is_black: Optional[bool] = None
         if status == "success" and self.black_screen_detection_enabled:
             logger.debug("[STREAM-PROBE] Running black screen detection for stream %s", stream_id)
-            is_black = await self._detect_black_screen(url)
+            try:
+                is_black = await asyncio.wait_for(
+                    self._detect_black_screen(url),
+                    timeout=min(
+                        PROBE_STAGE_MAX_SECONDS,
+                        max(1.0, self.black_screen_sample_duration + 35),
+                    ),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[STREAM-PROBE] Black-screen detection exceeded its "
+                    "outer budget for stream %s",
+                    stream_id,
+                )
+                is_black = None
 
         saved = self._save_probe_result(
             stream_id, name, result, status, error_message, measured_bitrate, is_black
         )
-        await self._push_stats_to_dispatcharr(stream_id, saved)
+        try:
+            await asyncio.wait_for(
+                self._push_stats_to_dispatcharr(stream_id, saved),
+                timeout=PROBE_STATS_PUSH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[STREAM-PROBE] Timed out reflecting stats for stream %s; "
+                "the local probe result is complete",
+                stream_id,
+            )
         return saved
 
     async def _run_ffprobe(self, url: str, _retry_attempt: int = 0) -> dict:

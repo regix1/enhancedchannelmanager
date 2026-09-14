@@ -109,9 +109,10 @@ async def find_dead_streams(
     """Return the subset of ``stream_ids`` that has no working stream.
 
     Args:
-        stream_ids: The candidate stream ids — the streams a promotion plan
-            is about to turn into channels, and only those. Duplicates and
-            ``None`` entries are tolerated.
+        stream_ids: The candidate stream ids a promotion plan is about to
+            turn into channels, plus bounded attachments already owned by
+            that rule when retirement is enabled. Duplicates and ``None``
+            entries are tolerated.
         client: The Dispatcharr client, needed only to look up probe URLs.
             Without it nothing is probed.
         probe_missing: Probe the candidates that have no health record yet.

@@ -271,6 +271,64 @@ class TestParseEventName:
         assert parsed.title == expected_title
         assert parsed.start == expected_start
 
+    @pytest.mark.parametrize(
+        ("name", "expected_title", "expected_start"),
+        [
+            (
+                "MLB 15 : Padres x Giants start:2026-09-14 00:20:00 "
+                "stop:2026-09-14 07:33:20",
+                "Padres x Giants",
+                _et(2026, 9, 14, 0, 20),
+            ),
+            (
+                "UFC 04 : NOCHE UFC: POST FIGHT PRESS CONFERENCE "
+                "start:2026 09 13 02:10:00 stop:2026 09 13 03:15:00",
+                "NOCHE UFC: POST FIGHT PRESS CONFERENCE",
+                _et(2026, 9, 13, 2, 10),
+            ),
+            (
+                "MLB 04 | Orioles x Blue Jays start:2026-09-12 20:07:00 "
+                "stop:2026-09-13 03:20:20",
+                "Orioles x Blue Jays",
+                _et(2026, 9, 12, 20, 7),
+            ),
+        ],
+    )
+    def test_explicit_start_marker_formats_parse(
+        self, name, expected_title, expected_start
+    ):
+        parsed = parse_event_name(
+            name,
+            [{"name": "older-shape", "title_pattern": r"^NO MATCH$"}],
+            now=_NOW,
+        )
+        assert parsed.title == expected_title
+        assert parsed.start == expected_start
+
+    def test_explicit_start_marker_is_a_fallback_after_operator_patterns(self):
+        pattern = {
+            "name": "unrelated-provider-shape",
+            "title_pattern": r"^OTHER (?P<title>.+)$",
+        }
+        parsed = parse_event_name(
+            "MLB 12 : Royals x Red Sox start:2026-09-13 20:05:00 "
+            "stop:2026-09-14 03:18:20",
+            [pattern],
+            now=_NOW,
+        )
+        assert parsed.title == "Royals x Red Sox"
+        assert parsed.start == _et(2026, 9, 13, 20, 5)
+
+    def test_invalid_explicit_start_date_is_never_guessed(self):
+        parsed = parse_event_name(
+            "MLB 01 : A x B start:2026-02-30 20:05:00 "
+            "stop:2026-03-01 03:18:20",
+            [{"name": "older-shape", "title_pattern": r"^NO MATCH$"}],
+            now=_NOW,
+        )
+        assert parsed.title == "A x B"
+        assert parsed.start is None
+
     def test_numeric_date_needs_a_time_after_it(self):
         # A bare numeric "7.5" with no time must NOT parse a start (never
         # guessed) — guards the numeric-date pattern against false positives.

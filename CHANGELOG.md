@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- PPV and ESPN+ event channels now accept provider schedules carrying explicit `start:YYYY-MM-DD HH:MM:SS` timestamps and retire when their currently attached streams are conclusively dead, including bare or temporarily unparseable current playlist names. Saved PPV poster variants also survive the provider switching its slot delimiter between `|` and `:`. Preview and execution share the same bounded health evidence, while future events and streams without sufficient evidence remain protected. Stream probes have outer stage deadlines so a stalled relay or statistics write cannot freeze the scheduled event refresh indefinitely.
+
 ## [0.18.1] — 2026-08-30
 
 ### Security

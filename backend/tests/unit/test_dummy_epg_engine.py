@@ -947,6 +947,39 @@ def test_a_name_matching_no_variant_falls_back_to_the_profile_patterns():
     assert prog_stop - prog_start == timedelta(minutes=180)
 
 
+def test_explicit_start_delimiter_drift_keeps_variant_artwork():
+    """A provider changing its slot separator must not drop its saved poster."""
+    tz = pytz.timezone(_EVENT_TZ)
+    now = datetime.now(tz)
+    start = tz.localize(datetime(now.year, now.month, now.day, 20, 5, 0))
+    stop = start + timedelta(hours=7)
+    name = (
+        f"MLB 12 : Royals x Red Sox start:{start:%Y-%m-%d %H:%M:%S} "
+        f"stop:{stop:%Y-%m-%d %H:%M:%S}"
+    )
+    poster = "https://example.com/mlb/{away}/{home}/cover"
+    profile = _variant_profile(180, [{
+        "name": "MLB matchup",
+        "title_pattern": (
+            r"^MLB\s+\d+\s*\|\s*"
+            r"(?P<title>(?P<away>.+?)\s+x\s+(?P<home>.+?))\s+"
+            r"start:(?P<year>\d{4})-(?P<month>\d{2})-"
+            r"(?P<day>\d{2})\s+(?P<hour>\d{2}):"
+            r"(?P<minute>\d{2}):[0-5]\d\s+stop:.*$"
+        ),
+        "title_template": "{title}",
+        "program_poster_url_template": poster,
+    }])
+
+    programme = next(
+        row for row in _programmes_for(profile, name)
+        if row.findtext("title") == "Royals x Red Sox"
+    )
+    assert programme.find("icon").get("src") == (
+        "https://example.com/mlb/Royals/Red Sox/cover"
+    )
+
+
 def test_preview_uses_variant_duration():
     """The preview path resolves the duration through the variant as well."""
     name, _start = _event_name_today()

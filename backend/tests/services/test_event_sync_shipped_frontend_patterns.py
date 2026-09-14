@@ -54,7 +54,7 @@ def _pattern_dict(entry: dict) -> dict:
     return {
         "name": entry["id"],
         "title_pattern": entry["title_pattern"],
-        "time_pattern": entry["time_pattern"],
+        "time_pattern": entry.get("time_pattern"),
         "date_pattern": entry["date_pattern"],
     }
 
@@ -122,7 +122,11 @@ def test_generic_patterns_keep_same_minute_events_distinct(entry):
     to their own distinct team titles.
     """
     pattern = _pattern_dict(entry)
-    if entry["id"] == "title-day-first-date-no-at":
+    if entry["id"] == "slot-title-explicit-start":
+        name_a = "PPV 01 : Yankees vs Red Sox start:2026-01-17 14:45:00"
+        name_b = "PPV 02 : Lakers vs Celtics start:2026-01-17 14:45:00"
+        title_a, title_b = "Yankees vs Red Sox", "Lakers vs Celtics"
+    elif entry["id"] == "title-day-first-date-no-at":
         name_a = "Yankees vs Red Sox 11 Jul 06:00 PM ET"
         name_b = "Lakers vs Celtics 11 Jul 06:00 PM ET"
         title_a, title_b = "Yankees vs Red Sox", "Lakers vs Celtics"

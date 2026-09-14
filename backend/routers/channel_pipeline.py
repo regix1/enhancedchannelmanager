@@ -3816,6 +3816,7 @@ async def preview_event_sync(
         # Stays empty for the same reason: with the health gate off there
         # are no all-dead units, so no channel leaves the managed set. [24]
         retired_channel_keys: set[str] = set()
+        executor = None
 
         if config.get("skip_dead_streams") or config.get("retire_finished_events"):
             # Health the preview can read WITHOUT writing: a probe stores a
@@ -3824,35 +3825,20 @@ async def preview_event_sync(
             # is the one that goes and asks the provider. On a rule whose
             # streams have never been probed the preview therefore shows
             # none dead and the run may still drop some.
-            from services.event_sync_promote import event_has_started
-            from services.event_sync_stream_health import find_dead_streams
+            from channel_pipeline_executor import ActionExecutor
 
-            dead = await find_dead_streams(
-                [
-                    row.stream.stream_id
-                    for unit in plan.units for row in unit.rows
-                ],
-                # Both read off the same fetch and the same parsed start the
-                # run uses, so preview and run reach the same verdict for
-                # every stream except the ones a live run probes. [15]
-                stale_stream_ids={
-                    row.stream.stream_id
-                    for row in resolution.resolved
-                    if row.stream.is_stale
-                    and row.stream.stream_id is not None
-                },
-                event_start_by_stream={
-                    row.stream.stream_id: unit.rows[0].result.parsed.start
-                    for unit in plan.units
-                    if event_has_started(
-                        unit.rows[0].result.parsed, now,
-                        since=now - timedelta(hours=24) if config.get("retire_finished_events") else None,
-                    )
-                    for row in unit.rows
-                    if row.stream.stream_id is not None
-                },
-                **({"probe_before": now - timedelta(minutes=5)}
-                   if config.get("retire_finished_events") else {}),
+            executor = ActionExecutor(
+                client,
+                existing_channels=target_channels,
+                managed_channel_ids=managed_channel_ids,
+            )
+            dead = await executor._event_health(
+                request.rule_id,
+                config,
+                plan.units,
+                resolution.resolved,
+                now,
+                probe_missing=False,
             )
             # Which streams belong to which event, read BEFORE the health
             # replan, the same instant the run reads it. A delisted stream
@@ -3965,13 +3951,11 @@ async def preview_event_sync(
         retirements = []
         if config.get("retire_finished_events"):
             import copy
-            from channel_pipeline_executor import ActionExecutor
             from channel_pipeline_engine import ChannelPipelineEngine
 
-            executor = ActionExecutor(client, existing_channels=target_channels,
-                                      managed_channel_ids=managed_channel_ids)
             eligible, event_states = await executor._event_lifecycle(
                 request.rule_id, config, (*plan.units, *plan.capped_units), now,
+                dead,
             )
             plan = build_promotion_plan(config, resolution.resolved, existing_name_to_id,
                                         now=now, dead_stream_ids=dead, eligible_event_keys=eligible)
