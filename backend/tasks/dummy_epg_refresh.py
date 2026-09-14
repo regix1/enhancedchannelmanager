@@ -226,7 +226,10 @@ class DummyEPGRefreshTask(TaskScheduler):
             client=client,
             checked_after=now - STREAM_FLOW_MAX_AGE,
             probe_missing=True,
+            cancelled=lambda: self._cancel_requested,
         )
+        if self._cancel_requested:
+            return
         rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():

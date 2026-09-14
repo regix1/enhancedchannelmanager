@@ -1576,6 +1576,30 @@ class TestHideEmptyChannels:
         assert client.update_channel.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_cancelled_flow_batch_does_not_change_visibility(self):
+        task = self._task()
+        client = MagicMock()
+        client.update_channel = AsyncMock()
+
+        async def stop(*args, **kwargs):
+            task._cancel_requested = True
+            return {110: False, 111: True}
+
+        with patch(
+            "tasks.dummy_epg_refresh._current_programme_availability",
+            return_value={10: True, 11: False},
+        ), patch(
+            "services.event_sync_stream_health.collect_stream_flow",
+            AsyncMock(side_effect=stop),
+        ):
+            await task._apply_empty_channel_visibility(
+                [{"hide_empty_group_ids": [900]}],
+                self._channels(), self._coverage(), client,
+            )
+
+        client.update_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_fresh_flow_overrides_guide_while_fresh_failure_hides(self):
         client = MagicMock()
         client.update_channel = AsyncMock()

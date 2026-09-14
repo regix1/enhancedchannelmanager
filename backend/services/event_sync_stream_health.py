@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,7 @@ async def collect_stream_flow(
     client,
     checked_after: datetime,
     probe_missing: bool = False,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[int, bool | None]:
     """Return fresh measured-flow verdicts for a bounded stream set.
 
@@ -336,7 +338,9 @@ async def collect_stream_flow(
                 len(missing),
             )
             return states
-        await _probe_and_collect_failures(client, missing, floor)
+        await _probe_and_collect_failures(
+            client, missing, floor, cancelled=cancelled,
+        )
         try:
             refreshed = await _load_stats(missing)
         except Exception as e:
@@ -562,7 +566,11 @@ def _probed_after_kickoff(stat: dict, started_at: datetime) -> bool:
 
 
 async def _probe_and_collect_failures(
-    client, stream_ids: list[int], floor_bps: int
+    client,
+    stream_ids: list[int],
+    floor_bps: int,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> set[int]:
     """Probe candidates with no health record and report the failures.
 
@@ -579,6 +587,9 @@ async def _probe_and_collect_failures(
     prober's own single-stream probe rather than reimplementing one.
     """
     from stream_prober import ensure_prober
+
+    if cancelled is not None and cancelled():
+        return set()
 
     try:
         prober = ensure_prober()
@@ -618,8 +629,15 @@ async def _probe_and_collect_failures(
     semaphore = asyncio.Semaphore(max(1, prober.max_concurrent_probes))
 
     async def _probe_one(stream_id: int, url: str, name: str, m3u_account) -> None:
+        if cancelled is not None and cancelled():
+            return
         # Respect the total probe budget as well as each account's smaller limit.
         async with prober.semaphore_for_account(m3u_account), semaphore:
+            # A task can be cancelled while this stream waits behind another
+            # provider connection. Drop queued work after the in-flight sample
+            # releases its permit instead of making cancellation drain the batch.
+            if cancelled is not None and cancelled():
+                return
             try:
                 result = await prober.probe_stream(stream_id, url, name)
             except Exception as e:

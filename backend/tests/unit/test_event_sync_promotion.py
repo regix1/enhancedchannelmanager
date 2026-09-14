@@ -3495,6 +3495,52 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
 
 
 @pytest.mark.asyncio
+async def test_probe_batch_drops_queued_streams_after_cancel():
+    from services.event_sync_stream_health import _probe_and_collect_failures
+    from stream_prober import StreamProber
+
+    client = AsyncMock()
+    client.get_streams_by_ids.return_value = [
+        {
+            "id": stream_id,
+            "name": f"Event {stream_id}",
+            "url": f"https://example.invalid/{stream_id}",
+            "m3u_account": 7,
+        }
+        for stream_id in (1, 2, 3)
+    ]
+    prober = StreamProber.__new__(StreamProber)
+    prober.max_concurrent_probes = 1
+    prober.account_probe_limits = {7: 1}
+    prober._account_semaphores = {}
+    prober.refresh_account_probe_limits = AsyncMock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    stopped = {"value": False}
+
+    async def probe(stream_id, url, name):
+        started.set()
+        await release.wait()
+        return {"probe_status": "failed"}
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    with patch("stream_prober.ensure_prober", return_value=prober):
+        run = asyncio.create_task(_probe_and_collect_failures(
+            client,
+            [1, 2, 3],
+            2_000_000,
+            cancelled=lambda: stopped["value"],
+        ))
+        await started.wait()
+        stopped["value"] = True
+        release.set()
+        dead = await run
+
+    assert dead == {1}
+    prober.probe_stream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("guard", ["idle", "source_error", "viewer"])
 async def test_old_event_retirement_keeps_its_evidence(retirement, guard):
     from channel_pipeline_executor import ExecutionContext
