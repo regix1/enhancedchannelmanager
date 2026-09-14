@@ -149,7 +149,9 @@ async def _fetch_all_channels(client=None) -> dict:
         client = get_client()
     channels = []
     for page in range(1, 1001):
-        response = await client.get_channels(page=page, page_size=500)
+        response = await client.get_channels(
+            page=page, page_size=500, visibility_filter="all",
+        )
         channels.extend(response if isinstance(response, list) else response.get("results", []))
         if isinstance(response, list) or not response.get("next"):
             break

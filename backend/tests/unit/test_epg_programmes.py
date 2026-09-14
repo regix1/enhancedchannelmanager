@@ -307,6 +307,10 @@ async def test_shared_fetch_expands_mixed_streams_once_and_both_group_shapes():
     assert [row["channel_id"] for row in guides._resolve_group_assignments([65], channels)] == [1, 4]
     assert channels[1]["streams"][1]["name"] == "kept"
     assert channels[4]["streams"][0]["name"] == "resolved"
+    assert all(
+        item.kwargs["visibility_filter"] == "all"
+        for item in upstream.get_channels.await_args_list
+    )
     upstream.get_streams_by_ids.assert_awaited_once_with([2])
 
 

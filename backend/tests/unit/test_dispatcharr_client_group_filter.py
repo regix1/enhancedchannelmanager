@@ -90,6 +90,24 @@ async def test_no_group_filter_skips_group_lookup():
 
 
 @pytest.mark.asyncio
+async def test_visibility_filter_is_forwarded_to_dispatcharr():
+    """Internal lifecycle reads can include channels hidden from output."""
+    client = _make_client()
+    try:
+        request_mock = AsyncMock(
+            return_value=_response(200, {"results": [{"id": 1}], "count": 1})
+        )
+
+        with patch.object(client, "_request", request_mock):
+            await client.get_channels(visibility_filter="all")
+
+        params = request_mock.await_args.kwargs["params"]
+        assert params["visibility_filter"] == "all"
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unknown_group_id_does_not_silently_return_all():
     """An unresolvable group ID must NOT fall through to an unfiltered query
     (which would silently return every channel). It returns empty instead."""

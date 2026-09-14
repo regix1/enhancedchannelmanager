@@ -154,3 +154,32 @@ async def test_bulk_run_counts_missing_streams_as_failed():
     assert result["failed"] == 1
     failed = prober.get_probe_results()["failed_streams"]
     assert any(s["id"] == 99 for s in failed)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_probe_includes_hidden_channel_streams():
+    client = AsyncMock()
+    client.get_channel_groups.return_value = [{"id": 65, "name": "Live Events/PPV"}]
+    client.get_channels.return_value = {
+        "results": [{
+            "id": 10,
+            "name": "Hidden event slot",
+            "channel_group_id": 65,
+            "channel_number": 900,
+            "hidden_from_output": True,
+            "streams": [110],
+        }],
+        "next": None,
+    }
+    prober = _make_prober(client)
+
+    stream_ids, channels, numbers = await prober._fetch_channel_stream_ids(
+        ["Live Events/PPV"],
+    )
+
+    assert stream_ids == {110}
+    assert channels == {110: ["Hidden event slot"]}
+    assert numbers == {110: 900}
+    client.get_channels.assert_awaited_once_with(
+        page=1, page_size=500, visibility_filter="all",
+    )

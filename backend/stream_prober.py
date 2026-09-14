@@ -1903,7 +1903,9 @@ class StreamProber:
 
         while True:
             try:
-                result = await self.client.get_channels(page=page, page_size=500)
+                result = await self.client.get_channels(
+                    page=page, page_size=500, visibility_filter="all",
+                )
                 channels = result.get("results", [])
                 for channel in channels:
                     total_channels_seen += 1

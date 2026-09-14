@@ -456,6 +456,7 @@ class DispatcharrClient:
         page_size: int = 100,
         search: Optional[str] = None,
         channel_group: Optional[int] = None,
+        visibility_filter: Optional[str] = None,
     ) -> dict:
         """Get paginated list of channels.
 
@@ -470,6 +471,8 @@ class DispatcharrClient:
         params = {"page": page, "page_size": page_size}
         if search:
             params["search"] = search
+        if visibility_filter is not None:
+            params["visibility_filter"] = visibility_filter
         if channel_group is not None:
             group_name = await self._channel_group_name_for_id(channel_group)
             if group_name is None:
