@@ -23,45 +23,6 @@ MAX_WAIT_SECONDS = 300
 STREAM_FLOW_MAX_AGE = timedelta(hours=2)
 
 
-def _current_programme_availability(profiles, channel_map, wanted, now):
-    """Return whether each opted-in channel has a real current guide title."""
-    from dummy_epg_engine import generate_channel_xml, get_xmltv_id
-    from services.epg_programmes import _placeholder, programme_times
-
-    owners = {}
-    for profile in profiles:
-        for assignment in profile.get("channel_assignments") or []:
-            owners.setdefault(assignment.get("channel_id"), (profile, assignment))
-
-    available = {}
-    for channel_id, channel in channel_map.items():
-        if channel.get("channel_group_id") not in wanted or channel_id not in owners:
-            continue
-        profile, assignment = owners[channel_id]
-        try:
-            _, programmes = generate_channel_xml(
-                channel_id,
-                channel.get("name", ""),
-                channel.get("channel_number"),
-                get_xmltv_id(assignment, channel, profile),
-                profile,
-                channel.get("streams") or [],
-            )
-            available[channel_id] = any(
-                begin <= now < end and not _placeholder(programme)
-                for programme in programmes
-                for begin, end in (programme_times(programme),)
-            )
-        except Exception as e:
-            logger.warning(
-                "[dummy_epg_refresh] Could not evaluate current programme on "
-                "channel %s: %s",
-                channel_id,
-                e,
-            )
-    return available
-
-
 async def wait_for_epg_source_refresh(
     client,
     source_id: int,
@@ -215,9 +176,11 @@ class DummyEPGRefreshTask(TaskScheduler):
             logger.info("[%s] Sources still loading — leaving channel visibility alone", self.task_id)
             return 0
         now = datetime.now(timezone.utc)
-        available = await asyncio.to_thread(
-            _current_programme_availability, profile_data, channel_map, wanted, now,
-        )
+        rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
+        available = {
+            channel_id: row.get("current") is not None
+            for channel_id, row in rows.items()
+        }
         stream_ids = {
             stream.get("id") if isinstance(stream, dict) else stream
             for channel in channel_map.values()
@@ -233,7 +196,6 @@ class DummyEPGRefreshTask(TaskScheduler):
         )
         if self._cancel_requested:
             return 0
-        rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():
             if (channel.get("channel_group_id") not in wanted

@@ -1,13 +1,10 @@
-"""Quickly reveal hidden event channels when their streams begin flowing."""
+"""Keep event-channel visibility aligned with current guide coverage."""
 from __future__ import annotations
 
-import asyncio
 import logging
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from cache import get_cache
 from database import get_session
 from dispatcharr_client import get_client
 from models import DummyEPGProfile
@@ -19,24 +16,6 @@ logger = logging.getLogger(__name__)
 CHECK_INTERVAL_SECONDS = 300
 FLOW_MAX_AGE = timedelta(minutes=5)
 MAX_CHANNELS_PER_RUN = 12
-
-
-def _current_xmltv_ids(guide_text: str, now: datetime) -> set[str]:
-    """Return outward channel ids carrying a real programme at ``now``."""
-    from services.epg_programmes import _placeholder, programme_times
-
-    root = ET.fromstring(guide_text)
-    current = set()
-    for programme in root.findall("programme"):
-        try:
-            begin, end = programme_times(programme)
-        except ValueError:
-            continue
-        if begin <= now < end and not _placeholder(programme):
-            channel = programme.get("channel")
-            if channel:
-                current.add(channel)
-    return current
 
 
 def _round_robin(rows: list, cursor: int, limit: int) -> tuple[list, int]:
@@ -51,11 +30,11 @@ def _round_robin(rows: list, cursor: int, limit: int) -> tuple[list, int]:
 
 @register_task
 class EventVisibilityTask(TaskScheduler):
-    """Probe only hidden event slots whose published guide says they are live."""
+    """Show current flowing event slots and hide slots whose events ended."""
 
     task_id = "event_visibility"
     task_name = "Event Visibility Check"
-    task_description = "Reveal scheduled PPV and ESPN+ channels when measured stream flow begins"
+    task_description = "Keep PPV and ESPN+ visibility aligned with active guide and stream flow"
 
     def __init__(self, schedule_config: Optional[ScheduleConfig] = None):
         if schedule_config is None:
@@ -95,62 +74,23 @@ class EventVisibilityTask(TaskScheduler):
                 completed_at=datetime.utcnow(),
             )
 
-        from dummy_epg_engine import get_xmltv_id
-        from routers.dummy_epg import XMLTV_CACHE_TTL
-        from services.epg_programmes import _fetch_all_channels
+        from services.epg_programmes import _fetch_all_channels, can_cache, prepare_profiles
 
         client = get_client()
         channel_map = await _fetch_all_channels(client)
-        guide_text = get_cache().get("dummy_epg_xmltv_all", ttl=XMLTV_CACHE_TTL)
-        current_channel_ids = set()
-        if guide_text:
-            try:
-                current_xmltv_ids = await asyncio.to_thread(
-                    _current_xmltv_ids, guide_text, now,
-                )
-            except (ET.ParseError, TypeError, ValueError) as exc:
-                logger.warning("[%s] Published event guide could not be read: %s", self.task_id, exc)
-                return TaskResult(
-                    success=False,
-                    message="Published event guide could not be read",
-                    error="GUIDE_UNREADABLE",
-                    started_at=started_at,
-                    completed_at=datetime.utcnow(),
-                )
-            for profile in profiles:
-                profile_groups = set(profile.get("hide_empty_group_ids") or [])
-                for channel_id, channel in channel_map.items():
-                    if channel.get("channel_group_id") not in profile_groups:
-                        continue
-                    xmltv_id = get_xmltv_id(
-                        {"channel_id": channel_id}, channel, profile,
-                    )
-                    if xmltv_id in current_xmltv_ids:
-                        current_channel_ids.add(channel_id)
-        else:
-            from services.epg_programmes import can_cache, prepare_profiles
-            from tasks.dummy_epg_refresh import _current_programme_availability
-
-            profile_data, coverage = await prepare_profiles(
-                profiles, channel_map, client,
+        _, coverage = await prepare_profiles(profiles, channel_map, client)
+        if not can_cache(coverage):
+            return TaskResult(
+                success=True,
+                message="Published event guide is not ready",
+                started_at=started_at,
+                completed_at=datetime.utcnow(),
             )
-            if not can_cache(coverage):
-                return TaskResult(
-                    success=True,
-                    message="Published event guide is not ready",
-                    started_at=started_at,
-                    completed_at=datetime.utcnow(),
-                )
-            available = await asyncio.to_thread(
-                _current_programme_availability,
-                profile_data,
-                channel_map,
-                wanted,
-                now,
-            )
-            current_channel_ids = {
-                channel_id for channel_id, current in available.items() if current
-            }
+        current_channel_ids = {
+            row["channel_id"]
+            for row in coverage.get("channels", ())
+            if row.get("current") is not None
+        }
 
         event_channels = [
             (channel_id, channel)

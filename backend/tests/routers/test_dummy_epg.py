@@ -1482,18 +1482,19 @@ class TestHideEmptyChannels:
     @staticmethod
     def _coverage():
         return {"sources": [{"source_id": 51, "status": "ready"}], "channels": [
-            {"channel_id": 10, "real_minutes": 0},
-            {"channel_id": 11, "real_minutes": 120},
-            {"channel_id": 12, "real_minutes": 0},
+            {"channel_id": 10, "real_minutes": 0, "current": None},
+            {"channel_id": 11, "real_minutes": 120, "current": {"title": "Event"}},
+            {"channel_id": 12, "real_minutes": 0, "current": None},
         ]}
 
     async def _apply(self, coverage, client, *, available=None, flow=None, profiles=None):
         current = available if available is not None else {10: False, 11: True, 12: False}
         measured = flow if flow is not None else {110: None, 111: None, 112: None}
+        coverage = {**coverage, "channels": [
+            {**row, "current": {"title": "Event"} if current.get(row["channel_id"]) else None}
+            for row in coverage.get("channels", [])
+        ]}
         with patch(
-            "tasks.dummy_epg_refresh._current_programme_availability",
-            return_value=current,
-        ), patch(
             "services.event_sync_stream_health.collect_stream_flow",
             AsyncMock(return_value=measured),
         ):
@@ -1586,9 +1587,6 @@ class TestHideEmptyChannels:
             return {110: False, 111: True}
 
         with patch(
-            "tasks.dummy_epg_refresh._current_programme_availability",
-            return_value={10: True, 11: False},
-        ), patch(
             "services.event_sync_stream_health.collect_stream_flow",
             AsyncMock(side_effect=stop),
         ):

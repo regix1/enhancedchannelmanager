@@ -1,5 +1,4 @@
 """Focused checks for the quick hidden-event visibility task."""
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,20 +8,18 @@ from task_scheduler import ScheduleType
 from tasks.event_visibility import (
     CHECK_INTERVAL_SECONDS,
     EventVisibilityTask,
-    _current_xmltv_ids,
     _round_robin,
 )
 
 
-NOW = datetime(2026, 9, 14, 23, 0, tzinfo=timezone.utc)
-
-
-def _guide(title: str = "Current event") -> str:
-    return (
-        "<tv><programme channel=\"ecm-10\" "
-        "start=\"20260914220000 +0000\" stop=\"20260915010000 +0000\">"
-        f"<title>{title}</title></programme></tv>"
-    )
+def _coverage(current: bool = True):
+    return {
+        "sources": [{"status": "ready"}],
+        "channels": [{
+            "channel_id": 10,
+            "current": {"title": "Current event"} if current else None,
+        }],
+    }
 
 
 def _profile():
@@ -48,11 +45,6 @@ def test_default_schedule_checks_every_five_minutes():
     assert task.schedule_config.timezone == "America/Chicago"
 
 
-def test_current_xmltv_ids_excludes_placeholder_programmes():
-    assert _current_xmltv_ids(_guide(), NOW) == {"ecm-10"}
-    assert _current_xmltv_ids(_guide("Programming unavailable"), NOW) == set()
-
-
 def test_round_robin_does_not_starve_later_channels():
     first, cursor = _round_robin([1, 2, 3, 4], 0, 2)
     second, cursor = _round_robin([1, 2, 3, 4], cursor, 2)
@@ -76,16 +68,14 @@ async def test_reveals_flowing_hidden_channel_and_refreshes_emby():
             "streams": [{"id": 110, "name": "PPV stream"}],
         }
     }
-    cache = MagicMock()
-    cache.get.return_value = _guide()
     flow = AsyncMock(return_value={110: True})
     refresh_emby = AsyncMock()
 
-    with patch("tasks.event_visibility.get_cache", return_value=cache), \
-         patch("tasks.event_visibility.get_session", return_value=_session()), \
+    with patch("tasks.event_visibility.get_session", return_value=_session()), \
          patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("tasks.event_visibility._current_xmltv_ids", return_value={"ecm-10"}), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage()))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=flow), \
          patch("emby_client.request_guide_refresh", new=refresh_emby):
         result = await task.execute()
@@ -116,15 +106,14 @@ async def test_leaves_idle_hidden_channel_alone_without_probe():
             "streams": [{"id": 110, "name": "PPV stream"}],
         }
     }
-    cache = MagicMock()
-    cache.get.return_value = _guide("Programming unavailable")
     flow = AsyncMock()
     refresh_emby = AsyncMock()
 
-    with patch("tasks.event_visibility.get_cache", return_value=cache), \
-         patch("tasks.event_visibility.get_session", return_value=_session()), \
+    with patch("tasks.event_visibility.get_session", return_value=_session()), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=flow), \
          patch("emby_client.request_guide_refresh", new=refresh_emby):
         result = await task.execute()
@@ -150,14 +139,13 @@ async def test_hides_ended_visible_channel_and_refreshes_emby():
             "streams": [{"id": 110, "name": "PPV stream"}],
         }
     }
-    cache = MagicMock()
-    cache.get.return_value = _guide("Programming unavailable")
     refresh_emby = AsyncMock()
 
-    with patch("tasks.event_visibility.get_cache", return_value=cache), \
-         patch("tasks.event_visibility.get_session", return_value=_session()), \
+    with patch("tasks.event_visibility.get_session", return_value=_session()), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock()) as flow, \
          patch("emby_client.request_guide_refresh", new=refresh_emby):
         result = await task.execute()
@@ -175,7 +163,7 @@ async def test_hides_ended_visible_channel_and_refreshes_emby():
 
 
 @pytest.mark.asyncio
-async def test_uses_ready_source_rows_when_xmltv_cache_is_empty():
+async def test_waits_for_ready_source_rows():
     task = EventVisibilityTask()
     client = AsyncMock()
     channels = {
@@ -188,30 +176,20 @@ async def test_uses_ready_source_rows_when_xmltv_cache_is_empty():
             "streams": [{"id": 110, "name": "ESPN+ stream"}],
         }
     }
-    cache = MagicMock()
-    cache.get.return_value = None
-    prepared = [{
-        **_profile().to_dict(),
-        "channel_assignments": [{"channel_id": 10}],
-    }]
-    coverage = {"sources": [{"status": "ready"}], "channels": []}
-    flow = AsyncMock(return_value={110: True})
+    flow = AsyncMock()
 
-    with patch("tasks.event_visibility.get_cache", return_value=cache), \
-         patch("tasks.event_visibility.get_session", return_value=_session()), \
+    with patch("tasks.event_visibility.get_session", return_value=_session()), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(prepared, coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.dummy_epg_refresh._current_programme_availability", return_value={10: True}), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
+         patch("services.epg_programmes.can_cache", return_value=False), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=flow), \
          patch("emby_client.request_guide_refresh", new=AsyncMock()):
         result = await task.execute()
 
-    assert result.success_count == 1
-    client.update_channel.assert_awaited_once_with(
-        10, {"hidden_from_output": False},
-    )
+    assert result.message == "Published event guide is not ready"
+    client.update_channel.assert_not_awaited()
+    flow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -228,15 +206,13 @@ async def test_does_not_reveal_channel_without_measured_flow():
             "streams": [{"id": 110, "name": "PPV stream"}],
         }
     }
-    cache = MagicMock()
-    cache.get.return_value = _guide()
     refresh_emby = AsyncMock()
 
-    with patch("tasks.event_visibility.get_cache", return_value=cache), \
-         patch("tasks.event_visibility.get_session", return_value=_session()), \
+    with patch("tasks.event_visibility.get_session", return_value=_session()), \
          patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("tasks.event_visibility._current_xmltv_ids", return_value={"ecm-10"}), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage()))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(return_value={110: False})), \
          patch("emby_client.request_guide_refresh", new=refresh_emby):
         result = await task.execute()
