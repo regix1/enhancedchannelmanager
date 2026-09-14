@@ -92,10 +92,14 @@ async def test_reveals_flowing_hidden_channel_and_refreshes_emby():
 
     assert result.success is True
     assert result.success_count == 1
-    assert result.details == {"revealed_channel_ids": [10]}
+    assert result.details == {
+        "revealed_channel_ids": [10],
+        "hidden_channel_ids": [],
+    }
     client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": False})
     refresh_emby.assert_awaited_once_with()
     assert flow.await_args.kwargs["probe_missing"] is True
+    assert flow.await_args.kwargs["probe_while_busy"] is True
 
 
 @pytest.mark.asyncio
@@ -130,6 +134,84 @@ async def test_leaves_idle_hidden_channel_alone_without_probe():
     flow.assert_not_awaited()
     client.update_channel.assert_not_awaited()
     refresh_emby.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hides_ended_visible_channel_and_refreshes_emby():
+    task = EventVisibilityTask()
+    client = AsyncMock()
+    channels = {
+        10: {
+            "id": 10,
+            "name": "PPV 10",
+            "channel_number": 900,
+            "channel_group_id": 65,
+            "hidden_from_output": False,
+            "streams": [{"id": 110, "name": "PPV stream"}],
+        }
+    }
+    cache = MagicMock()
+    cache.get.return_value = _guide("Programming unavailable")
+    refresh_emby = AsyncMock()
+
+    with patch("tasks.event_visibility.get_cache", return_value=cache), \
+         patch("tasks.event_visibility.get_session", return_value=_session()), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock()) as flow, \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
+        result = await task.execute()
+
+    assert result.success_count == 1
+    assert result.details == {
+        "revealed_channel_ids": [],
+        "hidden_channel_ids": [10],
+    }
+    client.update_channel.assert_awaited_once_with(
+        10, {"hidden_from_output": True},
+    )
+    flow.assert_not_awaited()
+    refresh_emby.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_uses_ready_source_rows_when_xmltv_cache_is_empty():
+    task = EventVisibilityTask()
+    client = AsyncMock()
+    channels = {
+        10: {
+            "id": 10,
+            "name": "ESPN+ 00",
+            "channel_number": 8000,
+            "channel_group_id": 2479,
+            "hidden_from_output": True,
+            "streams": [{"id": 110, "name": "ESPN+ stream"}],
+        }
+    }
+    cache = MagicMock()
+    cache.get.return_value = None
+    prepared = [{
+        **_profile().to_dict(),
+        "channel_assignments": [{"channel_id": 10}],
+    }]
+    coverage = {"sources": [{"status": "ready"}], "channels": []}
+    flow = AsyncMock(return_value={110: True})
+
+    with patch("tasks.event_visibility.get_cache", return_value=cache), \
+         patch("tasks.event_visibility.get_session", return_value=_session()), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(prepared, coverage))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
+         patch("tasks.dummy_epg_refresh._current_programme_availability", return_value={10: True}), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=flow), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()):
+        result = await task.execute()
+
+    assert result.success_count == 1
+    client.update_channel.assert_awaited_once_with(
+        10, {"hidden_from_output": False},
+    )
 
 
 @pytest.mark.asyncio

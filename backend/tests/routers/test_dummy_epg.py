@@ -1600,18 +1600,17 @@ class TestHideEmptyChannels:
         client.update_channel.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_fresh_flow_overrides_guide_while_fresh_failure_hides(self):
+    async def test_empty_guide_hides_even_when_stream_flows(self):
         client = MagicMock()
         client.update_channel = AsyncMock()
         await self._apply(
             self._coverage(),
             client,
-            available={10: True, 11: False},
-            flow={110: False, 111: True},
+            available={10: False, 11: True},
+            flow={110: True, 111: False},
         )
         assert client.update_channel.await_args_list == [
             call(10, {"hidden_from_output": True}),
-            call(11, {"hidden_from_output": False}),
         ]
 
 

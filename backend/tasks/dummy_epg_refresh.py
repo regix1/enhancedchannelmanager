@@ -260,7 +260,7 @@ class DummyEPGRefreshTask(TaskScheduler):
                 flowing = False
             else:
                 flowing = None
-            hide = not available[channel_id] if flowing is None else not flowing
+            hide = not available[channel_id] or flowing is False
             if bool(channel.get("hidden_from_output")) is hide:
                 continue
             try:

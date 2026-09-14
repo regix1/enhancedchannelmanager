@@ -142,7 +142,9 @@ async def test_current_flow_probes_only_streams_without_a_recent_measurement():
             checked_after=checked_after,
             probe_missing=True,
         ) == {1: True, 2: False}
-    probe.assert_awaited_once_with(client, [2], 2_000_000)
+    probe.assert_awaited_once_with(
+        client, [2], 2_000_000, cancelled=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -166,6 +168,31 @@ async def test_current_flow_does_not_duplicate_an_active_scheduled_probe():
             probe_missing=True,
         ) == {1: None}
     probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_current_flow_can_probe_an_event_during_a_scheduled_probe():
+    checked_after = _KICKOFF - timedelta(minutes=30)
+    fresh = _stat(1, measured=5_000_000)
+    load = AsyncMock(side_effect=[{}, {1: fresh}])
+    probe = AsyncMock(return_value=set())
+    prober = MagicMock(_probing_in_progress=True)
+    with patch(
+        "services.event_sync_stream_health._load_stats", load,
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ), patch(
+        "services.event_sync_stream_health._min_stream_bitrate_bps",
+        return_value=2_000_000,
+    ), patch("stream_prober.get_prober", return_value=prober):
+        assert await collect_stream_flow(
+            [1],
+            client=MagicMock(),
+            checked_after=checked_after,
+            probe_missing=True,
+            probe_while_busy=True,
+        ) == {1: True}
+    probe.assert_awaited_once()
 
 
 @pytest.mark.asyncio

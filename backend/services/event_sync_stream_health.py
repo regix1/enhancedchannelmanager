@@ -293,6 +293,7 @@ async def collect_stream_flow(
     client,
     checked_after: datetime,
     probe_missing: bool = False,
+    probe_while_busy: bool = False,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[int, bool | None]:
     """Return fresh measured-flow verdicts for a bounded stream set.
@@ -329,7 +330,7 @@ async def collect_stream_flow(
             current_prober = get_prober()
         except Exception:
             current_prober = None
-        if current_prober is not None and getattr(
+        if not probe_while_busy and current_prober is not None and getattr(
             current_prober, "_probing_in_progress", False,
         ):
             logger.info(
