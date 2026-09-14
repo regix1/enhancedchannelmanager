@@ -104,6 +104,43 @@ async def test_tasks_count_only_completed_sources(dummy, outcome):
 
 
 @pytest.mark.asyncio
+async def test_dummy_refresh_notifies_emby_after_visibility_changes():
+    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+
+    task = DummyEPGRefreshTask()
+    task._visibility_updates = 2
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    refresh_emby = AsyncMock()
+
+    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
+         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
+        # The regeneration stand-in represents two completed visibility writes.
+        task._regenerate_xmltv.side_effect = lambda: setattr(task, "_visibility_updates", 2) or 1
+        await task.execute()
+
+    refresh_emby.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_dummy_refresh_skips_emby_when_visibility_is_unchanged():
+    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+
+    task = DummyEPGRefreshTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    refresh_emby = AsyncMock()
+
+    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
+         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
+        await task.execute()
+
+    refresh_emby.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [None, "ready", "pending", "error", "stale", "artwork"])
 async def test_scheduled_generation_uses_shared_preparation_once(status):
     from tasks.dummy_epg_refresh import DummyEPGRefreshTask

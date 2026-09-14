@@ -136,6 +136,7 @@ class DummyEPGRefreshTask(TaskScheduler):
                 schedule_type=ScheduleType.MANUAL,
             )
         super().__init__(schedule_config)
+        self._visibility_updates = 0
 
     async def _regenerate_xmltv(self) -> int:
         """Regenerate combined and profile guides from the shared source inputs."""
@@ -176,13 +177,15 @@ class DummyEPGRefreshTask(TaskScheduler):
                 for profile_id, per_xml in per_profile.items():
                     cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
             if can_cache(_coverage):
-                await self._apply_empty_channel_visibility(profile_data, channel_map, _coverage, client)
+                self._visibility_updates = await self._apply_empty_channel_visibility(
+                    profile_data, channel_map, _coverage, client,
+                )
             logger.info("[%s] Regenerated XMLTV for %s profiles", self.task_id, len(profiles))
             return len(profiles)
         finally:
             db.close()
 
-    async def _apply_empty_channel_visibility(self, profile_data, channel_map, coverage, client) -> None:
+    async def _apply_empty_channel_visibility(self, profile_data, channel_map, coverage, client) -> int:
         """Hide the channels of an opted-in group while they have no programmes.
 
         A numbered event slot carries something only when an event is on it, and the
@@ -201,7 +204,7 @@ class DummyEPGRefreshTask(TaskScheduler):
 
         wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
         if not wanted:
-            return
+            return 0
         # Only a fully scanned composition may decide visibility. A source that has
         # not answered yet yields channels with no programmes and NO warning to say
         # why — `schedule_pending` needs a selection to be missing from, and a cold
@@ -210,7 +213,7 @@ class DummyEPGRefreshTask(TaskScheduler):
         sources = coverage.get("sources") or ()
         if not sources or any(source.get("status") != "ready" for source in sources):
             logger.info("[%s] Sources still loading — leaving channel visibility alone", self.task_id)
-            return
+            return 0
         now = datetime.now(timezone.utc)
         available = await asyncio.to_thread(
             _current_programme_availability, profile_data, channel_map, wanted, now,
@@ -229,7 +232,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             cancelled=lambda: self._cancel_requested,
         )
         if self._cancel_requested:
-            return
+            return 0
         rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
         changed = 0
         for channel_id, channel in channel_map.items():
@@ -267,11 +270,22 @@ class DummyEPGRefreshTask(TaskScheduler):
                 logger.warning("[%s] Could not set visibility on channel %s: %s", self.task_id, channel_id, e)
         if changed:
             logger.info("[%s] Updated visibility on %s idle event channel(s)", self.task_id, changed)
+        return changed
+
+    async def _request_emby_refresh(self) -> None:
+        """Ask Emby to reload Live TV after this run changed visibility."""
+        if not self._visibility_updates:
+            return
+        from emby_client import request_guide_refresh
+
+        await request_guide_refresh()
+        self._visibility_updates = 0
 
     async def execute(self) -> TaskResult:
         """Execute the dummy EPG refresh pipeline."""
         client = get_client()
         started_at = datetime.utcnow()
+        self._visibility_updates = 0
 
         # Step 1: Regenerate XMLTV cache
         self._set_progress(status="regenerating", current_item="Regenerating XMLTV...")
@@ -290,6 +304,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             )
 
         if self._cancel_requested:
+            await self._request_emby_refresh()
             return TaskResult(
                 success=False, message="Cancelled", error="CANCELLED",
                 started_at=started_at, completed_at=datetime.utcnow(),
@@ -302,6 +317,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             all_sources = await client.get_epg_sources()
         except Exception as e:
             logger.exception("[%s] Failed to fetch EPG sources: %s", self.task_id, e)
+            await self._request_emby_refresh()
             return TaskResult(
                 success=True,
                 message=f"Regenerated {profile_count} profiles, but failed to fetch Dispatcharr sources: {e}",
@@ -318,6 +334,7 @@ class DummyEPGRefreshTask(TaskScheduler):
 
         if not matching:
             logger.info("[%s] No matching Dispatcharr sources to refresh", self.task_id)
+            await self._request_emby_refresh()
             return TaskResult(
                 success=True,
                 message=f"Regenerated {profile_count} profiles, no Dispatcharr sources to refresh",
@@ -379,6 +396,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             "[%s] Finished in %.1fs: regenerated %s profiles, refreshed %s/%s sources",
             self.task_id, duration, profile_count, success_count, len(matching),
         )
+        await self._request_emby_refresh()
 
         if self._cancel_requested:
             return TaskResult(

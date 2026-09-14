@@ -22,6 +22,7 @@ from tasks.dbas_backup import DbasBackupTask
 from tasks.dbas_restore import DbasRestoreTask
 from tasks.dbas_sync import DbasSyncTask
 from tasks.stats_v2_rollup import StatsV2RollupTask
+from tasks.event_visibility import EventVisibilityTask
 
 __all__ = [
     "EPGRefreshTask",
@@ -41,4 +42,5 @@ __all__ = [
     "DbasRestoreTask",
     "DbasSyncTask",
     "StatsV2RollupTask",
+    "EventVisibilityTask",
 ]
