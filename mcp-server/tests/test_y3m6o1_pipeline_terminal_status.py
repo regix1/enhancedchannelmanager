@@ -3,8 +3,7 @@ poll-loop terminal-status handling.
 
 Blocker 2: ``_TERMINAL_STATUSES`` omitted ``completed_with_errors``, ``capped``,
 and ``abandoned``, so a run finalizing in any of those states was polled all
-``_POLL_MAX_ATTEMPTS`` times and then falsely reported "still running after N
-polls". These tests prove:
+until the timeout and then falsely reported "still running". These tests prove:
 
   * EACH real terminal status a ChannelPipelineExecution can persist exits the
     poll loop on the FIRST poll — no timeout, exactly one status poll. The
@@ -76,7 +75,6 @@ async def test_each_terminal_status_exits_poll_loop_immediately(status):
     with (
         patch("tools.channel_pipeline.get_ecm_client", return_value=mock_client),
         patch("tools.channel_pipeline._poll_sleep", new=AsyncMock(return_value=None)),
-        patch("tools.channel_pipeline._POLL_MAX_ATTEMPTS", 3),
     ):
         mcp = _register()
         result = await mcp.call_tool("run_channel_pipeline", {"dry_run": False})

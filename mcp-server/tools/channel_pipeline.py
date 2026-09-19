@@ -10,6 +10,7 @@ have migrated (tracking bead to be filed after this phase ships).
 import asyncio
 import json
 import logging
+import math
 from typing import Annotated
 
 from pydantic import Field
@@ -25,8 +26,8 @@ logger = logging.getLogger(__name__)
 # Polling constants for run_channel_pipeline (bd-1wq7z.8).
 # Extracted as module-level names so tests can patch them cheaply.
 # ---------------------------------------------------------------------------
-_POLL_INTERVAL_SECONDS: float = 5.0   # seconds between status checks
-_POLL_MAX_ATTEMPTS: int = 120          # cap at 120 × 5 s = 10 minutes
+_POLL_INTERVAL_SECONDS: float = 5.0
+_POLL_TIMEOUT_SECONDS: int = 600
 
 # Terminal statuses that end the poll loop.
 #
@@ -407,12 +408,17 @@ def register(mcp: FastMCP):
         , rule_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
         , m3u_account_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
         , details: bool = False, max_rows: int = 25
+        , wait_for_completion: bool = True
+        , timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] | None = _POLL_TIMEOUT_SECONDS
     ) -> str:
         """Run the auto-creation pipeline to create channels from matching streams.
 
         The backend returns 202 immediately and runs the pipeline in the
-        background. This tool polls until the run completes (or times out),
-        then reports the real results.
+        background. By default, this tool polls for up to 10 minutes and then
+        reports the real results. Set ``wait_for_completion`` to false to return
+        the execution ID immediately and poll it with
+        ``get_channel_pipeline_execution``. Set ``timeout_seconds`` to null to
+        wait without a server-side deadline.
 
         Args:
             rule_ids: Positive saved rule IDs; omit for the existing global selection.
@@ -422,6 +428,10 @@ def register(mcp: FastMCP):
             max_rows: Details row limit from 1 to 100 (default 25).
             dry_run: If true (default), preview what would be created without making changes.
                      Set to false to actually create the channels.
+            wait_for_completion: If false, return as soon as the backend starts
+                                 the execution. The default is true.
+            timeout_seconds: Maximum polling time when waiting. The default is
+                             600 seconds. Set to null for no server-side limit.
         """
         try:
             scope = _run_scope(rule_ids, m3u_account_ids)
@@ -459,11 +469,27 @@ def register(mcp: FastMCP):
 
             logger.info("[MCP] run_channel_pipeline started execution_id=%s dry_run=%s", execution_id, dry_run)
 
+            if not wait_for_completion and prepared_result is None:
+                status = kickoff.get("status")
+                status_text = f", status={status}" if status else ""
+                return (
+                    "Auto-creation run started asynchronously "
+                    f"(execution_id={execution_id}{status_text}). "
+                    "Poll it with get_channel_pipeline_execution."
+                )
+
             # Poll until the execution reaches a terminal status.
             result = prepared_result
             if result is None:
-                for attempt in range(_POLL_MAX_ATTEMPTS):
+                max_attempts = (
+                    None
+                    if timeout_seconds is None
+                    else max(1, math.ceil(timeout_seconds / _POLL_INTERVAL_SECONDS))
+                )
+                attempt = 0
+                while max_attempts is None or attempt < max_attempts:
                     await _poll_sleep(_POLL_INTERVAL_SECONDS)
+                    attempt += 1
                     try:
                         result = await client.call_endpoint(
                             ENDPOINTS["ac_get_execution"],
@@ -485,9 +511,9 @@ def register(mcp: FastMCP):
                         break
                 else:
                     return (
-                        f"Auto-creation run is still running after {_POLL_MAX_ATTEMPTS} polls "
+                        f"Auto-creation run is still running after {timeout_seconds} seconds "
                         f"(execution_id={execution_id}). "
-                        "Check status with list_channel_pipeline_executions."
+                        "Poll it with get_channel_pipeline_execution."
                     )
 
             if details and dry_run:
@@ -647,6 +673,8 @@ def register(mcp: FastMCP):
         , rule_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
         , m3u_account_ids: list[Annotated[int, Field(strict=True, gt=0)]] | None = None
         , details: bool = False, max_rows: int = 25
+        , wait_for_completion: bool = True
+        , timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] | None = _POLL_TIMEOUT_SECONDS
     ) -> str:
         """[DEPRECATED — use run_channel_pipeline instead] Run the auto-creation pipeline to create channels from matching streams.
 
@@ -656,7 +684,8 @@ def register(mcp: FastMCP):
         """
         return await run_channel_pipeline(
             dry_run=dry_run, plan_id=plan_id, plan_hash=plan_hash, plan_phase=plan_phase,
-            rule_ids=rule_ids, m3u_account_ids=m3u_account_ids, details=details, max_rows=max_rows
+            rule_ids=rule_ids, m3u_account_ids=m3u_account_ids, details=details, max_rows=max_rows,
+            wait_for_completion=wait_for_completion, timeout_seconds=timeout_seconds,
         )
 
     @mcp.tool()
@@ -1325,6 +1354,24 @@ def register(mcp: FastMCP):
             allow_manual_channel_merge=allow_manual_channel_merge,
             event_sync_config=event_sync_config, clear_event_sync_config=clear_event_sync_config,
         )
+
+    @mcp.tool()
+    async def get_channel_pipeline_execution(execution_id: int) -> str:
+        """Get one pipeline execution for exact asynchronous status polling.
+
+        Args:
+            execution_id: Execution ID returned by run_channel_pipeline.
+        """
+        try:
+            client = get_ecm_client()
+            result = await client.call_endpoint(
+                ENDPOINTS["ac_get_execution"],
+                path_args={"execution_id": execution_id},
+            )
+            return json.dumps(result, ensure_ascii=False, sort_keys=True)
+        except Exception as e:
+            logger.error("[MCP] get_channel_pipeline_execution failed: %s", e)
+            return f"Error getting pipeline execution: {e}"
 
     @mcp.tool()
     async def list_channel_pipeline_executions(limit: int = 10) -> str:

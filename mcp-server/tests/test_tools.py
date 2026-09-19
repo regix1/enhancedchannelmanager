@@ -2419,12 +2419,15 @@ class TestRunAutoCreation:
         }
 
         mock_client = AsyncMock()
-        # kick-off + unlimited running responses
-        mock_client.call_endpoint.side_effect = [kickoff_response] + [still_running] * 100
+        # kick-off + a still-running response
+        mock_client.call_endpoint.side_effect = [kickoff_response, still_running]
 
         with patch("tools.channel_pipeline.get_ecm_client", return_value=mock_client):
             with patch("tools.channel_pipeline._poll_sleep", return_value=None):
-                result = await mcp.call_tool("run_auto_creation", {"dry_run": True})
+                result = await mcp.call_tool(
+                    "run_auto_creation",
+                    {"dry_run": True, "timeout_seconds": 1},
+                )
 
         text = result[0][0].text
         # Must surface execution_id so the user can check later.
@@ -2433,6 +2436,98 @@ class TestRunAutoCreation:
         assert "still running" in text.lower() or "running" in text.lower()
         # Must NOT say "complete" or "Duration: 0.0s".
         assert "complete" not in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_async_mode_returns_execution_id_without_polling(self):
+        """Async mode returns after kickoff so client deadlines cannot duplicate the run."""
+        from tools.channel_pipeline import register
+        from mcp.server.fastmcp import FastMCP
+        from unittest.mock import AsyncMock
+
+        mcp = FastMCP("test")
+        register(mcp)
+        mock_client = AsyncMock()
+        mock_client.call_endpoint.return_value = {
+            "execution_id": 56,
+            "status": "running",
+        }
+
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=mock_client):
+            result = await mcp.call_tool(
+                "run_auto_creation",
+                {"dry_run": False, "wait_for_completion": False},
+            )
+
+        text = result[0][0].text
+        assert "56" in text
+        assert "asynchronously" in text
+        assert mock_client.call_endpoint.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_null_timeout_waits_until_terminal_status(self):
+        """A null timeout keeps polling until the execution reaches a terminal state."""
+        from tools.channel_pipeline import register
+        from mcp.server.fastmcp import FastMCP
+        from unittest.mock import AsyncMock
+
+        mcp = FastMCP("test")
+        register(mcp)
+        mock_client = AsyncMock()
+        mock_client.call_endpoint.side_effect = [
+            {"execution_id": 57, "status": "running"},
+            {"id": 57, "status": "running"},
+            {
+                "id": 57,
+                "status": "completed",
+                "streams_evaluated": 10,
+                "streams_matched": 2,
+                "channels_created": 2,
+                "duration_seconds": 11.0,
+            },
+        ]
+
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=mock_client):
+            with patch("tools.channel_pipeline._poll_sleep", return_value=None):
+                result = await mcp.call_tool(
+                    "run_auto_creation",
+                    {"dry_run": False, "timeout_seconds": None},
+                )
+
+        text = result[0][0].text
+        assert "complete" in text.lower()
+        assert "57" in text
+        assert mock_client.call_endpoint.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_get_execution_polls_exact_id(self):
+        """The exact-status tool reads the execution returned by async mode."""
+        from _endpoint_contracts import ENDPOINTS
+        from tools.channel_pipeline import register
+        from mcp.server.fastmcp import FastMCP
+        from unittest.mock import AsyncMock
+
+        mcp = FastMCP("test")
+        register(mcp)
+        mock_client = AsyncMock()
+        mock_client.call_endpoint.return_value = {
+            "id": 58,
+            "status": "running",
+            "channels_created": 0,
+        }
+
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=mock_client):
+            result = await mcp.call_tool(
+                "get_channel_pipeline_execution",
+                {"execution_id": 58},
+            )
+
+        text = result[0][0].text
+        assert '"id": 58' in text
+        assert '"status": "running"' in text
+        mock_client.call_endpoint.assert_awaited_once_with(
+            ENDPOINTS["ac_get_execution"],
+            path_args={"execution_id": 58},
+        )
 
     @pytest.mark.asyncio
     async def test_ac_get_execution_endpoint_registered(self):

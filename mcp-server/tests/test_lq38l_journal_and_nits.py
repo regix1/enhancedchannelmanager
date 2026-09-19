@@ -795,6 +795,7 @@ class TestDummyEpgProfile:
             "  event_timezone=US/Eastern, program_duration=180min\n"
             "  channel_group_ids=[65] (1 group(s) assigned)\n"
             "  hide_empty_group_ids=[]\n"
+            "  stream_match_group_ids=[]\n"
             "  epg_source_ids=[49]\n"
             "  channel_mappings=[]\n"
             "  substitution_pairs: 1 configured"
