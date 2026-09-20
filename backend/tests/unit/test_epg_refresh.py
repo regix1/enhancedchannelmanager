@@ -94,13 +94,36 @@ async def test_tasks_count_only_completed_sources(dummy, outcome):
         task._cancel_requested = outcome == "cancelled"
         return outcome == "success"
 
+    refresh_emby = AsyncMock()
     with patch(module + ".get_client", return_value=client), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=finish), \
-         patch.object(DummyEPGRefreshTask, "_regenerate_xmltv", new=AsyncMock(return_value=1)):
+         patch.object(DummyEPGRefreshTask, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
         result = await task.execute()
     assert result.success_count == (1 if outcome == "success" else 0)
     assert result.success is (outcome == "success")
     assert result.failed_count == (1 if outcome == "timeout" else 0)
+    assert refresh_emby.await_count == (1 if dummy and outcome == "success" else 0)
+
+
+@pytest.mark.asyncio
+async def test_dummy_refresh_retains_guide_while_sources_are_loading():
+    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+
+    task = DummyEPGRefreshTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock()
+    refresh_emby = AsyncMock()
+
+    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
+         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=None)), \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
+        result = await task.execute()
+
+    assert result.success is False
+    assert result.error == "GUIDE_SOURCES_PENDING"
+    client.get_epg_sources.assert_not_awaited()
+    refresh_emby.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -160,14 +183,18 @@ async def test_scheduled_generation_uses_shared_preparation_once(status):
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)) as fetch, \
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(prepared, coverage))) as prepare, \
          patch("concurrency.run_cpu_bound", new=AsyncMock(return_value="<tv/>")) as render:
-        assert await DummyEPGRefreshTask()._regenerate_xmltv() == 1
+        result = await DummyEPGRefreshTask()._regenerate_xmltv()
     fetch.assert_awaited_once_with(client)
     prepare.assert_awaited_once_with([profile.to_dict.return_value], channels, client, wait_for_sources=True)
-    assert render.await_count == 2
-    assert render.await_args_list[0].args[1:] == (prepared, channels)
     if status in {None, "ready", "artwork"}:
+        assert result == 1
+        assert render.await_count == 2
+        assert render.await_args_list[0].args[1:] == (prepared, channels)
         cache.return_value.set.assert_any_call("dummy_epg_xmltv_all", "<tv/>")
         cache.return_value.set.assert_any_call("dummy_epg_xmltv_7", "<tv/>")
+        cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
     else:
+        assert result is None
+        render.assert_not_awaited()
         cache.return_value.set.assert_not_called()
-    cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+        cache.return_value.invalidate_prefix.assert_not_called()

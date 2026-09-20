@@ -99,7 +99,7 @@ class DummyEPGRefreshTask(TaskScheduler):
         super().__init__(schedule_config)
         self._visibility_updates = 0
 
-    async def _regenerate_xmltv(self) -> int:
+    async def _regenerate_xmltv(self) -> int | None:
         """Regenerate combined and profile guides from the shared source inputs."""
         from database import get_session
         from models import DummyEPGProfile
@@ -123,24 +123,25 @@ class DummyEPGRefreshTask(TaskScheduler):
                 [profile.to_dict() for profile in profiles], channel_map, client,
                 wait_for_sources=True,
             )
+            if not can_cache(_coverage):
+                logger.warning(
+                    "[%s] Guide sources are still loading; retaining the published guide",
+                    self.task_id,
+                )
+                return None
             xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
             per_profile = {}
             for profile in profile_data:
                 per_profile[profile["id"]] = await run_cpu_bound(
                     generate_xmltv, [profile], channel_map,
                 )
-            # Only drop the published guide once this run has one to put in its place.
-            # A scan that timed out composes a guide of empty channels, and discarding
-            # the last good one for that leaves nothing to serve until the next run.
-            if can_cache(_coverage):
-                cache.invalidate_prefix("dummy_epg_xmltv")
-                cache.set("dummy_epg_xmltv_all", xml_string)
-                for profile_id, per_xml in per_profile.items():
-                    cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
-            if can_cache(_coverage):
-                self._visibility_updates = await self._apply_empty_channel_visibility(
-                    profile_data, channel_map, _coverage, client,
-                )
+            cache.invalidate_prefix("dummy_epg_xmltv")
+            cache.set("dummy_epg_xmltv_all", xml_string)
+            for profile_id, per_xml in per_profile.items():
+                cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
+            self._visibility_updates = await self._apply_empty_channel_visibility(
+                profile_data, channel_map, _coverage, client,
+            )
             logger.info("[%s] Regenerated XMLTV for %s profiles", self.task_id, len(profiles))
             return len(profiles)
         finally:
@@ -234,9 +235,9 @@ class DummyEPGRefreshTask(TaskScheduler):
             logger.info("[%s] Updated visibility on %s idle event channel(s)", self.task_id, changed)
         return changed
 
-    async def _request_emby_refresh(self) -> None:
-        """Ask Emby to reload Live TV after this run changed visibility."""
-        if not self._visibility_updates:
+    async def _request_emby_refresh(self, *, force: bool = False) -> None:
+        """Ask Emby to reload Live TV after this run changed its guide or visibility."""
+        if not force and not self._visibility_updates:
             return
         from emby_client import request_guide_refresh
 
@@ -254,6 +255,14 @@ class DummyEPGRefreshTask(TaskScheduler):
 
         try:
             profile_count = await self._regenerate_xmltv()
+            if profile_count is None:
+                return TaskResult(
+                    success=False,
+                    message="Guide sources are still loading; retained the published guide",
+                    error="GUIDE_SOURCES_PENDING",
+                    started_at=started_at,
+                    completed_at=datetime.utcnow(),
+                )
             logger.info("[%s] Regenerated %s profiles", self.task_id, profile_count)
         except Exception as e:
             logger.exception("[%s] Failed to regenerate XMLTV: %s", self.task_id, e)
@@ -358,7 +367,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             "[%s] Finished in %.1fs: regenerated %s profiles, refreshed %s/%s sources",
             self.task_id, duration, profile_count, success_count, len(matching),
         )
-        await self._request_emby_refresh()
+        await self._request_emby_refresh(force=success_count > 0)
 
         if self._cancel_requested:
             return TaskResult(
