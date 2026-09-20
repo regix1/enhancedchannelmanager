@@ -447,6 +447,8 @@ async def test_shared_fetch_expands_mixed_streams_once_and_both_group_shapes():
     upstream.get_channels.side_effect = [
         {"results": [channel(streams=[2, {"id": 3, "name": "kept"}])], "next": "next"},
         {"results": [{"id": 4, "name": "Other", "channel_group": 65, "streams": [2]}], "next": None},
+        {"results": [channel(streams=[2, {"id": 3, "name": "kept"}])], "next": "next"},
+        {"results": [{"id": 4, "name": "Other", "channel_group": 65, "streams": [2]}], "next": None},
     ]
     upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "resolved"}]
     channels = await guides._fetch_all_channels(upstream)
@@ -458,6 +460,42 @@ async def test_shared_fetch_expands_mixed_streams_once_and_both_group_shapes():
         for item in upstream.get_channels.await_args_list
     )
     upstream.get_streams_by_ids.assert_awaited_once_with([2])
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_retries_an_incomplete_channel_page_set():
+    upstream = AsyncMock()
+    complete = [
+        {"results": [channel(), channel(id=2, name="Second")], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+    ]
+    upstream.get_channels.side_effect = [
+        {"results": [channel()], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        *copy.deepcopy(complete),
+        *copy.deepcopy(complete),
+    ]
+    upstream.get_streams_by_ids.return_value = []
+
+    channels = await guides._fetch_all_channels(upstream)
+
+    assert sorted(channels) == [1, 2, 3]
+    assert upstream.get_channels.await_count == 6
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
+    upstream = AsyncMock()
+    upstream.get_channels.side_effect = [
+        {"results": [channel(), channel(id=2, name="Second")], "count": 2, "next": None},
+        {"results": [channel(), channel(id=3, name="Third")], "count": 2, "next": None},
+        {"results": [channel(), channel(id=2, name="Second")], "count": 2, "next": None},
+    ]
+
+    with pytest.raises(ValueError, match="changed during pagination"):
+        await guides._fetch_all_channels(upstream)
+
+    upstream.get_streams_by_ids.assert_not_awaited()
 
 
 @pytest.mark.parametrize("start,stop", [

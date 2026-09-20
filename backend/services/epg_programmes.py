@@ -147,20 +147,51 @@ def _resolve_group_assignments(channel_group_ids: list, channel_map: dict) -> li
 
 
 async def _fetch_all_channels(client=None) -> dict:
-    """Fetch channels once and expand their stream IDs in one batch."""
+    """Fetch a stable complete channel set and expand stream IDs in one batch."""
     if client is None:
         from dispatcharr_client import get_client
         client = get_client()
+
+    async def fetch() -> tuple[list[dict], bool, bool]:
+        rows = []
+        counts = set()
+        for page in range(1, 1001):
+            response = await client.get_channels(
+                page=page, page_size=500, visibility_filter="all",
+            )
+            values = response if isinstance(response, list) else response.get("results", [])
+            rows.extend(values)
+            if isinstance(response, list):
+                return rows, True, True
+            count = response.get("count")
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                counts.add(count)
+            if not response.get("next"):
+                break
+        else:
+            raise ValueError("Channel pagination exceeds its limit.")
+        ids = [row.get("id") for row in rows]
+        complete = len(ids) == len(set(ids)) and (not counts or (len(counts) == 1 and len(ids) in counts))
+        return rows, complete, False
+
+    prior = None
     channels = []
-    for page in range(1, 1001):
-        response = await client.get_channels(
-            page=page, page_size=500, visibility_filter="all",
-        )
-        channels.extend(response if isinstance(response, list) else response.get("results", []))
-        if isinstance(response, list) or not response.get("next"):
+    for _ in range(3):
+        candidate, complete, single_page = await fetch()
+        if single_page:
+            channels = candidate
             break
+        if not complete:
+            continue
+        fingerprint = hashlib.sha256(
+            json.dumps(sorted(candidate, key=lambda row: row.get("id", 0)), sort_keys=True, default=str).encode()
+        ).hexdigest()
+        if fingerprint == prior:
+            channels = candidate
+            break
+        prior = fingerprint
     else:
-        raise ValueError("Channel pagination exceeds its limit.")
+        raise ValueError("Channel catalogue changed during pagination.")
     channel_map = {channel["id"]: dict(channel) for channel in channels}
     stream_ids = {stream for channel in channels for stream in channel.get("streams", []) if isinstance(stream, int)}
     if stream_ids:
