@@ -419,6 +419,12 @@ async def test_keeps_streams_when_profile_matching_fails(failure_site):
         "US/Eastern",
         datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc),
     ),
+    pytest.param(
+        "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
+        "US/Eastern",
+        datetime(2026, 9, 20, 5, 30, tzinfo=timezone.utc),
+        id="dateless-event-crosses-midnight",
+    ),
     (
         "UFC 02 : CRYPTO.COM UFC 331: PRELIMS start:2026 09 20 01:00:00 stop:2026 09 20 04:00:00",
         "UTC",
@@ -446,7 +452,7 @@ async def test_bootstraps_active_ufc_titled_slot_before_numbered_fallback(
     }
     profile = _profile(
         [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
-        event_timezone=event_timezone, program_duration=180,
+        event_timezone=event_timezone, program_duration=360,
     )
     titled = SimpleNamespace(name=title, group_id=2462, stream_id=2134594)
     fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)

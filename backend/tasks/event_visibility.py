@@ -418,7 +418,10 @@ class EventVisibilityTask(TaskScheduler):
 
         bootstrap_matches_by_channel = {}
         if match_scan_ready and match_streams:
-            from services.event_sync_matcher import parse_event_name
+            from services.event_sync_matcher import (
+                SYNTHESIZED_DATE_PATTERN_NAMES,
+                parse_event_name,
+            )
 
             for channel_id, channel in ended:
                 target_group_id = channel.get("channel_group_id")
@@ -446,6 +449,20 @@ class EventVisibilityTask(TaskScheduler):
                         now=now,
                         assume_current_date=True,
                     )
+                    if (
+                        parsed.start is not None
+                        and parsed.start > now
+                        and parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES
+                    ):
+                        prior = parse_event_name(
+                            stream.name,
+                            match_patterns,
+                            event_timezone=event_timezone,
+                            now=now - timedelta(minutes=duration),
+                            assume_current_date=True,
+                        )
+                        if prior.start is not None:
+                            parsed = prior
                     if (
                         parsed.start is not None
                         and parsed.start <= now
