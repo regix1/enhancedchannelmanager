@@ -178,22 +178,14 @@ async def _fetch_all_channels(client=None) -> dict:
         )
         return rows, complete, False
 
-    prior = None
     channels = []
     for _ in range(3):
         candidate, complete, single_page = await fetch()
-        if single_page:
+        if single_page or complete:
             channels = candidate
             break
-        if not complete:
-            continue
-        fingerprint = tuple(sorted(row["id"] for row in candidate))
-        if fingerprint == prior:
-            channels = candidate
-            break
-        prior = fingerprint
     else:
-        raise ValueError("Channel catalogue changed during pagination.")
+        raise ValueError("Channel catalogue remained incomplete after retries.")
     channel_map = {channel["id"]: dict(channel) for channel in channels}
     stream_ids = {
         stream

@@ -473,14 +473,13 @@ async def test_shared_fetch_retries_an_incomplete_channel_page_set():
         {"results": [channel()], "count": 3, "next": "next"},
         {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
         *copy.deepcopy(complete),
-        *copy.deepcopy(complete),
     ]
     upstream.get_streams_by_ids.return_value = []
 
     channels = await guides._fetch_all_channels(upstream)
 
     assert sorted(channels) == [1, 2, 3]
-    assert upstream.get_channels.await_count == 6
+    assert upstream.get_channels.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -499,22 +498,23 @@ async def test_shared_fetch_ignores_unrelated_channel_field_changes():
     channels = await guides._fetch_all_channels(upstream)
 
     assert channels[1]["streams"] == [{"id": 2, "name": "resolved"}]
-    assert upstream.get_channels.await_count == 2
+    assert upstream.get_channels.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_shared_fetch_uses_latest_rows_while_streams_change():
+async def test_shared_fetch_accepts_complete_snapshot_during_channel_updates():
     upstream = AsyncMock()
     upstream.get_channels.side_effect = [
         {"results": [channel(streams=[2])], "count": 1, "next": None},
         {"results": [channel(streams=[3])], "count": 1, "next": None},
     ]
-    upstream.get_streams_by_ids.return_value = [{"id": 3, "name": "latest"}]
+    upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "complete"}]
 
     channels = await guides._fetch_all_channels(upstream)
 
-    assert channels[1]["streams"] == [{"id": 3, "name": "latest"}]
-    upstream.get_streams_by_ids.assert_awaited_once_with([3])
+    assert channels[1]["streams"] == [{"id": 2, "name": "complete"}]
+    upstream.get_streams_by_ids.assert_awaited_once_with([2])
+    assert upstream.get_channels.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -541,12 +541,15 @@ async def test_shared_fetch_accepts_incomplete_embedded_stream_rows():
 async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
     upstream = AsyncMock()
     upstream.get_channels.side_effect = [
-        {"results": [channel(), channel(id=2, name="Second")], "count": 2, "next": None},
-        {"results": [channel(), channel(id=3, name="Third")], "count": 2, "next": None},
-        {"results": [channel(), channel(id=2, name="Second")], "count": 2, "next": None},
+        {"results": [channel()], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
     ]
 
-    with pytest.raises(ValueError, match="changed during pagination"):
+    with pytest.raises(ValueError, match="remained incomplete"):
         await guides._fetch_all_channels(upstream)
 
     upstream.get_streams_by_ids.assert_not_awaited()
