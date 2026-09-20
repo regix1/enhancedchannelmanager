@@ -154,7 +154,6 @@ async def _fetch_all_channels(client=None) -> dict:
 
     async def fetch() -> tuple[list[dict], bool, bool]:
         rows = []
-        counts = set()
         for page in range(1, 1001):
             response = await client.get_channels(
                 page=page, page_size=500, visibility_filter="all",
@@ -163,9 +162,6 @@ async def _fetch_all_channels(client=None) -> dict:
             rows.extend(values)
             if isinstance(response, list):
                 return rows, True, True
-            count = response.get("count")
-            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-                counts.add(count)
             if not response.get("next"):
                 break
         else:
@@ -174,7 +170,6 @@ async def _fetch_all_channels(client=None) -> dict:
         complete = (
             all(isinstance(channel_id, int) and not isinstance(channel_id, bool) for channel_id in ids)
             and len(ids) == len(set(ids))
-            and (not counts or (len(counts) == 1 and len(ids) in counts))
         )
         return rows, complete, False
 

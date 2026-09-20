@@ -471,7 +471,7 @@ async def test_shared_fetch_retries_an_incomplete_channel_page_set():
     ]
     upstream.get_channels.side_effect = [
         {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": None},
         *copy.deepcopy(complete),
     ]
     upstream.get_streams_by_ids.return_value = []
@@ -480,6 +480,21 @@ async def test_shared_fetch_retries_an_incomplete_channel_page_set():
 
     assert sorted(channels) == [1, 2, 3]
     assert upstream.get_channels.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_accepts_count_changes_between_pages():
+    upstream = AsyncMock()
+    upstream.get_channels.side_effect = [
+        {"results": [channel(), channel(id=2, name="Second")], "count": 3, "next": "next"},
+        {"results": [channel(id=3, name="Third")], "count": 4, "next": None},
+    ]
+    upstream.get_streams_by_ids.return_value = []
+
+    channels = await guides._fetch_all_channels(upstream)
+
+    assert sorted(channels) == [1, 2, 3]
+    assert upstream.get_channels.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -542,11 +557,11 @@ async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
     upstream = AsyncMock()
     upstream.get_channels.side_effect = [
         {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": None},
         {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": None},
         {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
+        {"results": [channel()], "count": 3, "next": None},
     ]
 
     with pytest.raises(ValueError, match="remained incomplete"):
