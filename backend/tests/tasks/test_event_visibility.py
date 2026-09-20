@@ -663,6 +663,28 @@ async def test_reconciliation_cancellation_prevents_publication_and_mutation():
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_reports_the_failed_preparation_stage():
+    profile = _profile()
+    client = MagicMock()
+    task = EventVisibilityTask()
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_publication.read_publication", return_value=None), \
+         patch(
+             "services.epg_programmes._fetch_all_channels",
+             new=AsyncMock(side_effect=ValueError("unstable channel catalogue")),
+         ):
+        outcome = await reconcile_profiles(task, wait_for_sources=False)
+
+    assert outcome.success is False
+    assert outcome.error == "GUIDE_UNAVAILABLE"
+    assert outcome.details["configured_profile_count"] == 1
+    assert outcome.details["failure_stage"] == "channels"
+    assert outcome.details["failure_type"] == "ValueError"
+
+
+@pytest.mark.asyncio
 async def test_preparation_wait_observes_cancellation_without_cancelling_shared_loads():
     entered = asyncio.Event()
     stopped = asyncio.Event()

@@ -687,6 +687,8 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
     client = get_client()
 
     for attempt in range(2):
+        details = _result_details(0)
+        stage = "profiles"
         try:
             profiles, rules = _load_profiles()
             details = _result_details(len(profiles))
@@ -696,17 +698,21 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     message="No enabled guide profiles require reconciliation",
                 )
             token = (_profile_token(profiles), _rule_token(rules))
+            stage = "ownership"
             conflicts = validate_ownership(profiles, rules)
             disputed_groups = {row["group_id"] for row in conflicts}
+            stage = "publications"
             retained = {}
             for profile in profiles:
                 retained[profile["id"]] = read_publication(f"profile:{profile['id']}")
 
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
+            stage = "channels"
             channel_map = await _fetch_all_channels(client)
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
+            stage = "programmes"
             preparation = await _await_preparation(
                 prepare_profiles(
                     profiles,
@@ -722,6 +728,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             prepared, coverage = preparation
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
+            stage = "slots"
             configs = {}
             scopes = []
             invalid_profiles = set()
@@ -736,13 +743,16 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 scopes.extend(config.get("secondary") or [])
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
+            stage = "streams"
             streams, complete_scopes, scope_failures = await _fetch_match_streams(client, scopes)
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
+            stage = "sources"
             source_rows = _source_rows(await client.get_epg_sources())
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
 
+            stage = "plans"
             plans = {}
             observations = {}
             for profile in prepared:
@@ -807,8 +817,9 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                         )
         except Exception as exc:
             logger.exception("[EVENT-WORKFLOW] Could not prepare reconciliation: %s", exc)
-            details = _result_details(0)
             details["reason_codes"] = ["GUIDE_UNAVAILABLE"]
+            details["failure_stage"] = stage
+            details["failure_type"] = type(exc).__name__
             return _finish(
                 started_at, details, success=False,
                 message="Guide reconciliation could not prepare complete input",

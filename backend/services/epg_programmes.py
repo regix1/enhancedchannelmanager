@@ -171,7 +171,11 @@ async def _fetch_all_channels(client=None) -> dict:
         else:
             raise ValueError("Channel pagination exceeds its limit.")
         ids = [row.get("id") for row in rows]
-        complete = len(ids) == len(set(ids)) and (not counts or (len(counts) == 1 and len(ids) in counts))
+        complete = (
+            all(isinstance(channel_id, int) and not isinstance(channel_id, bool) for channel_id in ids)
+            and len(ids) == len(set(ids))
+            and (not counts or (len(counts) == 1 and len(ids) in counts))
+        )
         return rows, complete, False
 
     prior = None
@@ -183,39 +187,7 @@ async def _fetch_all_channels(client=None) -> dict:
             break
         if not complete:
             continue
-        stable_rows = []
-        for row in candidate:
-            group = row.get("channel_group_id") or row.get("channel_group")
-            if isinstance(group, dict):
-                group = group.get("id")
-            link = row.get("epg_data_id") or row.get("epg_data")
-            if isinstance(link, dict):
-                link = link.get("id")
-            streams = sorted(
-                [
-                    (
-                        stream.get("id"),
-                        stream.get("name", ""),
-                    )
-                    if isinstance(stream, dict)
-                    else (stream, "")
-                    for stream in (row.get("streams") or [])
-                ],
-                key=lambda stream: (str(stream[0]), str(stream[1] or "")),
-            )
-            stable_rows.append({
-                "id": row.get("id"),
-                "name": row.get("name"),
-                "channel_number": row.get("channel_number"),
-                "channel_group_id": group,
-                "epg_data_id": link,
-                "tvg_id": row.get("tvg_id"),
-                "hidden_from_output": row.get("hidden_from_output"),
-                "streams": streams,
-            })
-        fingerprint = hashlib.sha256(
-            json.dumps(sorted(stable_rows, key=lambda row: row.get("id", 0)), sort_keys=True, default=str).encode()
-        ).hexdigest()
+        fingerprint = tuple(sorted(row["id"] for row in candidate))
         if fingerprint == prior:
             channels = candidate
             break
@@ -223,7 +195,12 @@ async def _fetch_all_channels(client=None) -> dict:
     else:
         raise ValueError("Channel catalogue changed during pagination.")
     channel_map = {channel["id"]: dict(channel) for channel in channels}
-    stream_ids = {stream for channel in channels for stream in channel.get("streams", []) if isinstance(stream, int)}
+    stream_ids = {
+        stream
+        for channel in channels
+        for stream in (channel.get("streams") or [])
+        if isinstance(stream, int)
+    }
     if stream_ids:
         try:
             streams = {stream["id"]: stream for stream in await client.get_streams_by_ids(sorted(stream_ids))}
@@ -232,7 +209,7 @@ async def _fetch_all_channels(client=None) -> dict:
         for channel in channel_map.values():
             channel["streams"] = [
                 streams.get(stream, {"id": stream, "name": ""}) if isinstance(stream, int) else stream
-                for stream in channel.get("streams", [])
+                for stream in (channel.get("streams") or [])
             ]
     return channel_map
 

@@ -503,6 +503,21 @@ async def test_shared_fetch_ignores_unrelated_channel_field_changes():
 
 
 @pytest.mark.asyncio
+async def test_shared_fetch_uses_latest_rows_while_streams_change():
+    upstream = AsyncMock()
+    upstream.get_channels.side_effect = [
+        {"results": [channel(streams=[2])], "count": 1, "next": None},
+        {"results": [channel(streams=[3])], "count": 1, "next": None},
+    ]
+    upstream.get_streams_by_ids.return_value = [{"id": 3, "name": "latest"}]
+
+    channels = await guides._fetch_all_channels(upstream)
+
+    assert channels[1]["streams"] == [{"id": 3, "name": "latest"}]
+    upstream.get_streams_by_ids.assert_awaited_once_with([3])
+
+
+@pytest.mark.asyncio
 async def test_shared_fetch_accepts_incomplete_embedded_stream_rows():
     upstream = AsyncMock()
     row = channel(streams=[2, {"name": "missing id"}, {"id": 2, "name": None}])
