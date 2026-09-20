@@ -216,7 +216,7 @@ class EventVisibilityTask(TaskScheduler):
 
     task_id = "event_visibility"
     task_name = "Event Visibility Check"
-    task_description = "Keep PPV and ESPN+ visibility aligned with active guide events"
+    task_description = "Keep PPV, ESPN+, and UFC visibility aligned with active guide events"
 
     def __init__(self, schedule_config: Optional[ScheduleConfig] = None):
         if schedule_config is None:
@@ -259,8 +259,42 @@ class EventVisibilityTask(TaskScheduler):
 
         client = get_client()
         channel_map = await _fetch_all_channels(client)
-        _, coverage = await prepare_profiles(profiles, channel_map, client)
-        if not can_cache(coverage):
+        profiles, coverage = await prepare_profiles(profiles, channel_map, client)
+        coverage_rows = coverage.get("channels", ())
+        ready_profiles = []
+        for profile in profiles:
+            assignment_ids = {
+                item.get("channel_id")
+                for item in profile.get("channel_assignments") or []
+                if item.get("channel_id") is not None
+            }
+            if not assignment_ids:
+                profile_groups = set(profile.get("channel_group_ids") or [])
+                assignment_ids = {
+                    channel_id
+                    for channel_id, channel in channel_map.items()
+                    if channel.get("channel_group_id") in profile_groups
+                }
+            profile_coverage = {
+                "sources": (
+                    coverage.get("sources", ())
+                    if profile.get("epg_source_ids") else []
+                ),
+                "channels": [
+                    row for row in coverage_rows
+                    if row.get("channel_id") in assignment_ids
+                ],
+            }
+            if can_cache(profile_coverage):
+                ready_profiles.append(profile)
+
+        profiles = ready_profiles
+        wanted = {
+            group_id
+            for profile in profiles
+            for group_id in profile.get("hide_empty_group_ids") or []
+        }
+        if not wanted:
             return TaskResult(
                 success=True,
                 message="Published event guide is not ready",

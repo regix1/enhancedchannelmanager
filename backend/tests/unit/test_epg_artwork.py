@@ -300,6 +300,32 @@ class TestMatchupBanner:
         assert "<icon" not in out
         assert rw.bannered == 0
 
+    def test_a_live_game_without_teams_gets_a_portrait_league_cover(self, tmp_path):
+        xml = (
+            '<programme><title>Live: NFL Football</title>'
+            '<icon src="https://example.test/nfl-landscape.jpg" />'
+            '<desc>Minnesota visits Chicago.</desc></programme>'
+        )
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+
+        out = _run(rw, xml)
+
+        assert f'<icon src="{GT}/nfl/cover" />' in out
+        assert "nfl-landscape.jpg" not in out
+        assert rw.bannered == 1
+
+    def test_a_live_nfl_studio_show_keeps_its_source_artwork(self, tmp_path):
+        xml = (
+            '<programme><title>Live: FOX NFL Kickoff</title>'
+            '<icon src="https://example.test/kickoff.jpg" /></programme>'
+        )
+        rw = ArtworkRewriter(_cache(tmp_path), banner_base=GT)
+
+        out = _run(rw, xml)
+
+        assert "kickoff.jpg" in out
+        assert rw.bannered == 0
+
     def test_no_base_url_leaves_the_feed_as_it_was(self, tmp_path):
         """The default: an operator with no game-thumbs sees today's guide."""
         rw = ArtworkRewriter(_cache(tmp_path))

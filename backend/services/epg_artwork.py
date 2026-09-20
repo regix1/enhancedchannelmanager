@@ -118,6 +118,15 @@ _ICON_EL = re.compile(r"<icon\b[^>]*/>|<icon\b[^>]*>.*?</icon>", re.DOTALL)
 # spellings, which is the order game-thumbs takes its two team segments in.
 _MATCHUP = re.compile(r"^(?P<away>.+?)\s+(?:at|vs\.?)\s+(?P<home>.+)$", re.I)
 
+# Some affiliate listings name the live game but omit the teams entirely.
+# Those get a league cover instead of retaining a landscape series image.
+# Exact titles keep studio shows such as "FOX NFL Kickoff" out of this path.
+_GENERIC_GAME = re.compile(
+    r"^(?:Live:\s*)?(?:(?:WNBA|NBA|College)\s+Basketball|"
+    r"(?:NFL|College)\s+Football|(?:Minor League|MLB)\s+Baseball|NHL\s+Hockey)$",
+    re.I,
+)
+
 # Consecutive assets the CDN answered for on NO code before a run stops
 # probing. Every one of those already failed on all five codes, so a run of
 # them is the host being down rather than assets being unusual, and the ones
@@ -221,9 +230,13 @@ def matchup_banner(base: str, title: str, sub_title: str,
         return None
     matchup = unescape(sub_title).strip()
     if not matchup and ":" in plain_title:
-        matchup = plain_title.rpartition(":")[2].strip()
+        title_matchup = plain_title.rpartition(":")[2].strip()
+        if _MATCHUP.match(title_matchup):
+            matchup = title_matchup
     teams = _MATCHUP.match(matchup)
     if teams is None:
+        if not matchup and _GENERIC_GAME.fullmatch(plain_title.strip()):
+            return f"{base}/{league}/cover"
         return None
     away, home = _slug(teams.group("away")), _slug(teams.group("home"))
     if not away or not home:

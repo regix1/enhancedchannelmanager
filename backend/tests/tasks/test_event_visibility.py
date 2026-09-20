@@ -806,6 +806,86 @@ async def test_waits_for_ready_source_rows():
 
 
 @pytest.mark.asyncio
+async def test_ufc_reconciliation_continues_while_another_profile_is_pending():
+    task = EventVisibilityTask()
+    client = AsyncMock()
+    client.get_epg_sources.return_value = [{
+        "id": 52,
+        "name": "UFC Events (auto)",
+        "url": "http://ecm/api/dummy-epg/xmltv/2",
+        "is_active": True,
+    }]
+    channels = {
+        10: {
+            "id": 10, "name": "UFC02", "channel_number": 8102,
+            "channel_group_id": 16, "epg_data_id": 1,
+            "hidden_from_output": True,
+            "streams": [{"id": 1868499, "name": "UFC 02", "channel_group_id": 2462}],
+        },
+        20: {
+            "id": 20, "name": "ESPN+ 00", "channel_number": 8000,
+            "channel_group_id": 2479, "epg_data_id": 2,
+            "hidden_from_output": True,
+            "streams": [{"id": 110, "name": "ESPN PLUS 00:", "channel_group_id": 754}],
+        },
+    }
+    ufc_profile = _profile(
+        [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
+        epg_source_ids=[], program_duration=360,
+        channel_assignments=[{"channel_id": 10}],
+    )
+    espn_profile = _profile(
+        [754], id=3, hide_empty_group_ids=[2479], channel_group_ids=[2479],
+        epg_source_ids=[51], channel_assignments=[{"channel_id": 20}],
+    )
+    coverage = {
+        "sources": [{"source_id": 51, "status": "pending", "last_success": None}],
+        "channels": [{
+            "channel_id": 20,
+            "current": None,
+            "warnings": ["schedule_pending"],
+        }],
+    }
+    titled = SimpleNamespace(
+        name="LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
+        group_id=2462,
+        stream_id=2134594,
+    )
+    fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)
+    clock = MagicMock(wraps=datetime)
+    clock.now.return_value = datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc)
+    guide_cache = MagicMock()
+    wait_refresh = AsyncMock(return_value=True)
+    refresh_emby = AsyncMock()
+
+    with patch("tasks.event_visibility.datetime", clock), \
+         patch("tasks.event_visibility.get_session", return_value=_session(
+             profiles=[ufc_profile, espn_profile],
+         )), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(
+             [ufc_profile.to_dict(), espn_profile.to_dict()], coverage,
+         ))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
+             [fallback, titled], {1868499: 2462, 2134594: 2462},
+         ))), \
+         patch("cache.get_cache", return_value=guide_cache), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=wait_refresh), \
+         patch("emby_client.request_guide_refresh", new=refresh_emby):
+        result = await task.execute()
+
+    client.update_channel.assert_awaited_once_with(
+        10, {"streams": [2134594, 1868499], "hidden_from_output": False},
+    )
+    assert result.details["stream_updated_channel_ids"] == [10]
+    assert all(call.args[0] != 20 for call in client.update_channel.await_args_list)
+    guide_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+    wait_refresh.assert_awaited_once()
+    refresh_emby.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_reveals_current_channel_without_probe():
     task = EventVisibilityTask()
     client = AsyncMock()
