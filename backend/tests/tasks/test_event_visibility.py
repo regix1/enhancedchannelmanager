@@ -93,6 +93,33 @@ def test_default_schedule_checks_every_five_minutes():
     assert task.schedule_config.timezone == "America/Chicago"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_for_sources", [False, True])
+async def test_reconciliation_requests_recovery_without_changing_wait_mode(wait_for_sources):
+    profile = _profile()
+    task = EventVisibilityTask()
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+
+    async def finish_preparation(*args, **kwargs):
+        task._cancel_requested = True
+        return [copy.deepcopy(profile)], coverage
+
+    prepare = AsyncMock(side_effect=finish_preparation)
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=MagicMock()), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("services.epg_publication.read_publication", return_value=None):
+        outcome = await reconcile_profiles(task, wait_for_sources=wait_for_sources)
+
+    assert outcome.error == "CANCELLED"
+    assert prepare.await_args.kwargs["wait_for_sources"] is wait_for_sources
+    assert prepare.await_args.kwargs["recover_sources"] is True
+
+
 @pytest.mark.parametrize(
     "url, expected",
     [
@@ -209,6 +236,94 @@ async def test_fetch_match_streams_isolates_a_failed_scope():
     assert [stream.stream_id for stream in streams] == [22]
     assert complete == {(2, None)}
     assert failures == {(1, None): "RuntimeError"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_streams_applies_the_limit_to_each_scope(monkeypatch):
+    monkeypatch.setattr("tasks.event_visibility.MAX_MATCH_STREAMS", 2)
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
+    client.get_streams = AsyncMock(side_effect=[
+        {
+            "results": [
+                {"id": 11, "name": "One A"},
+                {"id": 12, "name": "One B"},
+            ],
+            "next": None,
+        },
+        {
+            "results": [
+                {"id": 21, "name": "Two A"},
+                {"id": 22, "name": "Two B"},
+            ],
+            "next": None,
+        },
+    ])
+
+    streams, complete, failures = await _fetch_match_streams(
+        client,
+        [
+            {"group_id": 1, "m3u_account_id": None},
+            {"group_id": 2, "m3u_account_id": None},
+        ],
+    )
+
+    assert [stream.stream_id for stream in streams] == [11, 12, 21, 22]
+    assert complete == {(1, None), (2, None)}
+    assert failures == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_streams_discards_a_scope_after_a_later_page_fails():
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
+    client.get_streams = AsyncMock(side_effect=[
+        {"results": [{"id": 11, "name": "One A"}], "next": "page-2"},
+        RuntimeError("later page unavailable"),
+        {"results": [{"id": 22, "name": "Two A"}], "next": None},
+    ])
+
+    streams, complete, failures = await _fetch_match_streams(
+        client,
+        [
+            {"group_id": 1, "m3u_account_id": None},
+            {"group_id": 2, "m3u_account_id": None},
+        ],
+    )
+
+    assert [stream.stream_id for stream in streams] == [22]
+    assert complete == {(2, None)}
+    assert failures == {(1, None): "RuntimeError"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_streams_discards_an_oversized_scope_and_continues(monkeypatch):
+    monkeypatch.setattr("tasks.event_visibility.MAX_MATCH_STREAMS", 2)
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
+    client.get_streams = AsyncMock(side_effect=[
+        {
+            "results": [
+                {"id": 11, "name": "One A"},
+                {"id": 12, "name": "One B"},
+                {"id": 13, "name": "One C"},
+            ],
+            "next": None,
+        },
+        {"results": [{"id": 22, "name": "Two A"}], "next": None},
+    ])
+
+    streams, complete, failures = await _fetch_match_streams(
+        client,
+        [
+            {"group_id": 1, "m3u_account_id": None},
+            {"group_id": 2, "m3u_account_id": None},
+        ],
+    )
+
+    assert [stream.stream_id for stream in streams] == [22]
+    assert complete == {(2, None)}
+    assert failures == {(1, None): "ValueError"}
 
 
 def test_profile_plan_keeps_incomplete_inventory_unknown():

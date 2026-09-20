@@ -4,6 +4,7 @@ import asyncio
 import copy
 import gzip
 import json
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -830,12 +831,12 @@ async def test_current_mapping_lookup_overrides_remembered_identity_and_refreshe
     channels[1]["epg_data_id"] = 91
     _, pending = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
     assert pending["channels"][0]["source_tvg_id"] is None
-    next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_TTL + 1
+    next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_RETRY + 1
     _, second = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     assert second["channels"][0]["source_tvg_id"] == "333"
     rows[1]["tvg_id"] = "444"
     guides._CATALOGUE_CACHE[(upstream, 91)]["checked"] -= guides.SOURCE_RETRY + 1
-    next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_TTL + 1
+    next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_RETRY + 1
     _, third = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     assert third["channels"][0]["source_tvg_id"] == "444"
     upstream.get_epg_data.assert_not_awaited()
@@ -1584,6 +1585,218 @@ async def test_public_reads_queue_selection_without_starting_source_download(mon
 
 
 @pytest.mark.asyncio
+async def test_unresolved_current_link_warms_saved_mapping_before_verification(monkeypatch):
+    current = {"id": 91, "epg_source": 50, "tvg_id": "saved-1"}
+    upstream = client()
+    link_ready = False
+
+    async def read_link(link):
+        if not link_ready:
+            raise RuntimeError("generated link pending")
+        return current
+
+    upstream.get_epg_data_by_id.side_effect = read_link
+    monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
+    install_feed(monkeypatch, feed(
+        programme(tvg="saved-1"),
+        headers='<channel id="saved-1"><display-name>External saved row</display-name></channel>',
+    ))
+    selected = profile(
+        channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "saved-1"}],
+    )
+    channels = {1: channel(name="Slot 1", tvg_id="", epg_data_id=91)}
+    with patch.object(guides, "_read_source", wraps=guides._read_source) as source_read:
+        prepared, coverage = await guides.prepare_profiles(
+            [selected], channels, upstream, now=NOW, wait_for_sources=True,
+        )
+
+        entry = next(iter(guides._SOURCE_CACHE.values()))
+        assert set(entry["rows"]) == {"saved-1"}
+        assert prepared[0]["source_programmes"][1] == []
+        assert coverage["channels"][0]["current"] is None
+        assert "mapping_unavailable" in coverage["channels"][0]["warnings"]
+        assert coverage["profiles"]["1"]["can_publish"] is False
+
+        link_ready = True
+        guides._CATALOGUE_CACHE[(upstream, 91)]["checked"] -= guides.SOURCE_RETRY + 1
+        prepared, verified = await guides.prepare_profiles(
+            [selected], channels, upstream, now=NOW,
+        )
+
+    assert source_read.await_count == 1
+    assert prepared[0]["source_programmes"][1]
+    assert verified["channels"][0]["source_tvg_id"] == "saved-1"
+    assert selected["channel_mappings"] == [
+        {"channel_id": 1, "source_id": 50, "tvg_id": "saved-1"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["missing", "error", "uncovered", "stale"])
+async def test_recovery_permission_starts_only_unusable_source_states(monkeypatch, state):
+    upstream = client()
+    await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW)
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    request = next(iter(entry["demand"].values()))
+    selection = {
+        "queries": frozenset(entry["demand"]),
+        "start": request["start"],
+        "stop": request["stop"],
+    }
+    entry.update({
+        "checked": time.monotonic() - guides.SOURCE_RETRY - 1,
+        "error": None,
+        "selection": selection,
+    })
+    if state == "error":
+        entry.update(success=datetime.now(timezone.utc), error="Request failed.")
+    elif state == "uncovered":
+        entry.update(success=datetime.now(timezone.utc), selection={
+            "queries": frozenset(), "start": request["start"], "stop": request["stop"],
+        })
+    elif state == "stale":
+        entry["success"] = datetime.now(timezone.utc) - timedelta(seconds=guides.SOURCE_MAX_AGE + 1)
+    else:
+        entry.pop("success", None)
+        entry.pop("selection", None)
+
+    loaded = {
+        "headers": {}, "rows": {}, "ended": {}, "warnings": [], "size": 0,
+        "diagnostics": {}, "channel_warnings": {},
+    }
+    with patch.object(guides, "_read_source", new=AsyncMock(return_value=loaded)) as read:
+        await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW)
+        await asyncio.sleep(0)
+        assert read.await_count == 0
+
+        await guides.prepare_profiles(
+            [profile()], {1: channel()}, upstream, now=NOW, recover_sources=True,
+        )
+        await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+
+    assert read.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_skips_usable_covered_source_but_waiting_refreshes_at_ttl(monkeypatch):
+    upstream = client()
+    await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW)
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    request = next(iter(entry["demand"].values()))
+    entry.update({
+        "success": datetime.now(timezone.utc),
+        "checked": time.monotonic() - guides.SOURCE_TTL - 1,
+        "error": None,
+        "selection": {
+            "queries": frozenset(entry["demand"]),
+            "start": request["start"],
+            "stop": request["stop"],
+        },
+    })
+    loaded = {
+        "headers": {}, "rows": {}, "ended": {}, "warnings": [], "size": 0,
+        "diagnostics": {}, "channel_warnings": {},
+    }
+    with patch.object(guides, "_read_source", new=AsyncMock(return_value=loaded)) as read:
+        _, coverage = await guides.prepare_profiles(
+            [profile()], {1: channel()}, upstream, now=NOW, recover_sources=True,
+        )
+        await asyncio.sleep(0)
+        assert read.await_count == 0
+        assert coverage["sources"][0]["status"] == "ready"
+
+        await guides.prepare_profiles(
+            [profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True,
+        )
+
+    assert read.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_backoff_coalesces_and_carries_late_public_demand(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    upstream = client()
+    first = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}])
+    second = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 2}])
+    channels = {1: channel(), 2: channel(id=2, name="TNT", tvg_id="TNT.us")}
+    await guides.prepare_profiles([first], channels, upstream, now=NOW)
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    entry["checked"] = time.monotonic()
+
+    async def read(_source, queries, _start, _stop, _now):
+        calls.append({query["key"] for query in queries})
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+        return {
+            "headers": {}, "rows": {}, "ended": {}, "warnings": [], "size": 0,
+            "diagnostics": {}, "channel_warnings": {},
+        }
+
+    monkeypatch.setattr(guides, "_read_source", read)
+    await guides.prepare_profiles([first], channels, upstream, now=NOW, recover_sources=True)
+    await asyncio.sleep(0)
+    assert calls == []
+
+    entry["checked"] -= guides.SOURCE_RETRY + 1
+    await guides.prepare_profiles([first], channels, upstream, now=NOW, recover_sources=True)
+    await started.wait()
+    owned = list(guides._SOURCE_LOADS.values())
+    await guides.prepare_profiles([first], channels, upstream, now=NOW, recover_sources=True)
+    await guides.prepare_profiles([second], channels, upstream, now=NOW)
+    assert len(calls) == 1
+    assert len(entry["demand"]) == 2
+
+    release.set()
+    await asyncio.gather(*owned)
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    assert len(entry["selection"]["queries"]) == 1
+    entry["checked"] -= guides.SOURCE_RETRY + 1
+    await guides.prepare_profiles([second], channels, upstream, now=NOW, recover_sources=True)
+    await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+
+    assert len(calls) == 2
+    assert len(calls[1]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ValueError("unavailable"), asyncio.CancelledError()])
+async def test_failed_recovery_keeps_completed_snapshot_and_demand(monkeypatch, failure):
+    install_feed(monkeypatch, feed(programme()))
+    upstream = client()
+    await guides.prepare_profiles(
+        [profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True,
+    )
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    previous_rows = entry["rows"]
+    previous_size = entry["size"]
+    previous_demand = set(entry["demand"])
+    entry["success"] = datetime.now(timezone.utc) - timedelta(seconds=guides.SOURCE_MAX_AGE + 1)
+    previous_success = entry["success"]
+    entry["checked"] -= guides.SOURCE_RETRY + 1
+
+    with patch.object(guides, "_read_source", new=AsyncMock(side_effect=failure)) as read:
+        await guides.prepare_profiles(
+            [profile()], {1: channel()}, upstream, now=NOW, recover_sources=True,
+        )
+        await asyncio.gather(*list(guides._SOURCE_LOADS.values()), return_exceptions=True)
+        entry = next(iter(guides._SOURCE_CACHE.values()))
+        await guides.prepare_profiles(
+            [profile()], {1: channel()}, upstream, now=NOW, recover_sources=True,
+        )
+        await asyncio.sleep(0)
+
+    assert read.await_count == 1
+    assert entry["success"] == previous_success
+    assert entry["rows"] is previous_rows
+    assert entry["size"] == previous_size
+    assert set(entry["demand"]) == previous_demand
+    assert entry["error"]
+
+
+@pytest.mark.asyncio
 async def test_changed_queries_share_source_backoff_and_event_scope(monkeypatch):
     install_feed(monkeypatch, feed(programme()))
     upstream = client()
@@ -1595,7 +1808,7 @@ async def test_changed_queries_share_source_backoff_and_event_scope(monkeypatch)
         assert coverage["channels"][0]["event"] is None
         assert coverage["channels"][0]["current"] is None
         entry = next(iter(guides._SOURCE_CACHE.values()))
-        entry["checked"] -= guides.SOURCE_TTL + 1
+        entry["checked"] -= guides.SOURCE_RETRY + 1
         await guides.prepare_profiles([profile()], {2: event_channel}, upstream, now=NOW, wait_for_sources=True)
         assert read.await_count == 2
 
@@ -2077,13 +2290,25 @@ async def test_pending_query_demand_is_bounded_without_claiming_unscanned_rows(m
     monkeypatch.setattr(guides, "MAX_QUERIES", 2)
     install_feed(monkeypatch, feed(programme()))
     channels = {index: channel(id=index, name=f"Station {index}") for index in range(1, 4)}
-    prepared, coverage = await guides.prepare_profiles([profile()], channels, client(), now=NOW, wait_for_sources=True)
-    entry = next(iter(guides._SOURCE_CACHE.values()))
-    assert len(entry["demand"]) == 2
-    assert len(entry["selection"]["queries"]) == 2
-    assert prepared[0]["source_programmes"][3] == []
-    assert coverage["channels"][2]["event"] is None
-    assert "schedule_pending" in coverage["channels"][2]["warnings"]
+    upstream = client()
+    with patch.object(guides, "_read_source", wraps=guides._read_source) as read:
+        prepared, coverage = await guides.prepare_profiles(
+            [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+        )
+        entry = next(iter(guides._SOURCE_CACHE.values()))
+        assert len(entry["demand"]) == 2
+        assert len(entry["selection"]["queries"]) == 2
+        assert prepared[0]["source_programmes"][3] == []
+        assert coverage["channels"][2]["event"] is None
+        assert "schedule_pending" in coverage["channels"][2]["warnings"]
+
+        entry["checked"] -= guides.SOURCE_RETRY + 1
+        await guides.prepare_profiles(
+            [profile()], channels, upstream, now=NOW, recover_sources=True,
+        )
+        await asyncio.sleep(0)
+
+    assert read.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -2351,7 +2576,7 @@ async def test_source_staging_preserves_uneven_chunks_and_bounds_writes(monkeypa
             offset += size
             index += 1
 
-    writes, stored = [], []
+    writes, reads, stored = [], [], []
     to_thread = asyncio.to_thread
 
     async def run(function, *args, **kwargs):
@@ -2360,6 +2585,8 @@ async def test_source_staging_preserves_uneven_chunks_and_bounds_writes(monkeypa
             assert type(args[0]) is bytes
             writes.append(args[0])
         result = await to_thread(function, *args, **kwargs)
+        if name == "read" and result:
+            reads.append(bytes(result))
         if name == "seek" and not stored:
             stored.append(await to_thread(function.__self__.read))
             await to_thread(function.__self__.seek, 0)
@@ -2375,11 +2602,55 @@ async def test_source_staging_preserves_uneven_chunks_and_bounds_writes(monkeypa
     assert b"".join(writes) == document
     assert all(0 < len(block) <= 1024 * 1024 for block in writes)
     assert len(writes) == (len(document) + 1024 * 1024 - 1) // (1024 * 1024)
+    expected_reads = 2 * ((len(document) + 1024 * 1024 - 1) // (1024 * 1024))
+    assert len(reads) == expected_reads
+    assert all(0 < len(block) <= 1024 * 1024 for block in reads)
     assert ET.tostring(loaded["rows"]["ESPN.us"][0]) == ET.tostring(row)
     diagnostics = loaded["diagnostics"]
     assert diagnostics["xml_complete"] is True
     assert diagnostics["write_calls"] == len(writes)
     assert diagnostics["staged_bytes"] == diagnostics["validation_bytes"] == diagnostics["selection_bytes"] == len(document)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_count", [1, 100])
+async def test_selection_identity_checks_follow_candidates_not_query_cross_product(monkeypatch, query_count):
+    queries = [
+        guides._query(
+            profile(),
+            channel(id=index, name=f"Mapped {index}", tvg_id=""),
+            {"channel_id": index, "source_id": 50, "tvg_id": f"mapped-{index}"},
+            NOW,
+        )
+        for index in range(query_count)
+    ]
+    mapped_headers = "".join(
+        f'<channel id="mapped-{index}"><display-name>Mapped {index}</display-name></channel>'
+        for index in range(query_count)
+    )
+    unrelated_headers = "".join(
+        f'<channel id="other-{index}"><display-name>Other {index}</display-name></channel>'
+        for index in range(2000)
+    )
+    mapped_rows = [programme(f"mapped-{index}", f"Mapped show {index}") for index in range(query_count)]
+    unrelated_rows = [
+        programme(f"other-{index}", f"Other show {index}-{repeat}")
+        for index in range(2000)
+        for repeat in range(2)
+    ]
+    document = feed(*mapped_rows, *unrelated_rows, headers=mapped_headers + unrelated_headers)
+    install_feed(monkeypatch, document)
+
+    with patch.object(guides, "_identity", wraps=guides._identity) as identity:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+
+    assert identity.call_count == query_count
+    assert identity.call_count <= len(queries) * 2
+    assert set(loaded["headers"]) == {f"mapped-{index}" for index in range(query_count)}
+    assert set(loaded["rows"]) == {f"mapped-{index}" for index in range(query_count)}
+    assert sum(len(rows) for rows in loaded["rows"].values()) == query_count
+    assert loaded["diagnostics"]["selection_bytes"] == len(document)
+    assert loaded["warnings"] == []
 
 
 @pytest.mark.asyncio

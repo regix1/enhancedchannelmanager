@@ -113,10 +113,11 @@ async def _fetch_match_streams(client, scopes: list[dict]):
     complete = set()
     failures = {}
     group_names = {}
-    seen_ids = set()
     for scope in normalized:
         key = _scope_key(scope)
         try:
+            scope_streams = []
+            seen_ids = set()
             group_id, account_id = key
             if group_id not in group_names:
                 group_names[group_id] = await client._channel_group_name_for_id(group_id)
@@ -143,24 +144,24 @@ async def _fetch_match_streams(client, scopes: list[dict]):
                     actual_account = _stream_account_id(row)
                     if account_id is not None and actual_account != account_id:
                         continue
-                    identity = (key, stream_id)
-                    if identity in seen_ids:
+                    if stream_id in seen_ids:
                         continue
-                    seen_ids.add(identity)
-                    streams.append(SecondaryStream(
+                    seen_ids.add(stream_id)
+                    scope_streams.append(SecondaryStream(
                         name=name,
                         group_id=group_id,
                         stream_id=stream_id,
                         provider_id=actual_account,
                         is_stale=row.get("is_stale"),
                     ))
-                if len(streams) > MAX_MATCH_STREAMS:
+                if len(scope_streams) > MAX_MATCH_STREAMS:
                     raise ValueError(
                         f"Guide-match stream scan exceeds {MAX_MATCH_STREAMS} streams."
                     )
                 if not isinstance(response, dict) or not response.get("next"):
                     break
                 page += 1
+            streams.extend(scope_streams)
             complete.add(key)
         except Exception as exc:
             failures[key] = type(exc).__name__
@@ -720,6 +721,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     client,
                     now=now,
                     wait_for_sources=wait_for_sources,
+                    recover_sources=True,
                 ),
                 lambda: task._cancel_requested,
             )

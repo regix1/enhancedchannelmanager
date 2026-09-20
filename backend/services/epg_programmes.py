@@ -318,12 +318,28 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     import tempfile
     from contextlib import aclosing
     from config import CONFIG_DIR, get_settings
+    from stream_normalization import strip_country_prefix
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
+    dated_queries = [query for query in queries if query["event"].start is not None]
+    ended_queries = [query for query in dated_queries if query["dynamic"]]
     query_terms = {id(query): set(normalize_alias_term(query["event"].title or ""))
-                   for query in queries if query["event"].start is not None}
+                   for query in dated_queries}
+    mapped_queries = {}
+    direct_queries = {}
+    named_queries = {}
+    for query in queries:
+        mapping = query["mapping"]
+        if mapping and mapping["source_id"] == source["id"]:
+            mapped_queries.setdefault(mapping["tvg_id"], []).append(query)
+        for tvg_id in query["ids"]:
+            if not tvg_id.isdigit():
+                direct_queries.setdefault(tvg_id, []).append(query)
+        if not query["dynamic"] and query["name"]:
+            named_queries.setdefault(query["name"], []).append(query)
     parser = ET.XMLPullParser(events=("start", "end"))
     root = None
     headers, rows, warnings = {}, {}, set()
+    matches = {}
     ended = {}
     channel_warnings = {}
     diagnostics = {"root": "absent", "xml_complete": False, "transport_complete": False,
@@ -335,7 +351,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     prefix = b""
     invalid_utf8 = forbidden = False
     retained = count = pending_size = 0
-    event_headers = any(query["dynamic"] and query["event"].start is not None for query in queries)
+    event_headers = bool(ended_queries)
 
     def consume(chunk: bytes | None, select: bool = True) -> None:
         nonlocal root, retained, count, pending_size, prefix, invalid_utf8, forbidden
@@ -368,30 +384,62 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                 continue
             if element.tag == "channel":
                 tvg_id = element.get("id", "")
-                if event_headers or any(_identity(query, source["id"], tvg_id, element) is not None for query in queries):
+                candidate_queries = list(mapped_queries.get(tvg_id, ()))
+                candidate_queries.extend(direct_queries.get(tvg_id, ()))
+                names = [" ".join((name.text or "").casefold().split())
+                         for name in element.findall("display-name")]
+                for name in names:
+                    candidate_queries.extend(named_queries.get(name, ()))
+                    if re.match(r"^us\s*[-:|/]\s*", name):
+                        candidate_queries.extend(named_queries.get(strip_country_prefix(name), ()))
+                candidate_keys = set()
+                matched_queries = []
+                for query in candidate_queries:
+                    if query["key"] in candidate_keys:
+                        continue
+                    candidate_keys.add(query["key"])
+                    if _identity(query, source["id"], tvg_id, element) is not None:
+                        matched_queries.append(query)
+                if event_headers or matched_queries:
                     saved = copy.deepcopy(element)
                     retained += len(ET.tostring(saved))
                     headers[tvg_id] = saved
+                    if matched_queries:
+                        matches[tvg_id] = matched_queries
+                    else:
+                        matches.pop(tvg_id, None)
                 if root is not None:
                     root.remove(element)
                     pending_size = 0
             elif element.tag == "programme":
                 tvg_id = element.get("channel", "")
+                matched_queries = matches.get(tvg_id)
+                if matched_queries is None:
+                    candidate_queries = list(mapped_queries.get(tvg_id, ()))
+                    candidate_queries.extend(direct_queries.get(tvg_id, ()))
+                    candidate_keys = set()
+                    matched_queries = []
+                    for query in candidate_queries:
+                        if query["key"] in candidate_keys:
+                            continue
+                        candidate_keys.add(query["key"])
+                        if _identity(query, source["id"], tvg_id, None) is not None:
+                            matched_queries.append(query)
+                    if matched_queries:
+                        matches[tvg_id] = matched_queries
                 try:
                     begin, end = programme_times(element)
                 except ValueError:
                     warnings.add("invalid_schedule")
-                    for query in queries:
-                        if _identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None:
-                            channel_warnings.setdefault(query["key"], set()).add("invalid_schedule")
+                    for query in matched_queries:
+                        channel_warnings.setdefault(query["key"], set()).add("invalid_schedule")
                 else:
                     if now - timedelta(hours=24) < end <= now and end - begin <= timedelta(hours=24) and not _placeholder(element):
                         ended_event = None
-                        for query in queries:
+                        for query in ended_queries:
                             parsed = query["event"]
                             window = query["time_window_minutes"] if query["enforce_time_window"] else None
-                            if (not query["dynamic"] or parsed.start is None
-                                    or (window is not None and abs((parsed.start - begin).total_seconds()) > window * 60)):
+                            if window is not None and abs((parsed.start - begin).total_seconds()) > window * 60:
                                 continue
                             if ended_event is None:
                                 ended_event = _event(element, begin)
@@ -416,19 +464,15 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                     if end > now and end > start and begin < stop and not _placeholder(element):
                         if end - begin > timedelta(hours=24) or begin < start - timedelta(days=1):
                             warnings.add("implausible_schedule")
-                            for query in queries:
-                                if _identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None:
-                                    channel_warnings.setdefault(query["key"], set()).add("implausible_schedule")
+                            for query in matched_queries:
+                                channel_warnings.setdefault(query["key"], set()).add("implausible_schedule")
                         else:
-                            wanted = any(_identity(query, source["id"], tvg_id, headers.get(tvg_id)) is not None
-                                         for query in queries)
-                            if not wanted:
+                            wanted = bool(matched_queries)
+                            if not wanted and dated_queries:
                                 event_title = _event(element, begin)
                                 event_terms = None
-                                for query in queries:
+                                for query in dated_queries:
                                     parsed = query["event"]
-                                    if parsed.start is None:
-                                        continue
                                     delta = abs((parsed.start - begin).total_seconds())
                                     window = query["time_window_minutes"] if query["enforce_time_window"] else None
                                     if window is not None and delta > window * 60:
@@ -513,7 +557,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                     phase_started = time.monotonic()
                     try:
                         await asyncio.to_thread(spool.seek, 0)
-                        while chunk := await asyncio.to_thread(spool.read, 65536):
+                        while chunk := await asyncio.to_thread(spool.read, block_size):
                             diagnostics[f"{phase}_bytes"] += len(chunk)
                             await asyncio.to_thread(consume, chunk, select)
                         await asyncio.to_thread(consume, None, select)
@@ -539,7 +583,7 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
     if root is None:
         raise ValueError("XMLTV document is empty.")
     for tvg_id in list(headers):
-        if tvg_id not in rows and not any(_identity(query, source["id"], tvg_id, headers[tvg_id]) is not None for query in queries):
+        if tvg_id not in rows and tvg_id not in matches:
             retained -= len(ET.tostring(headers[tvg_id]))
             del headers[tvg_id]
     return {"headers": headers, "rows": rows, "ended": ended, "warnings": sorted(warnings), "size": retained,
@@ -870,7 +914,8 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
 
 
 async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, now: datetime | None = None,
-                           wait_for_sources: bool = False) -> tuple[list[dict], dict]:
+                           wait_for_sources: bool = False,
+                           recover_sources: bool = False) -> tuple[list[dict], dict]:
     """Prepare the same selected schedules for HTTP, diagnostics and scheduled generation."""
     global _ARTWORK_LOAD
     from dummy_epg_engine import get_xmltv_id
@@ -971,11 +1016,6 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             resolved = resolve_sources(profile["epg_source_ids"], sources)
             profile_coverage["source_ids"] = [source["id"] for source in resolved]
             mappings = {item["channel_id"]: item for item in capture_mappings(profile, channel_map, epg_rows, sources)}
-            for channel_id in list(mappings):
-                channel = channel_map.get(channel_id, {})
-                link = channel.get("epg_data_id") or channel.get("epg_data")
-                if isinstance(link, int) and link in unresolved_links:
-                    mappings.pop(channel_id)
         except ValueError as exc:
             resolved, mappings = [], {}
             profile_coverage["reason_codes"].append("GUIDE_SOURCES_PENDING")
@@ -1022,10 +1062,15 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
                     if canonical not in {source["id"] for source in resolved}:
                         query["blocked"] = "source_not_selected"
         for source in resolved:
-            if not any(not query.get("blocked") for query in queries):
+            selected_queries = [
+                query for query in queries
+                if not query.get("blocked")
+                or (query.get("blocked") == "mapping_unavailable" and query.get("mapping"))
+            ]
+            if not selected_queries:
                 continue
             job = jobs.setdefault(source["id"], {"source": source, "queries": [], "start": start, "stop": stop})
-            job["queries"].extend(query for query in queries if not query.get("blocked"))
+            job["queries"].extend(selected_queries)
             job["start"], job["stop"] = min(start, job["start"]), max(stop, job["stop"])
     for source_id, job in jobs.items():
         fingerprint = json.dumps({"id": source_id, "url": job["source"].get("url")}, sort_keys=True, default=str)
@@ -1039,8 +1084,25 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             if identity in demand or len(demand) < MAX_QUERIES:
                 demand[identity] = {"query": query, "start": job["start"], "stop": job["stop"]}
         entry["demand"] = demand
+        if not demand:
+            continue
+        success = entry.get("success")
+        selection = entry.get("selection") or {}
+        demand_start = min(request["start"] for request in demand.values())
+        demand_stop = max(request["stop"] for request in demand.values())
+        covered = (
+            success is not None
+            and all(identity in selection.get("queries", ()) for identity in demand)
+            and selection.get("start", demand_stop) <= demand_start
+            and selection.get("stop", demand_start) >= demand_stop
+        )
+        stale = success is not None and (
+            datetime.now(timezone.utc) - success
+        ).total_seconds() > SOURCE_MAX_AGE
+        recovery_needed = bool(entry.get("error")) or not covered or stale
         age = time.monotonic() - entry.get("checked", float("-inf"))
-        if (wait_for_sources and demand and age >= (SOURCE_RETRY if entry.get("error") else SOURCE_TTL)
+        if ((wait_for_sources or (recover_sources and recovery_needed))
+                and age >= (SOURCE_RETRY if recovery_needed else SOURCE_TTL)
                 and key not in _SOURCE_LOADS):
             _SOURCE_LOADS[key] = asyncio.create_task(_load_source(
                 key, job["source"], [request["query"] for request in demand.values()],
