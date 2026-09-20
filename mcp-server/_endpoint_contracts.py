@@ -183,6 +183,7 @@ _DUMMY_EPG_PROFILE_FIELDS = frozenset({
     "tvg_id_template", "include_date_tag", "include_live_tag", "include_new_tag",
     "pattern_builder_examples", "pattern_variants", "channel_group_ids",
     "epg_source_ids", "channel_mappings", "hide_empty_group_ids",
+    "stream_match_group_ids",
 })
 
 

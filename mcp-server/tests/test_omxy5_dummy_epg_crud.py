@@ -94,6 +94,16 @@ class TestCreateDummyEpgProfile:
 
 
 class TestUpdateDummyEpgProfile:
+    def test_contract_accepts_stream_match_groups(self):
+        from _endpoint_contracts import ENDPOINTS
+
+        assert "stream_match_group_ids" in (
+            ENDPOINTS["dummy_epg_create_profile"].request_fields
+        )
+        assert "stream_match_group_ids" in (
+            ENDPOINTS["dummy_epg_update_profile"].request_fields
+        )
+
     @pytest.mark.asyncio
     async def test_forwards_only_provided_fields(self):
         mcp = _mcp()

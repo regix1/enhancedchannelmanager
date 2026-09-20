@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import pytz
@@ -16,20 +17,9 @@ from task_scheduler import ScheduleConfig, ScheduleType, TaskResult, TaskSchedul
 logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SECONDS = 300
-FLOW_MAX_AGE = timedelta(minutes=5)
-MAX_CHANNELS_PER_RUN = 12
 MATCH_STREAM_PAGE_SIZE = 500
 MAX_MATCH_STREAMS = 10000
-
-
-def _round_robin(rows: list, cursor: int, limit: int) -> tuple[list, int]:
-    """Take a fair bounded slice so persistent failures cannot starve peers."""
-    if not rows or limit <= 0:
-        return [], 0
-    start = cursor % len(rows)
-    count = min(limit, len(rows))
-    selected = [rows[(start + offset) % len(rows)] for offset in range(count)]
-    return selected, (start + count) % len(rows)
+EPG_LINK_MAX_RESULTS = 10000
 
 
 def _stream_id(stream) -> int | None:
@@ -43,6 +33,13 @@ def _stream_group_id(stream) -> int | None:
     if group is None:
         group = stream.get("channel_group")
     return group.get("id") if isinstance(group, dict) else group
+
+
+def _espn_slot(name: str | None, *, stream: bool = False) -> int | None:
+    """Read an ESPN+ slot from a channel or its numbered IPTorrents stream."""
+    pattern = r"^ESPN PLUS\s+(\d+):?$" if stream else r"^ESPN\+\s*(\d+)$"
+    match = re.fullmatch(pattern, str(name or "").strip(), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _guide_name(current: dict | None, event_timezone: str) -> str | None:
@@ -122,13 +119,74 @@ async def _fetch_match_streams(client, group_ids: list[int]) -> tuple[list, dict
     return streams, groups_by_stream
 
 
+async def _link_dummy_epg(client, event_channels: list[tuple[int, dict]]) -> tuple[list[int], dict[int, str]]:
+    """Link unassigned event channels to their generated Dummy EPG rows."""
+    missing = {
+        channel_id: channel
+        for channel_id, channel in event_channels
+        if "epg_data_id" in channel and channel.get("epg_data_id") is None
+    }
+    if not missing:
+        return [], {}
+
+    from services.epg_programmes import _dummy_source, _epg_source_id
+
+    sources = await client.get_epg_sources()
+    if isinstance(sources, dict):
+        sources = sources.get("results", sources.get("sources", []))
+    dummy_sources = sorted(
+        (
+            source for source in sources or []
+            if isinstance(source, dict)
+            and source.get("id") is not None
+            and source.get("is_active", True)
+            and _dummy_source(source["id"], sources)
+        ),
+        key=lambda source: source["id"],
+    )
+    if not dummy_sources:
+        return [], {}
+
+    wanted = {f"ecm-{channel_id}" for channel_id in missing}
+    rows_by_tvg = {}
+    for source in dummy_sources:
+        rows = await client.get_epg_data(
+            epg_source=source["id"],
+            max_results=EPG_LINK_MAX_RESULTS,
+        )
+        for row in rows:
+            tvg_id = row.get("tvg_id")
+            if tvg_id in wanted and row.get("id") is not None:
+                rows_by_tvg.setdefault(tvg_id, row)
+
+    linked = []
+    linked_sources = {}
+    for channel_id, channel in sorted(missing.items()):
+        row = rows_by_tvg.get(f"ecm-{channel_id}")
+        if row is None:
+            continue
+        await client.update_channel(channel_id, {"epg_data_id": row["id"]})
+        channel["epg_data_id"] = row["id"]
+        linked.append(channel_id)
+        source_id = _epg_source_id(row.get("epg_source") or row.get("epg_source_id"))
+        if source_id is not None:
+            source = next(
+                (candidate for candidate in dummy_sources if candidate["id"] == source_id),
+                None,
+            )
+            linked_sources[source_id] = (
+                source.get("name") if source else f"Source {source_id}"
+            )
+    return linked, linked_sources
+
+
 @register_task
 class EventVisibilityTask(TaskScheduler):
-    """Show current flowing event slots and hide slots whose events ended."""
+    """Show current event slots and hide slots whose events ended."""
 
     task_id = "event_visibility"
     task_name = "Event Visibility Check"
-    task_description = "Keep PPV and ESPN+ visibility aligned with active guide and stream flow"
+    task_description = "Keep PPV and ESPN+ visibility aligned with active guide events"
 
     def __init__(self, schedule_config: Optional[ScheduleConfig] = None):
         if schedule_config is None:
@@ -138,7 +196,6 @@ class EventVisibilityTask(TaskScheduler):
                 timezone="America/Chicago",
             )
         super().__init__(schedule_config)
-        self._cursor = 0
 
     async def execute(self) -> TaskResult:
         started_at = datetime.utcnow()
@@ -204,6 +261,20 @@ class EventVisibilityTask(TaskScheduler):
             for channel_id, channel in channel_map.items()
             if channel.get("channel_group_id") in wanted
         ]
+        failed = 0
+        linked_channel_ids = []
+        linked_sources = {}
+        try:
+            linked_channel_ids, linked_sources = await _link_dummy_epg(
+                client, event_channels,
+            )
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "[%s] Could not link generated event guide rows: %s",
+                self.task_id,
+                exc,
+            )
         ended = [
             (channel_id, channel)
             for channel_id, channel in event_channels
@@ -216,10 +287,8 @@ class EventVisibilityTask(TaskScheduler):
         ]
 
         candidates.sort(key=lambda row: (row[1].get("channel_number") or 999999, row[0]))
-        selected, self._cursor = _round_robin(
-            candidates, self._cursor, MAX_CHANNELS_PER_RUN,
-        )
-        if not selected and not ended:
+        selected = candidates
+        if not selected and not ended and not linked_channel_ids:
             return TaskResult(
                 success=True,
                 message="No event channel visibility changes are needed",
@@ -234,12 +303,18 @@ class EventVisibilityTask(TaskScheduler):
         ))
         match_streams = []
         groups_by_stream = {}
+        match_streams_by_id = {}
         match_scan_ready = True
         if all_match_group_ids:
             try:
                 match_streams, groups_by_stream = await _fetch_match_streams(
                     client, all_match_group_ids,
                 )
+                match_streams_by_id = {
+                    stream.stream_id: stream
+                    for stream in match_streams
+                    if stream.stream_id is not None
+                }
             except Exception as exc:
                 match_scan_ready = False
                 logger.warning(
@@ -250,7 +325,6 @@ class EventVisibilityTask(TaskScheduler):
 
         hidden_now = []
         stream_updates = []
-        failed = 0
         for channel_id, channel in ended:
             update = {}
             if not channel.get("hidden_from_output"):
@@ -260,8 +334,15 @@ class EventVisibilityTask(TaskScheduler):
                 fallback_ids = [
                     _stream_id(stream)
                     for stream in channel.get("streams") or []
-                    if (_stream_group_id(stream) or groups_by_stream.get(_stream_id(stream)))
-                    not in set(group_ids)
+                    if (
+                        (_stream_group_id(stream) or groups_by_stream.get(_stream_id(stream)))
+                        not in set(group_ids)
+                        or _espn_slot(
+                            stream.get("name") if isinstance(stream, dict)
+                            else getattr(match_streams_by_id.get(_stream_id(stream)), "name", None),
+                            stream=True,
+                        ) is not None
+                    )
                 ]
                 fallback_ids = [stream_id for stream_id in fallback_ids if stream_id is not None]
                 if fallback_ids != [
@@ -285,6 +366,17 @@ class EventVisibilityTask(TaskScheduler):
                     exc,
                 )
 
+        slot_matches_by_channel = {}
+        streams_by_slot = {}
+        for stream in match_streams:
+            slot = _espn_slot(stream.name, stream=True)
+            if slot is not None:
+                streams_by_slot.setdefault(slot, []).append(stream)
+        for channel_id, channel in selected:
+            slot = _espn_slot(channel.get("name"))
+            if slot is not None and slot in streams_by_slot:
+                slot_matches_by_channel[channel_id] = list(streams_by_slot[slot])
+
         guide_name_to_ids = {}
         for channel_id, channel in selected:
             target_group_id = channel.get("channel_group_id")
@@ -298,7 +390,11 @@ class EventVisibilityTask(TaskScheduler):
                 guide_name_to_ids.setdefault(guide_name, []).append(channel_id)
 
         matches_by_channel = {}
-        if match_scan_ready and guide_name_to_ids and match_streams:
+        titled_match_streams = [
+            stream for stream in match_streams
+            if _espn_slot(stream.name, stream=True) is None
+        ]
+        if match_scan_ready and guide_name_to_ids and titled_match_streams:
             from services.event_sync_resolver import (
                 DISPOSITION_WOULD_ATTACH,
                 resolve_event_sync,
@@ -314,10 +410,10 @@ class EventVisibilityTask(TaskScheduler):
                         "time_window_minutes": 30,
                         "enforce_time_window": True,
                         "attach_threshold": 0.8,
-                        "assume_current_date": False,
+                        "assume_current_date": True,
                     },
                     sorted(guide_name_to_ids),
-                    match_streams,
+                    titled_match_streams,
                     now=now,
                 )
             except Exception as exc:
@@ -346,40 +442,17 @@ class EventVisibilityTask(TaskScheduler):
                             resolved.stream
                         )
 
-        stream_ids = {
-            _stream_id(stream)
-            for _, channel in selected
-            for stream in channel.get("streams") or []
-        } | {
-            row.stream_id
-            for rows in matches_by_channel.values()
-            for row in rows
-        }
-        stream_ids.discard(None)
-
-        flow = {}
         if selected:
             self._set_progress(
                 total=len(selected) + len(ended),
                 current=len(ended),
-                success_count=len(hidden_now),
+                success_count=len(set(hidden_now) | set(linked_channel_ids)),
                 failed_count=failed,
-                status="probing",
-                current_item="Checking scheduled hidden event channels",
-            )
-
-            from services.event_sync_stream_health import collect_stream_flow
-
-            flow = await collect_stream_flow(
-                stream_ids,
-                client=client,
-                checked_after=now - FLOW_MAX_AGE,
-                probe_missing=True,
-                probe_while_busy=True,
-                cancelled=lambda: self._cancel_requested,
+                status="matching",
+                current_item="Matching scheduled event channels",
             )
         if self._cancel_requested:
-            if hidden_now or stream_updates:
+            if hidden_now or stream_updates or linked_channel_ids:
                 from emby_client import request_guide_refresh
 
                 await request_guide_refresh()
@@ -418,32 +491,28 @@ class EventVisibilityTask(TaskScheduler):
             )
             primary_ids = [
                 row.stream_id for row in matched
-                if row.stream_id is not None and flow.get(row.stream_id) is True
-            ]
-            primary_ids.extend(
-                row.stream_id for row in matched
                 if row.stream_id is not None
-                and row.stream_id in attached_ids
-                and flow.get(row.stream_id) is None
-                and row.stream_id not in primary_ids
-            )
+            ]
+            slot_ids = [
+                row.stream_id
+                for row in sorted(
+                    slot_matches_by_channel.get(channel_id, []),
+                    key=lambda row: row.stream_id or 0,
+                )
+                if row.stream_id is not None
+            ]
             desired_ids = primary_ids + [
                 stream_id for stream_id in fallback_ids
                 if stream_id not in primary_ids
+            ] + [
+                stream_id for stream_id in slot_ids
+                if stream_id not in primary_ids and stream_id not in fallback_ids
             ]
             update = {}
             if match_scan_ready and group_ids and desired_ids != attached_ids:
                 update["streams"] = desired_ids
 
-            states = [flow.get(stream_id) for stream_id in desired_ids]
-            if any(state is True for state in states):
-                hide = False
-            elif states and all(state is False for state in states):
-                hide = True
-            elif not states:
-                hide = True
-            else:
-                hide = bool(channel.get("hidden_from_output"))
+            hide = False
             if bool(channel.get("hidden_from_output")) is not hide:
                 update["hidden_from_output"] = hide
 
@@ -468,12 +537,31 @@ class EventVisibilityTask(TaskScheduler):
                     | set(hidden_now)
                     | set(hidden_failed)
                     | set(stream_updates)
+                    | set(linked_channel_ids)
                 ),
                 failed_count=failed,
-                status="probing",
+                status="matching",
             )
 
-        if shown or hidden_now or hidden_failed or stream_updates:
+        if linked_sources:
+            from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+
+            for source_id, source_name in sorted(linked_sources.items()):
+                completed = await wait_for_epg_source_refresh(
+                    client,
+                    source_id,
+                    source_name,
+                    cancelled=lambda: self._cancel_requested,
+                )
+                if not completed:
+                    failed += 1
+                    logger.warning(
+                        "[%s] Linked guide source %s did not refresh successfully",
+                        self.task_id,
+                        source_id,
+                    )
+
+        if shown or hidden_now or hidden_failed or stream_updates or linked_channel_ids:
             from emby_client import request_guide_refresh
 
             await request_guide_refresh()
@@ -483,6 +571,7 @@ class EventVisibilityTask(TaskScheduler):
             | set(hidden_now)
             | set(hidden_failed)
             | set(stream_updates)
+            | set(linked_channel_ids)
         )
         total_items = len(selected) + len(ended)
         return TaskResult(
@@ -490,7 +579,8 @@ class EventVisibilityTask(TaskScheduler):
             message=(
                 f"Checked {len(selected)} active event channel(s), "
                 f"revealed {len(shown)}, hid {len(hidden_now) + len(hidden_failed)}, "
-                f"updated streams on {len(stream_updates)} channel(s)"
+                f"updated streams on {len(stream_updates)} channel(s), "
+                f"linked guide rows on {len(linked_channel_ids)} channel(s)"
             ),
             started_at=started_at,
             completed_at=datetime.utcnow(),
@@ -502,5 +592,6 @@ class EventVisibilityTask(TaskScheduler):
                 "revealed_channel_ids": shown,
                 "hidden_channel_ids": hidden_now + hidden_failed,
                 "stream_updated_channel_ids": stream_updates,
+                "epg_linked_channel_ids": linked_channel_ids,
             },
         )
