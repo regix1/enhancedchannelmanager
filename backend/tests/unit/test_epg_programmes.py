@@ -503,6 +503,26 @@ async def test_shared_fetch_ignores_unrelated_channel_field_changes():
 
 
 @pytest.mark.asyncio
+async def test_shared_fetch_accepts_incomplete_embedded_stream_rows():
+    upstream = AsyncMock()
+    row = channel(streams=[2, {"name": "missing id"}, {"id": 2, "name": None}])
+    upstream.get_channels.side_effect = [
+        {"results": [copy.deepcopy(row)], "count": 1, "next": None},
+        {"results": [copy.deepcopy(row)], "count": 1, "next": None},
+    ]
+    upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "resolved"}]
+
+    channels = await guides._fetch_all_channels(upstream)
+
+    assert channels[1]["streams"] == [
+        {"id": 2, "name": "resolved"},
+        {"name": "missing id"},
+        {"id": 2, "name": None},
+    ]
+    upstream.get_streams_by_ids.assert_awaited_once_with([2])
+
+
+@pytest.mark.asyncio
 async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
     upstream = AsyncMock()
     upstream.get_channels.side_effect = [

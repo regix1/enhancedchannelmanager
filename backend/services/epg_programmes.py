@@ -192,13 +192,16 @@ async def _fetch_all_channels(client=None) -> dict:
             if isinstance(link, dict):
                 link = link.get("id")
             streams = sorted(
-                (
-                    stream.get("id"),
-                    stream.get("name", ""),
-                )
-                if isinstance(stream, dict)
-                else (stream, "")
-                for stream in row.get("streams", [])
+                [
+                    (
+                        stream.get("id"),
+                        stream.get("name", ""),
+                    )
+                    if isinstance(stream, dict)
+                    else (stream, "")
+                    for stream in (row.get("streams") or [])
+                ],
+                key=lambda stream: (str(stream[0]), str(stream[1] or "")),
             )
             stable_rows.append({
                 "id": row.get("id"),
