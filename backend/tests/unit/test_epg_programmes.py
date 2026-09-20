@@ -2122,6 +2122,7 @@ async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatc
 
     def timeout(delay):
         nonlocal deadline
+        assert delay == 24 * 60 * 60
         deadline = original_timeout(delay)
         deadlines.append(deadline)
         return deadline
@@ -2155,6 +2156,8 @@ async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatc
 
 @pytest.mark.asyncio
 async def test_programme_budget_remains_finite_and_transport_defaults_are_unchanged(monkeypatch):
+    assert guides.SOURCE_TIMEOUT == 24 * 60 * 60
+    assert guides.SOURCE_MAX_AGE == 80 * 60
     observed = []
     def respond(request):
         observed.append(request.extensions["timeout"]["read"])

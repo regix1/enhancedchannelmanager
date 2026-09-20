@@ -29,10 +29,10 @@ HTTP_WAIT = 5.0
 # Large programme feeds are parsed incrementally; selected rows keep their own smaller limit.
 MAX_DOWNLOAD = 4 * 1024 * 1024 * 1024
 MAX_DECODED = 4 * 1024 * 1024 * 1024
-SOURCE_TIMEOUT = 1200.0
+SOURCE_TIMEOUT = 24 * 60 * 60.0
 SOURCE_READ_TIMEOUT = 300.0
-# The hourly refresh may take its full bounded read time to replace a completed scan.
-SOURCE_MAX_AGE = 3600 + SOURCE_TIMEOUT
+# Keep guide freshness independent of the time allowed for a replacement scan.
+SOURCE_MAX_AGE = 80 * 60
 MAX_QUERIES = 4096
 MAX_RETAINED = 64 * 1024 * 1024
 MAX_CACHE = 128 * 1024 * 1024
