@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytz
@@ -42,10 +42,24 @@ def _espn_slot(name: str | None, *, stream: bool = False) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _ufc_slot(name: str | None, *, stream: bool = False) -> int | None:
+def _ufc_slot(
+    name: str | None, *, stream: bool = False, titled: bool = False,
+) -> int | None:
     """Read a UFC slot from a channel or its numbered IPTV stream."""
+    value = str(name or "").strip()
+    if titled:
+        patterns = (
+            r"^LIVE\s+EVENT\s+(\d{1,2})(?=\s|:|-|\|).*\bUFC\b",
+            r"^UFC\s*(?:INT\s*)?(\d{1,2})\s*:\s*\S",
+            r"^US\s+\(UFC(?:\s+INT)?\s*(\d{1,2})\)\s*\|",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, value, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
     pattern = r"^UFC\s*(?:INT\s*)?(\d+):?$" if stream else r"^UFC\s*(\d+)$"
-    match = re.fullmatch(pattern, str(name or "").strip(), flags=re.IGNORECASE)
+    match = re.fullmatch(pattern, value, flags=re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
@@ -262,19 +276,21 @@ class EventVisibilityTask(TaskScheduler):
         }
 
         match_groups_by_target = {}
+        patterns_by_target = {}
         timezone_by_target = {}
+        duration_by_target = {}
         from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
 
-        match_patterns = list(DEFAULT_EVENT_PATTERNS)
-        pattern_keys = {
-            (
-                pattern.get("title_pattern"),
-                pattern.get("time_pattern"),
-                pattern.get("date_pattern"),
-            )
-            for pattern in match_patterns
-        }
         for profile in sorted(profiles, key=lambda row: row.get("id") or 0):
+            match_patterns = list(DEFAULT_EVENT_PATTERNS)
+            pattern_keys = {
+                (
+                    pattern.get("title_pattern"),
+                    pattern.get("time_pattern"),
+                    pattern.get("date_pattern"),
+                )
+                for pattern in match_patterns
+            }
             for pattern in profile.get("pattern_variants") or []:
                 if not isinstance(pattern, dict) or not pattern.get("title_pattern"):
                     continue
@@ -291,8 +307,12 @@ class EventVisibilityTask(TaskScheduler):
             for group_id in profile.get("hide_empty_group_ids") or []:
                 if match_group_ids:
                     match_groups_by_target.setdefault(group_id, match_group_ids)
+                    patterns_by_target.setdefault(group_id, match_patterns)
                     timezone_by_target.setdefault(
                         group_id, profile.get("event_timezone") or "US/Eastern",
+                    )
+                    duration_by_target.setdefault(
+                        group_id, profile.get("program_duration", 180),
                     )
 
         event_channels = [
@@ -362,8 +382,63 @@ class EventVisibilityTask(TaskScheduler):
                     exc,
                 )
 
+        bootstrap_matches_by_channel = {}
+        if match_scan_ready and match_streams:
+            from services.event_sync_matcher import parse_event_name
+
+            for channel_id, channel in ended:
+                target_group_id = channel.get("channel_group_id")
+                group_ids = match_groups_by_target.get(target_group_id, [])
+                if not group_ids:
+                    continue
+                slot = _slot_key(channel.get("name"))
+                if slot is None or slot[0] != "ufc":
+                    continue
+                match_patterns = patterns_by_target.get(target_group_id)
+                event_timezone = timezone_by_target.get(
+                    target_group_id, "US/Eastern",
+                )
+                duration = duration_by_target.get(target_group_id, 180)
+                allowed = set(group_ids)
+                for stream in match_streams:
+                    if stream.group_id not in allowed:
+                        continue
+                    if _ufc_slot(stream.name, titled=True) != slot[1]:
+                        continue
+                    parsed = parse_event_name(
+                        stream.name,
+                        match_patterns,
+                        event_timezone=event_timezone,
+                        now=now,
+                        assume_current_date=True,
+                    )
+                    if (
+                        parsed.start is not None
+                        and parsed.start <= now
+                        and now < parsed.start + timedelta(minutes=duration)
+                    ):
+                        bootstrap_matches_by_channel.setdefault(
+                            channel_id, [],
+                        ).append(stream)
+
+        if bootstrap_matches_by_channel:
+            bootstrap_ids = set(bootstrap_matches_by_channel)
+            selected.extend(
+                row for row in ended if row[0] in bootstrap_ids
+            )
+            ended = [row for row in ended if row[0] not in bootstrap_ids]
+            selected.sort(
+                key=lambda row: (
+                    row[1].get("channel_number") or 999999,
+                    row[0],
+                )
+            )
+
         hidden_now = []
         stream_updates = []
+        bootstrap_updates = []
+        bootstrap_source_ids = set()
+        bootstrap_refresh_ready = False
         for channel_id, channel in ended:
             update = {}
             if not channel.get("hidden_from_output"):
@@ -414,56 +489,73 @@ class EventVisibilityTask(TaskScheduler):
         for channel_id, channel in selected:
             slot = _slot_key(channel.get("name"))
             if slot is not None and slot in streams_by_slot:
-                slot_matches_by_channel[channel_id] = list(streams_by_slot[slot])
+                allowed = set(match_groups_by_target.get(
+                    channel.get("channel_group_id"), [],
+                ))
+                matches = [
+                    stream for stream in streams_by_slot[slot]
+                    if stream.group_id in allowed
+                ]
+                if matches:
+                    slot_matches_by_channel[channel_id] = matches
 
-        guide_name_to_ids = {}
-        for channel_id, channel in selected:
-            target_group_id = channel.get("channel_group_id")
-            if target_group_id not in match_groups_by_target:
-                continue
-            guide_name = _guide_name(
-                (coverage_by_channel.get(channel_id) or {}).get("current"),
-                timezone_by_target.get(target_group_id, "US/Eastern"),
-            )
-            if guide_name:
-                guide_name_to_ids.setdefault(guide_name, []).append(channel_id)
-
-        matches_by_channel = {}
-        titled_match_streams = [
-            stream for stream in match_streams
-            if _slot_key(stream.name, stream=True) is None
-        ]
-        if match_scan_ready and guide_name_to_ids and titled_match_streams:
+        matches_by_channel = {
+            channel_id: list(streams)
+            for channel_id, streams in bootstrap_matches_by_channel.items()
+        }
+        if match_scan_ready:
             from services.event_sync_resolver import (
                 DISPOSITION_WOULD_ATTACH,
                 resolve_event_sync,
             )
             from concurrency import run_cpu_bound
 
-            try:
-                resolution = await run_cpu_bound(
-                    resolve_event_sync,
-                    {
-                        "master_group_id": 0,
-                        "secondary_group_ids": all_match_group_ids,
-                        "time_window_minutes": 30,
-                        "enforce_time_window": True,
-                        "attach_threshold": 0.8,
-                        "assume_current_date": True,
-                        "patterns": match_patterns,
-                    },
-                    sorted(guide_name_to_ids),
-                    titled_match_streams,
-                    now=now,
-                )
-            except Exception as exc:
-                match_scan_ready = False
-                logger.warning(
-                    "[%s] Could not match streams to the current guide: %s",
-                    self.task_id,
-                    exc,
-                )
-            else:
+            for target_group_id, group_ids in match_groups_by_target.items():
+                guide_name_to_ids = {}
+                for channel_id, channel in selected:
+                    if channel.get("channel_group_id") != target_group_id:
+                        continue
+                    guide_name = _guide_name(
+                        (coverage_by_channel.get(channel_id) or {}).get("current"),
+                        timezone_by_target.get(target_group_id, "US/Eastern"),
+                    )
+                    if guide_name:
+                        guide_name_to_ids.setdefault(guide_name, []).append(
+                            channel_id,
+                        )
+                allowed = set(group_ids)
+                titled_match_streams = [
+                    stream for stream in match_streams
+                    if stream.group_id in allowed
+                    and _slot_key(stream.name, stream=True) is None
+                ]
+                if not guide_name_to_ids or not titled_match_streams:
+                    continue
+                match_patterns = patterns_by_target.get(target_group_id)
+                try:
+                    resolution = await run_cpu_bound(
+                        resolve_event_sync,
+                        {
+                            "master_group_id": 0,
+                            "secondary_group_ids": group_ids,
+                            "time_window_minutes": 30,
+                            "enforce_time_window": True,
+                            "attach_threshold": 0.8,
+                            "assume_current_date": True,
+                            "patterns": match_patterns,
+                        },
+                        sorted(guide_name_to_ids),
+                        titled_match_streams,
+                        now=now,
+                    )
+                except Exception as exc:
+                    match_scan_ready = False
+                    logger.warning(
+                        "[%s] Could not match streams to the current guide: %s",
+                        self.task_id,
+                        exc,
+                    )
+                    break
                 for resolved in resolution.resolved:
                     if resolved.disposition != DISPOSITION_WOULD_ATTACH:
                         continue
@@ -552,7 +644,10 @@ class EventVisibilityTask(TaskScheduler):
             if match_scan_ready and group_ids and desired_ids != attached_ids:
                 update["streams"] = desired_ids
 
-            hide = False
+            hide = (
+                channel_id in bootstrap_matches_by_channel
+                and not match_scan_ready
+            )
             if bool(channel.get("hidden_from_output")) is not hide:
                 update["hidden_from_output"] = hide
 
@@ -563,12 +658,16 @@ class EventVisibilityTask(TaskScheduler):
                         stream_updates.append(channel_id)
                     if "hidden_from_output" in update:
                         (hidden_failed if hide else shown).append(channel_id)
+                    if channel_id in bootstrap_matches_by_channel:
+                        bootstrap_updates.append(channel_id)
                 except Exception as exc:
                     failed += 1
                     logger.warning(
                         "[%s] Could not update event channel %s: %s",
                         self.task_id, channel_id, exc,
                     )
+            elif channel_id in bootstrap_matches_by_channel:
+                bootstrap_updates.append(channel_id)
             self._set_progress(
                 total=len(selected) + len(ended),
                 current=index + len(ended),
@@ -583,6 +682,35 @@ class EventVisibilityTask(TaskScheduler):
                 status="matching",
             )
 
+        if bootstrap_updates:
+            from cache import get_cache
+
+            get_cache().invalidate_prefix("dummy_epg_xmltv")
+            try:
+                sources = await client.get_epg_sources()
+                if isinstance(sources, dict):
+                    sources = sources.get("results", sources.get("sources", []))
+                for source in sources or []:
+                    if (
+                        isinstance(source, dict)
+                        and source.get("id") is not None
+                        and source.get("is_active", True)
+                        and "/api/dummy-epg/xmltv" in (source.get("url") or "")
+                    ):
+                        bootstrap_source_ids.add(source["id"])
+                        linked_sources.setdefault(
+                            source["id"],
+                            source.get("name") or f"Source {source['id']}",
+                        )
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "[%s] Could not load generated guide sources: %s",
+                    self.task_id,
+                    exc,
+                )
+            bootstrap_refresh_ready = bool(bootstrap_source_ids)
+
         if linked_sources:
             from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
 
@@ -594,17 +722,14 @@ class EventVisibilityTask(TaskScheduler):
                     cancelled=lambda: self._cancel_requested,
                 )
                 if not completed:
+                    if source_id in bootstrap_source_ids:
+                        bootstrap_refresh_ready = False
                     failed += 1
                     logger.warning(
                         "[%s] Linked guide source %s did not refresh successfully",
                         self.task_id,
                         source_id,
                     )
-
-        if shown or hidden_now or hidden_failed or stream_updates or linked_channel_ids:
-            from emby_client import request_guide_refresh
-
-            await request_guide_refresh()
 
         changed_channel_ids = (
             set(shown)
@@ -613,6 +738,12 @@ class EventVisibilityTask(TaskScheduler):
             | set(stream_updates)
             | set(linked_channel_ids)
         )
+        ordinary_changes = changed_channel_ids - set(bootstrap_updates)
+        if ordinary_changes or (bootstrap_updates and bootstrap_refresh_ready):
+            from emby_client import request_guide_refresh
+
+            await request_guide_refresh()
+
         total_items = len(selected) + len(ended)
         return TaskResult(
             success=True,

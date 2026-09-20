@@ -11,6 +11,7 @@ NOTE: Routes /api/tasks/engine/status, /api/tasks/history/all, and
 /api/tasks/parameter-schemas are shadowed by /api/tasks/{task_id} in the
 monolith (they're defined after the parameterized route).
 """
+import asyncio
 import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -256,6 +257,189 @@ class TestRunTask:
             response = await async_client.post("/api/tasks/nonexistent/run")
 
         assert response.status_code == 404
+
+
+class TestStartTask:
+    """Tests for POST /api/tasks/{task_id}/runs."""
+
+    @pytest.mark.asyncio
+    async def test_returns_accepted_identity_without_waiting(self, async_client):
+        from task_engine import TaskRun
+
+        completion = asyncio.get_running_loop().create_future()
+        admitted = TaskRun(
+            execution_id=37,
+            task_id="stream_probe",
+            started_at=datetime(2026, 9, 20, 3, 0, 0),
+            completion=completion,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start_task = AsyncMock(return_value=admitted)
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.post(
+                "/api/tasks/stream_probe/runs",
+                json={"schedule_id": 4, "parameters": {"batch_size": 8}},
+            )
+
+        assert response.status_code == 202
+        assert response.json() == {
+            "status": "accepted",
+            "task_id": "stream_probe",
+            "execution_id": 37,
+            "started_at": "2026-09-20T03:00:00Z",
+        }
+        assert not completion.done()
+        mock_engine.start_task.assert_awaited_once_with(
+            "stream_probe",
+            schedule_id=4,
+            parameters={"batch_size": 8},
+        )
+        completion.cancel()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_returns_conflict(self, async_client):
+        from task_scheduler import TaskResult
+
+        mock_engine = MagicMock()
+        mock_engine.start_task = AsyncMock(
+            return_value=TaskResult(
+                success=False,
+                message="Task is already running",
+                error="ALREADY_RUNNING",
+            )
+        )
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.post("/api/tasks/stream_probe/runs")
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["error"] == "ALREADY_RUNNING"
+
+    @pytest.mark.asyncio
+    async def test_stopping_engine_returns_unavailable(self, async_client):
+        from task_scheduler import TaskResult
+
+        mock_engine = MagicMock()
+        mock_engine.start_task = AsyncMock(
+            return_value=TaskResult(
+                success=False,
+                message="Task engine is stopping",
+                error="ENGINE_STOPPING",
+            )
+        )
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.post("/api/tasks/stream_probe/runs")
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "ENGINE_STOPPING"
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_returns_not_found(self, async_client):
+        mock_engine = MagicMock()
+        mock_engine.start_task = AsyncMock(return_value=None)
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.post("/api/tasks/unknown/runs")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_admission_failure_returns_server_error(self, async_client):
+        mock_engine = MagicMock()
+        mock_engine.start_task = AsyncMock(
+            side_effect=RuntimeError("controlled admission failure")
+        )
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.post("/api/tasks/stream_probe/runs")
+
+        assert response.status_code == 500
+
+
+class TestGetTaskExecution:
+    """Tests for GET /api/tasks/{task_id}/executions/{execution_id}."""
+
+    @staticmethod
+    def _execution():
+        return {
+            "id": 37,
+            "task_id": "stream_probe",
+            "started_at": "2026-09-20T03:00:00Z",
+            "completed_at": None,
+            "duration_seconds": None,
+            "status": "running",
+            "success": None,
+            "message": None,
+            "error": None,
+            "total_items": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "details": None,
+            "triggered_by": "manual",
+        }
+
+    @pytest.mark.asyncio
+    async def test_returns_exact_execution(self, async_client):
+        mock_engine = MagicMock()
+        mock_engine.get_task_execution.return_value = self._execution()
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.get(
+                "/api/tasks/stream_probe/executions/37",
+                params={"started_at": "2026-09-19T22:00:00-05:00"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == 37
+        mock_engine.get_task_execution.assert_called_once_with(
+            "stream_probe",
+            37,
+            datetime(2026, 9, 20, 3, 0, 0),
+        )
+
+    @pytest.mark.asyncio
+    async def test_mismatched_identity_returns_not_found(self, async_client):
+        mock_engine = MagicMock()
+        mock_engine.get_task_execution.return_value = None
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.get(
+                "/api/tasks/stream_probe/executions/37",
+                params={"started_at": "2026-09-20T03:00:00Z"},
+            )
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_read_failure_returns_server_error(self, async_client):
+        mock_engine = MagicMock()
+        mock_engine.get_task_execution.side_effect = RuntimeError(
+            "controlled read failure"
+        )
+
+        with patch("task_engine.get_engine", return_value=mock_engine):
+            response = await async_client.get(
+                "/api/tasks/stream_probe/executions/37",
+                params={"started_at": "2026-09-20T03:00:00Z"},
+            )
+
+        assert response.status_code == 500
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "params"),
+        [
+            ("/api/tasks/stream_probe/executions/0", {"started_at": "2026-09-20T03:00:00Z"}),
+            ("/api/tasks/stream_probe/executions/37", {}),
+            ("/api/tasks/stream_probe/executions/37", {"started_at": "2026-09-20T03:00:00"}),
+        ],
+    )
+    async def test_invalid_identity_returns_unprocessable(self, async_client, path, params):
+        response = await async_client.get(path, params=params)
+        assert response.status_code == 422
 
 
 class TestCancelTask:

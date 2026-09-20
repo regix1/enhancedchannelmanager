@@ -18,6 +18,8 @@ ordinary user-triggerable tasks). These tests prove:
 """
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -124,6 +126,75 @@ class TestPrivilegedTaskRunGate:
             resp = await async_client.post("/api/tasks/dbas_restore/run")
         assert resp.status_code == 200
         engine.run_task.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "task_id",
+        ["dbas_restore", "dbas_backup", "dbas_sync", "dbas_sync_7"],
+    )
+    async def test_non_admin_async_start_privileged_task_forbidden(
+        self, async_client, task_id
+    ):
+        from main import app
+
+        cleanup = _override_admin(app, is_admin=False)
+        engine = MagicMock()
+        engine.start_task = AsyncMock()
+        try:
+            with patch("task_engine.get_engine", return_value=engine):
+                response = await async_client.post(f"/api/tasks/{task_id}/runs")
+        finally:
+            cleanup()
+
+        assert response.status_code == 403
+        engine.start_task.assert_not_called()
+
+    async def test_admin_async_start_privileged_task_allowed(self, async_client):
+        from main import app
+        from task_engine import TaskRun
+
+        completion = asyncio.get_running_loop().create_future()
+        admitted = TaskRun(
+            execution_id=41,
+            task_id="dbas_restore",
+            started_at=datetime(2026, 9, 20, 3, 0, 0),
+            completion=completion,
+        )
+        cleanup = _override_admin(app, is_admin=True)
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=admitted)
+        try:
+            with patch("task_engine.get_engine", return_value=engine):
+                response = await async_client.post("/api/tasks/dbas_restore/runs")
+        finally:
+            cleanup()
+
+        assert response.status_code == 202
+        engine.start_task.assert_awaited_once()
+        completion.cancel()
+
+    async def test_non_admin_async_start_ordinary_task_allowed(self, async_client):
+        from main import app
+        from task_engine import TaskRun
+
+        completion = asyncio.get_running_loop().create_future()
+        admitted = TaskRun(
+            execution_id=42,
+            task_id="stream_probe",
+            started_at=datetime(2026, 9, 20, 3, 1, 0),
+            completion=completion,
+        )
+        cleanup = _override_admin(app, is_admin=False)
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=admitted)
+        try:
+            with patch("task_engine.get_engine", return_value=engine):
+                response = await async_client.post("/api/tasks/stream_probe/runs")
+        finally:
+            cleanup()
+
+        assert response.status_code == 202
+        engine.start_task.assert_awaited_once()
+        completion.cancel()
 
 
 @pytest.mark.asyncio

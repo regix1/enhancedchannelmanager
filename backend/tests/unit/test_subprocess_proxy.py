@@ -54,6 +54,7 @@ def test_allowlist_matches_only_profile_mutating_and_task_routes():
     assert _should_forward("POST", "/api/auto-creation/rules/7/run")
     assert _should_forward("POST", "/api/tasks/m3u_change_monitor/run")  # GAP B (non-numeric id)
     assert _should_forward("POST", "/api/tasks/channel_pipeline/run")
+    assert _should_forward("POST", "/api/tasks/m3u_change_monitor/runs")
     # Finding 2: a task CANCEL must hit the same (main) engine as its run.
     assert _should_forward("POST", "/api/tasks/m3u_change_monitor/cancel")
     assert _should_forward("POST", "/api/profile-conflict-reviews/42/accept")
@@ -64,6 +65,8 @@ def test_allowlist_matches_only_profile_mutating_and_task_routes():
     assert not _should_forward("POST", "/api/m3u/refresh")          # bulk refresh (no poll) stays local
     assert not _should_forward("GET", "/api/tasks/m3u_change_monitor/run")
     assert not _should_forward("POST", "/api/tasks/x/run/extra")    # anchored — no sub-path
+    assert not _should_forward("POST", "/api/tasks/x/runs/extra")   # anchored — no sub-path
+    assert not _should_forward("POST", "/api/tasks/x/runss")        # anchored — no suffix
     assert not _should_forward("GET", "/api/profile-conflict-reviews/42/accept")
 
 
@@ -127,6 +130,32 @@ async def test_subprocess_forwards_task_run_to_main_not_local():
     call_next.assert_not_awaited()
     assert "127.0.0.1:6100/api/tasks/m3u_change_monitor/run" in http_client.request.await_args.args[1]
     assert resp.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_subprocess_forwards_async_task_start_to_main_not_local():
+    """The accepted-run route must use the main engine and shared admission lock."""
+    factory, http_client = _fake_httpx(
+        status=202,
+        content=b'{"status":"accepted","execution_id":17}',
+    )
+    call_next = AsyncMock()
+
+    with patch("tls.https_server.is_https_subprocess", return_value=True), \
+         patch("config.get_http_port", return_value=6100), \
+         patch("tls.subprocess_proxy.httpx.AsyncClient", factory):
+        response = await subprocess_proxy_middleware(
+            _request("POST", "/api/tasks/m3u_change_monitor/runs"),
+            call_next,
+        )
+
+    call_next.assert_not_awaited()
+    assert http_client.request.await_args.args[0] == "POST"
+    assert (
+        "127.0.0.1:6100/api/tasks/m3u_change_monitor/runs"
+        in http_client.request.await_args.args[1]
+    )
+    assert response.status_code == 202
 
 
 @pytest.mark.parametrize("path", [

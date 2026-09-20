@@ -718,17 +718,9 @@ class TaskScheduler(ABC):
                 error="ALREADY_RUNNING",
             )
 
-        # Validate configuration
-        is_valid, error_msg = await self.validate_config()
-        if not is_valid:
-            logger.error("[%s] Configuration validation failed: %s", self.task_id, error_msg)
-            return TaskResult(
-                success=False,
-                message=f"Configuration validation failed: {error_msg}",
-                error="CONFIG_INVALID",
-            )
-
-        # Initialize for this run
+        # Publish the running state before validation can suspend. Explicit
+        # cancellation during validation must target this run and must not be
+        # erased by a later progress reset.
         self._reset_progress()
         self._status = TaskStatus.RUNNING
         self._progress.started_at = datetime.utcnow()
@@ -736,48 +728,72 @@ class TaskScheduler(ABC):
 
         result = TaskResult(
             success=False,
-            started_at=datetime.utcnow(),
+            started_at=self._progress.started_at,
         )
 
         try:
-            logger.info("[%s] Starting task: %s", self.task_id, self.task_name)
-            await self.on_start()
-
-            # Create progress notification
-            await self._create_progress_notification()
-
-            # Execute the task
-            result = await self.execute()
-            result.started_at = self._progress.started_at
-            result.completed_at = datetime.utcnow()
-
-            if self._cancel_requested:
+            is_valid, error_msg = await self.validate_config()
+            if not is_valid:
+                self._status = TaskStatus.FAILED
+                result.message = f"Configuration validation failed: {error_msg}"
+                result.error = "CONFIG_INVALID"
+                result.completed_at = datetime.utcnow()
+                logger.error(
+                    "[%s] Configuration validation failed: %s",
+                    self.task_id,
+                    error_msg,
+                )
+            elif self._cancel_requested:
                 self._status = TaskStatus.CANCELLED
                 result.success = False
                 result.message = "Task was cancelled"
                 result.error = "CANCELLED"
+                result.completed_at = datetime.utcnow()
                 await self.on_cancel()
                 logger.info("[%s] Task cancelled", self.task_id)
-            elif result.success:
-                self._status = TaskStatus.COMPLETED
-                await self.on_complete(result)
-                logger.info("[%s] Task completed successfully: %s", self.task_id, result.message)
-            elif task_outcome(result) is TaskOutcome.WARNING:
-                # The run did not succeed CLEANLY, but it ran to completion and
-                # left real, kept state (bead …-daziw). Calling that "Task
-                # failed" was the false positive bead …-bdmby closes:
-                # ``docs/user_guide/troubleshooting/read-the-logs.md`` tells
-                # operators to grep the log, and every degraded DBAS restore hit.
-                # ``on_complete`` stays gated on ``result.success`` — a task's
-                # own success hook is not this line's question.
-                self._status = TaskStatus.COMPLETED
-                logger.warning(
-                    "[%s] Task completed with warnings: %s", self.task_id, result.message
-                )
             else:
-                self._status = TaskStatus.FAILED
-                logger.warning("[%s] Task failed: %s", self.task_id, result.message)
+                logger.info("[%s] Starting task: %s", self.task_id, self.task_name)
+                await self.on_start()
+                await self._create_progress_notification()
 
+                result = await self.execute()
+                result.started_at = self._progress.started_at
+                result.completed_at = datetime.utcnow()
+
+                if self._cancel_requested:
+                    self._status = TaskStatus.CANCELLED
+                    result.success = False
+                    result.message = "Task was cancelled"
+                    result.error = "CANCELLED"
+                    await self.on_cancel()
+                    logger.info("[%s] Task cancelled", self.task_id)
+                elif result.success:
+                    self._status = TaskStatus.COMPLETED
+                    await self.on_complete(result)
+                    logger.info(
+                        "[%s] Task completed successfully: %s",
+                        self.task_id,
+                        result.message,
+                    )
+                elif task_outcome(result) is TaskOutcome.WARNING:
+                    self._status = TaskStatus.COMPLETED
+                    logger.warning(
+                        "[%s] Task completed with warnings: %s",
+                        self.task_id,
+                        result.message,
+                    )
+                else:
+                    self._status = TaskStatus.FAILED
+                    logger.warning("[%s] Task failed: %s", self.task_id, result.message)
+
+        except asyncio.CancelledError:
+            self._status = TaskStatus.CANCELLED
+            result.success = False
+            result.message = "Task was cancelled"
+            result.error = "CANCELLED"
+            result.completed_at = datetime.utcnow()
+            await self.on_cancel()
+            logger.info("[%s] Task coroutine cancelled", self.task_id)
         except Exception as e:
             self._status = TaskStatus.FAILED
             result.success = False
@@ -804,8 +820,12 @@ class TaskScheduler(ABC):
             if self._enabled and self.schedule_config.schedule_type != ScheduleType.MANUAL:
                 self._calculate_next_run()
 
-            # Reset to idle after a brief delay
-            await asyncio.sleep(0.1)
+            # A late engine shutdown cancellation must not replace a business
+            # result that already reached terminal finalization.
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                pass
             if self._status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 self._status = TaskStatus.IDLE
 

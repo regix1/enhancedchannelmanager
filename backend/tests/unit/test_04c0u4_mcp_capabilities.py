@@ -78,6 +78,10 @@ def test_normal_channel_automation_remains_allowed():
     assert is_mcp_route_allowed("GET", "/api/channels")
     assert is_mcp_route_allowed("PATCH", "/api/channels/{channel_id}")
     assert is_mcp_route_allowed("POST", "/api/settings")
+    assert is_mcp_route_allowed("POST", "/api/tasks/{task_id}/runs")
+    assert is_mcp_route_allowed(
+        "GET", "/api/tasks/{task_id}/executions/{execution_id}"
+    )
 
 
 def test_epg_row_read_is_a_declared_read_only_service_capability():
@@ -102,6 +106,20 @@ async def test_mcp_cannot_run_dbas_backup_directly():
         await run_task(
             "dbas_backup",
             TaskRunRequest(parameters={"include_credentials": False}),
+            is_admin=True,
+            caller_is_mcp=True,
+        )
+    assert exc.value.status_code == 403
+    assert "MCP service principal" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_mcp_cannot_start_privileged_task_directly():
+    from routers.tasks import start_task
+
+    with pytest.raises(HTTPException) as exc:
+        await start_task(
+            "dbas_sync_7",
             is_admin=True,
             caller_is_mcp=True,
         )

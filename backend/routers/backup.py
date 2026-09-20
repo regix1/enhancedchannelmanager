@@ -43,6 +43,7 @@ from auth.dependencies import (
     instance_has_operator_identity,
     is_mcp_service_principal,
 )
+from cache import get_cache
 from config import (
     CONFIG_DIR,
     CONFIG_FILE,
@@ -6592,6 +6593,7 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
             if tvg_id_template == "ecm-{channel_number}":
                 tvg_id_template = "ecm-{channel_id}"
             profile = DummyEPGProfile(
+                id=item.get("id"),
                 name=item["name"],
                 enabled=item.get("enabled", True),
                 name_source=item.get("name_source", "channel"),
@@ -6623,6 +6625,9 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 channel_group_ids=json.dumps(item["channel_group_ids"]) if item.get("channel_group_ids") else None,
                 hide_empty_group_ids=json.dumps(item["hide_empty_group_ids"]) if item.get("hide_empty_group_ids") else None,
             )
+            profile.set_stream_match_group_ids(item.get("stream_match_group_ids", []))
+            profile.set_epg_source_ids(item.get("epg_source_ids", []))
+            profile.set_channel_mappings(item.get("channel_mappings", []))
             session.add(profile)
             session.flush()
 
@@ -6635,6 +6640,7 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 )
                 session.add(a)
         session.commit()
+        get_cache().invalidate_prefix("dummy_epg_xmltv")
         return {"warnings": []}
     except Exception:
         session.rollback()

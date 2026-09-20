@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy.exc import IntegrityError
 
 import config as config_mod
 from models import (
@@ -1600,6 +1601,106 @@ class TestValidateYaml:
 
 class TestRestoreYaml:
     """Tests for POST /api/backup/restore-yaml."""
+
+    @pytest.mark.asyncio
+    async def test_dummy_epg_profile_round_trip_preserves_matching_state(
+        self, async_client, test_session
+    ):
+        """The YAML producer and restorer preserve profile-linked matching state."""
+        from routers.backup import _gather_db_tables, _restore_dummy_epg_profiles
+
+        profile = DummyEPGProfile(id=731, name="PPV Events")
+        profile.set_stream_match_group_ids([8, 13])
+        profile.set_epg_source_ids([21, 34])
+        profile.set_channel_mappings([
+            {"channel_id": 55, "source_id": 21, "tvg_id": "ufc"},
+        ])
+        test_session.add(profile)
+        test_session.flush()
+        test_session.add(DummyEPGChannelAssignment(
+            profile_id=731,
+            channel_id=55,
+            channel_name="PPV 1",
+            tvg_id_override="ppv-1",
+        ))
+        test_session.commit()
+
+        exported = _gather_db_tables()["dummy_epg_profiles"]
+        with patch("routers.backup.get_cache"):
+            _restore_dummy_epg_profiles(exported)
+
+        test_session.expire_all()
+        restored = test_session.query(DummyEPGProfile).one()
+        assert restored.id == 731
+        assert restored.get_stream_match_group_ids() == [8, 13]
+        assert restored.get_epg_source_ids() == [21, 34]
+        assert restored.get_channel_mappings() == [
+            {"channel_id": 55, "source_id": 21, "tvg_id": "ufc"},
+        ]
+        assignment = test_session.query(DummyEPGChannelAssignment).one()
+        assert assignment.profile_id == 731
+
+    @pytest.mark.asyncio
+    async def test_dummy_epg_restore_accepts_older_export(self, async_client, test_session):
+        """Exports without IDs or matching fields retain their historical defaults."""
+        from routers.backup import _restore_dummy_epg_profiles
+
+        with patch("routers.backup.get_cache"):
+            _restore_dummy_epg_profiles([{"name": "Legacy Events"}])
+
+        test_session.expire_all()
+        restored = test_session.query(DummyEPGProfile).one()
+        assert restored.id is not None
+        assert restored.get_stream_match_group_ids() == []
+        assert restored.get_epg_source_ids() == []
+        assert restored.get_channel_mappings() == []
+
+    @pytest.mark.asyncio
+    async def test_dummy_epg_restore_rolls_back_duplicate_ids(
+        self, async_client, test_session
+    ):
+        """A duplicate exported ID leaves the prior profiles and cache intact."""
+        from routers.backup import _restore_dummy_epg_profiles
+
+        existing = DummyEPGProfile(id=4, name="Existing Events")
+        test_session.add(existing)
+        test_session.flush()
+        test_session.add(DummyEPGChannelAssignment(
+            profile_id=4,
+            channel_id=91,
+            channel_name="Existing Slot",
+        ))
+        test_session.commit()
+
+        mock_cache = MagicMock()
+        with patch("routers.backup.get_cache", return_value=mock_cache):
+            with pytest.raises(IntegrityError):
+                _restore_dummy_epg_profiles([
+                    {"id": 12, "name": "First"},
+                    {"id": 12, "name": "Duplicate"},
+                ])
+
+        test_session.expire_all()
+        restored = test_session.query(DummyEPGProfile).one()
+        assert restored.id == 4
+        assert restored.name == "Existing Events"
+        assert test_session.query(DummyEPGChannelAssignment).one().profile_id == 4
+        mock_cache.invalidate_prefix.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dummy_epg_restore_invalidates_only_xmltv_cache(
+        self, async_client
+    ):
+        """A committed profile restore expires only generated XMLTV entries."""
+        from routers.backup import _restore_dummy_epg_profiles
+
+        mock_cache = MagicMock()
+        with patch("routers.backup.get_cache", return_value=mock_cache):
+            _restore_dummy_epg_profiles([{"id": 29, "name": "PPV Events"}])
+
+        mock_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+        mock_cache.invalidate.assert_not_called()
+        mock_cache.clear.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restores_all_sections(self, async_client, test_session):

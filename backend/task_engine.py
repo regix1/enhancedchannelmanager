@@ -12,10 +12,12 @@ import asyncio
 import copy
 import contextlib
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_, or_
+from sqlalchemy.exc import DisconnectionError, OperationalError, SQLAlchemyError
 
 import journal
 from database import get_session
@@ -566,6 +568,22 @@ def _warning_task_completion_message(task_id: str, result: TaskResult) -> str:
     )
 
 
+@dataclass
+class TaskRun:
+    """One admitted execution owned by the task engine."""
+
+    execution_id: int
+    task_id: str
+    started_at: datetime
+    completion: asyncio.Future[TaskResult]
+    started: bool = False
+    cancel_requested: bool = False
+
+
+class TaskHistoryError(RuntimeError):
+    """The accepted execution row cannot record its terminal state."""
+
+
 class TaskEngine:
     """
     Background execution engine for scheduled tasks.
@@ -581,8 +599,11 @@ class TaskEngine:
         self.check_interval = check_interval
         self.max_concurrent = max_concurrent
         self._running = False
+        self._stopping = False
         self._task: Optional[asyncio.Task] = None
         self._active_tasks: set[str] = set()  # Currently running task IDs
+        self._runs: dict[str, TaskRun] = {}
+        self._jobs: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
         # Notification callbacks for task progress
         self._create_notification_callback = None
@@ -601,6 +622,22 @@ class TaskEngine:
         self._delete_notification_callback = delete_callback
         logger.info("[TASK-ENGINE] Task engine notification callbacks configured")
 
+    def _track_job(self, coroutine) -> asyncio.Task:
+        """Retain a coroutine until it reaches a terminal state."""
+        job = asyncio.create_task(coroutine)
+        self._jobs.add(job)
+        job.add_done_callback(self._job_done)
+        return job
+
+    def _job_done(self, job: asyncio.Task) -> None:
+        """Release a finished job and observe exceptional completion."""
+        self._jobs.discard(job)
+        if job.cancelled():
+            return
+        error = job.exception()
+        if error is not None:
+            logger.error("[TASK-ENGINE] Owned task job failed: %s", error)
+
     async def start(self) -> None:
         """Start the task execution engine."""
         if self._running:
@@ -608,6 +645,7 @@ class TaskEngine:
             return
 
         logger.info("[TASK-ENGINE] Starting task execution engine")
+        self._stopping = False
         self._running = True
 
         # Cleanup any stale "running" executions from previous runs. Runs
@@ -653,10 +691,10 @@ class TaskEngine:
 
     async def stop(self) -> None:
         """Stop the task execution engine."""
-        if not self._running:
-            return
-
         logger.info("[TASK-ENGINE] Stopping task execution engine")
+        loop = asyncio.get_running_loop()
+        shutdown_at = loop.time() + 30
+        self._stopping = True
         self._running = False
 
         if self._task:
@@ -667,13 +705,33 @@ class TaskEngine:
                 logger.debug("[TASK-ENGINE] Task loop cancelled during shutdown")
             self._task = None
 
-        # Wait for active tasks to complete (with timeout)
+        jobs = {job for job in self._jobs if not job.done()}
+        if jobs:
+            logger.info(
+                "[TASK-ENGINE] Waiting for %s owned task jobs to complete...",
+                len(jobs),
+            )
+            normal_wait = max(0, shutdown_at - 5 - loop.time())
+            if normal_wait:
+                await asyncio.wait(jobs, timeout=normal_wait)
+
         if self._active_tasks:
-            logger.info("[TASK-ENGINE] Waiting for %s active tasks to complete...", len(self._active_tasks))
-            timeout = 30  # 30 second timeout
-            start = datetime.utcnow()
-            while self._active_tasks and (datetime.utcnow() - start).total_seconds() < timeout:
-                await asyncio.sleep(1)
+            for task_id in list(self._active_tasks):
+                await self.cancel_task(task_id)
+            await asyncio.sleep(0)
+
+        jobs = {job for job in self._jobs if not job.done()}
+        for job in jobs:
+            job.cancel()
+
+        remaining = max(0, shutdown_at - loop.time())
+        if jobs and remaining:
+            await asyncio.wait(jobs, timeout=remaining)
+
+        if loop.time() >= shutdown_at:
+            for run in list(self._runs.values()):
+                if not run.completion.done():
+                    run.completion.cancel()
 
         logger.info("[TASK-ENGINE] Task engine stopped")
 
@@ -952,7 +1010,7 @@ class TaskEngine:
 
                     # Found a due schedule - run the task
                     logger.info("[TASK-ENGINE] Task %s is due (via schedule), scheduling execution", task_id)
-                    asyncio.create_task(self._execute_task_with_schedules(
+                    self._track_job(self._execute_task_with_schedules(
                         task_id, triggered_schedules, triggered_by="scheduled"
                     ))
             finally:
@@ -977,7 +1035,9 @@ class TaskEngine:
 
                 if instance._next_run and instance._next_run <= now:
                     logger.info("[TASK-ENGINE] Task %s is due (legacy), scheduling execution", task_id)
-                    asyncio.create_task(self._execute_task(task_id, triggered_by="scheduled"))
+                    self._track_job(
+                        self._execute_task(task_id, triggered_by="scheduled")
+                    )
 
     async def _execute_task_with_schedules(
         self, task_id: str, triggered_schedules: list, triggered_by: str = "scheduled"
@@ -1009,7 +1069,7 @@ class TaskEngine:
                 parameters=schedule_parameters,
                 schedule_id=schedule.id,
             )
-            if result:
+            if result and result.error not in {"ALREADY_RUNNING", "ENGINE_STOPPING"}:
                 results.append((schedule.id, result))
 
         # Update next_run_at for triggered schedules
@@ -1062,25 +1122,14 @@ class TaskEngine:
 
         return results[-1][1] if results else None
 
-    async def _execute_task(
+    async def _start_task(
         self,
         task_id: str,
         triggered_by: str = "manual",
         parameters: Optional[dict] = None,
         schedule_id: Optional[int] = None,
-    ) -> Optional[TaskResult]:
-        """
-        Execute a task and record the result.
-
-        Args:
-            task_id: ID of task to execute
-            triggered_by: Who triggered the task ("scheduled", "manual", "api")
-            parameters: Task-specific parameters from the schedule (e.g., channel_groups, batch_size)
-            schedule_id: ID of the schedule that triggered this execution (for tracking)
-
-        Returns:
-            TaskResult or None if task not found
-        """
+    ) -> TaskRun | TaskResult | None:
+        """Commit one execution and publish its engine-owned task job."""
         registry = get_registry()
         instance = registry.get_task_instance(task_id)
 
@@ -1088,8 +1137,14 @@ class TaskEngine:
             logger.error("[%s] Task not found", task_id)
             return None
 
-        # Check if already running
         async with self._lock:
+            if self._stopping:
+                logger.warning("[%s] Task engine is stopping", task_id)
+                return TaskResult(
+                    success=False,
+                    message="Task engine is stopping",
+                    error="ENGINE_STOPPING",
+                )
             if task_id in self._active_tasks:
                 logger.warning("[%s] Task is already running", task_id)
                 return TaskResult(
@@ -1097,25 +1152,189 @@ class TaskEngine:
                     message="Task is already running",
                     error="ALREADY_RUNNING",
                 )
+
+            execution = TaskExecution(
+                task_id=task_id,
+                started_at=datetime.utcnow(),
+                status="running",
+                triggered_by=triggered_by,
+            )
+            session = None
+            try:
+                session = get_session()
+                session.add(execution)
+                session.commit()
+                if execution.id is None:
+                    raise TaskHistoryError("Committed task execution has no identity")
+                execution_id = execution.id
+                execution_started_at = execution.started_at
+            except Exception:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        session.rollback()
+                logger.exception("[%s] Failed to create execution record", task_id)
+                raise
+            finally:
+                if session is not None:
+                    session.close()
+
+            completion = asyncio.get_running_loop().create_future()
+            run = TaskRun(
+                execution_id=execution_id,
+                task_id=task_id,
+                started_at=execution_started_at,
+                completion=completion,
+            )
             self._active_tasks.add(task_id)
+            self._runs[task_id] = run
+            coroutine = self._run_task(
+                run,
+                instance,
+                triggered_by=triggered_by,
+                parameters=parameters,
+                schedule_id=schedule_id,
+            )
+            try:
+                self._track_job(coroutine)
+            except BaseException as error:
+                coroutine.close()
+                self._active_tasks.discard(task_id)
+                if self._runs.get(task_id) is run:
+                    self._runs.pop(task_id, None)
+                completion.cancel()
+                session = get_session()
+                try:
+                    execution = session.get(TaskExecution, run.execution_id)
+                    if execution is not None:
+                        execution.status = "failed"
+                        execution.success = False
+                        execution.completed_at = datetime.utcnow()
+                        execution.error = "TASK_LAUNCH_FAILED"
+                        session.commit()
+                finally:
+                    session.close()
+                logger.exception("[%s] Failed to launch owned task job: %s", task_id, error)
+                raise
 
-        # Create execution record
-        execution = TaskExecution(
-            task_id=task_id,
-            started_at=datetime.utcnow(),
-            status="running",
+            return run
+
+    async def _execute_task(
+        self,
+        task_id: str,
+        triggered_by: str = "manual",
+        parameters: Optional[dict] = None,
+        schedule_id: Optional[int] = None,
+    ) -> Optional[TaskResult]:
+        """Execute through the shared admission owner and await completion."""
+        admitted = await self._start_task(
+            task_id,
             triggered_by=triggered_by,
+            parameters=parameters,
+            schedule_id=schedule_id,
         )
+        if not isinstance(admitted, TaskRun):
+            return admitted
+        return await asyncio.shield(admitted.completion)
 
-        try:
-            session = get_session()
-            session.add(execution)
-            session.commit()
-            execution_id = execution.id
-            session.close()
-        except Exception as e:
-            logger.exception("[%s] Failed to create execution record: %s", task_id, e)
-            execution_id = None
+    async def _persist_task_result(self, run: TaskRun, result: TaskResult) -> None:
+        """Persist one terminal result, retrying only connection failures."""
+        import json
+
+        delay = 1
+        retrying = False
+        while True:
+            session = None
+            try:
+                session = get_session()
+                execution = session.get(TaskExecution, run.execution_id)
+                if execution is None:
+                    raise TaskHistoryError(
+                        f"Task execution {run.execution_id} no longer exists"
+                    )
+                execution.completed_at = result.completed_at
+                execution.duration_seconds = result.duration_seconds
+                execution.status = execution_status(result)
+                execution.success = execution_succeeded(result)
+                execution.message = result.message
+                execution.error = result.error
+                execution.total_items = result.total_items
+                execution.success_count = result.success_count
+                execution.failed_count = result.failed_count
+                execution.skipped_count = result.skipped_count
+                execution.details = json.dumps(result.details) if result.details else None
+                session.commit()
+                if retrying:
+                    logger.info(
+                        "[%s] Task execution history persistence recovered",
+                        run.task_id,
+                    )
+                return
+            except (OperationalError, DisconnectionError) as error:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        session.rollback()
+                if not retrying:
+                    logger.exception(
+                        "[%s] Task execution history persistence failed; retrying: %s",
+                        run.task_id,
+                        error,
+                    )
+                retrying = True
+            except SQLAlchemyError as error:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        session.rollback()
+                raise TaskHistoryError(
+                    f"Task execution {run.execution_id} could not be persisted"
+                ) from error
+            finally:
+                if session is not None:
+                    session.close()
+
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    async def _run_task(
+        self,
+        run: TaskRun,
+        instance,
+        triggered_by: str,
+        parameters: Optional[dict],
+        schedule_id: Optional[int],
+    ) -> TaskResult:
+        """Own one admitted task body through terminal persistence and cleanup."""
+        task_id = run.task_id
+        execution_id = run.execution_id
+        registry = get_registry()
+        run.started = True
+
+        if run.cancel_requested:
+            completed_at = datetime.utcnow()
+            result = TaskResult(
+                success=False,
+                message="Task was cancelled",
+                error="CANCELLED",
+                started_at=run.started_at,
+                completed_at=completed_at,
+            )
+            try:
+                await self._persist_task_result(run, result)
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    if not run.completion.done():
+                        run.completion.cancel()
+                elif not run.completion.done():
+                    run.completion.set_exception(error)
+                    run.completion.exception()
+                raise
+            finally:
+                async with self._lock:
+                    if self._runs.get(task_id) is run:
+                        self._runs.pop(task_id, None)
+                        self._active_tasks.discard(task_id)
+            if not run.completion.done():
+                run.completion.set_result(result)
+            return result
 
         # Attribute every journal row made by this run to "scheduler" when the
         # run was triggered by the scheduler (no HTTP request, so the actor-source
@@ -1130,6 +1349,9 @@ class TaskEngine:
             else None
         )
         invocation_config = None
+        result: Optional[TaskResult] = None
+        terminal_committed = False
+        completion_error: Optional[BaseException] = None
 
         try:
             # Registry instances are long-lived singletons. Treat run parameters
@@ -1216,35 +1438,11 @@ class TaskEngine:
             instance.set_run_trigger(triggered_by)
             result = await instance.run()
 
-            # Update execution record
-            if execution_id:
-                try:
-                    session = get_session()
-                    execution = session.query(TaskExecution).get(execution_id)
-                    if execution:
-                        execution.completed_at = result.completed_at
-                        execution.duration_seconds = result.duration_seconds
-                        # Severity comes from the ONE derivation (bead …-fexq1),
-                        # so the stored row cannot contradict the alert emitted
-                        # for the same run a few lines below. Previously both
-                        # fields were read off result.success alone, which
-                        # stored a degraded-but-completed run as "failed" while
-                        # its own notification said "Completed with Warnings".
-                        execution.status = execution_status(result)
-                        execution.success = execution_succeeded(result)
-                        execution.message = result.message
-                        execution.error = result.error
-                        execution.total_items = result.total_items
-                        execution.success_count = result.success_count
-                        execution.failed_count = result.failed_count
-                        execution.skipped_count = result.skipped_count
-                        if result.details:
-                            import json
-                            execution.details = json.dumps(result.details)
-                        session.commit()
-                    session.close()
-                except Exception as e:
-                    logger.exception("[%s] Failed to update execution record: %s", task_id, e)
+            # Persist before publishing completion side effects. A transient
+            # database outage keeps the row running and retries this write; it
+            # never re-enters the task body.
+            await self._persist_task_result(run, result)
+            terminal_committed = True
 
             # Update registry
             registry.sync_to_database(task_id)
@@ -1451,63 +1649,90 @@ class TaskEngine:
                         alert_category=alert_category,
                     )
 
-            return result
-
-        except Exception as e:
-            logger.exception("[%s] Task execution failed: %s", task_id, e)
-            failure_error = getattr(e, "error_code", str(e))
-
-            # Determine alert category for granular filtering
-            alert_category = "probe_failures" if task_id == "stream_probe" else None
-
-            # Log exception to journal
-            log_entry(
-                category="task",
-                action_type="error",
-                entity_name=instance.task_name,
-                description=f"Error in {instance.task_name}: {str(e)}",
-                entity_id=execution_id,
-                after_value={
-                    "task_id": task_id,
-                    "error": str(e),
-                    "triggered_by": triggered_by,
-                },
-                user_initiated=(triggered_by == "manual"),
-            )
-
-            # Send error notification for exception
-            await self._notify_task_result(
-                task_name=instance.task_name,
-                task_id=task_id,
-                notification_type="error",
-                title=f"Task Error: {instance.task_name}",
-                message=f"Task failed with exception: {str(e)}",
-                result=None,
-                alert_category=alert_category,
-            )
-
-            # Update execution record with error
-            if execution_id:
+        except TaskHistoryError as error:
+            completion_error = error
+            logger.exception("[%s] Task execution history failed: %s", task_id, error)
+        except asyncio.CancelledError as error:
+            if terminal_committed:
+                logger.debug(
+                    "[%s] Owned task job cancelled after terminal persistence",
+                    task_id,
+                )
+            elif result is not None and result.completed_at is not None:
+                completion_error = error
+                logger.warning(
+                    "[%s] Owned task job cancelled before terminal persistence completed",
+                    task_id,
+                )
+            else:
+                result = TaskResult(
+                    success=False,
+                    message="Task was cancelled",
+                    error="CANCELLED",
+                    started_at=run.started_at,
+                    completed_at=datetime.utcnow(),
+                )
                 try:
-                    session = get_session()
-                    execution = session.query(TaskExecution).get(execution_id)
-                    if execution:
-                        execution.completed_at = datetime.utcnow()
-                        execution.status = "failed"
-                        execution.success = False
-                        execution.error = failure_error
-                        session.commit()
-                    session.close()
-                except Exception as db_err:
-                    logger.exception("[%s] Failed to update execution record: %s", task_id, db_err)
+                    await self._persist_task_result(run, result)
+                    terminal_committed = True
+                except BaseException as persist_error:
+                    completion_error = persist_error
+        except Exception as error:
+            if terminal_committed and result is not None:
+                logger.exception(
+                    "[%s] Post-completion task side effect failed: %s",
+                    task_id,
+                    error,
+                )
+            else:
+                logger.exception("[%s] Task execution failed: %s", task_id, error)
+                failure_error = getattr(error, "error_code", str(error))
+                result = TaskResult(
+                    success=False,
+                    message=f"Task execution failed: {str(error)}",
+                    error=failure_error,
+                    started_at=run.started_at,
+                    completed_at=datetime.utcnow(),
+                )
+                try:
+                    await self._persist_task_result(run, result)
+                    terminal_committed = True
+                except BaseException as persist_error:
+                    completion_error = persist_error
 
-            return TaskResult(
-                success=False,
-                message=f"Task execution failed: {str(e)}",
-                error=failure_error,
-                started_at=datetime.utcnow(),
-                completed_at=datetime.utcnow(),
-            )
+                if completion_error is None:
+                    alert_category = (
+                        "probe_failures" if task_id == "stream_probe" else None
+                    )
+                    try:
+                        log_entry(
+                            category="task",
+                            action_type="error",
+                            entity_name=instance.task_name,
+                            description=f"Error in {instance.task_name}: {str(error)}",
+                            entity_id=execution_id,
+                            after_value={
+                                "task_id": task_id,
+                                "error": str(error),
+                                "triggered_by": triggered_by,
+                            },
+                            user_initiated=(triggered_by == "manual"),
+                        )
+                        await self._notify_task_result(
+                            task_name=instance.task_name,
+                            task_id=task_id,
+                            notification_type="error",
+                            title=f"Task Error: {instance.task_name}",
+                            message=f"Task failed with exception: {str(error)}",
+                            result=result,
+                            alert_category=alert_category,
+                        )
+                    except Exception as side_effect_error:
+                        logger.exception(
+                            "[%s] Failed to publish task failure side effects: %s",
+                            task_id,
+                            side_effect_error,
+                        )
 
         finally:
             try:
@@ -1520,24 +1745,56 @@ class TaskEngine:
                 if _scheduler_source_token is not None:
                     journal.reset_mutation_source(_scheduler_source_token)
                 async with self._lock:
-                    self._active_tasks.discard(task_id)
+                    if self._runs.get(task_id) is run:
+                        self._runs.pop(task_id, None)
+                        self._active_tasks.discard(task_id)
 
-    async def run_task(self, task_id: str, schedule_id: Optional[int] = None, parameters: Optional[dict] = None) -> Optional[TaskResult]:
-        """
-        Manually run a task (API entry point).
+        if completion_error is not None:
+            if isinstance(completion_error, asyncio.CancelledError):
+                if not run.completion.done():
+                    run.completion.cancel()
+            elif not run.completion.done():
+                run.completion.set_exception(completion_error)
+                run.completion.exception()
+            raise completion_error
+
+        if result is None:
+            error = TaskHistoryError(
+                f"Task execution {execution_id} completed without a result"
+            )
+            if not run.completion.done():
+                run.completion.set_exception(error)
+                run.completion.exception()
+            raise error
+
+        if not run.completion.done():
+            run.completion.set_result(result)
+        return result
+
+    async def start_task(
+        self,
+        task_id: str,
+        schedule_id: Optional[int] = None,
+        parameters: Optional[dict] = None,
+    ) -> TaskRun | TaskResult | None:
+        """Admit a manual task and return after its owned job is published.
 
         Args:
             task_id: ID of task to run
             schedule_id: Optional schedule ID to use parameters from
             parameters: Optional ad-hoc parameters (takes priority over schedule)
 
-        Returns:
-            TaskResult or None if task not found
+        Returns a TaskRun for accepted work, the existing refusal result for a
+        duplicate or stopped engine, or None when the task is unknown.
         """
         if parameters:
             logger.info("[%s] Manual run with ad-hoc parameters: %s", task_id,
                         _param_keys(parameters))
-            return await self._execute_task(task_id, triggered_by="manual", parameters=parameters)
+            return await self._start_task(
+                task_id,
+                triggered_by="manual",
+                parameters=parameters,
+            )
 
         if schedule_id:
             # Load parameters from the specified schedule
@@ -1559,7 +1816,23 @@ class TaskEngine:
             except Exception as e:
                 logger.exception("[%s] Failed to load schedule parameters: %s", task_id, e)
 
-        return await self._execute_task(task_id, triggered_by="manual", parameters=parameters, schedule_id=schedule_id)
+        return await self._start_task(
+            task_id,
+            triggered_by="manual",
+            parameters=parameters,
+            schedule_id=schedule_id,
+        )
+
+    async def run_task(self, task_id: str, schedule_id: Optional[int] = None, parameters: Optional[dict] = None) -> Optional[TaskResult]:
+        """Manually run a task and preserve the awaited completion contract."""
+        admitted = await self.start_task(
+            task_id,
+            schedule_id=schedule_id,
+            parameters=parameters,
+        )
+        if not isinstance(admitted, TaskRun):
+            return admitted
+        return await asyncio.shield(admitted.completion)
 
     async def cancel_task(self, task_id: str) -> dict:
         """
@@ -1577,8 +1850,16 @@ class TaskEngine:
         if not instance:
             return {"status": "not_found", "message": f"Task {task_id} not found"}
 
-        if task_id not in self._active_tasks:
+        run = self._runs.get(task_id)
+        if run is None:
             return {"status": "not_running", "message": f"Task {task_id} is not running"}
+
+        if not run.started:
+            run.cancel_requested = True
+            return {
+                "status": "cancelling",
+                "message": "Cancellation requested",
+            }
 
         return instance.cancel()
 
@@ -1593,6 +1874,32 @@ class TaskEngine:
             "active_task_count": len(self._active_tasks),
             "registered_task_count": len(registry.list_task_ids()),
         }
+
+    def get_task_execution(
+        self,
+        task_id: str,
+        execution_id: int,
+        started_at: datetime,
+    ) -> Optional[dict]:
+        """Read one execution by its full immutable acceptance identity."""
+        if started_at.tzinfo is not None:
+            started_at = started_at.astimezone(timezone.utc).replace(tzinfo=None)
+
+        session = get_session()
+        try:
+            query = session.query(TaskExecution).filter(
+                TaskExecution.id == execution_id,
+                TaskExecution.task_id == task_id,
+            )
+            query, empty = _scope_to_sync_target_lifetimes(session, query, task_id)
+            if empty:
+                return None
+            execution = query.first()
+            if execution is None or execution.started_at != started_at:
+                return None
+            return execution.to_dict()
+        finally:
+            session.close()
 
     def get_task_history(
         self,
@@ -1648,7 +1955,8 @@ class TaskEngine:
             try:
                 cutoff = datetime.utcnow() - timedelta(days=days)
                 result = session.query(TaskExecution).filter(
-                    TaskExecution.started_at < cutoff
+                    TaskExecution.started_at < cutoff,
+                    TaskExecution.status != "running",
                 ).delete()
                 session.commit()
                 logger.info("[TASK-ENGINE] Purged %s task execution records older than %s days", result, days)

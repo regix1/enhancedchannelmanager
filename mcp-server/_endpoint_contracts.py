@@ -1409,6 +1409,38 @@ ENDPOINTS: dict[str, Endpoint] = {
         path="/api/tasks/{task_id}/run",
         request_fields=frozenset({"schedule_id", "parameters"}),  # TaskRunRequest (optional)
     ),
+    "tasks_start": Endpoint(
+        name="tasks_start",
+        method="POST",
+        path="/api/tasks/{task_id}/runs",
+        request_fields=frozenset({"schedule_id", "parameters"}),  # TaskRunRequest (optional)
+        response_fields=frozenset({"status", "task_id", "execution_id", "started_at"}),
+    ),
+    "tasks_execution": Endpoint(
+        name="tasks_execution",
+        method="GET",
+        path="/api/tasks/{task_id}/executions/{execution_id}",
+        query_params=frozenset({"started_at"}),
+        response_fields=frozenset(
+            {
+                "id",
+                "task_id",
+                "started_at",
+                "completed_at",
+                "duration_seconds",
+                "status",
+                "success",
+                "message",
+                "error",
+                "total_items",
+                "success_count",
+                "failed_count",
+                "skipped_count",
+                "details",
+                "triggered_by",
+            }
+        ),
+    ),
     "tasks_cancel": Endpoint(
         name="tasks_cancel",
         method="POST",

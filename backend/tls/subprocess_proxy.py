@@ -64,9 +64,10 @@ _FORWARD_ALLOWLIST = [
     ("POST", re.compile(r"^/api/channel-pipeline/rules/\d+/run$")),
     ("POST", re.compile(r"^/api/auto-creation/run$")),
     ("POST", re.compile(r"^/api/auto-creation/rules/\d+/run$")),
-    # Task run AND cancel — both must hit the SAME (main) engine, else a
+    # Task start, legacy run, AND cancel must hit the SAME (main) engine, else a
     # forwarded run cannot be cancelled from HTTPS (per-process _active_tasks).
     ("POST", re.compile(r"^/api/tasks/[^/]+/run$")),
+    ("POST", re.compile(r"^/api/tasks/[^/]+/runs$")),
     ("POST", re.compile(r"^/api/tasks/[^/]+/cancel$")),
     ("POST", re.compile(r"^/api/profile-conflict-reviews/\d+/accept$")),
 ]

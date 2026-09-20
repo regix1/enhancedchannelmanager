@@ -1,5 +1,7 @@
 """Direct-ASGI adversarial checks for the MCP service-principal boundary."""
 
+import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -131,7 +133,9 @@ async def test_direct_mcp_dbas_backup_run_is_human_only_before_validation_or_exe
     "path,body",
     [
         ("/api/tasks/dbas_restore/run", {}),
+        ("/api/tasks/dbas_restore/runs", {}),
         ("/api/tasks/dbas_sync_7/run", {}),
+        ("/api/tasks/dbas_sync_7/runs", {}),
         (
             "/api/tasks/dbas_sync_7/schedules",
             {"schedule_type": "daily", "schedule_time": "03:00"},
@@ -179,6 +183,25 @@ async def test_external_mcp_client_key_cannot_reach_even_safe_backend_capability
 
 
 @pytest.mark.asyncio
+async def test_external_mcp_client_key_cannot_enter_async_task_start(async_client):
+    engine_factory = MagicMock(side_effect=AssertionError("task engine was reached"))
+    with (
+        patch("main.get_auth_settings", return_value=_auth_on()),
+        patch("main.get_settings", return_value=_runtime_settings()),
+        patch("auth.dependencies.get_auth_settings", return_value=_auth_on()),
+        patch("auth.dependencies.get_settings", return_value=_runtime_settings()),
+        patch("task_engine.get_engine", engine_factory),
+    ):
+        response = await async_client.post(
+            "/api/tasks/stream_probe/runs",
+            json={},
+            headers={"Authorization": f"Bearer {MCP_KEY}"},
+        )
+    assert response.status_code == 403, response.text
+    engine_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_private_sidecar_principal_with_bound_claim_reaches_safe_capability(async_client):
     credentials = MCPServiceCredentials("private-backend-key", "private-confirmation-key")
     claim = issue_test_claim(credentials, "GET", "/api/channels", None)
@@ -202,3 +225,42 @@ async def test_private_sidecar_principal_with_bound_claim_reaches_safe_capabilit
         )
     assert response.status_code == 200, response.text
     client.get_channels.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_private_sidecar_principal_can_start_ordinary_task(async_client):
+    from task_engine import TaskRun
+
+    credentials = MCPServiceCredentials("private-backend-key", "private-confirmation-key")
+    path = "/api/tasks/stream_probe/runs"
+    body = {}
+    claim = issue_test_claim(credentials, "POST", path, body)
+    completion = asyncio.get_running_loop().create_future()
+    admitted = TaskRun(
+        execution_id=73,
+        task_id="stream_probe",
+        started_at=datetime(2026, 9, 20, 3, 0, 0),
+        completion=completion,
+    )
+    engine = MagicMock()
+    engine.start_task = AsyncMock(return_value=admitted)
+    with (
+        patch("main.get_auth_settings", return_value=_auth_on()),
+        patch("main.get_settings", return_value=_runtime_settings()),
+        patch("main.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.get_auth_settings", return_value=_auth_on()),
+        patch("task_engine.get_engine", return_value=engine),
+    ):
+        response = await async_client.post(
+            path,
+            json=body,
+            headers={
+                "Authorization": "Bearer private-backend-key",
+                MCP_CLAIM_HEADER: claim,
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    engine.start_task.assert_awaited_once()
+    completion.cancel()

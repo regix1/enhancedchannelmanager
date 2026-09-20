@@ -5,10 +5,11 @@ Extracted from main.py (Phase 2 of v0.13.0 backend refactor).
 """
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, model_validator
+from fastapi import APIRouter, HTTPException, Path, Query, status
+from pydantic import BaseModel, Field, model_validator
 
 from auth import ResolveIsAdminIfEnabled, ResolveIsMcpServicePrincipalIfEnabled
 from database import get_session
@@ -102,6 +103,42 @@ class TaskRunRequest(BaseModel):
     """Request body for running a task."""
     schedule_id: Optional[int] = None  # Run with parameters from a specific schedule
     parameters: Optional[dict] = None  # Ad-hoc parameters for one-off runs
+
+
+class TaskStartResponse(BaseModel):
+    """Identity returned after durable asynchronous task admission."""
+
+    status: Literal["accepted"]
+    task_id: str
+    execution_id: int = Field(gt=0)
+    started_at: datetime
+
+
+class TaskExecutionResponse(BaseModel):
+    """One exact persisted task execution."""
+
+    id: int
+    task_id: str
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    status: Literal[
+        "running",
+        "completed",
+        "completed_with_warnings",
+        "failed",
+        "cancelled",
+        "terminated",
+    ]
+    success: Optional[bool] = None
+    message: Optional[str] = None
+    error: Optional[str] = None
+    total_items: int
+    success_count: int
+    failed_count: int
+    skipped_count: int
+    details: Optional[dict] = None
+    triggered_by: str
 
 
 class CronValidateRequest(BaseModel):
@@ -660,6 +697,105 @@ async def run_task(
         raise
     except Exception as e:
         logger.exception("[TASKS] Failed to run task %s: %s", task_id, e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/api/tasks/{task_id}/runs",
+    tags=["Tasks"],
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TaskStartResponse,
+)
+async def start_task(
+    task_id: str,
+    request: Optional[TaskRunRequest] = None,
+    is_admin: bool = ResolveIsAdminIfEnabled,
+    caller_is_mcp: bool = ResolveIsMcpServicePrincipalIfEnabled,
+):
+    """Admit a task and return its durable execution identity."""
+    logger.debug("[TASKS] POST /api/tasks/%s/runs", task_id)
+    _authorize_privileged_task_write(task_id, is_admin, caller_is_mcp)
+    try:
+        from task_engine import TaskRun, get_engine
+
+        engine = get_engine()
+        schedule_id = request.schedule_id if request else None
+        parameters = request.parameters if request else None
+        admitted = await engine.start_task(
+            task_id,
+            schedule_id=schedule_id,
+            parameters=parameters,
+        )
+        if admitted is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        if not isinstance(admitted, TaskRun):
+            if admitted.error == "ALREADY_RUNNING":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": admitted.error, "message": admitted.message},
+                )
+            if admitted.error == "ENGINE_STOPPING":
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": admitted.error, "message": admitted.message},
+                )
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+        return TaskStartResponse(
+            status="accepted",
+            task_id=admitted.task_id,
+            execution_id=admitted.execution_id,
+            started_at=admitted.started_at.replace(tzinfo=timezone.utc),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[TASKS] Failed to start task %s: %s", task_id, e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/api/tasks/{task_id}/executions/{execution_id}",
+    tags=["Tasks"],
+    response_model=TaskExecutionResponse,
+)
+async def get_task_execution(
+    task_id: str,
+    execution_id: int = Path(gt=0),
+    started_at: datetime = Query(),
+):
+    """Read one execution by the identity returned at admission."""
+    logger.debug(
+        "[TASKS] GET /api/tasks/%s/executions/%s",
+        task_id,
+        execution_id,
+    )
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        raise HTTPException(
+            status_code=422,
+            detail="started_at must include a timezone offset",
+        )
+    normalized_started_at = started_at.astimezone(timezone.utc).replace(tzinfo=None)
+    try:
+        from task_engine import get_engine
+
+        execution = get_engine().get_task_execution(
+            task_id,
+            execution_id,
+            normalized_started_at,
+        )
+        if execution is None:
+            raise HTTPException(status_code=404, detail="Task execution not found")
+        return execution
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            "[TASKS] Failed to read task execution %s for %s: %s",
+            execution_id,
+            task_id,
+            e,
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

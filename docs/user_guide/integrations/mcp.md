@@ -693,6 +693,51 @@ key. The `/sse` endpoint was removed.
 
 ---
 
+## Run long tasks and resume status checks
+
+`run_task` waits for the task's terminal result by default. This preserves the
+behavior of existing MCP clients. The wait has no overall duration limit, but
+the MCP client or its connection can still stop a tool call before the task
+finishes.
+
+For a task that may outlive one tool call, start it with
+`wait_for_completion=false`. The tool returns after ECM accepts the run and
+provides a JSON identity with `status`, `task_id`, `execution_id`, and
+`started_at`. Save the identity before starting a long wait.
+
+```text
+run_task(task_id="m3u_refresh", wait_for_completion=false)
+```
+
+Use the returned values in the read-only execution tool. Set
+`wait_for_completion=true` to keep polling that exact run until it reaches a
+terminal status.
+
+```text
+get_task_execution(
+  task_id="m3u_refresh",
+  execution_id=41,
+  started_at="2026-09-20T03:00:00Z",
+  wait_for_completion=true
+)
+```
+
+If the waiting call is interrupted or times out, repeat only
+`get_task_execution` with the same identity. Do not call `run_task` again to
+resume waiting because that would request another run. Omit
+`wait_for_completion`, or set it to false, to fetch one status snapshot.
+
+The terminal statuses are `completed`, `completed_with_warnings`, `failed`,
+`cancelled`, and `terminated`. The returned JSON keeps the actual status and
+any backend `message` or `error`; it does not describe failed, cancelled, or
+terminated work as successful.
+
+Cancelling an MCP wait stops only that observer. It does not cancel the task in
+ECM. Use `cancel_task` when you intend to request cancellation of the backend
+task. If the initial `run_task` acceptance call itself ends without returning
+an identity, do not retry it automatically because ECM may already have
+started the task.
+
 ## Going deeper
 
 - **Architecture**: [`docs/architecture.md`](https://github.com/MotWakorb/enhancedchannelmanager/blob/main/docs/architecture.md), covering the MCP

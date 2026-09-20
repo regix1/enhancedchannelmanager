@@ -230,6 +230,7 @@ class CleanupTask(TaskScheduler):
                 try:
                     result = session.query(TaskExecution).filter(
                         TaskExecution.started_at < task_cutoff,
+                        TaskExecution.status != "running",
                     ).delete(synchronize_session=False)
                     deleted_counts["task_executions"] = result
                     session.commit()

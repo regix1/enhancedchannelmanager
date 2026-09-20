@@ -829,6 +829,249 @@ class TestGetXmltvProfile:
 
         assert response.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_generates_ufc_title_from_live_event_stream(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(
+            test_session,
+            name="UFC Slots",
+            name_source="stream",
+            stream_index=1,
+            title_pattern=(
+                r"^LIVE\s+EVENT\s+\d{1,2}\s+"
+                r"\d{1,2}(?::\d{2})?\s*[AaPp][Mm]\s+(?P<title>.+?)\s*$"
+            ),
+            event_timezone="US/Eastern",
+            tvg_id_template="ecm-{channel_id}",
+        )
+        profile.set_channel_group_ids([16])
+        test_session.commit()
+        channels = {
+            10: {
+                "id": 10,
+                "name": "UFC02",
+                "channel_number": 8102,
+                "channel_group_id": 16,
+                "streams": [
+                    {"id": 2134594, "name": "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2"},
+                    {"id": 1868499, "name": "UFC 02"},
+                ],
+            },
+        }
+        cache = MagicMock()
+        cache.get.return_value = None
+
+        def prepared(profiles, *_args, **_kwargs):
+            return profiles, {"sources": [{"status": "ready"}], "channels": []}
+
+        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)), \
+             patch("routers.dummy_epg.cache", cache), \
+             patch("services.epg_programmes.prepare_profiles", AsyncMock(side_effect=prepared)), \
+             patch("services.epg_programmes.can_cache", return_value=True):
+            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+
+        assert response.status_code == 200, response.text
+        assert "UFC 331 Van v Pantoja 2" in response.text
+        assert "LIVE EVENT 02" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_source_backed_ufc_profile_does_not_derive_live_event_title(
+        self, async_client, test_session,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        profile = _create_profile(
+            test_session,
+            name="UFC Slots",
+            name_source="stream",
+            stream_index=1,
+            title_pattern=(
+                r"^LIVE\s+EVENT\s+\d{1,2}\s+"
+                r"\d{1,2}(?::\d{2})?\s*[AaPp][Mm]\s+(?P<title>.+?)\s*$"
+            ),
+            event_timezone="US/Eastern",
+            tvg_id_template="ecm-{channel_id}",
+        )
+        profile.set_channel_group_ids([16])
+        profile.set_epg_source_ids([51])
+        test_session.commit()
+        channels = {
+            10: {
+                "id": 10,
+                "name": "UFC02",
+                "channel_number": 8102,
+                "channel_group_id": 16,
+                "streams": [{
+                    "id": 2134594,
+                    "name": "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
+                }],
+            },
+        }
+        guide_start = datetime(2026, 9, 20, tzinfo=timezone.utc)
+        cache = MagicMock()
+        cache.get.return_value = None
+
+        def prepared(profiles, *_args, **_kwargs):
+            rows = []
+            for saved in profiles:
+                saved = dict(saved)
+                saved.update({
+                    "source_programmes": {10: []},
+                    "guide_start": guide_start,
+                    "guide_stop": guide_start + timedelta(days=1),
+                })
+                rows.append(saved)
+            return rows, {"sources": [{"status": "ready"}], "channels": []}
+
+        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)), \
+             patch("routers.dummy_epg.cache", cache), \
+             patch("services.epg_programmes.prepare_profiles", AsyncMock(side_effect=prepared)), \
+             patch("services.epg_programmes.can_cache", return_value=True):
+            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+
+        assert response.status_code == 200, response.text
+        assert "UFC 331 Van v Pantoja 2" not in response.text
+        assert "Programming unavailable" in response.text
+
+
+class TestProfileSplit:
+    @pytest.mark.asyncio
+    async def test_moves_group_between_profiles_without_changing_guide_ids(
+        self, async_client, test_session,
+    ):
+        import copy
+        from xml.etree import ElementTree
+
+        first = _create_profile(
+            test_session,
+            name="PPV and ESPN+",
+            tvg_id_template="ecm-{channel_id}",
+        )
+        first.set_channel_group_ids([65, 2479])
+        first.set_hide_empty_group_ids([65, 2479])
+        test_session.commit()
+        channels = {
+            10: {
+                "id": 10, "name": "PPV 10", "channel_number": 9000,
+                "channel_group_id": 65, "hidden_from_output": False,
+                "streams": [{"id": 110, "name": "PPV fallback"}],
+            },
+            20: {
+                "id": 20, "name": "ESPN+ 20", "channel_number": 8020,
+                "channel_group_id": 2479, "hidden_from_output": True,
+                "streams": [{"id": 220, "name": "ESPN PLUS 20:"}],
+            },
+        }
+        before = copy.deepcopy(channels)
+        cache = MagicMock()
+        cache.get.return_value = None
+
+        def prepared(profiles, *_args, **_kwargs):
+            return profiles, {"sources": [{"status": "ready"}], "channels": []}
+
+        def channel_ids(response):
+            root = ElementTree.fromstring(response.text)
+            return [channel.attrib["id"] for channel in root.findall("channel")]
+
+        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)), \
+             patch("routers.dummy_epg.get_client", return_value=AsyncMock()), \
+             patch("routers.dummy_epg.cache", cache), \
+             patch("services.epg_programmes.prepare_profiles", AsyncMock(side_effect=prepared)), \
+             patch("services.epg_programmes.can_cache", return_value=True):
+            created = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "ESPN+ (auto)",
+                "channel_group_ids": [2479],
+                "hide_empty_group_ids": [2479],
+                "tvg_id_template": "ecm-{channel_id}",
+            })
+            assert created.status_code == 200, created.text
+            second_id = created.json()["id"]
+
+            overlap_all = await async_client.get("/api/dummy-epg/xmltv")
+            overlap_first = await async_client.get(f"/api/dummy-epg/xmltv/{first.id}")
+            overlap_second = await async_client.get(f"/api/dummy-epg/xmltv/{second_id}")
+
+            moved = await async_client.patch(f"/api/dummy-epg/profiles/{first.id}", json={
+                "channel_group_ids": [65],
+                "hide_empty_group_ids": [65],
+                "channel_mappings": [],
+            })
+            assert moved.status_code == 200, moved.text
+
+            final_all = await async_client.get("/api/dummy-epg/xmltv")
+            final_first = await async_client.get(f"/api/dummy-epg/xmltv/{first.id}")
+            final_second = await async_client.get(f"/api/dummy-epg/xmltv/{second_id}")
+
+        assert channel_ids(overlap_all) == ["ecm-10", "ecm-20"]
+        assert channel_ids(overlap_first) == ["ecm-10", "ecm-20"]
+        assert channel_ids(overlap_second) == ["ecm-20"]
+        assert channel_ids(final_all) == ["ecm-10", "ecm-20"]
+        assert set(channel_ids(final_first)).isdisjoint(channel_ids(final_second))
+        assert channel_ids(final_second) == ["ecm-20"]
+        assert channels == before
+
+    @pytest.mark.asyncio
+    async def test_splits_channel_mappings_with_target_groups(
+        self, async_client, test_session,
+    ):
+        first = _create_profile(test_session, name="PPV and ESPN+")
+        first.set_channel_group_ids([65, 2479])
+        first.set_hide_empty_group_ids([65, 2479])
+        first.set_epg_source_ids([51])
+        ppv_mapping = {"channel_id": 10, "source_id": 51, "tvg_id": "PPV-10"}
+        espn_mapping = {"channel_id": 20, "source_id": 51, "tvg_id": "ESPN-20"}
+        first.set_channel_mappings([ppv_mapping, espn_mapping])
+        test_session.commit()
+        channels = {
+            10: {"id": 10, "name": "PPV 10", "channel_group_id": 65, "epg_data_id": 501},
+            20: {"id": 20, "name": "ESPN+ 20", "channel_group_id": 2479, "epg_data_id": 502},
+        }
+        rows = {
+            501: {"id": 501, "epg_source": 51, "tvg_id": "PPV-10"},
+            502: {"id": 502, "epg_source": 51, "tvg_id": "ESPN-20"},
+        }
+        client = AsyncMock()
+        client.get_epg_sources.return_value = [{
+            "id": 51, "source_type": "xmltv", "is_active": True,
+            "url": "https://guide.example/xml",
+        }]
+        client.get_epg_data_by_id.side_effect = lambda link: rows[link]
+
+        with patch("routers.dummy_epg.get_client", return_value=client), \
+             patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)):
+            created = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "ESPN+ (auto)",
+                "channel_group_ids": [2479],
+                "hide_empty_group_ids": [2479],
+                "epg_source_ids": [51],
+                "channel_mappings": [espn_mapping],
+            })
+            assert created.status_code == 200, created.text
+            second_id = created.json()["id"]
+
+            moved = await async_client.patch(f"/api/dummy-epg/profiles/{first.id}", json={
+                "channel_group_ids": [65],
+                "hide_empty_group_ids": [65],
+                "channel_mappings": [ppv_mapping],
+            })
+            assert moved.status_code == 200, moved.text
+
+            saved_first = (await async_client.get(f"/api/dummy-epg/profiles/{first.id}")).json()
+            saved_second = (await async_client.get(f"/api/dummy-epg/profiles/{second_id}")).json()
+
+        assert saved_first["channel_group_ids"] == [65]
+        assert saved_first["hide_empty_group_ids"] == [65]
+        assert saved_first["epg_source_ids"] == [51]
+        assert saved_first["channel_mappings"] == [ppv_mapping]
+        assert saved_second["channel_group_ids"] == [2479]
+        assert saved_second["hide_empty_group_ids"] == [2479]
+        assert saved_second["channel_mappings"] == [espn_mapping]
+        first_channels = {item["channel_id"] for item in saved_first["channel_mappings"]}
+        second_channels = {item["channel_id"] for item in saved_second["channel_mappings"]}
+        assert set(saved_first["channel_group_ids"]).isdisjoint(saved_second["channel_group_ids"])
+        assert first_channels.isdisjoint(second_channels)
+
 
 # =============================================================================
 # Force Regenerate
