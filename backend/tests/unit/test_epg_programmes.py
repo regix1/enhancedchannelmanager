@@ -484,6 +484,25 @@ async def test_shared_fetch_retries_an_incomplete_channel_page_set():
 
 
 @pytest.mark.asyncio
+async def test_shared_fetch_ignores_unrelated_channel_field_changes():
+    upstream = AsyncMock()
+    first = channel(streams=[2])
+    first["updated_at"] = "2026-09-20T18:00:00Z"
+    second = copy.deepcopy(first)
+    second["updated_at"] = "2026-09-20T18:00:01Z"
+    upstream.get_channels.side_effect = [
+        {"results": [first], "count": 1, "next": None},
+        {"results": [second], "count": 1, "next": None},
+    ]
+    upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "resolved"}]
+
+    channels = await guides._fetch_all_channels(upstream)
+
+    assert channels[1]["streams"] == [{"id": 2, "name": "resolved"}]
+    assert upstream.get_channels.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
     upstream = AsyncMock()
     upstream.get_channels.side_effect = [

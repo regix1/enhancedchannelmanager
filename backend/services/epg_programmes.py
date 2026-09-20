@@ -183,8 +183,35 @@ async def _fetch_all_channels(client=None) -> dict:
             break
         if not complete:
             continue
+        stable_rows = []
+        for row in candidate:
+            group = row.get("channel_group_id") or row.get("channel_group")
+            if isinstance(group, dict):
+                group = group.get("id")
+            link = row.get("epg_data_id") or row.get("epg_data")
+            if isinstance(link, dict):
+                link = link.get("id")
+            streams = sorted(
+                (
+                    stream.get("id"),
+                    stream.get("name", ""),
+                )
+                if isinstance(stream, dict)
+                else (stream, "")
+                for stream in row.get("streams", [])
+            )
+            stable_rows.append({
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "channel_number": row.get("channel_number"),
+                "channel_group_id": group,
+                "epg_data_id": link,
+                "tvg_id": row.get("tvg_id"),
+                "hidden_from_output": row.get("hidden_from_output"),
+                "streams": streams,
+            })
         fingerprint = hashlib.sha256(
-            json.dumps(sorted(candidate, key=lambda row: row.get("id", 0)), sort_keys=True, default=str).encode()
+            json.dumps(sorted(stable_rows, key=lambda row: row.get("id", 0)), sort_keys=True, default=str).encode()
         ).hexdigest()
         if fingerprint == prior:
             channels = candidate
