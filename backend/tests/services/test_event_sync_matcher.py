@@ -341,11 +341,23 @@ class TestParseEventName:
             "Boxing 05 : FURY vs HALL 6PM",
             "Boxing 6: Fury v Makhmudov 19:00",
             "LIVE EVENT 05 - 4:15pm Zenith Racing Series Road America",
+            "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
         ],
     )
     def test_dateless_stays_unmatchable_without_the_flag(self, name):
         # The never-guess rail: a time with no date is None by default.
         assert parse_event_name(name, now=_NOW).start is None
+
+    def test_live_event_time_without_separator_parses_when_enabled(self):
+        parsed = parse_event_name(
+            "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
+            now=_NOW,
+            assume_current_date=True,
+        )
+
+        assert parsed.title == "UFC 331 Van v Pantoja 2"
+        assert parsed.start == _et(2026, 7, 11, 21, 0)
+        assert parsed.matched_pattern == "dateless-live-event-time-first"
 
     @pytest.mark.parametrize(
         ("name", "expected_title", "expected_start"),

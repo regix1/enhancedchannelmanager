@@ -413,6 +413,21 @@ _ASSUME_DATE_PATTERNS: tuple[dict, ...] = (
             r"\s*(?P<ampm>[AaPp])\.?[Mm]?\.?"
         ),
     },
+    # IPTorrents omits the separator between its LIVE EVENT slot number and
+    # the leading event time: "LIVE EVENT 02   9pm <title>".
+    {
+        "name": "dateless-live-event-time-first",
+        "title_pattern": (
+            r"^LIVE\s+EVENT\s+\d{1,2}\s+"
+            r"\d{1,2}(?::\d{2})?\s*[AaPp]\.?[Mm]?\.?\s+"
+            r"(?P<title>.+?)\s*$"
+        ),
+        "time_pattern": (
+            r"^LIVE\s+EVENT\s+\d{1,2}\s+"
+            r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?"
+            r"\s*(?P<ampm>[AaPp])\.?[Mm]?\.?"
+        ),
+    },
 )
 
 # Pattern names whose parsed START carries a SYNTHESIZED date (fabricated

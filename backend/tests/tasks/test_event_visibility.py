@@ -12,6 +12,8 @@ from tasks.event_visibility import (
     _espn_slot,
     _guide_name,
     _link_dummy_epg,
+    _slot_key,
+    _ufc_slot,
 )
 
 
@@ -25,12 +27,13 @@ def _coverage(current: bool = True):
     }
 
 
-def _profile(stream_match_group_ids=None):
+def _profile(stream_match_group_ids=None, pattern_variants=None):
     return SimpleNamespace(to_dict=lambda: {
         "id": 1,
         "enabled": True,
-        "hide_empty_group_ids": [65, 2479],
+        "hide_empty_group_ids": [16, 65, 2479],
         "stream_match_group_ids": stream_match_group_ids or [],
+        "pattern_variants": pattern_variants or [],
         "event_timezone": "US/Eastern",
         "tvg_id_template": "ecm-{channel_id}",
     })
@@ -58,6 +61,22 @@ def test_default_schedule_checks_every_five_minutes():
 ])
 def test_espn_slot_uses_only_numbered_iptorrents_names(name, stream, expected):
     assert _espn_slot(name, stream=stream) == expected
+
+
+@pytest.mark.parametrize("name, stream, expected", [
+    ("UFC01", False, 1),
+    ("UFC 09", False, 9),
+    ("UFC 02:", True, 2),
+    ("UFC INT09", True, 9),
+    ("UFC 02 : CRYPTO.COM UFC 331", True, None),
+])
+def test_ufc_slot_uses_only_numbered_names(name, stream, expected):
+    assert _ufc_slot(name, stream=stream) == expected
+
+
+def test_slot_key_keeps_channel_families_separate():
+    assert _slot_key("ESPN+ 01") == ("espn", 1)
+    assert _slot_key("UFC01") == ("ufc", 1)
 
 
 def test_rtv_programme_matches_trex_event_name():
@@ -114,6 +133,36 @@ def test_rtv_programme_matches_dateless_trex_event_name_today():
             stream_id=2126837,
         )],
         now=datetime(2026, 9, 19, 23, tzinfo=timezone.utc),
+    )
+
+    assert resolution.resolved[0].disposition == "would_attach"
+
+
+def test_ufc_guide_matches_titled_iptorrents_event():
+    from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
+    from services.event_sync_resolver import SecondaryStream, resolve_event_sync
+
+    guide_name = _guide_name({
+        "title": "UFC 331: Van vs. Pantoja 2",
+        "start": "2026-09-20T01:00:00+00:00",
+    }, "US/Eastern")
+    resolution = resolve_event_sync(
+        {
+            "master_group_id": 0,
+            "secondary_group_ids": [2462],
+            "time_window_minutes": 30,
+            "enforce_time_window": True,
+            "attach_threshold": 0.8,
+            "assume_current_date": True,
+            "patterns": list(DEFAULT_EVENT_PATTERNS),
+        },
+        [guide_name],
+        [SecondaryStream(
+            name="LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
+            group_id=2462,
+            stream_id=2134594,
+        )],
+        now=datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc),
     )
 
     assert resolution.resolved[0].disposition == "would_attach"
@@ -520,6 +569,81 @@ async def test_ended_channel_keeps_numbered_iptorrents_fallback():
 
 
 @pytest.mark.asyncio
+async def test_orders_titled_ufc_stream_before_numbered_slot():
+    task = EventVisibilityTask()
+    client = AsyncMock()
+    current = {
+        "title": "Crypto.com UFC 331: Prelims",
+        "start": "2026-09-20T00:55:00+00:00",
+    }
+    guide_name = _guide_name(current, "US/Eastern")
+    channels = {
+        10: {
+            "id": 10,
+            "name": "UFC02",
+            "channel_number": 8102,
+            "channel_group_id": 16,
+            "epg_data_id": 1,
+            "hidden_from_output": False,
+            "streams": [{
+                "id": 1868499,
+                "name": "UFC 02",
+                "channel_group_id": 2462,
+            }],
+        }
+    }
+    ufc_pattern = {
+        "name": "ufc-parenthesized-date",
+        "title_pattern": (
+            r"^US\s+\(UFC(?:\s+INT)?\s*\d+\)\s*\|\s*(?P<title>.+?)\s*"
+            r"\((?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
+            r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\)\s*$"
+        ),
+    }
+    profile = _profile([2462], [ufc_pattern])
+    titled = SimpleNamespace(
+        name=(
+            "UFC 02 : CRYPTO.COM UFC 331: PRELIMS "
+            "start:2026 09 20 00:55:00 stop:2026 09 20 04:00:00"
+        ),
+        group_id=2462,
+        stream_id=2087027,
+    )
+    fallback = SimpleNamespace(
+        name="UFC 02",
+        group_id=2462,
+        stream_id=1868499,
+    )
+    resolution = SimpleNamespace(resolved=[SimpleNamespace(
+        disposition="would_attach",
+        best=SimpleNamespace(master_name=guide_name),
+        stream=titled,
+    )])
+    coverage = {
+        "sources": [{"status": "ready"}],
+        "channels": [{"channel_id": 10, "current": current}],
+    }
+
+    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
+         patch("services.epg_programmes.can_cache", return_value=True), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
+             [fallback, titled], {1868499: 2462, 2087027: 2462},
+         ))), \
+         patch("services.event_sync_resolver.resolve_event_sync", return_value=resolution) as resolve, \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()):
+        await task.execute()
+
+    client.update_channel.assert_awaited_once_with(
+        10,
+        {"streams": [2087027, 1868499]},
+    )
+    assert resolve.call_args.args[0]["patterns"][-1] == ufc_pattern
+
+
+@pytest.mark.asyncio
 async def test_processes_every_current_channel_in_one_run():
     task = EventVisibilityTask()
     client = AsyncMock()
@@ -582,6 +706,29 @@ async def test_links_generated_epg_rows_and_returns_sources_to_refresh():
         epg_source=46,
         max_results=10000,
     )
+
+
+@pytest.mark.asyncio
+async def test_links_generated_epg_row_when_dispatcharr_omits_empty_link():
+    client = AsyncMock()
+    client.get_epg_sources.return_value = [{
+        "id": 46,
+        "name": "ECM Dummy EPG",
+        "url": "http://ecm/api/dummy-epg/xmltv/1",
+        "is_active": True,
+    }]
+    client.get_epg_data.return_value = [{
+        "id": 501,
+        "tvg_id": "ecm-10",
+        "epg_source": 46,
+    }]
+    channels = [(10, {"id": 10})]
+
+    linked, sources = await _link_dummy_epg(client, channels)
+
+    assert linked == [10]
+    assert sources == {46: "ECM Dummy EPG"}
+    client.update_channel.assert_awaited_once_with(10, {"epg_data_id": 501})
 
 
 @pytest.mark.asyncio

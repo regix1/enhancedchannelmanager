@@ -42,6 +42,22 @@ def _espn_slot(name: str | None, *, stream: bool = False) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _ufc_slot(name: str | None, *, stream: bool = False) -> int | None:
+    """Read a UFC slot from a channel or its numbered IPTV stream."""
+    pattern = r"^UFC\s*(?:INT\s*)?(\d+):?$" if stream else r"^UFC\s*(\d+)$"
+    match = re.fullmatch(pattern, str(name or "").strip(), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _slot_key(name: str | None, *, stream: bool = False) -> tuple[str, int] | None:
+    """Identify a stable event slot without mixing different channel families."""
+    for family, reader in (("espn", _espn_slot), ("ufc", _ufc_slot)):
+        slot = reader(name, stream=stream)
+        if slot is not None:
+            return family, slot
+    return None
+
+
 def _guide_name(current: dict | None, event_timezone: str) -> str | None:
     """Render one current guide row in the event matcher's default shape."""
     if not isinstance(current, dict):
@@ -124,7 +140,7 @@ async def _link_dummy_epg(client, event_channels: list[tuple[int, dict]]) -> tup
     missing = {
         channel_id: channel
         for channel_id, channel in event_channels
-        if "epg_data_id" in channel and channel.get("epg_data_id") is None
+        if channel.get("epg_data_id") is None and channel.get("epg_data") is None
     }
     if not missing:
         return [], {}
@@ -247,7 +263,30 @@ class EventVisibilityTask(TaskScheduler):
 
         match_groups_by_target = {}
         timezone_by_target = {}
+        from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
+
+        match_patterns = list(DEFAULT_EVENT_PATTERNS)
+        pattern_keys = {
+            (
+                pattern.get("title_pattern"),
+                pattern.get("time_pattern"),
+                pattern.get("date_pattern"),
+            )
+            for pattern in match_patterns
+        }
         for profile in sorted(profiles, key=lambda row: row.get("id") or 0):
+            for pattern in profile.get("pattern_variants") or []:
+                if not isinstance(pattern, dict) or not pattern.get("title_pattern"):
+                    continue
+                key = (
+                    pattern.get("title_pattern"),
+                    pattern.get("time_pattern"),
+                    pattern.get("date_pattern"),
+                )
+                if key in pattern_keys:
+                    continue
+                match_patterns.append(pattern)
+                pattern_keys.add(key)
             match_group_ids = profile.get("stream_match_group_ids") or []
             for group_id in profile.get("hide_empty_group_ids") or []:
                 if match_group_ids:
@@ -337,7 +376,7 @@ class EventVisibilityTask(TaskScheduler):
                     if (
                         (_stream_group_id(stream) or groups_by_stream.get(_stream_id(stream)))
                         not in set(group_ids)
-                        or _espn_slot(
+                        or _slot_key(
                             stream.get("name") if isinstance(stream, dict)
                             else getattr(match_streams_by_id.get(_stream_id(stream)), "name", None),
                             stream=True,
@@ -369,11 +408,11 @@ class EventVisibilityTask(TaskScheduler):
         slot_matches_by_channel = {}
         streams_by_slot = {}
         for stream in match_streams:
-            slot = _espn_slot(stream.name, stream=True)
+            slot = _slot_key(stream.name, stream=True)
             if slot is not None:
                 streams_by_slot.setdefault(slot, []).append(stream)
         for channel_id, channel in selected:
-            slot = _espn_slot(channel.get("name"))
+            slot = _slot_key(channel.get("name"))
             if slot is not None and slot in streams_by_slot:
                 slot_matches_by_channel[channel_id] = list(streams_by_slot[slot])
 
@@ -392,7 +431,7 @@ class EventVisibilityTask(TaskScheduler):
         matches_by_channel = {}
         titled_match_streams = [
             stream for stream in match_streams
-            if _espn_slot(stream.name, stream=True) is None
+            if _slot_key(stream.name, stream=True) is None
         ]
         if match_scan_ready and guide_name_to_ids and titled_match_streams:
             from services.event_sync_resolver import (
@@ -411,6 +450,7 @@ class EventVisibilityTask(TaskScheduler):
                         "enforce_time_window": True,
                         "attach_threshold": 0.8,
                         "assume_current_date": True,
+                        "patterns": match_patterns,
                     },
                     sorted(guide_name_to_ids),
                     titled_match_streams,
