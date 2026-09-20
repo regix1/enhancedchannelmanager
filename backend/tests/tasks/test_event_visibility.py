@@ -663,18 +663,24 @@ async def test_reconciliation_cancellation_prevents_publication_and_mutation():
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_reports_the_failed_preparation_stage():
+@pytest.mark.parametrize("response", [
+    [{"id": 10}, {"id": 10}],
+    {"results": [{"id": 10}], "count": 2, "next": None},
+    [{"id": None}],
+])
+async def test_reconciliation_reports_the_failed_preparation_stage(response):
     profile = _profile()
     client = MagicMock()
+    client.get_channels = AsyncMock(return_value=response)
+    client.update_channel = AsyncMock()
+    client.refresh_epg_source = AsyncMock()
     task = EventVisibilityTask()
 
     with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_publication.read_publication", return_value=None), \
-         patch(
-             "services.epg_programmes._fetch_all_channels",
-             new=AsyncMock(side_effect=ValueError("unstable channel catalogue")),
-         ):
+         patch("services.epg_publication.publish_profiles") as publish, \
+         patch("emby_client.request_guide_refresh", new_callable=AsyncMock) as emby:
         outcome = await reconcile_profiles(task, wait_for_sources=False)
 
     assert outcome.success is False
@@ -682,6 +688,10 @@ async def test_reconciliation_reports_the_failed_preparation_stage():
     assert outcome.details["configured_profile_count"] == 1
     assert outcome.details["failure_stage"] == "channels"
     assert outcome.details["failure_type"] == "ValueError"
+    publish.assert_not_called()
+    client.update_channel.assert_not_awaited()
+    client.refresh_epg_source.assert_not_awaited()
+    emby.assert_not_awaited()
 
 
 @pytest.mark.asyncio

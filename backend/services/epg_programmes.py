@@ -147,40 +147,30 @@ def _resolve_group_assignments(channel_group_ids: list, channel_map: dict) -> li
 
 
 async def _fetch_all_channels(client=None) -> dict:
-    """Fetch a stable complete channel set and expand stream IDs in one batch."""
+    """Fetch a complete channel list and expand stream IDs in one batch."""
     if client is None:
         from dispatcharr_client import get_client
         client = get_client()
 
-    async def fetch() -> tuple[list[dict], bool, bool]:
-        rows = []
-        for page in range(1, 1001):
-            response = await client.get_channels(
-                page=page, page_size=500, visibility_filter="all",
-            )
-            values = response if isinstance(response, list) else response.get("results", [])
-            rows.extend(values)
-            if isinstance(response, list):
-                return rows, True, True
-            if not response.get("next"):
-                break
-        else:
-            raise ValueError("Channel pagination exceeds its limit.")
-        ids = [row.get("id") for row in rows]
-        complete = (
-            all(isinstance(channel_id, int) and not isinstance(channel_id, bool) for channel_id in ids)
-            and len(ids) == len(set(ids))
-        )
-        return rows, complete, False
-
-    channels = []
-    for _ in range(3):
-        candidate, complete, single_page = await fetch()
-        if single_page or complete:
-            channels = candidate
-            break
+    # Reading all rows in one response avoids overlapping pages when the
+    # upstream sort key is tied, including hidden slots without a number.
+    response = await client.get_channels(page=None, page_size=None, visibility_filter="all")
+    if isinstance(response, list):
+        channels = response
+    elif isinstance(response, dict) and isinstance(response.get("results"), list):
+        channels = response["results"]
+        count = response.get("count")
+        if response.get("next") or type(count) is not int or count != len(channels):
+            raise ValueError("Channel catalogue response is paginated or incomplete.")
     else:
-        raise ValueError("Channel catalogue remained incomplete after retries.")
+        raise ValueError("Channel catalogue response must contain a list.")
+    seen = set()
+    for index, channel in enumerate(channels):
+        if not isinstance(channel, dict) or type(channel.get("id")) is not int or channel["id"] <= 0:
+            raise ValueError(f"Channel catalogue row {index} has an invalid ID.")
+        if channel["id"] in seen:
+            raise ValueError(f"Channel catalogue contains duplicate ID {channel['id']}.")
+        seen.add(channel["id"])
     channel_map = {channel["id"]: dict(channel) for channel in channels}
     stream_ids = {
         stream

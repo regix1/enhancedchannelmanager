@@ -444,57 +444,41 @@ def test_capture_keeps_numeric_identity_and_remembered_missing_channel():
 @pytest.mark.asyncio
 async def test_shared_fetch_expands_mixed_streams_once_and_both_group_shapes():
     upstream = AsyncMock()
-    upstream.get_channels.side_effect = [
-        {"results": [channel(streams=[2, {"id": 3, "name": "kept"}])], "next": "next"},
-        {"results": [{"id": 4, "name": "Other", "channel_group": 65, "streams": [2]}], "next": None},
-        {"results": [channel(streams=[2, {"id": 3, "name": "kept"}])], "next": "next"},
-        {"results": [{"id": 4, "name": "Other", "channel_group": 65, "streams": [2]}], "next": None},
+    upstream.get_channels.return_value = [
+        channel(streams=[2, {"id": 3, "name": "kept"}]),
+        {"id": 4, "name": "Other", "channel_group": 65, "streams": [2]},
     ]
     upstream.get_streams_by_ids.return_value = [{"id": 2, "name": "resolved"}]
     channels = await guides._fetch_all_channels(upstream)
     assert [row["channel_id"] for row in guides._resolve_group_assignments([65], channels)] == [1, 4]
     assert channels[1]["streams"][1]["name"] == "kept"
     assert channels[4]["streams"][0]["name"] == "resolved"
-    assert all(
-        item.kwargs["visibility_filter"] == "all"
-        for item in upstream.get_channels.await_args_list
-    )
+    upstream.get_channels.assert_awaited_once_with(page=None, page_size=None, visibility_filter="all")
     upstream.get_streams_by_ids.assert_awaited_once_with([2])
 
 
 @pytest.mark.asyncio
-async def test_shared_fetch_retries_an_incomplete_channel_page_set():
+async def test_shared_fetch_rejects_duplicate_channels():
     upstream = AsyncMock()
-    complete = [
-        {"results": [channel(), channel(id=2, name="Second")], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 3, "next": None},
-    ]
-    upstream.get_channels.side_effect = [
-        {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel()], "count": 3, "next": None},
-        *copy.deepcopy(complete),
-    ]
-    upstream.get_streams_by_ids.return_value = []
-
-    channels = await guides._fetch_all_channels(upstream)
-
-    assert sorted(channels) == [1, 2, 3]
-    assert upstream.get_channels.await_count == 4
+    upstream.get_channels.return_value = [channel(), channel(name="Latest")]
+    with pytest.raises(ValueError, match="duplicate ID 1"):
+        await guides._fetch_all_channels(upstream)
+    upstream.get_streams_by_ids.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_shared_fetch_accepts_count_changes_between_pages():
+@pytest.mark.parametrize("response", [
+    {"results": [channel()], "count": 2, "next": None},
+    {"results": [channel()], "count": 1, "next": "next"},
+    {"results": [channel()], "count": True, "next": None},
+    {"results": [channel()], "next": None},
+])
+async def test_shared_fetch_rejects_incomplete_responses(response):
     upstream = AsyncMock()
-    upstream.get_channels.side_effect = [
-        {"results": [channel(), channel(id=2, name="Second")], "count": 3, "next": "next"},
-        {"results": [channel(id=3, name="Third")], "count": 4, "next": None},
-    ]
-    upstream.get_streams_by_ids.return_value = []
-
-    channels = await guides._fetch_all_channels(upstream)
-
-    assert sorted(channels) == [1, 2, 3]
-    assert upstream.get_channels.await_count == 2
+    upstream.get_channels.return_value = response
+    with pytest.raises(ValueError, match="paginated or incomplete"):
+        await guides._fetch_all_channels(upstream)
+    upstream.get_streams_by_ids.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -553,21 +537,69 @@ async def test_shared_fetch_accepts_incomplete_embedded_stream_rows():
 
 
 @pytest.mark.asyncio
-async def test_shared_fetch_rejects_channel_pages_that_never_stabilize():
+@pytest.mark.parametrize("row", [None, "private", {}, channel(id=None), channel(id="4"), channel(id=True), channel(id=0)])
+async def test_shared_fetch_rejects_invalid_channel_rows(row):
     upstream = AsyncMock()
-    upstream.get_channels.side_effect = [
-        {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel()], "count": 3, "next": None},
-        {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel()], "count": 3, "next": None},
-        {"results": [channel()], "count": 3, "next": "next"},
-        {"results": [channel()], "count": 3, "next": None},
-    ]
+    upstream.get_channels.return_value = [channel(), row]
+    with pytest.raises(ValueError, match="row 1 has an invalid ID"):
+        await guides._fetch_all_channels(upstream)
+    upstream.get_streams_by_ids.assert_not_awaited()
 
-    with pytest.raises(ValueError, match="remained incomplete"):
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [None, {}, {"results": None}, {"detail": "private"}, "private"])
+async def test_shared_fetch_rejects_unknown_response_shapes(response):
+    upstream = AsyncMock()
+    upstream.get_channels.return_value = response
+    with pytest.raises(ValueError, match="must contain a list"):
         await guides._fetch_all_channels(upstream)
 
-    upstream.get_streams_by_ids.assert_not_awaited()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [[], {"results": [], "count": 0, "next": None}])
+async def test_shared_fetch_accepts_complete_empty_responses(response):
+    upstream = AsyncMock()
+    upstream.get_channels.return_value = response
+    assert await guides._fetch_all_channels(upstream) == {}
+
+
+@pytest.mark.asyncio
+async def test_shared_fetch_reads_hidden_slots_without_page_boundaries():
+    from config import DispatcharrSettings
+    from dispatcharr_client import DispatcharrClient
+
+    rows = [channel(id=index, channel_number=None, hidden_from_output=True) for index in range(1, 623)]
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert request.url.path == "/api/channels/channels/"
+        assert request.url.params["visibility_filter"] == "all"
+        if "page" not in request.url.params and "page_size" not in request.url.params:
+            return httpx.Response(200, json=rows)
+        page = int(request.url.params["page"])
+        # Equal sort keys allow an offset query to repeat some earlier rows.
+        batch = rows[:500] if page == 1 else rows[467:589]
+        return httpx.Response(200, json={"results": batch, "count": 622, "next": "next" if page == 1 else None})
+
+    upstream = DispatcharrClient(DispatcharrSettings(
+        url="http://dispatcharr.invalid", auth_method="api_key", dispatcharr_api_key="test-key",
+    ))
+    await upstream._client.aclose()
+    upstream._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        first = await upstream.get_channels(page=1, page_size=500, visibility_filter="all")
+        second = await upstream.get_channels(page=2, page_size=500, visibility_filter="all")
+        paged = first["results"] + second["results"]
+        assert len(paged) == 622
+        assert len({row["id"] for row in paged}) == 589
+        requests.clear()
+        channels = await guides._fetch_all_channels(upstream)
+    finally:
+        await upstream.close()
+    assert set(channels) == set(range(1, 623))
+    assert len(requests) == 1
+    assert all(row["hidden_from_output"] for row in channels.values())
 
 
 @pytest.mark.parametrize("start,stop", [

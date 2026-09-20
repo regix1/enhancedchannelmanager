@@ -452,13 +452,17 @@ class DispatcharrClient:
 
     async def get_channels(
         self,
-        page: int = 1,
-        page_size: int = 100,
+        page: Optional[int] = 1,
+        page_size: Optional[int] = 100,
         search: Optional[str] = None,
         channel_group: Optional[int] = None,
         visibility_filter: Optional[str] = None,
-    ) -> dict:
-        """Get paginated list of channels.
+    ) -> dict | list:
+        """Get channels, omitting both page arguments for one complete list.
+
+        Dispatcharr disables pagination only when both parameters are absent.
+        Whole-catalogue readers use this mode because channel-number ordering
+        does not break ties between hidden channels with no number.
 
         ``channel_group`` is a channel-group **ID** (the value ECM callers —
         frontend, MCP — work with). Dispatcharr's ``channel_group`` query
@@ -468,7 +472,9 @@ class DispatcharrClient:
         forwarding. An unresolvable ID yields an empty page rather than falling
         through to an unfiltered query (which would silently return everything).
         """
-        params = {"page": page, "page_size": page_size}
+        if (page is None) != (page_size is None):
+            raise ValueError("Channel page and page size must both be set or both omitted.")
+        params = {} if page is None else {"page": page, "page_size": page_size}
         if search:
             params["search"] = search
         if visibility_filter is not None:
@@ -480,7 +486,7 @@ class DispatcharrClient:
                     "[DISPATCHARR] channel_group filter id=%s matched no group; "
                     "returning empty page", channel_group
                 )
-                return {"count": 0, "next": None, "previous": None, "results": []}
+                return [] if page is None else {"count": 0, "next": None, "previous": None, "results": []}
             params["channel_group"] = group_name
 
         response = await self._request("GET", "/api/channels/channels/", params=params)

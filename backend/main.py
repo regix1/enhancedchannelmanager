@@ -1214,6 +1214,36 @@ async def sanitized_http_exception_handler(request: Request, exc: HTTPException)
     )
 
 
+async def _rebuild_guide_on_startup():
+    """Await the shared refresh result instead of a process-local XMLTV cache."""
+    from services.epg_programmes import SOURCE_RETRY
+    from task_engine import get_engine
+
+    for attempt in range(1, 4):
+        try:
+            result = await get_engine().run_task("dummy_epg_refresh")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[MAIN] Startup guide rebuild failed on attempt %s", attempt)
+        else:
+            if result is None:
+                logger.error("[MAIN] Startup guide rebuild task is not registered")
+                return
+            if result.success:
+                logger.info("[MAIN] Startup guide reconciliation completed on attempt %s", attempt)
+                return
+            if result.error in {"ENGINE_STOPPING", "CANCELLED"}:
+                return
+            logger.warning(
+                "[MAIN] Startup guide reconciliation did not complete on attempt %s: %s",
+                attempt, result.error,
+            )
+        if attempt < 3:
+            await asyncio.sleep(SOURCE_RETRY)
+    logger.warning("[MAIN] Startup guide reconciliation remains pending; scheduled tasks will retry")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Log configuration status on startup."""
@@ -1781,38 +1811,8 @@ async def startup_event():
 
     asyncio.create_task(_check_stale_groups_on_startup())
 
-    # The composed guide and the source schedules it draws on live in this
-    # process, so a restart leaves every channel reading "Programming
-    # unavailable" until the hourly refresh rescans. Rebuild it now rather than
-    # serve holes for up to an hour after each deploy. The engine already
-    # refuses a second concurrent run, so this cannot collide with the schedule
-    # firing at the same moment.
-    async def _rebuild_guide_on_startup():
-        from cache import get_cache
-        from routers.dummy_epg import XMLTV_CACHE_TTL
-        from services.epg_programmes import SOURCE_TTL
-        from task_engine import get_engine
-
-        await asyncio.sleep(15)  # Wait for services to be ready
-        # One pass is not enough on a busy container: the sources can still be
-        # loading when it composes, and it then publishes a guide of empty
-        # channels. The refresh only caches a composition can_cache accepts, so
-        # an empty cache IS the "still incomplete" signal, with no second
-        # opinion about completeness to disagree with the first. Retry no sooner
-        # than the source backoff, which is the floor on rescanning anyway.
-        for attempt in range(1, 4):
-            try:
-                await get_engine().run_task("dummy_epg_refresh")
-            except Exception as e:
-                logger.warning("[MAIN] Startup guide rebuild failed: %s", e)
-                return
-            if get_cache().get("dummy_epg_xmltv_all", ttl=XMLTV_CACHE_TTL) is not None:
-                logger.info("[MAIN] Startup: rebuilt the dummy EPG guide on attempt %s", attempt)
-                return
-            logger.info("[MAIN] Startup: guide still incomplete after attempt %s, waiting for the source backoff", attempt)
-            await asyncio.sleep(SOURCE_TTL)
-        logger.warning("[MAIN] Startup: guide still incomplete, leaving it to the hourly refresh")
-
+    # Persisted publications remain readable while the shared workflow refreshes
+    # source schedules and resumes pending delivery after a restart.
     asyncio.create_task(_rebuild_guide_on_startup())
 
     # Start the daily update-availability check (bead

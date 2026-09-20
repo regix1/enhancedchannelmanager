@@ -108,6 +108,50 @@ async def test_visibility_filter_is_forwarded_to_dispatcharr():
 
 
 @pytest.mark.asyncio
+async def test_whole_channel_list_omits_pagination_and_keeps_filters():
+    client = _make_client()
+    try:
+        request = AsyncMock(return_value=_response(200, [{"id": 1}]))
+        with patch.object(client, "_request", request), patch.object(
+            client, "get_channel_groups", AsyncMock(return_value=[{"id": 65, "name": "Sports"}]),
+        ):
+            result = await client.get_channels(
+                page=None, page_size=None, search="ESPN", channel_group=65, visibility_filter="all",
+            )
+        assert result == [{"id": 1}]
+        request.assert_awaited_once_with("GET", "/api/channels/channels/", params={
+            "search": "ESPN", "channel_group": "Sports", "visibility_filter": "all",
+        })
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_whole_channel_list_with_unknown_group_stays_empty():
+    client = _make_client()
+    try:
+        request = AsyncMock()
+        with patch.object(client, "_request", request), patch.object(
+            client, "get_channel_groups", AsyncMock(return_value=[]),
+        ):
+            assert await client.get_channels(page=None, page_size=None, channel_group=65) == []
+        request.assert_not_awaited()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page,page_size", [(None, 100), (1, None)])
+async def test_channel_pagination_requires_both_parameters(page, page_size):
+    client = _make_client()
+    try:
+        with pytest.raises(ValueError, match="both"):
+            await client.get_channels(page=page, page_size=page_size)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_unknown_group_id_does_not_silently_return_all():
     """An unresolvable group ID must NOT fall through to an unfiltered query
     (which would silently return every channel). It returns empty instead."""
