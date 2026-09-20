@@ -257,7 +257,7 @@ def _query(
         "channel_id": channel["id"], "mapping": mapping, "ids": sorted(identities),
         "name": " ".join(channel.get("name", "").casefold().split()),
         "event": parsed,
-        "dynamic": parsed.start is not None or slot["family"] is not None,
+        "dynamic": mapping is None and (parsed.start is not None or slot["family"] is not None),
         "slot": slot,
         "time_window_minutes": config["time_window_minutes"],
         "enforce_time_window": config["enforce_time_window"],
@@ -941,8 +941,6 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             profile_coverage["can_publish"] = False
             profile_coverage["reason_codes"].append("GUIDE_CHANNEL_UNAVAILABLE")
         coverage["profiles"][str(profile_id)] = profile_coverage
-        if not profile.get("epg_source_ids"):
-            continue
         tz = pytz.timezone(profile.get("event_timezone") or "US/Eastern")
         local = now.astimezone(tz)
         midnight = datetime(local.year, local.month, local.day)
@@ -951,6 +949,9 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         profile.update({"guide_start": start, "guide_stop": stop, "source_programmes": {}, "source_channels": {}})
         coverage["window_start"] = min(coverage["window_start"] or start.isoformat(), start.isoformat())
         coverage["window_stop"] = max(coverage["window_stop"] or stop.isoformat(), stop.isoformat())
+        if not profile.get("epg_source_ids"):
+            prepared.append((profile, [], [], start, stop, profile_coverage))
+            continue
         try:
             resolved = resolve_sources(profile["epg_source_ids"], sources)
             profile_coverage["source_ids"] = [source["id"] for source in resolved]

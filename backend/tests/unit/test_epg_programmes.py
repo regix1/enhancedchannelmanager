@@ -374,6 +374,29 @@ def test_query_uses_configured_slot_and_matching_knobs():
     assert query["enforce_time_window"] is False
 
 
+@pytest.mark.asyncio
+async def test_source_free_profile_is_prepared_for_stream_events():
+    selected = profile(epg_source_ids=[])
+
+    prepared, coverage = await guides.prepare_profiles(
+        [selected], {1: channel(name="UFC01", tvg_id="")}, client(), now=NOW,
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0]["id"] == 1
+    assert prepared[0]["source_programmes"] == {}
+    assert prepared[0]["source_channels"] == {}
+    assert prepared[0]["guide_start"] < prepared[0]["guide_stop"]
+    assert coverage["profiles"]["1"] == {
+        "profile_id": 1,
+        "source_ids": [],
+        "sources": [],
+        "owned_channel_ids": [1],
+        "can_publish": True,
+        "reason_codes": [],
+    }
+
+
 def test_canonical_sources_reject_recursion_and_disabled_inputs():
     original = source()
     proxy = source(51, url="https://ecm.example/api/epg/artwork-proxy/50")
@@ -943,13 +966,11 @@ async def test_ambiguous_same_title_kickoffs_do_not_select_arbitrarily(monkeypat
 
 
 @pytest.mark.parametrize("seconds", [-1801, -1800, 0, 1800, 1801])
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("ended", [False, True])
-def test_composition_scores_only_possible_event_times(monkeypatch, seconds, explicit, ended):
-    mapping = {"channel_id": 1, "source_id": 50, "tvg_id": "PPV10.art"} if explicit else None
+def test_composition_scores_only_possible_event_times(monkeypatch, seconds, ended):
     query = guides._query(profile(), channel(
         name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="",
-    ), mapping, NOW)
+    ), None, NOW)
     begin = (query["event"].start + timedelta(seconds=seconds)).astimezone(timezone(timedelta(hours=-4)))
     end = begin + timedelta(minutes=10) if ended else NOW + timedelta(hours=4)
     row = programme("PPV10.art", "ONE FIGHT NIGHT 47 STAMP V FLORES",
@@ -971,19 +992,30 @@ def test_composition_scores_only_possible_event_times(monkeypatch, seconds, expl
         assert score.call_count == parse.call_count == 0
 
 
-@pytest.mark.parametrize("title", ["ONE Fight Night 48 Stamp vs. Flores", "ONE Fight Night 47 Stamp vs. Jones"])
-def test_composition_keeps_event_conflict_checks_with_explicit_binding(title):
+def test_composition_uses_explicit_binding():
     query = guides._query(profile(), channel(
         name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM", tvg_id="",
     ), {"channel_id": 1, "source_id": 50, "tvg_id": "PPV10.art"}, NOW)
     with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
-        rows, coverage = guides._compose(query, [source()],
-                                         {50: {"rows": {"PPV10.art": [programme("PPV10.art", title)]}}},
-                                         START, STOP, NOW)
-    assert score.call_count == 1
-    assert rows == []
-    assert coverage["event"] is None
-    assert coverage["match"] == "unresolved"
+        rows, coverage = guides._compose(
+            query,
+            [source()],
+            {50: {"rows": {
+                "PPV10.art": [programme("PPV10.art", "Mapped Schedule")],
+                "SportsmanChannel.us": [programme(
+                    "SportsmanChannel.us", "ONE Fight Night 47 Stamp vs. Flores",
+                )],
+            }}},
+            START,
+            STOP,
+            NOW,
+        )
+    assert query["dynamic"] is False
+    assert score.call_count == 0
+    assert len(rows) == 1
+    assert rows[0].get("channel") == "PPV10.art"
+    assert coverage["source_tvg_id"] == "PPV10.art"
+    assert coverage["match"] == "static"
 
 
 def test_composition_skips_schedules_without_static_identity():
