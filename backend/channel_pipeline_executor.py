@@ -5220,6 +5220,7 @@ class ActionExecutor:
         from database import get_session
         from models import ChannelPipelineRule, DummyEPGProfile
         from services.epg_programmes import prepare_profiles, SOURCE_MAX_AGE, _placeholder
+        from services.event_slots import validate_ownership
         from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
         from services.event_sync_stream_health import _load_stats, _min_stream_bitrate_bps
         from services.event_sync_resolver import effective_patterns
@@ -5235,6 +5236,17 @@ class ActionExecutor:
             owned = rule.get_managed_channel_ids() if rule else []
             profile = db.get(DummyEPGProfile, config.get("dummy_epg_profile_id"))
             profile = profile.to_dict() if profile and profile.enabled else None
+            ownership_disputed = any(
+                conflict["group_id"] == config["promote_target_group_id"]
+                for conflict in validate_ownership(
+                    db.query(DummyEPGProfile).filter(
+                        DummyEPGProfile.enabled == True  # noqa: E712
+                    ).all(),
+                    db.query(ChannelPipelineRule).filter(
+                        ChannelPipelineRule.enabled == True  # noqa: E712
+                    ).all(),
+                )
+            )
         finally:
             db.close()
         channels = {
@@ -5243,6 +5255,12 @@ class ActionExecutor:
             and self._channel_by_id[cid].get("channel_group_id") == config["promote_target_group_id"]
         }
         states.update({cid: "unknown" for cid in channels})
+        if ownership_disputed:
+            logger.warning(
+                "[EVENT-SYNC] Rule id=%s skipped lifecycle writes for disputed group %s",
+                rule_id, config["promote_target_group_id"],
+            )
+            return eligible, states
         if not profile or len(channels) > 256:
             return eligible, states
         unit_ids = {}

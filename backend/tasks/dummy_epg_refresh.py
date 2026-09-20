@@ -1,26 +1,18 @@
-"""
-Dummy EPG Refresh Task.
-
-Scheduled task to regenerate ECM dummy EPG XMLTV data and refresh
-matching sources in Dispatcharr.
-"""
+"""Publish and deliver generated guide documents through the shared workflow."""
 import asyncio
-import time
-from typing import Callable
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+import time
+from datetime import datetime, timezone
+from typing import Callable, Optional
 
 from dispatcharr_client import get_client
-from task_scheduler import TaskScheduler, TaskResult, ScheduleConfig, ScheduleType
 from task_registry import register_task
+from task_scheduler import ScheduleConfig, ScheduleType, TaskResult, TaskScheduler
 
 logger = logging.getLogger(__name__)
 
-# Polling configuration for waiting for refresh completion
 POLL_INTERVAL_SECONDS = 5
 MAX_WAIT_SECONDS = 300
-STREAM_FLOW_MAX_AGE = timedelta(hours=2)
 
 
 async def wait_for_epg_source_refresh(
@@ -46,7 +38,10 @@ async def wait_for_epg_source_refresh(
         await client.refresh_epg_source(source_id)
 
     started = time.monotonic()
-    running_states = {"fetching", "processing", "parsing", "loading", "pending", "running", "queued", "refreshing"}
+    running_states = {
+        "fetching", "processing", "parsing", "loading", "pending",
+        "running", "queued", "refreshing",
+    }
     observed_running = str(initial_source.get("status") or "").strip().lower() in running_states
     while True:
         if cancelled is not None and cancelled():
@@ -76,319 +71,64 @@ async def wait_for_epg_source_refresh(
 
 @register_task
 class DummyEPGRefreshTask(TaskScheduler):
-    """
-    Regenerate ECM dummy EPG XMLTV cache and refresh matching
-    Dispatcharr EPG sources.
-
-    Pipeline:
-    1. Regenerate all ECM XMLTV cache (same as POST /api/dummy-epg/generate)
-    2. Find Dispatcharr EPG sources whose URL contains /api/dummy-epg/xmltv
-    3. Trigger refresh for each matching source
-    4. Poll until refresh completes
-    """
+    """Run the full guide reconciliation on the manual refresh schedule."""
 
     task_id = "dummy_epg_refresh"
     task_name = "Dummy EPG Refresh"
-    task_description = "Regenerate ECM dummy EPG data and refresh in Dispatcharr"
+    task_description = "Publish generated guide data and reconcile its event channels"
 
     def __init__(self, schedule_config: Optional[ScheduleConfig] = None):
         if schedule_config is None:
-            schedule_config = ScheduleConfig(
-                schedule_type=ScheduleType.MANUAL,
-            )
+            schedule_config = ScheduleConfig(schedule_type=ScheduleType.MANUAL)
         super().__init__(schedule_config)
-        self._visibility_updates = 0
 
-    async def _regenerate_xmltv(self) -> int | None:
-        """Regenerate combined and profile guides from the shared source inputs."""
-        from database import get_session
-        from models import DummyEPGProfile
-        from dummy_epg_engine import generate_xmltv
+    async def _regenerate_xmltv(self):
+        """Publish complete documents without owning visibility or delivery."""
         from cache import get_cache
         from concurrency import run_cpu_bound
-        from services.epg_programmes import _fetch_all_channels, can_cache, prepare_profiles
+        from database import get_session
+        from models import DummyEPGProfile
+        from services.epg_programmes import _fetch_all_channels, prepare_profiles
+        from services.epg_publication import publication_lock, publish_profiles
 
-        cache = get_cache()
-        db = get_session()
+        session = get_session()
         try:
-            profiles = db.query(DummyEPGProfile).filter(
-                DummyEPGProfile.enabled == True  # noqa: E712
-            ).all()
-            if not profiles:
-                cache.invalidate_prefix("dummy_epg_xmltv")
-                return 0
-            client = get_client()
-            channel_map = await _fetch_all_channels(client)
-            profile_data, _coverage = await prepare_profiles(
-                [profile.to_dict() for profile in profiles], channel_map, client,
-                wait_for_sources=True,
-            )
-            if not can_cache(_coverage):
-                logger.warning(
-                    "[%s] Guide sources are still loading; retaining the published guide",
-                    self.task_id,
-                )
-                return None
-            xml_string = await run_cpu_bound(generate_xmltv, profile_data, channel_map)
-            per_profile = {}
-            for profile in profile_data:
-                per_profile[profile["id"]] = await run_cpu_bound(
-                    generate_xmltv, [profile], channel_map,
-                )
-            cache.invalidate_prefix("dummy_epg_xmltv")
-            cache.set("dummy_epg_xmltv_all", xml_string)
-            for profile_id, per_xml in per_profile.items():
-                cache.set(f"dummy_epg_xmltv_{profile_id}", per_xml)
-            self._visibility_updates = await self._apply_empty_channel_visibility(
-                profile_data, channel_map, _coverage, client,
-            )
-            logger.info("[%s] Regenerated XMLTV for %s profiles", self.task_id, len(profiles))
-            return len(profiles)
-        finally:
-            db.close()
-
-    async def _apply_empty_channel_visibility(self, profile_data, channel_map, coverage, client) -> int:
-        """Hide the channels of an opted-in group while they have no programmes.
-
-        A numbered event slot carries something only when an event is on it, and the
-        rest of the day it sits in the lineup announcing that it does not. Hiding is
-        the reversible form of removing it: the channel, its streams and its guide
-        binding all stay, so the slot reappears complete the moment its row fills,
-        with the id it always had. Deleting and recreating would churn that id daily
-        and lose the binding with it.
-
-        Scoped per group and off by default, because an empty guide row means
-        different things in different places: a slot between events is finished with,
-        a cable channel with a gap in its listings is still the channel you watch.
-        """
-        from services.epg_programmes import PROVISIONAL_WARNINGS
-        from services.event_sync_stream_health import collect_stream_flow
-
-        wanted = {group for profile in profile_data for group in profile.get("hide_empty_group_ids") or []}
-        if not wanted:
-            return 0
-        # Only a fully scanned composition may decide visibility. A source that has
-        # not answered yet yields channels with no programmes and NO warning to say
-        # why — `schedule_pending` needs a selection to be missing from, and a cold
-        # source has no selection at all — so an empty row is indistinguishable from
-        # an idle slot until every source reports ready.
-        sources = coverage.get("sources") or ()
-        if not sources or any(source.get("status") != "ready" for source in sources):
-            logger.info("[%s] Sources still loading — leaving channel visibility alone", self.task_id)
-            return 0
-        now = datetime.now(timezone.utc)
-        rows = {row["channel_id"]: row for row in coverage.get("channels", [])}
-        available = {
-            channel_id: row.get("current") is not None
-            for channel_id, row in rows.items()
-        }
-        stream_ids = {
-            stream.get("id") if isinstance(stream, dict) else stream
-            for channel in channel_map.values()
-            if channel.get("channel_group_id") in wanted
-            for stream in channel.get("streams") or []
-        }
-        flow = await collect_stream_flow(
-            stream_ids,
-            client=client,
-            checked_after=now - STREAM_FLOW_MAX_AGE,
-            probe_missing=True,
-            cancelled=lambda: self._cancel_requested,
-        )
-        if self._cancel_requested:
-            return 0
-        changed = 0
-        for channel_id, channel in channel_map.items():
-            if (channel.get("channel_group_id") not in wanted
-                    or channel_id not in rows or channel_id not in available):
-                continue
-            row = rows[channel_id]
-            # "Nobody asked the source yet" is not "there is nothing on". Composing
-            # before a scan lands makes every slot look empty, and acting on that
-            # hides the whole group until the next good run — the same mistake as
-            # publishing a guide of empty channels, in visibility form.
-            if any(warning in PROVISIONAL_WARNINGS for warning in row.get("warnings") or ()):
-                continue
-            streams = channel.get("streams") or []
-            stream_states = [
-                False if isinstance(stream, dict) and stream.get("is_stale") is True
-                else flow.get(stream.get("id") if isinstance(stream, dict) else stream)
-                for stream in streams
+            profiles = [
+                row.to_dict()
+                for row in session.query(DummyEPGProfile).filter(
+                    DummyEPGProfile.enabled == True  # noqa: E712
+                ).all()
             ]
-            if not stream_states:
-                flowing = False
-            elif any(state is True for state in stream_states):
-                flowing = True
-            elif all(state is False for state in stream_states):
-                flowing = False
-            else:
-                flowing = None
-            hide = not available[channel_id] or flowing is False
-            if bool(channel.get("hidden_from_output")) is hide:
-                continue
-            try:
-                await client.update_channel(channel_id, {"hidden_from_output": hide})
-                changed += 1
-            except Exception as e:
-                logger.warning("[%s] Could not set visibility on channel %s: %s", self.task_id, channel_id, e)
-        if changed:
-            logger.info("[%s] Updated visibility on %s idle event channel(s)", self.task_id, changed)
-        return changed
+        finally:
+            session.close()
 
-    async def _request_emby_refresh(self, *, force: bool = False) -> None:
-        """Ask Emby to reload Live TV after this run changed its guide or visibility."""
-        if not force and not self._visibility_updates:
-            return
-        from emby_client import request_guide_refresh
-
-        await request_guide_refresh()
-        self._visibility_updates = 0
+        client = get_client()
+        channel_map = await _fetch_all_channels(client)
+        prepared, coverage = await prepare_profiles(
+            profiles, channel_map, client, wait_for_sources=True,
+        )
+        async with publication_lock:
+            result = await run_cpu_bound(
+                publish_profiles,
+                prepared,
+                channel_map,
+                coverage,
+                observations={},
+                now=datetime.now(timezone.utc),
+            )
+            if result.superseded:
+                return result
+            cache = get_cache()
+            cache.invalidate_prefix("dummy_epg_xmltv")
+            for scope, document in result.xmltv_by_scope.items():
+                key = (
+                    "dummy_epg_xmltv_all" if scope == "all"
+                    else f"dummy_epg_xmltv_{scope.split(':', 1)[1]}"
+                )
+                cache.set(key, document)
+            return result
 
     async def execute(self) -> TaskResult:
-        """Execute the dummy EPG refresh pipeline."""
-        client = get_client()
-        started_at = datetime.utcnow()
-        self._visibility_updates = 0
+        from tasks.event_visibility import reconcile_profiles
 
-        # Step 1: Regenerate XMLTV cache
-        self._set_progress(status="regenerating", current_item="Regenerating XMLTV...")
-
-        try:
-            profile_count = await self._regenerate_xmltv()
-            if profile_count is None:
-                return TaskResult(
-                    success=False,
-                    message="Guide sources are still loading; retained the published guide",
-                    error="GUIDE_SOURCES_PENDING",
-                    started_at=started_at,
-                    completed_at=datetime.utcnow(),
-                )
-            logger.info("[%s] Regenerated %s profiles", self.task_id, profile_count)
-        except Exception as e:
-            logger.exception("[%s] Failed to regenerate XMLTV: %s", self.task_id, e)
-            return TaskResult(
-                success=False,
-                message=f"Failed to regenerate XMLTV: {e}",
-                error=str(e),
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-            )
-
-        if self._cancel_requested:
-            await self._request_emby_refresh()
-            return TaskResult(
-                success=False, message="Cancelled", error="CANCELLED",
-                started_at=started_at, completed_at=datetime.utcnow(),
-            )
-
-        # Step 2: Find matching Dispatcharr sources
-        self._set_progress(status="finding_sources", current_item="Finding Dispatcharr sources...")
-
-        try:
-            all_sources = await client.get_epg_sources()
-        except Exception as e:
-            logger.exception("[%s] Failed to fetch EPG sources: %s", self.task_id, e)
-            await self._request_emby_refresh()
-            return TaskResult(
-                success=True,
-                message=f"Regenerated {profile_count} profiles, but failed to fetch Dispatcharr sources: {e}",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-                total_items=profile_count,
-                success_count=profile_count,
-            )
-
-        matching = [
-            s for s in all_sources
-            if s.get("is_active") and s.get("url") and "/api/dummy-epg/xmltv" in s["url"]
-        ]
-
-        if not matching:
-            logger.info("[%s] No matching Dispatcharr sources to refresh", self.task_id)
-            await self._request_emby_refresh()
-            return TaskResult(
-                success=True,
-                message=f"Regenerated {profile_count} profiles, no Dispatcharr sources to refresh",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-                total_items=profile_count,
-                success_count=profile_count,
-            )
-
-        # Step 3: Refresh each matching source
-        self._set_progress(
-            total=len(matching), current=0, status="refreshing",
-            current_item=f"Refreshing {len(matching)} sources in Dispatcharr...",
-        )
-
-        success_count = 0
-        failed_count = 0
-        refreshed = []
-        errors = []
-
-        for i, source in enumerate(matching):
-            if self._cancel_requested:
-                break
-
-            source_id = source["id"]
-            source_name = source.get("name", f"Source {source_id}")
-            self._set_progress(
-                current=i + 1,
-                current_item=f"Refreshing {source_name}...",
-            )
-
-            try:
-                completed = await wait_for_epg_source_refresh(
-                    client, source_id, source_name,
-                    poll_interval=POLL_INTERVAL_SECONDS, max_wait=MAX_WAIT_SECONDS,
-                    cancelled=lambda: self._cancel_requested,
-                )
-                if self._cancel_requested:
-                    break
-                if not completed:
-                    raise RuntimeError("EPG source refresh did not complete successfully")
-                success_count += 1
-                refreshed.append(source_name)
-                self._increment_progress(success_count=1)
-            except Exception as e:
-                logger.error("[%s] Failed to refresh %s: %s", self.task_id, source_name, e)
-                failed_count += 1
-                errors.append(f"{source_name}: {e}")
-                self._increment_progress(failed_count=1)
-
-        self._set_progress(
-            success_count=success_count,
-            failed_count=failed_count,
-            status="completed" if not self._cancel_requested else "cancelled",
-        )
-
-        duration = (datetime.utcnow() - started_at).total_seconds()
-        logger.info(
-            "[%s] Finished in %.1fs: regenerated %s profiles, refreshed %s/%s sources",
-            self.task_id, duration, profile_count, success_count, len(matching),
-        )
-        await self._request_emby_refresh(force=success_count > 0)
-
-        if self._cancel_requested:
-            return TaskResult(
-                success=False, message="Cancelled", error="CANCELLED",
-                started_at=started_at, completed_at=datetime.utcnow(),
-                total_items=len(matching), success_count=success_count,
-                failed_count=failed_count,
-                details={"profiles_regenerated": profile_count, "refreshed": refreshed, "errors": errors},
-            )
-
-        msg = f"Regenerated {profile_count} profiles, refreshed {success_count} Dispatcharr sources"
-        if failed_count:
-            msg += f", {failed_count} failed"
-
-        return TaskResult(
-            success=failed_count == 0 or success_count > 0,
-            message=msg,
-            started_at=started_at,
-            completed_at=datetime.utcnow(),
-            total_items=len(matching),
-            success_count=success_count,
-            failed_count=failed_count,
-            details={"profiles_regenerated": profile_count, "refreshed": refreshed, "errors": errors},
-        )
+        return await reconcile_profiles(self, wait_for_sources=True)

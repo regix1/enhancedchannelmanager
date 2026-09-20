@@ -198,9 +198,18 @@ def _wire_epg(client, initial_entries: list[dict] | None = None,
         {"id": DUMMY_SOURCE_ID, "name": "ECM Dummy EPG", "url": source_url},
     ])
 
-    regenerate = AsyncMock(side_effect=lambda: epg_store.extend(
-        regenerated_entries or []
-    ) or len(regenerated_entries or []))
+    from services.epg_publication import PublicationResult
+    from tasks.event_visibility import _generated_scope
+
+    async def publish():
+        epg_store.extend(regenerated_entries or [])
+        scope = _generated_scope({"url": source_url})
+        return PublicationResult(
+            published_profile_ids=(PROFILE_ID,),
+            xmltv_by_scope={scope: "<tv/>"} if scope else {},
+        )
+
+    regenerate = AsyncMock(side_effect=publish)
     wait_refresh = AsyncMock()
     return epg_store, regenerate, wait_refresh
 

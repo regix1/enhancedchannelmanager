@@ -52,6 +52,7 @@ def test_allowlist_matches_only_profile_mutating_and_task_routes():
     # /api/auto-creation runs the SAME reconcile handler, so it must forward too.
     assert _should_forward("POST", "/api/auto-creation/run")
     assert _should_forward("POST", "/api/auto-creation/rules/7/run")
+    assert _should_forward("POST", "/api/dummy-epg/generate")
     assert _should_forward("POST", "/api/tasks/m3u_change_monitor/run")  # GAP B (non-numeric id)
     assert _should_forward("POST", "/api/tasks/channel_pipeline/run")
     assert _should_forward("POST", "/api/tasks/m3u_change_monitor/runs")
@@ -64,6 +65,8 @@ def test_allowlist_matches_only_profile_mutating_and_task_routes():
     assert not _should_forward("POST", "/api/channels")
     assert not _should_forward("POST", "/api/m3u/refresh")          # bulk refresh (no poll) stays local
     assert not _should_forward("GET", "/api/tasks/m3u_change_monitor/run")
+    assert not _should_forward("GET", "/api/dummy-epg/generate")
+    assert not _should_forward("POST", "/api/dummy-epg/generate/extra")
     assert not _should_forward("POST", "/api/tasks/x/run/extra")    # anchored — no sub-path
     assert not _should_forward("POST", "/api/tasks/x/runs/extra")   # anchored — no sub-path
     assert not _should_forward("POST", "/api/tasks/x/runss")        # anchored — no suffix

@@ -1611,6 +1611,18 @@ class TestRestoreYaml:
 
         profile = DummyEPGProfile(id=731, name="PPV Events")
         profile.set_stream_match_group_ids([8, 13])
+        profile.set_event_sync_config({
+            "secondary": [
+                {"group_id": 8, "m3u_account_id": 2},
+                {"group_id": 13, "m3u_account_id": None},
+            ],
+            "slot_patterns": [{
+                "name": "events",
+                "channel_pattern": r"PPV (?<slot>\d+)",
+                "event_patterns": [r"Event (?P<slot>\d+) .+"],
+                "bootstrap": True,
+            }],
+        })
         profile.set_epg_source_ids([21, 34])
         profile.set_channel_mappings([
             {"channel_id": 55, "source_id": 21, "tvg_id": "ufc"},
@@ -1633,12 +1645,19 @@ class TestRestoreYaml:
         restored = test_session.query(DummyEPGProfile).one()
         assert restored.id == 731
         assert restored.get_stream_match_group_ids() == [8, 13]
+        assert restored.get_event_sync_config()["secondary"] == [
+            {"group_id": 8, "m3u_account_id": 2},
+            {"group_id": 13, "m3u_account_id": None},
+        ]
+        assert restored.get_event_sync_config()["slot_patterns"][0]["name"] == "events"
         assert restored.get_epg_source_ids() == [21, 34]
         assert restored.get_channel_mappings() == [
             {"channel_id": 55, "source_id": 21, "tvg_id": "ufc"},
         ]
         assignment = test_session.query(DummyEPGChannelAssignment).one()
         assert assignment.profile_id == 731
+        assert "xmltv" not in exported[0]
+        assert "publication" not in exported[0]
 
     @pytest.mark.asyncio
     async def test_dummy_epg_restore_accepts_older_export(self, async_client, test_session):
@@ -1701,6 +1720,36 @@ class TestRestoreYaml:
         mock_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
         mock_cache.invalidate.assert_not_called()
         mock_cache.clear.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restore_rejects_new_profile_rule_ownership_conflict(
+        self, async_client, test_session,
+    ):
+        content = _make_yaml_export(database={
+            "dummy_epg_profiles": [{
+                "name": "Profile Owner",
+                "enabled": True,
+                "hide_empty_group_ids": [65],
+            }],
+            "auto_creation_rules": [{
+                "name": "Rule Owner",
+                "enabled": True,
+                "event_sync_config": {"master_group_id": 65},
+            }],
+        })
+
+        response = await async_client.post(
+            "/api/backup/restore-yaml",
+            data={"sections": json.dumps([
+                "dummy_epg_profiles", "auto_creation_rules",
+            ])},
+            files={"file": ("export.yaml", content, "text/yaml")},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["code"] == "ownership_conflict"
+        assert test_session.query(DummyEPGProfile).count() == 0
+        assert test_session.query(ChannelPipelineRule).count() == 0
 
     @pytest.mark.asyncio
     async def test_restores_all_sections(self, async_client, test_session):

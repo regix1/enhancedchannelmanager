@@ -268,6 +268,112 @@ def bounded(diagnostics):
     return diagnostics
 
 
+@pytest.mark.asyncio
+async def test_profile_readiness_isolated_across_distinct_sources(monkeypatch):
+    install_feed(monkeypatch, {
+        50: feed(programme()),
+        60: b"<tv>",
+    })
+    profiles = [
+        profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}]),
+        profile(
+            id=2, epg_source_ids=[60], channel_group_ids=[],
+            channel_assignments=[{"channel_id": 2}],
+        ),
+    ]
+    channels = {
+        1: channel(),
+        2: channel(id=2, name="TNT", tvg_id="TNT.us", channel_group_id=66),
+    }
+    upstream = client(sources=[source(), source(60)])
+
+    _, result = await guides.prepare_profiles(
+        profiles, channels, upstream, now=NOW, wait_for_sources=True,
+    )
+
+    assert result["profiles"]["1"]["can_publish"] is True
+    assert result["profiles"]["2"]["can_publish"] is False
+    assert result["profiles"]["1"]["source_ids"] == [50]
+    assert result["profiles"]["2"]["source_ids"] == [60]
+    assert "GUIDE_SOURCES_PENDING" in result["profiles"]["2"]["reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_shared_source_uncovered_query_blocks_only_its_profile(monkeypatch):
+    monkeypatch.setattr(guides, "MAX_QUERIES", 1)
+    install_feed(monkeypatch, feed(programme()))
+    profiles = [
+        profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}]),
+        profile(id=2, channel_group_ids=[], channel_assignments=[{"channel_id": 2}]),
+    ]
+    channels = {
+        1: channel(),
+        2: channel(id=2, name="TNT", tvg_id="TNT.us", channel_group_id=66),
+    }
+
+    _, result = await guides.prepare_profiles(
+        profiles, channels, client(), now=NOW, wait_for_sources=True,
+    )
+
+    assert result["profiles"]["1"]["can_publish"] is True
+    assert result["profiles"]["2"]["can_publish"] is False
+    assert "GUIDE_QUERY_PENDING" in result["profiles"]["2"]["reason_codes"]
+
+
+@pytest.mark.asyncio
+async def test_complete_empty_source_is_publishable(monkeypatch):
+    install_feed(monkeypatch, feed())
+
+    prepared, result = await guides.prepare_profiles(
+        [profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True,
+    )
+
+    assert prepared[0]["source_programmes"][1] == []
+    assert result["profiles"]["1"]["can_publish"] is True
+    assert result["profiles"]["1"]["reason_codes"] == []
+
+
+def test_query_ignores_only_the_generated_outward_id():
+    selected = profile(tvg_id_template="ecm-{channel_id}")
+    query = guides._query(
+        selected,
+        channel(tvg_id="ecm-external", streams=[{"id": 5, "name": "Backup", "tvg_id": "ecm-1"}]),
+        None,
+        NOW,
+        {"channel_id": 1},
+    )
+
+    assert query["ids"] == ["ecm-external"]
+
+
+def test_query_uses_configured_slot_and_matching_knobs():
+    selected = profile(
+        event_sync_config={
+            "secondary": [],
+            "attach_threshold": 0.65,
+            "time_window_minutes": 75,
+            "enforce_time_window": False,
+            "slot_patterns": [{
+                "name": "arena",
+                "channel_pattern": r"Arena Slot (?P<slot>\d+)",
+                "event_patterns": [],
+            }],
+        },
+    )
+
+    query = guides._query(
+        selected, channel(name="Arena Slot 7", tvg_id=""), None, NOW,
+    )
+
+    assert query["dynamic"] is True
+    assert query["slot"] == {
+        "family": "arena", "slot": "7", "role": "channel", "validation_issues": [],
+    }
+    assert query["attach_threshold"] == 0.65
+    assert query["time_window_minutes"] == 75
+    assert query["enforce_time_window"] is False
+
+
 def test_canonical_sources_reject_recursion_and_disabled_inputs():
     original = source()
     proxy = source(51, url="https://ecm.example/api/epg/artwork-proxy/50")
@@ -281,6 +387,23 @@ def test_canonical_sources_reject_recursion_and_disabled_inputs():
             guides.resolve_sources([50], [invalid])
     with pytest.raises(ValueError):
         guides.resolve_sources([True], [original])
+
+
+def test_generated_source_detection_accepts_only_aggregate_or_numeric_profile_paths():
+    for url in (
+        "https://ecm.example/api/dummy-epg/xmltv",
+        "https://ecm.example/api/dummy-epg/xmltv/",
+        "https://ecm.example/api/dummy-epg/xmltv/27",
+        "https://ecm.example/api/dummy-epg/xmltv/27/?token=ignored",
+    ):
+        assert guides._dummy_source(50, [source(url=url)])
+    for url in (
+        "https://ecm.example/api/dummy-epg/xmltv/profile",
+        "https://ecm.example/prefix/api/dummy-epg/xmltv",
+        "https://ecm.example/api/dummy-epg/xmltv/0",
+        "https://ecm.example/api/dummy-epg/xmltv/27/more",
+    ):
+        assert not guides._dummy_source(50, [source(url=url)])
 
 
 def test_capture_keeps_numeric_identity_and_remembered_missing_channel():
@@ -592,6 +715,8 @@ async def test_known_current_mapping_survives_a_failed_recheck(monkeypatch):
     upstream.get_epg_data_by_id.side_effect = RuntimeError("unavailable")
     prepared, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     assert prepared[0]["source_programmes"][1][0].get("stop") == "20260905050000 +0000"
+    assert coverage["sources"][0]["status"] == "ready"
+    assert "GUIDE_MAPPING_UNAVAILABLE" in coverage["profiles"]["1"]["reason_codes"]
     assert not guides.can_cache(coverage)
 
 
@@ -1307,7 +1432,7 @@ async def test_changed_queries_share_source_backoff_and_event_scope(monkeypatch)
     ("TNT", '<channel id="us"><display-name>US - TNT</display-name></channel><channel id="ca"><display-name>CA - TNT</display-name></channel>', "us"),
     ("TNT", '<channel id="us"><display-name>US - TNT</display-name></channel><channel id="other"><display-name>US - TNT</display-name></channel>', None),
     ("TNT", '<channel id="us"><display-name>US - TNT East</display-name></channel>', None),
-    ("ESPN PLUS 12", '<channel id="us"><display-name>ESPN PLUS 12</display-name></channel>', None),
+    ("ESPN PLUS 12", '<channel id="us"><display-name>ESPN PLUS 12</display-name></channel>', "us"),
 ])
 async def test_static_name_fallback_is_unique_and_country_limited(monkeypatch, name, headers, expected):
     install_feed(monkeypatch, feed(programme(tvg="us"), programme(tvg="ca"), programme(tvg="other"), headers=headers))
@@ -1687,6 +1812,29 @@ async def test_failed_refresh_does_not_renew_completed_snapshot_age(monkeypatch)
     assert coverage["sources"][0]["status"] == "stale"
     assert coverage["sources"][0]["last_success"] == previous.isoformat()
     assert prepared[0]["source_programmes"][1][0].get("stop") == "20260905050000 +0000"
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_keeps_fresh_complete_profile_evidence(monkeypatch):
+    install_feed(monkeypatch, feed(programme()))
+    upstream = client()
+    await guides.prepare_profiles(
+        [profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True,
+    )
+    entry = next(iter(guides._SOURCE_CACHE.values()))
+    original_success = entry["success"]
+    entry["checked"] -= guides.SOURCE_TTL + 1
+    monkeypatch.setattr(guides, "_read_source", AsyncMock(side_effect=ValueError("unavailable")))
+
+    prepared, result = await guides.prepare_profiles(
+        [profile()], {1: channel()}, upstream, now=NOW, wait_for_sources=True,
+    )
+
+    assert prepared[0]["source_programmes"][1]
+    assert result["profiles"]["1"]["can_publish"] is True
+    assert result["profiles"]["1"]["sources"][0]["status"] == "retained"
+    assert result["profiles"]["1"]["sources"][0]["last_success"] == original_success.isoformat()
+    assert guides.can_cache(result)
 
 
 @pytest.mark.asyncio

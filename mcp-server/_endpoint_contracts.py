@@ -183,7 +183,7 @@ _DUMMY_EPG_PROFILE_FIELDS = frozenset({
     "tvg_id_template", "include_date_tag", "include_live_tag", "include_new_tag",
     "pattern_builder_examples", "pattern_variants", "channel_group_ids",
     "epg_source_ids", "channel_mappings", "hide_empty_group_ids",
-    "stream_match_group_ids",
+    "stream_match_group_ids", "event_sync_config",
 })
 
 
@@ -641,13 +641,14 @@ ENDPOINTS: dict[str, Endpoint] = {
         method="POST",
         path="/api/dummy-epg/generate",
         request_fields=frozenset({"profile_ids"}),
+        response_fields=frozenset({"status", "task_id", "execution_id", "started_at"}),
     ),
     # -- enhancedchannelmanager-omxy5: dummy-EPG profile CRUD --------------
     "dummy_epg_get_profile": Endpoint(
         name="dummy_epg_get_profile",
         method="GET",
         path="/api/dummy-epg/profiles/{profile_id}",
-        response_fields=frozenset({"id", "name", "enabled", "channel_group_ids", "epg_source_ids", "channel_mappings"}),
+        response_fields=_DUMMY_EPG_PROFILE_FIELDS | {"id"},
     ),
     "dummy_epg_coverage": Endpoint(
         name="dummy_epg_coverage",
@@ -684,11 +685,12 @@ ENDPOINTS: dict[str, Endpoint] = {
             "fallback_title_template", "fallback_description_template",
             "event_timezone", "output_timezone", "program_duration",
             "channel_logo_url_template", "program_poster_url_template",
-            "pattern_variants", "include_trace",
+            "pattern_variants", "include_trace", "event_sync_config",
+            "sample_channel_name",
         }),
         response_fields=frozenset({
             "original_name", "substituted_name", "matched", "matched_variant",
-            "rendered", "traces",
+            "rendered", "traces", "event",
         }),
     ),
     # -- cloud-targets domain ----------------------------------------------

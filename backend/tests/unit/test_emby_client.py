@@ -590,9 +590,10 @@ async def test_request_guide_refresh_does_nothing_when_emby_is_off():
     the pipeline and the link endpoint can both call this unconditionally. [41]"""
     with patch("config.get_settings", return_value=_emby_settings(enabled=False)), \
          patch("emby_client.EmbyClient") as mock_client:
-        await request_guide_refresh()
+        result = await request_guide_refresh()
 
     mock_client.assert_not_called()
+    assert result is None
 
 
 async def test_request_guide_refresh_swallows_a_failure_and_closes_the_client():
@@ -603,7 +604,22 @@ async def test_request_guide_refresh_swallows_a_failure_and_closes_the_client():
 
     with patch("config.get_settings", return_value=_emby_settings(enabled=True)), \
          patch("emby_client.EmbyClient", return_value=client):
-        await request_guide_refresh()
+        result = await request_guide_refresh()
 
     client.refresh_guide.assert_awaited_once()
+    client.close.assert_awaited_once()
+    assert result is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_request_guide_refresh_returns_the_client_outcome(accepted):
+    client = AsyncMock()
+    client.refresh_guide.return_value = accepted
+
+    with patch("config.get_settings", return_value=_emby_settings(enabled=True)), \
+         patch("emby_client.EmbyClient", return_value=client):
+        result = await request_guide_refresh()
+
+    assert result is accepted
     client.close.assert_awaited_once()

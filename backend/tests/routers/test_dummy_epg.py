@@ -37,6 +37,91 @@ def _create_profile(session, **overrides):
     return profile
 
 
+def _coverage_result(
+    profile_id,
+    *,
+    generated_at="2026-09-05T05:00:00+00:00",
+    owned_channel_ids=None,
+    sources=None,
+    can_publish=True,
+    reason_codes=None,
+):
+    profile_sources = [] if sources is None else sources
+    return {
+        "generated_at": generated_at,
+        "window_start": "2026-09-05T00:00:00+00:00",
+        "window_stop": "2026-09-07T00:00:00+00:00",
+        "sources": [{"source_id": 900, "status": "error"}],
+        "channels": [],
+        "artwork_pending": False,
+        "profiles": {
+            str(profile_id): {
+                "profile_id": profile_id,
+                "source_ids": [source["source_id"] for source in profile_sources],
+                "sources": profile_sources,
+                "owned_channel_ids": [10] if owned_channel_ids is None else owned_channel_ids,
+                "can_publish": can_publish,
+                "reason_codes": [] if reason_codes is None else reason_codes,
+            },
+        },
+    }
+
+
+def _publication_record(
+    profile_id,
+    prepared,
+    *,
+    published_at="2026-09-05T04:00:00+00:00",
+    window_start="2026-09-05T00:00:00+00:00",
+    window_stop="2026-09-05T10:00:00+00:00",
+    channels=None,
+    revision=7,
+    config_hash=None,
+    required=None,
+    confirmed=None,
+    pending_emby=False,
+):
+    import hashlib
+    from services.epg_publication import _config_hash
+
+    stored_channels = [{
+        "channel_id": 10,
+        "xmltv_id": "ecm-10",
+        "profile_id": profile_id,
+        "events": [{
+            "start": "2026-09-05T04:00:00+00:00",
+            "stop": "2026-09-05T06:00:00+00:00",
+            "title": "Stored event",
+        }],
+    }] if channels is None else channels
+    document = '<?xml version="1.0"?><tv>' + "".join(
+        f'<channel id="{channel["xmltv_id"]}"/>'
+        for channel in stored_channels
+    ) + "</tv>"
+    document_hash = hashlib.sha256(document.encode()).hexdigest()
+    return {
+        "scope": f"profile:{profile_id}",
+        "xmltv": document,
+        "revision": revision,
+        "state": {
+            "version": 1,
+            "published_at": published_at,
+            "xmltv_hash": document_hash,
+            "config_hash": config_hash or _config_hash(prepared),
+            "window_start": window_start,
+            "window_stop": window_stop,
+            "members": {str(profile_id): document_hash},
+            "channels": stored_channels,
+            "observations": {},
+            "delivery": {
+                "required_dispatcharr_hashes": required or {},
+                "confirmed_dispatcharr_hashes": confirmed or {},
+                "pending_emby": pending_emby,
+            },
+        },
+    }
+
+
 # =============================================================================
 # Profile CRUD
 # =============================================================================
@@ -217,7 +302,13 @@ class TestCreateProfile:
 
     @pytest.mark.asyncio
     async def test_creates_profile_with_idle_visibility_groups(self, async_client):
-        with patch("routers.dummy_epg.cache"):
+        client = AsyncMock()
+        client.get_all_m3u_group_settings.return_value = {
+            1558: {}, 1557: {},
+        }
+        with patch("routers.dummy_epg.cache"), patch(
+            "routers.dummy_epg.get_client", return_value=client,
+        ):
             response = await async_client.post("/api/dummy-epg/profiles", json={
                 "name": "Event Slots",
                 "channel_group_ids": [5, 10],
@@ -230,6 +321,61 @@ class TestCreateProfile:
         assert response.json()["stream_match_group_ids"] == [1558, 1557]
 
     @pytest.mark.asyncio
+    async def test_explicit_empty_event_config_stays_generic(self, async_client):
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Generic Events",
+                "event_sync_config": {},
+            })
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["event_sync_config"]["secondary"] == []
+        assert body["event_sync_config"]["assume_current_date"] is False
+        assert body["event_sync_config"]["use_default_patterns"] is False
+        assert body["stream_match_group_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_match_ids_keep_compatibility_defaults(self, async_client):
+        client = AsyncMock()
+        client.get_all_m3u_group_settings.return_value = {20: {}, 30: {}}
+        with patch("routers.dummy_epg.cache"), patch(
+            "routers.dummy_epg.get_client", return_value=client,
+        ):
+            response = await async_client.post("/api/dummy-epg/profiles", json={
+                "name": "Legacy Events",
+                "stream_match_group_ids": [20, 30, 20],
+            })
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["stream_match_group_ids"] == [20, 30]
+        assert body["event_sync_config"]["secondary"] == [
+            {"group_id": 20, "m3u_account_id": None},
+            {"group_id": 30, "m3u_account_id": None},
+        ]
+        assert body["event_sync_config"]["assume_current_date"] is True
+        assert body["event_sync_config"]["use_default_patterns"] is True
+
+    @pytest.mark.asyncio
+    async def test_conflicting_legacy_and_canonical_scopes_are_rejected(self, async_client):
+        response = await async_client.post("/api/dummy-epg/profiles", json={
+            "name": "Conflicting Events",
+            "stream_match_group_ids": [20],
+            "event_sync_config": {
+                "secondary": [{"group_id": 30, "m3u_account_id": None}],
+            },
+        })
+        assert response.status_code == 422
+        assert "must match" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_event_config_is_rejected(self, async_client):
+        response = await async_client.post("/api/dummy-epg/profiles", json={
+            "name": "Null Events",
+            "event_sync_config": None,
+        })
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_rejects_idle_visibility_outside_selected_groups(self, async_client):
         response = await async_client.post("/api/dummy-epg/profiles", json={
             "name": "Wrong Scope",
@@ -239,6 +385,30 @@ class TestCreateProfile:
 
         assert response.status_code == 422
         assert "invalid group ids: [10]" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_lifecycle_group_owned_by_event_rule(
+        self, async_client, test_session,
+    ):
+        from models import ChannelPipelineRule
+
+        rule = ChannelPipelineRule(
+            name="Event Rule",
+            enabled=True,
+            priority=0,
+            conditions="[]",
+            actions="[]",
+            event_sync_config='{"master_group_id": 10}',
+        )
+        test_session.add(rule)
+        test_session.commit()
+        response = await async_client.post("/api/dummy-epg/profiles", json={
+            "name": "Conflicting Guide",
+            "channel_group_ids": [10],
+            "hide_empty_group_ids": [10],
+        })
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["code"] == "ownership_conflict"
 
     @pytest.mark.asyncio
     async def test_rejects_duplicate_name(self, async_client, test_session):
@@ -596,6 +766,33 @@ class TestPreview:
         assert conditional["taken"] is True
         assert conditional["kind_detail"] == "truthy"
 
+    @pytest.mark.asyncio
+    async def test_preview_returns_additive_event_classification(self, async_client):
+        response = await async_client.post("/api/dummy-epg/preview", json={
+            "sample_name": "Event 07 Soccer @ 20 Sep 12:00",
+            "sample_channel_name": "Channel 07",
+            "title_pattern": r"^Event \d+ (?P<title>.+?)\s*@",
+            "time_pattern": r"(?P<hour>\d{1,2}):(?P<minute>\d{2})$",
+            "date_pattern": r"@\s*(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+)",
+            "event_timezone": "UTC",
+            "program_duration": 60,
+            "event_sync_config": {
+                "slot_patterns": [{
+                    "name": "event",
+                    "channel_pattern": r"Channel (?<slot>\d+)",
+                    "event_patterns": [r"Event (?P<slot>\d+) .*"],
+                }],
+            },
+        })
+        assert response.status_code == 200, response.text
+        event = response.json()["event"]
+        assert event["family"] == "event"
+        assert event["slot"] == "7"
+        assert event["role"] == "event"
+        assert event["start"] is not None
+        assert event["stop"] is not None
+        assert event["validation_issues"] == []
+
 # =============================================================================
 # Batch preview — matcher-level validity flag (bead hirm6)
 # =============================================================================
@@ -710,6 +907,8 @@ class TestGetXmltvAll:
     @pytest.mark.asyncio
     async def test_returns_xml_content_type(self, async_client, test_session):
         """Returns response with application/xml content type."""
+        from services.epg_publication import PublicationResult
+
         # Profile is created so the endpoint has a row to render (side effect on test_session).
         _create_profile(test_session, name="XMLTV Test")
         xml_output = '<?xml version="1.0"?><tv></tv>'
@@ -719,7 +918,10 @@ class TestGetXmltvAll:
         mock_cache.set = MagicMock()
 
         with patch("routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock, return_value={}), \
-             patch("dummy_epg_engine.generate_xmltv", return_value=xml_output), \
+             patch(
+                 "services.epg_publication.publish_profiles",
+                 return_value=PublicationResult(xmltv_by_scope={"all": xml_output}),
+             ), \
              patch("routers.dummy_epg.cache", mock_cache):
             response = await async_client.get("/api/dummy-epg/xmltv")
 
@@ -728,21 +930,27 @@ class TestGetXmltvAll:
         assert "<?xml" in response.text
 
     @pytest.mark.asyncio
-    async def test_returns_cached_response(self, async_client, test_session):
-        """Returns cached XMLTV without regenerating."""
-        cached_xml = '<?xml version="1.0"?><tv><cached/></tv>'
-        mock_cache = MagicMock()
-        mock_cache.get.return_value = cached_xml
+    async def test_returns_durable_publication(self, async_client, test_session):
+        """Returns a complete durable publication without rebuilding it."""
+        cached_xml = '<?xml version="1.0"?><tv><channel id="saved"/></tv>'
 
-        with patch("routers.dummy_epg.cache", mock_cache):
+        with patch(
+            "services.epg_publication.read_publication",
+            return_value={"xmltv": cached_xml},
+        ), patch(
+            "routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock,
+        ) as fetch_channels:
             response = await async_client.get("/api/dummy-epg/xmltv")
 
         assert response.status_code == 200
-        assert "<cached/>" in response.text
+        assert 'id="saved"' in response.text
+        fetch_channels.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_only_includes_enabled_profiles(self, async_client, test_session):
         """Only enabled profiles are included in XMLTV output."""
+        from services.epg_publication import PublicationResult
+
         _create_profile(test_session, name="Enabled", enabled=True)
         _create_profile(test_session, name="Disabled", enabled=False)
 
@@ -752,13 +960,16 @@ class TestGetXmltvAll:
         mock_cache.set = MagicMock()
 
         with patch("routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock, return_value={}), \
-             patch("dummy_epg_engine.generate_xmltv", return_value=xml_output) as mock_gen, \
+             patch(
+                 "services.epg_publication.publish_profiles",
+                 return_value=PublicationResult(xmltv_by_scope={"all": xml_output}),
+             ) as mock_publish, \
              patch("routers.dummy_epg.cache", mock_cache):
             response = await async_client.get("/api/dummy-epg/xmltv")
 
         assert response.status_code == 200
-        # Verify generate_xmltv was called with only 1 profile (the enabled one)
-        call_args = mock_gen.call_args
+        # Verify publication was called with only 1 profile (the enabled one)
+        call_args = mock_publish.call_args
         profile_data = call_args[0][0]
         assert len(profile_data) == 1
         assert profile_data[0]["name"] == "Enabled"
@@ -766,6 +977,8 @@ class TestGetXmltvAll:
     @pytest.mark.asyncio
     async def test_resolves_group_ids_to_assignments(self, async_client, test_session):
         """XMLTV endpoint resolves channel_group_ids into channel_assignments."""
+        from services.epg_publication import PublicationResult
+
         profile = _create_profile(test_session, name="Group Profile")
         profile.set_channel_group_ids([5])
         test_session.commit()
@@ -782,12 +995,15 @@ class TestGetXmltvAll:
         mock_cache.set = MagicMock()
 
         with patch("routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock, return_value=channel_map), \
-             patch("dummy_epg_engine.generate_xmltv", return_value=xml_output) as mock_gen, \
+             patch(
+                 "services.epg_publication.publish_profiles",
+                 return_value=PublicationResult(xmltv_by_scope={"all": xml_output}),
+             ) as mock_publish, \
              patch("routers.dummy_epg.cache", mock_cache):
             response = await async_client.get("/api/dummy-epg/xmltv")
 
         assert response.status_code == 200
-        call_args = mock_gen.call_args
+        call_args = mock_publish.call_args
         profile_data = call_args[0][0]
         assert len(profile_data) == 1
         assignments = profile_data[0]["channel_assignments"]
@@ -802,21 +1018,31 @@ class TestGetXmltvProfile:
     @pytest.mark.asyncio
     async def test_returns_xml_for_single_profile(self, async_client, test_session):
         """Returns XMLTV for a specific profile."""
+        from services.epg_publication import PublicationResult
+
         profile = _create_profile(test_session, name="Single Profile")
-        xml_output = '<?xml version="1.0"?><tv><channel/></tv>'
+        xml_output = (
+            '<?xml version="1.0"?><tv>'
+            '<channel id="one"><display-name>One</display-name></channel></tv>'
+        )
 
         mock_cache = MagicMock()
         mock_cache.get.return_value = None
         mock_cache.set = MagicMock()
 
         with patch("routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock, return_value={}), \
-             patch("dummy_epg_engine.generate_xmltv", return_value=xml_output), \
+             patch(
+                 "services.epg_publication.publish_profiles",
+                 return_value=PublicationResult(
+                     xmltv_by_scope={f"profile:{profile.id}": xml_output},
+                 ),
+             ), \
              patch("routers.dummy_epg.cache", mock_cache):
             response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
 
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/xml"
-        assert "<channel/>" in response.text
+        assert 'channel id="one"' in response.text
 
     @pytest.mark.asyncio
     async def test_returns_404_for_nonexistent_profile(self, async_client):
@@ -981,6 +1207,7 @@ class TestProfileSplit:
              patch("services.epg_programmes.can_cache", return_value=True):
             created = await async_client.post("/api/dummy-epg/profiles", json={
                 "name": "ESPN+ (auto)",
+                "enabled": False,
                 "channel_group_ids": [2479],
                 "hide_empty_group_ids": [2479],
                 "tvg_id_template": "ecm-{channel_id}",
@@ -998,6 +1225,10 @@ class TestProfileSplit:
                 "channel_mappings": [],
             })
             assert moved.status_code == 200, moved.text
+            enabled = await async_client.patch(
+                f"/api/dummy-epg/profiles/{second_id}", json={"enabled": True},
+            )
+            assert enabled.status_code == 200, enabled.text
 
             final_all = await async_client.get("/api/dummy-epg/xmltv")
             final_first = await async_client.get(f"/api/dummy-epg/xmltv/{first.id}")
@@ -1005,9 +1236,10 @@ class TestProfileSplit:
 
         assert channel_ids(overlap_all) == ["ecm-10", "ecm-20"]
         assert channel_ids(overlap_first) == ["ecm-10", "ecm-20"]
-        assert channel_ids(overlap_second) == ["ecm-20"]
+        assert overlap_second.status_code == 503
+        assert overlap_second.json()["detail"]["code"] == "GUIDE_UNAVAILABLE"
         assert channel_ids(final_all) == ["ecm-10", "ecm-20"]
-        assert set(channel_ids(final_first)).isdisjoint(channel_ids(final_second))
+        assert channel_ids(final_first) == ["ecm-10", "ecm-20"]
         assert channel_ids(final_second) == ["ecm-20"]
         assert channels == before
 
@@ -1042,6 +1274,7 @@ class TestProfileSplit:
              patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)):
             created = await async_client.post("/api/dummy-epg/profiles", json={
                 "name": "ESPN+ (auto)",
+                "enabled": False,
                 "channel_group_ids": [2479],
                 "hide_empty_group_ids": [2479],
                 "epg_source_ids": [51],
@@ -1056,6 +1289,10 @@ class TestProfileSplit:
                 "channel_mappings": [ppv_mapping],
             })
             assert moved.status_code == 200, moved.text
+            enabled = await async_client.patch(
+                f"/api/dummy-epg/profiles/{second_id}", json={"enabled": True},
+            )
+            assert enabled.status_code == 200, enabled.text
 
             saved_first = (await async_client.get(f"/api/dummy-epg/profiles/{first.id}")).json()
             saved_second = (await async_client.get(f"/api/dummy-epg/profiles/{second_id}")).json()
@@ -1082,42 +1319,78 @@ class TestForceRegenerate:
     """Tests for POST /api/dummy-epg/generate."""
 
     @pytest.mark.asyncio
-    async def test_regenerates_all(self, async_client, test_session):
-        """Force-regenerates XMLTV for all enabled profiles."""
-        _create_profile(test_session, name="Regen Profile", enabled=True)
-        xml_output = '<?xml version="1.0"?><tv></tv>'
+    async def test_admits_durable_refresh(self, async_client):
+        """Admits one refresh without doing publication work in the request."""
+        import asyncio
+        from datetime import datetime
+        from task_engine import TaskRun
 
-        mock_cache = MagicMock()
-
-        with patch("routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock, return_value={}), \
-             patch("dummy_epg_engine.generate_xmltv", return_value=xml_output), \
-             patch("routers.dummy_epg.cache", mock_cache):
-            response = await async_client.post("/api/dummy-epg/generate")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
-        assert data["profiles_generated"] == 1
-
-        # Verify cache was invalidated and set
-        mock_cache.invalidate_prefix.assert_called_with("dummy_epg_xmltv")
-        assert mock_cache.set.call_count >= 1
-
-    @pytest.mark.asyncio
-    async def test_source_generation_uses_existing_background_task(self, async_client, test_session):
-        profile = _create_profile(test_session)
-        profile.set_epg_source_ids([42])
-        test_session.commit()
+        completion = asyncio.get_running_loop().create_future()
         engine = MagicMock()
-        engine.run_task = AsyncMock()
+        engine.start_task = AsyncMock(return_value=TaskRun(
+            execution_id=73,
+            task_id="dummy_epg_refresh",
+            started_at=datetime(2026, 9, 20, 14, 0),
+            completion=completion,
+        ))
         with patch("task_engine.get_engine", return_value=engine), patch(
-            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})
+            "routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock,
         ) as fetch_channels:
             response = await async_client.post("/api/dummy-epg/generate")
-        assert response.status_code == 200
-        assert response.json() == {"status": "pending", "profiles_generated": 0, "task_id": "dummy_epg_refresh"}
-        engine.run_task.assert_awaited_once_with("dummy_epg_refresh")
+
+        assert response.status_code == 202
+        assert response.json() == {
+            "status": "accepted",
+            "task_id": "dummy_epg_refresh",
+            "execution_id": 73,
+            "started_at": "2026-09-20T14:00:00Z",
+        }
+        engine.start_task.assert_awaited_once_with(
+            "dummy_epg_refresh", parameters=None,
+        )
         fetch_channels.assert_not_awaited()
+        completion.cancel()
+
+    @pytest.mark.asyncio
+    async def test_passes_selected_profiles_to_background_task(self, async_client):
+        import asyncio
+        from datetime import datetime
+        from task_engine import TaskRun
+
+        completion = asyncio.get_running_loop().create_future()
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=TaskRun(
+            execution_id=74,
+            task_id="dummy_epg_refresh",
+            started_at=datetime(2026, 9, 20, 14, 1),
+            completion=completion,
+        ))
+        with patch("task_engine.get_engine", return_value=engine):
+            response = await async_client.post(
+                "/api/dummy-epg/generate", json={"profile_ids": [3, 5]},
+            )
+        assert response.status_code == 202
+        engine.start_task.assert_awaited_once_with(
+            "dummy_epg_refresh", parameters={"profile_ids": [3, 5]},
+        )
+        completion.cancel()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [("ALREADY_RUNNING", 409), ("ENGINE_STOPPING", 503)],
+    )
+    async def test_reports_admission_refusal(self, async_client, error, status_code):
+        from task_scheduler import TaskResult
+
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=TaskResult(
+            success=False, message="Refresh was not admitted", error=error,
+        ))
+        with patch("task_engine.get_engine", return_value=engine):
+            response = await async_client.post("/api/dummy-epg/generate")
+        assert response.status_code == status_code
+        assert response.json()["detail"]["error"] == error
 
 
 # =============================================================================
@@ -1145,11 +1418,9 @@ class TestXmltvUnauthenticatedAccess:
         """GET /api/dummy-epg/xmltv returns the guide with auth enabled."""
         _create_profile(test_session, name="Open Read")
         cached_xml = '<?xml version="1.0"?><tv><channel id="ecm-1"/></tv>'
-        mock_cache = MagicMock()
-        mock_cache.get.return_value = cached_xml
 
         with patch("main.get_auth_settings", return_value=_AuthOn()), \
-             patch("routers.dummy_epg.cache", mock_cache):
+             patch("services.epg_publication.read_publication", return_value={"xmltv": cached_xml}):
             response = await async_client.get("/api/dummy-epg/xmltv")
 
         assert response.status_code == 200, response.text
@@ -1164,11 +1435,8 @@ class TestXmltvUnauthenticatedAccess:
         """
         profile = _create_profile(test_session, name="Open Profile Read")
         cached_xml = '<?xml version="1.0"?><tv><channel id="ecm-7"/></tv>'
-        mock_cache = MagicMock()
-        mock_cache.get.return_value = cached_xml
-
         with patch("main.get_auth_settings", return_value=_AuthOn()), \
-             patch("routers.dummy_epg.cache", mock_cache):
+             patch("services.epg_publication.read_publication", return_value={"xmltv": cached_xml}):
             response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
 
         assert response.status_code == 200, response.text
@@ -1235,6 +1503,31 @@ class TestXmltvUnauthenticatedAccess:
 
 
 class TestProgrammeSources:
+    @staticmethod
+    async def _request_coverage(
+        async_client,
+        profile,
+        prepared,
+        coverage,
+        publication,
+        *,
+        channel_map=None,
+    ):
+        with patch(
+            "routers.dummy_epg._fetch_all_channels",
+            AsyncMock(return_value={} if channel_map is None else channel_map),
+        ), patch(
+            "services.epg_programmes.prepare_profiles",
+            AsyncMock(return_value=([prepared], coverage)),
+        ), patch(
+            "services.epg_publication.read_publication",
+            side_effect=publication if isinstance(publication, Exception) else None,
+            return_value=None if isinstance(publication, Exception) else publication,
+        ):
+            return await async_client.get(
+                f"/api/dummy-epg/profiles/{profile.id}/coverage",
+            )
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("link_field", ["epg_data_id", "epg_data"])
     async def test_captures_numeric_identity_and_preserves_it_on_sparse_edit(self, async_client, test_session, link_field):
@@ -1307,43 +1600,594 @@ class TestProgrammeSources:
     @pytest.mark.asyncio
     async def test_coverage_is_private_and_read_only(self, async_client, test_session):
         profile = _create_profile(test_session)
+        profile.set_epg_source_ids([51, 42])
+        test_session.commit()
         with patch("main.get_auth_settings", return_value=_AuthOn()), patch("services.epg_programmes.prepare_profiles", new_callable=AsyncMock) as prepare:
             denied = await async_client.get(f"/api/dummy-epg/profiles/{profile.id}/coverage")
         assert denied.status_code == 401
         prepare.assert_not_awaited()
-        coverage = {"generated_at": "2026-09-05T05:00:00Z", "window_start": "2026-09-05T00:00:00Z", "window_stop": "2026-09-07T00:00:00Z", "sources": [
+        profile_sources = [
             {"source_id": 51, "status": "pending", "last_success": None, "error": None},
             {"source_id": 42, "status": "error", "last_success": None, "error": "Malformed XML.", "diagnostics": {
                 "wire_bytes": 512, "decoded_bytes": 4096, "http_status": 200, "content_type": "absent", "content_encoding": "gzip",
                 "compression": "gzip", "transport_complete": True, "xml_complete": False, "root": "tv",
                 "parser_code": 4, "parser_line": 1, "parser_column": 3902, "failure": "invalid_utf8"}},
-        ], "channels": []}
+        ]
+        coverage = _coverage_result(
+            profile.id,
+            owned_channel_ids=[],
+            sources=profile_sources,
+            can_publish=False,
+            reason_codes=["GUIDE_SOURCES_PENDING"],
+        )
+        coverage["sources"] = profile_sources
         before = profile.to_dict()
-        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})), patch("routers.dummy_epg.get_client", return_value=AsyncMock()) as client, patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([before], coverage))) as prepare:
+        prepared = {**before, "channel_assignments": []}
+        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})), patch("routers.dummy_epg.get_client", return_value=AsyncMock()) as client, patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([prepared], coverage))) as prepare, patch("services.epg_publication.read_publication", return_value=None), patch("services.epg_publication.publish_profiles") as publish, patch("services.epg_publication.update_observations") as update_observations, patch("services.epg_publication.update_delivery") as update_delivery:
             response = await async_client.get(f"/api/dummy-epg/profiles/{profile.id}/coverage")
         assert response.status_code == 200
-        assert response.json() == coverage
+        body = response.json()
+        for field in (
+            "generated_at", "window_start", "window_stop", "sources",
+            "channels", "artwork_pending", "profiles",
+        ):
+            assert body[field] == coverage[field]
+        assert body["publication"] == {
+            "status": "unavailable",
+            "published_at": None,
+            "revision": None,
+            "window_start": None,
+            "window_stop": None,
+            "config_matches": None,
+            "reason_codes": ["GUIDE_UNAVAILABLE"],
+            "delivery": None,
+            "channels": [],
+        }
         assert prepare.await_args.kwargs == {}
         client.return_value.refresh_epg_source.assert_not_awaited()
         client.return_value.update_channel.assert_not_awaited()
+        publish.assert_not_called()
+        update_observations.assert_not_called()
+        update_delivery.assert_not_called()
         assert profile.to_dict() == before
 
     @pytest.mark.asyncio
-    async def test_targeted_generation_keeps_all_profiles_in_combined_cache(self, async_client, test_session):
-        first = _create_profile(test_session, name="First")
-        second = _create_profile(test_session, name="Second")
-        first.set_channel_group_ids([1])
-        second.set_channel_group_ids([2])
+    async def test_coverage_projects_valid_publication_without_mutation(
+        self, async_client, test_session,
+    ):
+        import json
+        from models import GuidePublication
+
+        profile = _create_profile(
+            test_session, tvg_id_template="ecm-{channel_number}",
+        )
+        profile.set_channel_group_ids([65])
         test_session.commit()
-        channels = {1: {"id": 1, "name": "One", "channel_group": 1}, 2: {"id": 2, "name": "Two", "channel_group_id": 2}}
-        with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)), patch("routers.dummy_epg.cache") as cache:
-            response = await async_client.post("/api/dummy-epg/generate", json={"profile_ids": [first.id]})
-        assert response.status_code == 200
-        assert response.json()["profiles_generated"] == 1
-        combined = next(call.args[1] for call in cache.set.call_args_list if call.args[0] == "dummy_epg_xmltv_all")
-        assert "One" in combined and "Two" in combined
-        assert any(call.args[0] == f"dummy_epg_xmltv_{first.id}" for call in cache.set.call_args_list)
-        assert not any(call.args[0] == f"dummy_epg_xmltv_{second.id}" for call in cache.set.call_args_list)
+        channel_map = {
+            10: {
+                "id": 10,
+                "name": "Slot 10",
+                "channel_number": 10,
+                "channel_group_id": 65,
+            },
+        }
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{
+                "channel_id": 10, "channel_name": "Slot 10",
+            }],
+        }
+        coverage = _coverage_result(profile.id)
+        publication = _publication_record(profile.id, prepared)
+        row = GuidePublication(
+            scope=publication["scope"],
+            xmltv=publication["xmltv"],
+            state=json.dumps(publication["state"]),
+            revision=publication["revision"],
+        )
+        test_session.add(row)
+        test_session.commit()
+        before = (row.xmltv, row.state, row.revision)
+
+        with patch(
+            "routers.dummy_epg._fetch_all_channels",
+            AsyncMock(return_value=channel_map),
+        ), patch(
+            "services.epg_programmes.prepare_profiles",
+            AsyncMock(return_value=([prepared], coverage)),
+        ):
+            first = await async_client.get(
+                f"/api/dummy-epg/profiles/{profile.id}/coverage",
+            )
+            second = await async_client.get(
+                f"/api/dummy-epg/profiles/{profile.id}/coverage",
+            )
+
+        assert first.status_code == 200, first.text
+        projected = first.json()["publication"]
+        assert projected == second.json()["publication"]
+        assert projected == {
+            "status": "published",
+            "published_at": "2026-09-05T04:00:00+00:00",
+            "revision": 7,
+            "window_start": "2026-09-05T00:00:00+00:00",
+            "window_stop": "2026-09-05T10:00:00+00:00",
+            "config_matches": True,
+            "reason_codes": [],
+            "delivery": {
+                "dispatcharr_status": "unknown",
+                "pending_emby": False,
+            },
+            "channels": [{
+                "channel_id": 10,
+                "xmltv_id": "ecm-10",
+                "visibility_evidence": "published",
+                "events": [{
+                    "start": "2026-09-05T04:00:00+00:00",
+                    "stop": "2026-09-05T06:00:00+00:00",
+                    "title": "Stored event",
+                }],
+            }],
+        }
+        saved = test_session.query(GuidePublication).filter_by(
+            scope=publication["scope"],
+        ).one()
+        assert (saved.xmltv, saved.state, saved.revision) == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("source_status", "can_publish", "reason_codes"),
+        [
+            ("pending", False, ["GUIDE_SOURCES_PENDING"]),
+            ("error", False, ["GUIDE_QUERY_PENDING"]),
+            ("stale", False, ["GUIDE_SOURCE_STALE"]),
+            ("retained", True, []),
+        ],
+    )
+    async def test_coverage_keeps_readiness_separate_from_retained_evidence(
+        self, async_client, test_session,
+        source_status, can_publish, reason_codes,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {
+            10: {
+                "id": 10, "name": "Slot 10", "channel_number": 10,
+            },
+        }
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        source = {
+            "source_id": 51,
+            "status": source_status,
+            "last_success": "2026-09-05T03:00:00+00:00",
+            "error": "Source failed" if source_status == "error" else None,
+        }
+        coverage = _coverage_result(
+            profile.id,
+            sources=[source],
+            can_publish=can_publish,
+            reason_codes=reason_codes,
+        )
+        publication = _publication_record(profile.id, prepared)
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["profiles"][str(profile.id)]["sources"] == [source]
+        assert body["profiles"][str(profile.id)]["reason_codes"] == reason_codes
+        assert body["publication"]["status"] == "retained"
+        assert body["publication"]["reason_codes"] == []
+        assert body["publication"]["channels"][0]["visibility_evidence"] == "retained"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("events", "can_publish", "expected_status", "expected_evidence"),
+        [
+            ([], False, "retained", "unknown"),
+            ([{
+                "start": "2026-09-05T02:00:00+00:00",
+                "stop": "2026-09-05T03:00:00+00:00",
+                "title": "Expired event",
+            }], False, "retained", "unknown"),
+            ([{
+                "start": "2026-09-05T06:00:00+00:00",
+                "stop": "2026-09-05T07:00:00+00:00",
+                "title": "Future event",
+            }], False, "retained", "unknown"),
+            ([], True, "published", "published"),
+        ],
+    )
+    async def test_coverage_does_not_infer_absence_from_degraded_readiness(
+        self, async_client, test_session,
+        events, can_publish, expected_status, expected_evidence,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        source = {"source_id": 51, "status": "ready" if can_publish else "error"}
+        coverage = _coverage_result(
+            profile.id,
+            sources=[source],
+            can_publish=can_publish,
+            reason_codes=[] if can_publish else ["GUIDE_SOURCES_PENDING"],
+        )
+        publication = _publication_record(
+            profile.id,
+            prepared,
+            channels=[{
+                "channel_id": 10,
+                "xmltv_id": "ecm-10",
+                "profile_id": profile.id,
+                "events": events,
+            }],
+        )
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["publication"]["status"] == expected_status
+        assert (
+            response.json()["publication"]["channels"][0]["visibility_evidence"]
+            == expected_evidence
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("generated_at", "window_start", "window_stop", "status", "reasons"),
+        [
+            (
+                "2026-09-05T04:59:59+00:00",
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T06:00:00+00:00",
+                "retained",
+                ["GUIDE_WINDOW_PENDING"],
+            ),
+            (
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T06:00:00+00:00",
+                "published",
+                [],
+            ),
+            (
+                "2026-09-05T06:00:00+00:00",
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T06:00:00+00:00",
+                "retained",
+                ["GUIDE_WINDOW_EXPIRED"],
+            ),
+            (
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T05:00:00+00:00",
+                "2026-09-05T05:00:00+00:00",
+                "retained",
+                ["GUIDE_WINDOW_EXPIRED"],
+            ),
+        ],
+    )
+    async def test_coverage_uses_stored_window_boundaries(
+        self, async_client, test_session,
+        generated_at, window_start, window_stop, status, reasons,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = _coverage_result(profile.id, generated_at=generated_at)
+        publication = _publication_record(
+            profile.id,
+            prepared,
+            window_start=window_start,
+            window_stop=window_stop,
+        )
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()["publication"]
+        assert result["status"] == status
+        assert result["reason_codes"] == reasons
+        assert result["window_start"] == window_start
+        assert result["window_stop"] == window_stop
+        assert result["channels"][0]["visibility_evidence"] == (
+            "published" if status == "published" else "unknown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_coverage_marks_changed_config_and_membership_unknown(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {10: {"id": 10, "name": "Current", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = _coverage_result(profile.id)
+        publication = _publication_record(
+            profile.id,
+            prepared,
+            config_hash="0" * 64,
+            channels=[{
+                "channel_id": 20,
+                "xmltv_id": "ecm-20",
+                "profile_id": profile.id,
+                "events": [{
+                    "start": "2026-09-05T04:00:00+00:00",
+                    "stop": "2026-09-05T06:00:00+00:00",
+                    "title": "Historical event",
+                }],
+            }],
+        )
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()["publication"]
+        assert result["status"] == "retained"
+        assert result["config_matches"] is False
+        assert result["reason_codes"] == ["GUIDE_CONFIG_CHANGED"]
+        assert result["channels"] == [
+            {
+                "channel_id": 10,
+                "xmltv_id": None,
+                "visibility_evidence": "unknown",
+                "events": [],
+            },
+            {
+                "channel_id": 20,
+                "xmltv_id": "ecm-20",
+                "visibility_evidence": "unknown",
+                "events": [{
+                    "start": "2026-09-05T04:00:00+00:00",
+                    "stop": "2026-09-05T06:00:00+00:00",
+                    "title": "Historical event",
+                }],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_coverage_requires_current_outward_id_for_evidence(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(
+            test_session, tvg_id_template="ecm-{channel_number}",
+        )
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 11}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = _coverage_result(profile.id)
+        publication = _publication_record(profile.id, prepared)
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()["publication"]
+        assert result["status"] == "published"
+        assert result["channels"][0]["xmltv_id"] == "ecm-10"
+        assert result["channels"][0]["visibility_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_coverage_missing_publication_is_available_diagnostic(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = _coverage_result(profile.id)
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, None,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["publication"] == {
+            "status": "unavailable",
+            "published_at": None,
+            "revision": None,
+            "window_start": None,
+            "window_stop": None,
+            "config_matches": None,
+            "reason_codes": ["GUIDE_UNAVAILABLE"],
+            "delivery": None,
+            "channels": [{
+                "channel_id": 10,
+                "xmltv_id": None,
+                "visibility_evidence": "unknown",
+                "events": [],
+            }],
+        }
+
+    @pytest.mark.asyncio
+    async def test_coverage_disabled_profile_keeps_history_unknown(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session, enabled=False)
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = {
+            "generated_at": "2026-09-05T05:00:00+00:00",
+            "window_start": None,
+            "window_stop": None,
+            "sources": [],
+            "channels": [],
+            "artwork_pending": False,
+            "profiles": {},
+        }
+        publication = _publication_record(profile.id, prepared)
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["profiles"][str(profile.id)] == {
+            "profile_id": profile.id,
+            "source_ids": [],
+            "sources": [],
+            "owned_channel_ids": [10],
+            "can_publish": False,
+            "reason_codes": ["PROFILE_DISABLED"],
+        }
+        assert body["publication"]["status"] == "retained"
+        assert body["publication"]["reason_codes"] == ["PROFILE_DISABLED"]
+        assert body["publication"]["channels"][0]["visibility_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_coverage_reports_corrupt_publication_as_typed_failure(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        prepared = {**profile.to_dict(), "channel_assignments": []}
+        coverage = _coverage_result(profile.id, owned_channel_ids=[])
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage,
+            ValueError("stored XML is invalid"),
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {
+            "code": "GUIDE_PUBLICATION_FAILED",
+            "reason_codes": ["GUIDE_STATE_CORRUPT"],
+        }
+        assert "stored XML" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_coverage_rejects_missing_enabled_readiness_record(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        prepared = {**profile.to_dict(), "channel_assignments": []}
+        coverage = {
+            "generated_at": "2026-09-05T05:00:00+00:00",
+            "window_start": None,
+            "window_stop": None,
+            "sources": [],
+            "channels": [],
+            "artwork_pending": False,
+            "profiles": {},
+        }
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, None,
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {
+            "code": "GUIDE_PUBLICATION_FAILED",
+            "reason_codes": ["GUIDE_COVERAGE_INVALID"],
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("required", "confirmed", "config_hash", "expected"),
+        [
+            ({}, {}, None, "unknown"),
+            ({"source": "a" * 64}, {}, None, "pending"),
+            ({"source": "a" * 64}, {"source": "b" * 64}, None, "pending"),
+            ({"source": "a" * 64}, {"source": "a" * 64}, None, "confirmed"),
+            ({"source": "a" * 64}, {"source": "a" * 64}, "0" * 64, "unknown"),
+        ],
+    )
+    async def test_coverage_projects_delivery_independently(
+        self, async_client, test_session,
+        required, confirmed, config_hash, expected,
+    ):
+        profile = _create_profile(test_session)
+        channel_map = {10: {"id": 10, "name": "Slot", "channel_number": 10}}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10}],
+        }
+        coverage = _coverage_result(profile.id)
+        publication = _publication_record(
+            profile.id,
+            prepared,
+            required=required,
+            confirmed=confirmed,
+            config_hash=config_hash,
+            pending_emby=True,
+        )
+
+        response = await self._request_coverage(
+            async_client, profile, prepared, coverage, publication,
+            channel_map=channel_map,
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()["publication"]
+        assert result["delivery"] == {
+            "dispatcharr_status": expected,
+            "pending_emby": True,
+        }
+        assert result["status"] == (
+            "retained" if config_hash is not None else "published"
+        )
+
+    @pytest.mark.asyncio
+    async def test_targeted_generation_is_admitted_without_local_composition(
+        self, async_client,
+    ):
+        import asyncio
+        from datetime import datetime
+        from task_engine import TaskRun
+
+        completion = asyncio.get_running_loop().create_future()
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=TaskRun(
+            execution_id=88,
+            task_id="dummy_epg_refresh",
+            started_at=datetime(2026, 9, 20, 15, 0),
+            completion=completion,
+        ))
+        with patch("task_engine.get_engine", return_value=engine), patch(
+            "routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock,
+        ) as fetch_channels, patch("routers.dummy_epg.cache") as cache:
+            response = await async_client.post(
+                "/api/dummy-epg/generate", json={"profile_ids": [17]},
+            )
+        assert response.status_code == 202
+        engine.start_task.assert_awaited_once_with(
+            "dummy_epg_refresh", parameters={"profile_ids": [17]},
+        )
+        fetch_channels.assert_not_awaited()
+        cache.set.assert_not_called()
+        completion.cancel()
 
 
     @pytest.mark.asyncio
@@ -1355,17 +2199,77 @@ class TestProgrammeSources:
         path = f"/api/dummy-epg/profiles/{profile.id}/coverage"
         credentials = MCPServiceCredentials("private-coverage-key", "private-coverage-confirmation")
         claim = issue_test_claim(credentials, "GET", path, None)
+        prepared = {**profile.to_dict(), "channel_assignments": []}
+        coverage = _coverage_result(profile.id, owned_channel_ids=[])
         with (
             patch("main.get_auth_settings", return_value=_AuthOn()),
             patch("main.get_settings", return_value=SimpleNamespace(mcp_api_key="public-listener-key")),
             patch("main.load_mcp_service_credentials", return_value=credentials),
             patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})),
-            patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([], {"sources": [], "channels": []}))),
+            patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([prepared], coverage))),
+            patch("services.epg_publication.read_publication", return_value=None),
         ):
             response = await async_client.get(path, headers={"Authorization": "Bearer private-coverage-key", MCP_CLAIM_HEADER: claim})
             refused = await async_client.get(path, headers={"Authorization": "Bearer public-listener-key"})
         assert response.status_code == 200, response.text
+        assert response.json()["publication"]["status"] == "unavailable"
         assert refused.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_yaml_export_preserves_catalogue_failure_status(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        profile.set_channel_group_ids([65])
+        test_session.commit()
+        client = AsyncMock()
+        client.get_channel_groups.side_effect = TimeoutError("catalogue unavailable")
+
+        with patch("routers.dummy_epg.get_client", return_value=client):
+            response = await async_client.get(
+                "/api/dummy-epg/profiles/export/yaml",
+            )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Could not resolve portable group and account names for YAML export"
+        )
+        client.get_m3u_accounts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["group", "account"])
+    async def test_yaml_export_preserves_unresolved_reference_detail(
+        self, async_client, test_session, missing,
+    ):
+        profile = _create_profile(test_session)
+        if missing == "group":
+            profile.set_channel_group_ids([65])
+            groups = []
+            expected_groups = [65]
+            expected_accounts = []
+        else:
+            profile.set_event_sync_config({
+                "secondary": [{"group_id": 65, "m3u_account_id": 77}],
+            })
+            groups = [{"id": 65, "name": "Events"}]
+            expected_groups = []
+            expected_accounts = [77]
+        test_session.commit()
+        client = AsyncMock()
+        client.get_channel_groups.return_value = groups
+        client.get_m3u_accounts.return_value = []
+
+        with patch("routers.dummy_epg.get_client", return_value=client):
+            response = await async_client.get(
+                "/api/dummy-epg/profiles/export/yaml",
+            )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == {
+            "message": "Portable profile references could not be resolved",
+            "group_ids": expected_groups,
+            "m3u_account_ids": expected_accounts,
+        }
 
     @pytest.mark.asyncio
     async def test_yaml_round_trip_and_sparse_overwrite_keep_sources_and_artwork(self, async_client, test_session):
@@ -1379,7 +2283,15 @@ class TestProgrammeSources:
         profile.set_channel_mappings([{"channel_id": 2950, "source_id": 51, "tvg_id": "32645"}])
         test_session.commit()
         client = AsyncMock()
-        client.get_channel_groups.return_value = []
+        client.get_channel_groups.return_value = [
+            {"id": 65, "name": "Guide Slots"},
+            {"id": 1558, "name": "Primary Events"},
+            {"id": 1557, "name": "Backup Events"},
+        ]
+        client.get_m3u_accounts.return_value = []
+        client.get_all_m3u_group_settings.return_value = {
+            1558: {}, 1557: {},
+        }
         client.get_epg_sources.return_value = [{"id": 51, "source_type": "xmltv", "url": "https://guide.example/xml", "is_active": True}]
         client.get_epg_data.return_value = []
         with patch("routers.dummy_epg.get_session", return_value=test_session), patch("routers.dummy_epg.get_client", return_value=client), patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})):
@@ -1391,6 +2303,7 @@ class TestProgrammeSources:
             assert original["epg_source_ids"] == [51]
             assert original["channel_mappings"][0]["tvg_id"] == "32645"
             original["name"] = "Copy"
+            original["enabled"] = False
             copied = await async_client.post("/api/dummy-epg/profiles/import/yaml", json={"yaml_content": yaml.safe_dump(document)})
             assert copied.status_code == 200, copied.text
             assert copied.json()["errors"] == []
@@ -1464,14 +2377,21 @@ class TestProgrammeSources:
         with patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)), patch("routers.dummy_epg.cache", cache), patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([prepared], {"sources": [{"status": "ready" if source_status == "artwork" else source_status}], "artwork_pending": source_status == "artwork"}))) as prepare:
             path = f"/api/dummy-epg/xmltv/{profile.id}" if single_profile else "/api/dummy-epg/xmltv"
             response = await async_client.get(path)
-        assert response.status_code == 200, response.text
-        assert "ONE Fight Night 47" in response.text
-        assert 'channel="ecm-10"' in response.text
-        assert "20260905050000 +0000" in response.text
         if source_status in {"ready", "artwork"}:
-            cache.set.assert_called_once()
+            from models import GuidePublication
+
+            assert response.status_code == 200, response.text
+            assert "ONE Fight Night 47" in response.text
+            assert 'channel="ecm-10"' in response.text
+            assert "20260905050000 +0000" in response.text
+            scope = f"profile:{profile.id}" if single_profile else "all"
+            publication = test_session.query(GuidePublication).filter_by(
+                scope=scope,
+            ).one()
+            assert publication.xmltv == response.text
         else:
-            cache.set.assert_not_called()
+            assert response.status_code == 503
+            assert response.json()["detail"]["code"] == "GUIDE_UNAVAILABLE"
         prepare.assert_awaited_once()
         assert prepare.await_args.kwargs == {}
 
@@ -1531,379 +2451,71 @@ class TestProgrammeSources:
         assert saved["enabled"] == ("enabled" not in change)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("stalled", ["catalogue", "source"])
-    async def test_generation_returns_pending_then_publishes_loaded_schedule(self, async_client, test_session, monkeypatch, stalled):
+    async def test_generate_does_not_prepare_guide_in_request(self, async_client):
         import asyncio
-        from datetime import datetime, timedelta, timezone
-        from xml.etree import ElementTree as ET
-        from services import epg_programmes as guides
-        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+        from datetime import datetime
+        from task_engine import TaskRun
 
-        for name in ("_CATALOGUE_CACHE", "_CATALOGUE_LOADS", "_SOURCE_CACHE", "_SOURCE_LOADS"):
-            monkeypatch.setattr(guides, name, {})
-        profile = _create_profile(test_session)
-        profile.set_epg_source_ids([42])
-        profile.set_channel_group_ids([68])
-        test_session.commit()
-        channels = {1: {"id": 1, "name": "ESPN", "channel_number": 1, "channel_group_id": 68, "tvg_id": "ESPN.us", "streams": []}}
-        sources = [{"id": 42, "source_type": "xmltv", "is_active": True, "url": "https://guide.invalid/guide.xml"}]
-        release, started = asyncio.Event(), asyncio.Event()
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-        programme = ET.Element("programme", {
-            "channel": "ESPN.us", "start": now.strftime("%Y%m%d%H%M%S %z"),
-            "stop": (now + timedelta(hours=1)).strftime("%Y%m%d%H%M%S %z"),
-        })
-        ET.SubElement(programme, "title").text = "Fixture schedule"
-
-        async def catalogue():
-            if stalled == "catalogue":
-                started.set()
-                await release.wait()
-            return sources
-
-        async def read(*_):
-            if stalled == "source":
-                started.set()
-                await release.wait()
-            return {"headers": {}, "rows": {"ESPN.us": [programme]}, "warnings": [], "size": 100}
-
-        client = AsyncMock()
-        client.get_epg_sources.side_effect = catalogue
-        monkeypatch.setattr(guides, "_read_source", read)
-        db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [profile]
+        completion = asyncio.get_running_loop().create_future()
         engine = MagicMock()
-        engine.run_task = AsyncMock()
+        engine.start_task = AsyncMock(return_value=TaskRun(
+            execution_id=91,
+            task_id="dummy_epg_refresh",
+            started_at=datetime(2026, 9, 20, 15, 30),
+            completion=completion,
+        ))
         with patch("task_engine.get_engine", return_value=engine), patch(
-            "tasks.dummy_epg_refresh.get_client", return_value=client
-        ), patch("database.get_session", return_value=db), patch(
-            "services.epg_programmes._fetch_all_channels", AsyncMock(return_value=channels)
-        ), patch("cache.get_cache") as cache, patch("routers.dummy_epg.cache", cache.return_value):
+            "services.epg_programmes.prepare_profiles", new_callable=AsyncMock,
+        ) as prepare, patch(
+            "routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock,
+        ) as fetch_channels:
             response = await async_client.post("/api/dummy-epg/generate")
-            assert response.json() == {"status": "pending", "profiles_generated": 0, "task_id": "dummy_epg_refresh"}
-            cache.return_value.set.assert_not_called()
-            refresh = asyncio.create_task(DummyEPGRefreshTask()._regenerate_xmltv())
-            try:
-                await asyncio.wait_for(started.wait(), timeout=2)
-                cache.return_value.set.assert_not_called()
-                release.set()
-                assert await refresh == 1
-                published = {call.args[0]: call.args[1] for call in cache.return_value.set.call_args_list}
-                assert "Fixture schedule" in published["dummy_epg_xmltv_all"]
-                assert "Fixture schedule" in published[f"dummy_epg_xmltv_{profile.id}"]
-                engine.run_task.assert_awaited_once_with("dummy_epg_refresh")
-                client.get_epg_sources.assert_awaited_once()
-            finally:
-                release.set()
-                await refresh
+
+        assert response.status_code == 202
+        prepare.assert_not_awaited()
+        fetch_channels.assert_not_awaited()
+        completion.cancel()
 
     @pytest.mark.asyncio
-    async def test_background_guide_is_cached_while_portraits_are_pending(self, async_client, test_session, monkeypatch, tmp_path):
-        import asyncio
-        from datetime import datetime, timedelta, timezone
-        from xml.etree import ElementTree as ET
-        from cache import Cache
-        from services import epg_artwork, epg_programmes as guides
-        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-
-        for name in ("_CATALOGUE_CACHE", "_CATALOGUE_LOADS", "_SOURCE_CACHE", "_SOURCE_LOADS"):
-            monkeypatch.setattr(guides, name, {})
-        monkeypatch.setattr(guides, "_ARTWORK_LOAD", None)
-        monkeypatch.setattr(guides, "_ARTWORK_CHECKED", 0)
-        monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
-        profile = _create_profile(test_session, tvg_id_template="ecm-{channel_id}")
-        profile.set_epg_source_ids([42])
-        profile.set_channel_group_ids([68])
-        test_session.commit()
-        channels = {1: {"id": 1, "name": "ESPN", "channel_number": 1, "channel_group_id": 68, "tvg_id": "ESPN.us", "streams": []}}
-        sources = [{"id": 42, "source_type": "xmltv", "is_active": True, "url": "https://guide.invalid/guide.xml"}]
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-        programme = ET.Element("programme", {
-            "channel": "ESPN.us", "start": now.strftime("%Y%m%d%H%M%S %z"),
-            "stop": (now + timedelta(hours=1)).strftime("%Y%m%d%H%M%S %z"),
-        })
-        ET.SubElement(programme, "title").text = "Complete schedule"
-        landscape = "https://tmsimg.com/assets/p12345_b_h3_aa.jpg"
-        portrait = "https://tmsimg.com/assets/p12345_b_v12_aa.jpg"
-        ET.SubElement(programme, "icon", {"src": landscape})
-        started, release = asyncio.Event(), asyncio.Event()
-
-        async def probe(artwork_cache, unknown):
-            started.set()
-            await release.wait()
-            for key in unknown:
-                artwork_cache.put(key, "v12")
-            artwork_cache.save()
-            return len(unknown)
-
-        client = AsyncMock()
-        client.get_epg_sources.return_value = sources
-        read = AsyncMock(return_value={"headers": {}, "rows": {"ESPN.us": [programme]}, "warnings": [], "size": 100})
-        monkeypatch.setattr(guides, "_read_source", read)
-        monkeypatch.setattr(epg_artwork, "probe_unknown", probe)
-        db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [profile]
-        cache = Cache()
-        with patch("tasks.dummy_epg_refresh.get_client", return_value=client), patch(
-            "routers.dummy_epg.get_client", return_value=client
-        ), patch("database.get_session", return_value=db), patch(
-            "services.epg_programmes._fetch_all_channels", AsyncMock(return_value=channels)
-        ), patch("routers.dummy_epg._fetch_all_channels", AsyncMock(return_value=channels)) as fetch, patch(
-            "cache.get_cache", return_value=cache
-        ), patch.object(guides, "get_cache", return_value=cache), patch("routers.dummy_epg.cache", cache):
-            task = None
-            try:
-                assert await DummyEPGRefreshTask()._regenerate_xmltv() == 1
-                await asyncio.wait_for(started.wait(), timeout=1)
-                task = guides._ARTWORK_LOAD
-                for key in ("dummy_epg_xmltv_all", f"dummy_epg_xmltv_{profile.id}"):
-                    xml = cache.get(key, ttl=300)
-                    assert xml is not None
-                    assert landscape in xml
-                    ET.fromstring(xml)
-                response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
-                assert response.status_code == 200
-                assert landscape in response.text
-                assert "Complete schedule" in response.text
-                fetch.assert_not_awaited()
-                release.set()
-                await task
-                assert cache.get("dummy_epg_xmltv_all", ttl=300) is None
-                assert cache.get(f"dummy_epg_xmltv_{profile.id}", ttl=300) is None
-                response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
-                assert response.status_code == 200
-                assert portrait in response.text
-                assert landscape not in response.text
-                assert cache.get(f"dummy_epg_xmltv_{profile.id}", ttl=300) == response.text
-                assert fetch.await_count == 1
-                combined = await async_client.get("/api/dummy-epg/xmltv")
-                assert combined.status_code == 200
-                assert portrait in combined.text
-                assert cache.get("dummy_epg_xmltv_all", ttl=300) == combined.text
-                read.assert_awaited_once()
-            finally:
-                release.set()
-                task = task or guides._ARTWORK_LOAD
-                if task is not None:
-                    await asyncio.gather(task, return_exceptions=True)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(("source_status", "artwork_pending", "status"), [
-        ("error", False, "error"), ("stale", False, "error"),
-        ("pending", False, "pending"), ("pending", True, "pending"),
-    ])
-    async def test_generation_reports_unready_coverage_without_publishing(self, async_client, test_session, source_status, artwork_pending, status):
-        profile = _create_profile(test_session)
-        coverage = {
-            "sources": [{"source_id": 42, "status": source_status}],
-            "channels": [], "artwork_pending": artwork_pending,
-        }
-        with patch("services.epg_programmes.prepare_profiles", AsyncMock(return_value=([profile.to_dict()], coverage))), patch(
-            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={})
-        ), patch("routers.dummy_epg.cache") as cache:
+    async def test_unknown_refresh_task_returns_not_found(self, async_client):
+        engine = MagicMock()
+        engine.start_task = AsyncMock(return_value=None)
+        with patch("task_engine.get_engine", return_value=engine):
             response = await async_client.post("/api/dummy-epg/generate")
-        assert response.status_code == 200, response.text
-        assert response.json() == {"status": status, "profiles_generated": 1, "coverage": coverage}
-        cache.set.assert_not_called()
-
-
-class TestHideEmptyChannels:
-    """A numbered event slot should leave the lineup while it carries nothing, and
-    come back complete when it does — without churning its id or guide binding."""
-
-    @staticmethod
-    def _task():
-        from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-        return DummyEPGRefreshTask()
-
-    @staticmethod
-    def _channels():
-        return {
-            10: {"id": 10, "channel_group_id": 900, "hidden_from_output": False,
-                 "streams": [{"id": 110}]},
-            11: {"id": 11, "channel_group_id": 900, "hidden_from_output": True,
-                 "streams": [{"id": 111}]},
-            12: {"id": 12, "channel_group_id": 901, "hidden_from_output": False,
-                 "streams": [{"id": 112}]},
-        }
-
-    @staticmethod
-    def _coverage():
-        return {"sources": [{"source_id": 51, "status": "ready"}], "channels": [
-            {"channel_id": 10, "real_minutes": 0, "current": None},
-            {"channel_id": 11, "real_minutes": 120, "current": {"title": "Event"}},
-            {"channel_id": 12, "real_minutes": 0, "current": None},
-        ]}
-
-    async def _apply(self, coverage, client, *, available=None, flow=None, profiles=None):
-        current = available if available is not None else {10: False, 11: True, 12: False}
-        measured = flow if flow is not None else {110: None, 111: None, 112: None}
-        coverage = {**coverage, "channels": [
-            {**row, "current": {"title": "Event"} if current.get(row["channel_id"]) else None}
-            for row in coverage.get("channels", [])
-        ]}
-        with patch(
-            "services.event_sync_stream_health.collect_stream_flow",
-            AsyncMock(return_value=measured),
-        ):
-            await self._task()._apply_empty_channel_visibility(
-                profiles or [{"hide_empty_group_ids": [900]}],
-                self._channels(), coverage, client,
-            )
-
-    @pytest.mark.asyncio
-    async def test_a_slot_nobody_asked_the_source_about_is_left_alone(self):
-        """A composition taken before the scan lands reads every slot as empty.
-        Acting on that hides the whole group until the next good run."""
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        coverage = {"sources": [{"source_id": 51, "status": "ready"}], "channels": [
-            {"channel_id": 10, "real_minutes": 0, "warnings": ["schedule_pending"]},
-            {"channel_id": 11, "real_minutes": 0, "warnings": ["mapping_unavailable"]},
-        ]}
-        await self._apply(coverage, client)
-        client.update_channel.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_warning_that_is_not_about_lookup_still_hides(self):
-        """missing_artwork says nothing about whether the source was asked."""
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        coverage = {"sources": [{"source_id": 51, "status": "ready"}],
-                    "channels": [{"channel_id": 10, "real_minutes": 0, "warnings": ["missing_artwork"]}]}
-        await self._apply(coverage, client, available={10: False})
-        client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": True})
-
-    @pytest.mark.asyncio
-    async def test_an_opted_in_group_hides_the_empty_and_restores_the_filled(self):
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        await self._apply(self._coverage(), client)
-        assert client.update_channel.await_args_list == [
-            call(10, {"hidden_from_output": True}),
-            call(11, {"hidden_from_output": False}),
-        ]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("sources", [
-        [],
-        [{"source_id": 51, "status": "pending"}],
-        [{"source_id": 51, "status": "ready"}, {"source_id": 4, "status": "stale"}],
-    ])
-    async def test_a_source_still_loading_decides_no_visibility(self, sources):
-        """A cold source yields empty channels with NO warning to say why, so an
-        empty row cannot be told from an idle slot until every source is ready."""
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        coverage = {"sources": sources, "channels": [{"channel_id": 10, "real_minutes": 0}]}
-        await self._apply(coverage, client)
-        client.update_channel.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_group_nobody_opted_in_is_left_alone(self):
-        """Channel 12 is empty too, and must stay visible: a gap in a cable
-        channel's listings is not the same statement as an idle event slot."""
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        await self._apply(self._coverage(), client)
-        assert call(12, {"hidden_from_output": True}) not in client.update_channel.await_args_list
-
-    @pytest.mark.asyncio
-    async def test_no_opted_in_group_touches_nothing(self):
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        await self._apply(
-            self._coverage(), client, profiles=[{"hide_empty_group_ids": []}],
-        )
-        client.update_channel.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_failed_update_does_not_stop_the_rest(self):
-        client = MagicMock()
-        client.update_channel = AsyncMock(side_effect=[RuntimeError("boom"), None])
-        await self._apply(self._coverage(), client)
-        assert client.update_channel.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_cancelled_flow_batch_does_not_change_visibility(self):
-        task = self._task()
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-
-        async def stop(*args, **kwargs):
-            task._cancel_requested = True
-            return {110: False, 111: True}
-
-        with patch(
-            "services.event_sync_stream_health.collect_stream_flow",
-            AsyncMock(side_effect=stop),
-        ):
-            await task._apply_empty_channel_visibility(
-                [{"hide_empty_group_ids": [900]}],
-                self._channels(), self._coverage(), client,
-            )
-
-        client.update_channel.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_empty_guide_hides_even_when_stream_flows(self):
-        client = MagicMock()
-        client.update_channel = AsyncMock()
-        await self._apply(
-            self._coverage(),
-            client,
-            available={10: False, 11: True},
-            flow={110: True, 111: False},
-        )
-        assert client.update_channel.await_args_list == [
-            call(10, {"hidden_from_output": True}),
-        ]
+        assert response.status_code == 404
 
 
 class TestXmltvCacheOutlivesRefreshInterval:
-    """A guide that misses the cache is composed from the configured EPG
-    sources inside the request, which can take longer than the gateway's
-    request timeout — so the miss returns no guide at all rather than a slow
-    one. Dummy EPG Refresh warms the cache on an interval; the served TTL has
-    to outlive that interval or every request in the gap rebuilds and times
-    out. A 300s TTL against an hourly refresh left ~55 minutes of each hour
-    unservable.
-    """
-
-    # The interval Dummy EPG Refresh ships with. The TTL has to clear it with
-    # room for a late or skipped run.
-    REFRESH_INTERVAL_SECONDS = 3600
-
-    def test_ttl_constant_outlives_the_refresh_interval(self):
-        """The constant itself, so the bound is visible without a request."""
-        from routers.dummy_epg import XMLTV_CACHE_TTL
-
-        assert XMLTV_CACHE_TTL > self.REFRESH_INTERVAL_SECONDS
-
     @pytest.mark.asyncio
-    async def test_combined_read_uses_the_long_ttl(self, async_client, test_session):
-        """GET /xmltv reads with a TTL that survives between refreshes."""
-        _create_profile(test_session, name="TTL Combined")
-        mock_cache = MagicMock()
-        mock_cache.get.return_value = '<?xml version="1.0"?><tv/>'
-
-        with patch("routers.dummy_epg.cache", mock_cache):
+    async def test_combined_read_does_not_consult_process_cache(
+        self, async_client,
+    ):
+        xml = '<?xml version="1.0"?><tv><channel id="combined"/></tv>'
+        with patch(
+            "services.epg_publication.read_publication",
+            return_value={"xmltv": xml},
+        ), patch("routers.dummy_epg.cache") as cache:
             response = await async_client.get("/api/dummy-epg/xmltv")
 
-        assert response.status_code == 200, response.text
-        ttl = mock_cache.get.call_args.kwargs["ttl"]
-        assert ttl > self.REFRESH_INTERVAL_SECONDS
+        assert response.status_code == 200
+        assert 'id="combined"' in response.text
+        cache.get.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_profile_read_uses_the_long_ttl(self, async_client, test_session):
-        """The per-profile URL Dispatcharr polls needs the same bound."""
-        profile = _create_profile(test_session, name="TTL Profile")
-        mock_cache = MagicMock()
-        mock_cache.get.return_value = '<?xml version="1.0"?><tv/>'
+    async def test_disabled_profile_is_unavailable_without_publication_read(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session, enabled=False)
+        with patch(
+            "services.epg_publication.read_publication",
+        ) as read_publication:
+            response = await async_client.get(
+                f"/api/dummy-epg/xmltv/{profile.id}",
+            )
 
-        with patch("routers.dummy_epg.cache", mock_cache):
-            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
-
-        assert response.status_code == 200, response.text
-        ttl = mock_cache.get.call_args.kwargs["ttl"]
-        assert ttl > self.REFRESH_INTERVAL_SECONDS
+        assert response.status_code == 503
+        assert response.json()["detail"] == {
+            "code": "GUIDE_UNAVAILABLE",
+            "reason_codes": ["PROFILE_DISABLED"],
+        }
+        read_publication.assert_not_called()

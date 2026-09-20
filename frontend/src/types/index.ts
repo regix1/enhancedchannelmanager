@@ -1,3 +1,5 @@
+import type { ProfileEventSyncConfig } from './eventSync';
+
 export interface Channel {
   id: number;
   channel_number: number | null;
@@ -1862,13 +1864,15 @@ export interface DummyEPGMapping {
 
 export interface DummyEPGCoverage {
   generated_at: string;
-  window_start: string;
-  window_stop: string;
+  window_start: string | null;
+  window_stop: string | null;
   sources: {
     source_id: number;
-    status: string;
+    status: 'ready' | 'retained' | 'pending' | 'error' | 'stale' | 'artwork';
     last_success: string | null;
     error: string | null;
+    diagnostics?: Record<string, unknown>;
+    warnings?: string[];
   }[];
   channels: {
     channel_id: number;
@@ -1881,6 +1885,57 @@ export interface DummyEPGCoverage {
     real_minutes: number;
     gap_minutes: number;
     warnings: string[];
+  }[];
+  profiles: Record<string, DummyEPGReadiness>;
+  artwork_pending?: boolean;
+  publication: DummyEPGPublication;
+}
+
+export type GuideReasonCode =
+  | 'GUIDE_SOURCES_PENDING'
+  | 'GUIDE_CHANNEL_UNAVAILABLE'
+  | 'GUIDE_CONFIG_INVALID'
+  | 'GUIDE_MAPPING_UNAVAILABLE'
+  | 'GUIDE_QUERY_PENDING'
+  | 'GUIDE_SOURCE_NOT_SELECTED'
+  | 'GUIDE_SOURCE_STALE'
+  | 'GUIDE_OWNERSHIP_CONFLICT'
+  | 'GUIDE_XMLTV_ID_COLLISION'
+  | 'PROFILE_DISABLED';
+
+export interface DummyEPGReadiness {
+  profile_id: number;
+  source_ids: number[];
+  sources: DummyEPGCoverage['sources'];
+  owned_channel_ids: number[];
+  can_publish: boolean;
+  reason_codes: GuideReasonCode[];
+}
+
+export type GuidePublicationReasonCode =
+  | 'GUIDE_UNAVAILABLE'
+  | 'GUIDE_CONFIG_CHANGED'
+  | 'GUIDE_WINDOW_EXPIRED'
+  | 'GUIDE_WINDOW_PENDING'
+  | 'PROFILE_DISABLED';
+
+export interface DummyEPGPublication {
+  status: 'published' | 'retained' | 'unavailable';
+  published_at: string | null;
+  revision: number | null;
+  window_start: string | null;
+  window_stop: string | null;
+  config_matches: boolean | null;
+  reason_codes: GuidePublicationReasonCode[];
+  delivery: {
+    dispatcharr_status: 'pending' | 'confirmed' | 'unknown';
+    pending_emby: boolean;
+  } | null;
+  channels: {
+    channel_id: number;
+    xmltv_id: string | null;
+    visibility_evidence: 'published' | 'retained' | 'unknown';
+    events: { start: string; stop: string; title: string }[];
   }[];
 }
 
@@ -1916,6 +1971,8 @@ export interface DummyEPGProfile {
   pattern_variants: PatternVariant[];
   channel_group_ids: number[];
   hide_empty_group_ids?: number[];
+  stream_match_group_ids?: number[];
+  event_sync_config?: ProfileEventSyncConfig;
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
   last_generated_at: string | null;
@@ -1957,6 +2014,8 @@ export interface DummyEPGProfileCreateRequest {
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
   hide_empty_group_ids?: number[];
+  stream_match_group_ids?: number[];
+  event_sync_config?: ProfileEventSyncConfig;
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
 }
@@ -1993,6 +2052,8 @@ export interface DummyEPGProfileUpdateRequest {
   pattern_variants?: PatternVariant[];
   channel_group_ids?: number[];
   hide_empty_group_ids?: number[];
+  stream_match_group_ids?: number[];
+  event_sync_config?: ProfileEventSyncConfig;
   epg_source_ids?: number[];
   channel_mappings?: DummyEPGMapping[];
 }
@@ -2000,6 +2061,8 @@ export interface DummyEPGProfileUpdateRequest {
 // Preview request (no DB)
 export interface DummyEPGPreviewRequest {
   sample_name: string;
+  sample_channel_name?: string;
+  event_sync_config?: ProfileEventSyncConfig;
   substitution_pairs?: SubstitutionPair[];
   title_pattern?: string;
   time_pattern?: string;
@@ -2053,6 +2116,8 @@ export interface DummyEPGPreviewPipeStep {
 // Batch preview request
 export interface DummyEPGBatchPreviewRequest {
   sample_names: string[];
+  sample_channel_name?: string;
+  event_sync_config?: ProfileEventSyncConfig;
   substitution_pairs?: SubstitutionPair[];
   title_pattern?: string;
   time_pattern?: string;
@@ -2106,6 +2171,52 @@ export interface DummyEPGPreviewResult {
   // names (title_template, description_template, etc.); values are the
   // step-by-step render trace for that field.
   traces?: Record<string, DummyEPGPreviewTraceStep[]>;
+  event?: {
+    family: string | null;
+    slot: string | null;
+    role: 'channel' | 'event' | 'fallback' | null;
+    start: string | null;
+    stop: string | null;
+    matched_pattern: string | null;
+    validation_issues: string[];
+  };
+}
+
+export interface DummyEPGGenerationAdmission {
+  status: 'accepted';
+  task_id: string;
+  execution_id: number;
+  started_at: string;
+}
+
+export type GuideTaskReasonCode =
+  | 'GUIDE_UNAVAILABLE'
+  | 'GUIDE_PUBLICATION_FAILED'
+  | 'GUIDE_OWNERSHIP_CONFLICT'
+  | 'GUIDE_IMPORT_PENDING'
+  | 'GUIDE_EMBY_PENDING'
+  | 'GUIDE_SOURCES_PENDING'
+  | 'CANCELLED';
+
+export interface DummyEPGGenerationOutcome {
+  configured_profile_count: number;
+  published_profile_ids: number[];
+  retained_profile_ids: number[];
+  unavailable_profile_ids: number[];
+  publication_times: Record<string, string>;
+  source_reason_codes: Record<string, string[]>;
+  idle_channel_count: number;
+  active_channel_count: number;
+  unknown_channel_count: number;
+  stream_updated_channel_ids: number[];
+  epg_linked_channel_ids: number[];
+  revealed_channel_ids: number[];
+  hidden_channel_ids: number[];
+  pending_source_hashes: Record<string, string>;
+  emby_request_outcome: 'not_required' | 'accepted' | 'disabled' | 'pending';
+  pending_emby: boolean;
+  delivery_pending: boolean;
+  reason_codes: GuideTaskReasonCode[];
 }
 
 // Channel assignment for Dummy EPG profiles

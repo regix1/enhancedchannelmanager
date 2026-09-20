@@ -261,6 +261,52 @@ class ImportYAMLRequest(BaseModel):
     overwrite: bool = False
 
 
+def _ownership_keys(conflicts: list[dict]) -> set[tuple]:
+    return {
+        (
+            conflict["group_id"],
+            tuple(sorted(owner["key"] for owner in conflict["owners"])),
+        )
+        for conflict in conflicts
+    }
+
+
+def _current_ownership_conflicts(session) -> list[dict]:
+    from models import ChannelPipelineRule, DummyEPGProfile
+    from services.event_slots import validate_ownership
+
+    return validate_ownership(
+        list(session.query(DummyEPGProfile).all()),
+        list(session.query(ChannelPipelineRule).all()),
+    )
+
+
+def _validate_rule_ownership(session, rule, prior_conflicts: set[tuple]) -> None:
+    from models import ChannelPipelineRule, DummyEPGProfile
+    from services.event_slots import validate_ownership
+
+    rules = list(session.query(ChannelPipelineRule).all())
+    if rule not in rules:
+        rules.append(rule)
+    conflicts = validate_ownership(
+        list(session.query(DummyEPGProfile).all()), rules,
+    )
+    owner_key = (
+        f"rule:{rule.id}"
+        if rule.id is not None else f"rule:new:{rule.name}"
+    )
+    introduced = [
+        conflict for conflict in conflicts
+        if owner_key in {owner["key"] for owner in conflict["owners"]}
+        and (
+            conflict["group_id"],
+            tuple(sorted(owner["key"] for owner in conflict["owners"])),
+        ) not in prior_conflicts
+    ]
+    if introduced:
+        raise HTTPException(status_code=422, detail=introduced)
+
+
 def _apply_merge_streams_remove_non_matching(actions: list, value: bool) -> list:
     """Set remove_non_matching on every merge_streams action (stored as flat keys on the action dict)."""
     out = []
@@ -782,6 +828,7 @@ async def get_auto_creation_rule(rule_id: int):
             ).first()
             if not rule:
                 raise HTTPException(status_code=404, detail="Rule not found")
+
             return rule.to_dict()
         finally:
             session.close()
@@ -861,6 +908,9 @@ async def create_auto_creation_rule(request: CreateChannelPipelineRuleRequest, _
 
         session = get_session()
         try:
+            prior_conflicts = _ownership_keys(
+                _current_ownership_conflicts(session)
+            )
             # bd-j5p4k: write-time FK validation for normalization_group_ids.
             # Run BEFORE the DB insert so a bad ID can't create a partially
             # populated row. Mirrors the PUT/bulk-update guard added in
@@ -909,6 +959,7 @@ async def create_auto_creation_rule(request: CreateChannelPipelineRuleRequest, _
                     if request.event_sync_config else None
                 ),
             )
+            _validate_rule_ownership(session, rule, prior_conflicts)
             session.add(rule)
             session.commit()
             session.refresh(rule)
@@ -947,6 +998,10 @@ async def update_auto_creation_rule(rule_id: int, request: UpdateChannelPipeline
             ).first()
             if not rule:
                 raise HTTPException(status_code=404, detail="Rule not found")
+
+            prior_conflicts = _ownership_keys(
+                _current_ownership_conflicts(session)
+            )
 
             # bd-i75ax: write-time FK validation for normalization_group_ids.
             # Run BEFORE mutation so a bad ID can't leave partial scalar
@@ -1006,6 +1061,7 @@ async def update_auto_creation_rule(rule_id: int, request: UpdateChannelPipeline
                         })
                 rule.set_event_sync_config(request.event_sync_config)
 
+            _validate_rule_ownership(session, rule, prior_conflicts)
             session.commit()
             session.refresh(rule)
 
@@ -1260,7 +1316,11 @@ async def toggle_auto_creation_rule(rule_id: int, _admin=RequireAdminIfEnabled):
             if not rule:
                 raise HTTPException(status_code=404, detail="Rule not found")
 
+            prior_conflicts = _ownership_keys(
+                _current_ownership_conflicts(session)
+            )
             rule.enabled = not rule.enabled
+            _validate_rule_ownership(session, rule, prior_conflicts)
             session.commit()
             session.refresh(rule)
 
@@ -2570,6 +2630,9 @@ async def import_auto_creation_rules_yaml(request: ImportYAMLRequest, _admin=Req
             imported = []
             errors = []
             warnings = []
+            prior_conflicts = _ownership_keys(
+                _current_ownership_conflicts(session)
+            )
 
             for i, rule_data in enumerate(data["rules"]):
                 rule_name = rule_data.get('name', f'Rule {i}')
@@ -2761,6 +2824,16 @@ async def import_auto_creation_rules_yaml(request: ImportYAMLRequest, _admin=Req
                     logger.debug("[AUTO-CREATE-YAML] Rule '%s': created new, stored actions=%s", rule_name, rule.actions)
                     imported.append({"name": rule.name, "action": "created"})
 
+            current_conflicts = _current_ownership_conflicts(session)
+            introduced = [
+                conflict for conflict in current_conflicts
+                if (
+                    conflict["group_id"],
+                    tuple(sorted(owner["key"] for owner in conflict["owners"])),
+                ) not in prior_conflicts
+            ]
+            if introduced:
+                raise HTTPException(status_code=422, detail=introduced)
             session.commit()
 
             # De-duplicate priorities: if any rules share the same priority,

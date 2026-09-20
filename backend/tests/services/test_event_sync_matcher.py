@@ -397,6 +397,25 @@ class TestParseEventName:
         )
         assert parsed.start is None
 
+    def test_custom_dateless_pattern_uses_opt_in_date_synthesis(self):
+        patterns = [{
+            "name": "arena-time-only",
+            "title_pattern": r"^Arena \d+: (?P<title>.+?) at (?P<hour>\d{1,2}):(?P<minute>\d{2}) (?P<ampm>[AP]M)$",
+        }]
+
+        without = parse_event_name("Arena 7: Falcons vs Wolves at 8:15 PM", patterns, now=_NOW)
+        parsed = parse_event_name(
+            "Arena 7: Falcons vs Wolves at 8:15 PM",
+            patterns,
+            now=_NOW,
+            assume_current_date=True,
+        )
+
+        assert without.start is None
+        assert parsed.title == "Falcons vs Wolves"
+        assert parsed.start == _et(2026, 7, 11, 20, 15)
+        assert parsed.matched_pattern == "arena-time-only"
+
     @pytest.mark.parametrize(
         ("name", "expected_title", "hour", "minute"),
         [

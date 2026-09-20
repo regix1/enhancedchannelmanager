@@ -1,5 +1,9 @@
-import { useState, useEffect, useCallback, useId, memo } from 'react';
-import type { DummyEPGProfile, DummyEPGCustomProperties } from '../types';
+import { useState, useEffect, useCallback, useId, memo, useRef } from 'react';
+import type {
+  DummyEPGProfile,
+  DummyEPGCustomProperties,
+  DummyEPGGenerationOutcome,
+} from '../types';
 import * as api from '../services/api';
 import { copyToClipboard } from '../utils/clipboard';
 import { DummyEPGProfileModal } from './DummyEPGProfileModal';
@@ -11,6 +15,9 @@ import { logger } from '../utils/logger';
 import { PageHeader } from './PageHeader';
 import './DummyEPGManagerSection.css';
 import './ModalBase.css';
+
+const GENERATION_POLL_LIMIT = 300;
+const GENERATION_POLL_INTERVAL_MS = 1000;
 
 /** Map an ECM DummyEPGProfile to Dispatcharr custom_properties for an XMLTV EPG source. */
 function mapProfileToCustomProperties(profile: DummyEPGProfile): DummyEPGCustomProperties {
@@ -66,6 +73,7 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
   const deleteModal = useModal();
   const [profileToDelete, setProfileToDelete] = useState<DummyEPGProfile | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const generationRequest = useRef(0);
 
   const loadProfiles = useCallback(async () => {
     try {
@@ -82,6 +90,8 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
   useEffect(() => {
     loadProfiles();
   }, [loadProfiles]);
+
+  useEffect(() => () => { generationRequest.current += 1; }, []);
 
   const handleAddProfile = () => {
     setEditingProfile(null);
@@ -139,22 +149,49 @@ export const DummyEPGManagerSection = memo(function DummyEPGManagerSection({ onS
   };
 
   const handleRegenerate = async () => {
+    const request = ++generationRequest.current;
     setRegenerating(true);
     try {
-      const result = await api.regenerateDummyEPG();
-      if (result.status === 'pending') {
-        notifications.warning('Guide sources or artwork are still loading. Check saved guide coverage again shortly.', 'Dummy EPG');
-      } else if (result.status === 'error') {
-        notifications.error('XMLTV generation is incomplete. Check saved guide coverage for source errors.', 'Dummy EPG');
-      } else {
-        notifications.success('XMLTV regenerated successfully', 'Dummy EPG');
+      const admission = await api.regenerateDummyEPG();
+      notifications.info('Guide generation started. ECM will report the durable task result when it finishes.', 'Dummy EPG');
+
+      for (let poll = 0; poll < GENERATION_POLL_LIMIT; poll += 1) {
+        if (generationRequest.current !== request) return;
+        const { history } = await api.getTaskHistory(admission.task_id, 10);
+        const execution = history.find(item => item.id === admission.execution_id);
+        if (execution && execution.status !== 'running') {
+          const outcome = execution.details as DummyEPGGenerationOutcome | null;
+          const deliveryPending = outcome?.delivery_pending === true;
+          const retained = Boolean(outcome?.retained_profile_ids.length);
+          const unavailable = Boolean(outcome?.unavailable_profile_ids.length);
+          const cancelled = execution.status === 'cancelled'
+            || outcome?.reason_codes.includes('CANCELLED') === true;
+
+          if (cancelled) {
+            notifications.warning('Guide generation was cancelled. Committed guide work remains available.', 'Dummy EPG');
+          } else if (deliveryPending) {
+            notifications.warning('Guide generation completed, but delivery is still pending.', 'Dummy EPG');
+          } else if (execution.status === 'completed_with_warnings' || retained) {
+            notifications.warning('Guide generation completed with retained or degraded output. Check saved guide coverage for details.', 'Dummy EPG');
+          } else if (execution.status === 'completed') {
+            notifications.success('Guide generation completed.', 'Dummy EPG');
+          } else if (unavailable) {
+            notifications.error('Guide generation failed because no usable publication was available for one or more profiles.', 'Dummy EPG');
+          } else {
+            notifications.error('Guide generation failed. Check Task History for the recorded result.', 'Dummy EPG');
+          }
+          await loadProfiles();
+          return;
+        }
+
+        await new Promise<void>(resolve => window.setTimeout(resolve, GENERATION_POLL_INTERVAL_MS));
       }
-      await loadProfiles();
+      notifications.info('Guide generation is still running. Check Task History for its result.', 'Dummy EPG');
     } catch (err) {
-      logger.error('DummyEPGManagerSection: failed to regenerate XMLTV', err);
-      notifications.error('Failed to regenerate XMLTV', 'Dummy EPG');
+      logger.error('DummyEPGManagerSection: failed to start or track XMLTV generation', err);
+      notifications.error('Guide generation could not be started or its result could not be confirmed. Check Task History.', 'Dummy EPG');
     } finally {
-      setRegenerating(false);
+      if (generationRequest.current === request) setRegenerating(false);
     }
   };
 

@@ -2775,6 +2775,10 @@ class DummyEPGProfile(Base):
     # A working match is placed before the channel's existing streams; existing
     # streams outside these groups remain attached as fallbacks.
     stream_match_group_ids = Column(Text, nullable=True)
+    # Profile-owned event matching and stable slot configuration. The raw NULL
+    # value keeps the pre-column compatibility defaults; an explicit JSON
+    # object, including {}, selects the profile contract.
+    event_sync_config = Column(Text, nullable=True)
 
     # Timestamps
     last_generated_at = Column(DateTime, nullable=True)
@@ -2850,6 +2854,82 @@ class DummyEPGProfile(Base):
         """Set the ordered guide-match stream groups."""
         self.stream_match_group_ids = json.dumps(ids) if ids else None
 
+    def get_event_sync_config(self) -> dict:
+        """Return the normalized effective profile event configuration."""
+        from channel_pipeline_schema import validate_event_sync_config
+
+        legacy = self.event_sync_config is None
+        if legacy:
+            group_ids = []
+            for group_id in self.get_stream_match_group_ids():
+                if group_id not in group_ids:
+                    group_ids.append(group_id)
+            config = {
+                "secondary": [
+                    {"group_id": group_id, "m3u_account_id": None}
+                    for group_id in group_ids
+                ],
+                "assume_current_date": True,
+                "use_default_patterns": True,
+            }
+        else:
+            try:
+                parsed = json.loads(self.event_sync_config)
+            except (ValueError, TypeError):
+                parsed = None
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    "[DUMMY-EPG] Profile %s has invalid event_sync_config JSON; "
+                    "using compatibility defaults", self.id,
+                )
+                group_ids = []
+                for group_id in self.get_stream_match_group_ids():
+                    if group_id not in group_ids:
+                        group_ids.append(group_id)
+                parsed = {
+                    "secondary": [
+                        {"group_id": group_id, "m3u_account_id": None}
+                        for group_id in group_ids
+                    ],
+                    "assume_current_date": True,
+                    "use_default_patterns": True,
+                }
+            config = parsed
+
+        errors = validate_event_sync_config(
+            config, profile_group_ids=self.get_hide_empty_group_ids(),
+        )
+        if errors:
+            logger.warning(
+                "[DUMMY-EPG] Profile %s has invalid event_sync_config: %s",
+                self.id, errors,
+            )
+        return config
+
+    def set_event_sync_config(self, config: dict | None) -> None:
+        """Validate and store profile event configuration and legacy group IDs."""
+        if config is None:
+            self.event_sync_config = None
+            return
+        if not isinstance(config, dict):
+            raise ValueError("event_sync_config must be an object")
+
+        from channel_pipeline_schema import validate_event_sync_config
+
+        normalized = json.loads(json.dumps(config))
+        errors = validate_event_sync_config(
+            normalized, profile_group_ids=self.get_hide_empty_group_ids(),
+        )
+        if errors:
+            raise ValueError("; ".join(errors))
+        self.event_sync_config = json.dumps(normalized)
+        group_ids = []
+        for scope in normalized["secondary"]:
+            group_id = scope["group_id"]
+            if group_id not in group_ids:
+                group_ids.append(group_id)
+        self.set_stream_match_group_ids(group_ids)
+
     def get_epg_source_ids(self) -> list:
         """Return configured programme source IDs."""
         try:
@@ -2907,6 +2987,7 @@ class DummyEPGProfile(Base):
             "channel_mappings": self.get_channel_mappings(),
             "hide_empty_group_ids": self.get_hide_empty_group_ids(),
             "stream_match_group_ids": self.get_stream_match_group_ids(),
+            "event_sync_config": self.get_event_sync_config(),
             "last_generated_at": self.last_generated_at.isoformat() + "Z" if self.last_generated_at else None,
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
             "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,
@@ -2915,6 +2996,37 @@ class DummyEPGProfile(Base):
 
     def __repr__(self):
         return f"<DummyEPGProfile(id={self.id}, name={self.name}, enabled={self.enabled})>"
+
+
+class GuidePublication(Base):
+    """Latest complete retained guide for an aggregate or profile scope."""
+    __tablename__ = "dummy_epg_publications"
+
+    scope = Column(String(255), primary_key=True)
+    xmltv = Column(Text, nullable=True)
+    state = Column(Text, nullable=False, default="{}")
+    revision = Column(Integer, nullable=False, default=0)
+
+    def get_state(self) -> dict:
+        """Parse the retained publication state."""
+        try:
+            parsed = json.loads(self.state) if self.state else {}
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def set_state(self, state: dict) -> None:
+        """Store publication state as JSON text."""
+        self.state = json.dumps(state)
+
+    def to_dict(self) -> dict:
+        """Return the internal retained publication record."""
+        return {
+            "scope": self.scope,
+            "xmltv": self.xmltv,
+            "state": self.get_state(),
+            "revision": self.revision,
+        }
 
 
 class DummyEPGChannelAssignment(Base):

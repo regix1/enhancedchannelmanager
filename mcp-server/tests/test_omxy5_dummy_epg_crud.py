@@ -5,6 +5,8 @@ preview_dummy_epg. Delete is confirm-gated and previews channel-group
 assignments (the blast radius), mirroring delete_logo /
 delete_normalization_group.
 """
+import json
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -18,8 +20,57 @@ def _mcp():
     return mcp
 
 
+def _mcp_with_tasks():
+    from mcp.server.fastmcp import FastMCP
+    from tools.epg import register as register_epg
+    from tools.tasks import register as register_tasks
+
+    mcp = FastMCP("test")
+    register_epg(mcp)
+    register_tasks(mcp)
+    return mcp
+
+
 def _text(result) -> str:
     return result[0][0].text
+
+
+def _guide_details(**changes):
+    details = {
+        "configured_profile_count": 3,
+        "published_profile_ids": [1],
+        "retained_profile_ids": [2],
+        "unavailable_profile_ids": [3],
+        "publication_times": {
+            "1": "2026-09-20T15:00:04Z",
+            "2": "2026-09-20T14:45:00Z",
+        },
+        "source_reason_codes": {
+            "3": ["GUIDE_UNAVAILABLE"],
+        },
+        "idle_channel_count": 4,
+        "active_channel_count": 5,
+        "unknown_channel_count": 6,
+        "stream_updated_channel_ids": [101],
+        "epg_linked_channel_ids": [102],
+        "revealed_channel_ids": [103],
+        "hidden_channel_ids": [104],
+        "pending_source_hashes": {"51": "sha256:pending"},
+        "emby_request_outcome": "pending",
+        "pending_emby": True,
+        "delivery_pending": True,
+        "reason_codes": [
+            "GUIDE_UNAVAILABLE",
+            "GUIDE_PUBLICATION_FAILED",
+            "GUIDE_OWNERSHIP_CONFLICT",
+            "GUIDE_IMPORT_PENDING",
+            "GUIDE_EMBY_PENDING",
+            "GUIDE_SOURCES_PENDING",
+            "CANCELLED",
+        ],
+    }
+    details.update(changes)
+    return details
 
 
 class TestGetDummyEpgProfile:
@@ -34,6 +85,7 @@ class TestGetDummyEpgProfile:
             "title_template": "{title}", "event_timezone": "US/Eastern",
             "program_duration": 180, "channel_group_ids": [5, 7],
             "substitution_pairs": [{"find": "HD", "replace": ""}],
+            "event_sync_config": {"promote_lead_hours": 0},
         }
 
         with patch("tools.epg.get_ecm_client", return_value=client):
@@ -43,6 +95,7 @@ class TestGetDummyEpgProfile:
         assert "Sports Placeholder" in text
         assert "2 group(s) assigned" in text
         assert "1 configured" in text
+        assert 'event_sync_config={"promote_lead_hours": 0}' in text
         called = [c.args[0].name for c in client.call_endpoint.call_args_list]
         assert called == ["dummy_epg_get_profile"]
 
@@ -83,6 +136,15 @@ class TestCreateDummyEpgProfile:
                 "channel_group_ids": [5, 7],
                 "hide_empty_group_ids": [7],
                 "stream_match_group_ids": [1558, 1557],
+                "event_sync_config": {
+                    "promote_lead_hours": 0,
+                    "automatic_visibility": False,
+                    "secondary": [
+                        {"group_id": 1558, "m3u_account_id": 3},
+                        {"group_id": 1557, "m3u_account_id": None},
+                    ],
+                    "slot_patterns": [{"pattern": r"^Event (?P<slot>\\d+)$"}],
+                },
             })
 
         body = client.call_endpoint.call_args.kwargs["body"]
@@ -91,6 +153,15 @@ class TestCreateDummyEpgProfile:
         assert body["channel_group_ids"] == [5, 7]
         assert body["hide_empty_group_ids"] == [7]
         assert body["stream_match_group_ids"] == [1558, 1557]
+        assert body["event_sync_config"] == {
+            "promote_lead_hours": 0,
+            "automatic_visibility": False,
+            "secondary": [
+                {"group_id": 1558, "m3u_account_id": 3},
+                {"group_id": 1557, "m3u_account_id": None},
+            ],
+            "slot_patterns": [{"pattern": r"^Event (?P<slot>\\d+)$"}],
+        }
 
 
 class TestUpdateDummyEpgProfile:
@@ -103,6 +174,9 @@ class TestUpdateDummyEpgProfile:
         assert "stream_match_group_ids" in (
             ENDPOINTS["dummy_epg_update_profile"].request_fields
         )
+        assert "event_sync_config" in ENDPOINTS["dummy_epg_create_profile"].request_fields
+        assert "event_sync_config" in ENDPOINTS["dummy_epg_update_profile"].request_fields
+        assert "event_sync_config" in ENDPOINTS["dummy_epg_get_profile"].response_fields
 
     @pytest.mark.asyncio
     async def test_forwards_only_provided_fields(self):
@@ -147,6 +221,66 @@ class TestUpdateDummyEpgProfile:
         assert client.call_endpoint.call_args.kwargs["body"] == {
             "stream_match_group_ids": [],
         }
+
+    @pytest.mark.asyncio
+    async def test_forwards_an_explicit_event_config_clear(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.return_value = {"name": "Sports"}
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            await mcp.call_tool(
+                "update_dummy_epg_profile",
+                {"profile_id": 1, "event_sync_config": {}},
+            )
+
+        assert client.call_endpoint.call_args.kwargs["body"] == {
+            "event_sync_config": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_forwards_aliases_together_for_backend_conflict_validation(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.side_effect = RuntimeError(
+            "event_sync_config secondary scopes conflict with stream_match_group_ids"
+        )
+        config = {
+            "secondary": [
+                {"group_id": 1558, "m3u_account_id": None},
+                {"group_id": 1557, "m3u_account_id": None},
+            ]
+        }
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool(
+                "update_dummy_epg_profile",
+                {
+                    "profile_id": 1,
+                    "stream_match_group_ids": [1557, 1558],
+                    "event_sync_config": config,
+                },
+            )
+
+        assert client.call_endpoint.call_args.kwargs["body"] == {
+            "stream_match_group_ids": [1557, 1558],
+            "event_sync_config": config,
+        }
+        assert "conflict" in _text(result)
+
+    @pytest.mark.asyncio
+    async def test_rejects_explicit_null_event_config_before_http(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mcp = _mcp()
+        client = AsyncMock()
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            with pytest.raises(ToolError, match="valid dictionary"):
+                await mcp.call_tool(
+                    "update_dummy_epg_profile",
+                    {"profile_id": 1, "event_sync_config": None},
+                )
+        client.call_endpoint.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_changes_short_circuits(self):
@@ -251,6 +385,57 @@ class TestPreviewDummyEpg:
         assert "NOT MATCHED" in text
         assert "Programming" in text
 
+    @pytest.mark.asyncio
+    async def test_forwards_event_config_and_renders_backend_classification(self):
+        mcp = _mcp()
+        event = {
+            "family": "espn",
+            "slot": "7",
+            "role": "secondary",
+            "start": "2026-09-20T19:00:00-05:00",
+            "stop": "2026-09-20T22:00:00-05:00",
+            "matched_pattern": r"^ESPN \\#(?P<slot>\\d+)$",
+            "validation_issues": [],
+        }
+        client = AsyncMock()
+        client.call_endpoint.return_value = {
+            "original_name": "Feed 7",
+            "substituted_name": "Feed 7",
+            "matched": False,
+            "matched_variant": None,
+            "rendered": {},
+            "event": event,
+        }
+        config = {
+            "promote_lead_hours": 0,
+            "automatic_visibility": False,
+            "secondary": [
+                {"group_id": 1558, "m3u_account_id": 4},
+                {"group_id": 1557, "m3u_account_id": None},
+            ],
+            "slot_patterns": [{"pattern": r"^ESPN \\#(?P<slot>\\d+)$"}],
+        }
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool(
+                "preview_dummy_epg",
+                {
+                    "sample_name": "Feed 7",
+                    "sample_channel_name": "ESPN #7",
+                    "event_sync_config": config,
+                },
+            )
+
+        body = client.call_endpoint.call_args.kwargs["body"]
+        assert body["sample_channel_name"] == "ESPN #7"
+        assert body["event_sync_config"] == config
+        assert json.loads(_text(result).split("  Event: ", 1)[1]) == event
+        from _endpoint_contracts import ENDPOINTS
+        assert {"event_sync_config", "sample_channel_name"}.issubset(
+            ENDPOINTS["dummy_epg_preview"].request_fields
+        )
+        assert "event" in ENDPOINTS["dummy_epg_preview"].response_fields
+
 
 class TestProgrammeSourceTools:
     @pytest.mark.asyncio
@@ -325,6 +510,83 @@ class TestGenerateDummyEpg:
         call = client.call_endpoint.call_args
         assert call.args[0].name == "dummy_epg_generate"
         assert call.kwargs == {"body": {"profile_ids": [1, 2]}, "timeout": 60.0}
+
+    @pytest.mark.asyncio
+    async def test_returns_accepted_task_identity_without_waiting(self):
+        mcp = _mcp_with_tasks()
+        client = AsyncMock()
+        accepted = {
+            "status": "accepted",
+            "task_id": "dummy_epg_refresh",
+            "execution_id": 31,
+            "started_at": "2026-09-20T15:00:00Z",
+        }
+        client.call_endpoint.return_value = accepted
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool(
+                "generate_dummy_epg",
+                {"plan_profile_ids": [1, 2], "wait_for_completion": False},
+            )
+
+        assert json.loads(_text(result)) == accepted
+        client.call_endpoint.assert_awaited_once()
+        assert client.call_endpoint.await_args.args[0].name == "dummy_epg_generate"
+
+    @pytest.mark.asyncio
+    async def test_waits_through_the_existing_task_execution_tool(self):
+        mcp = _mcp_with_tasks()
+        client = AsyncMock()
+        accepted = {
+            "status": "accepted",
+            "task_id": "dummy_epg_refresh",
+            "execution_id": 31,
+            "started_at": "2026-09-20T15:00:00Z",
+        }
+        completed = {
+            "id": 31,
+            "task_id": "dummy_epg_refresh",
+            "status": "completed_with_warnings",
+            "started_at": "2026-09-20T15:00:00Z",
+            "completed_at": "2026-09-20T15:00:05Z",
+            "message": "Free text must not select the MCP outcome.",
+            "details": _guide_details(),
+        }
+        client.call_endpoint.side_effect = [accepted, completed]
+
+        with patch("tools.epg.get_ecm_client", return_value=client), patch(
+            "tools.tasks.get_ecm_client", return_value=client
+        ):
+            result = await mcp.call_tool(
+                "generate_dummy_epg",
+                {"plan_profile_ids": [], "wait_for_completion": True},
+            )
+
+        text = _text(result)
+        assert "status=completed_with_warnings (execution_id=31)" in text
+        assert "configured=3; published=[1]; retained=[2]; unavailable=[3]" in text
+        assert 'Publication times: {"1": "2026-09-20T15:00:04Z", "2": "2026-09-20T14:45:00Z"}' in text
+        assert 'Source reason codes: {"3": ["GUIDE_UNAVAILABLE"]}' in text
+        assert "Channels: idle=4; active=5; unknown=6" in text
+        assert "streams=[101]; EPG links=[102]; revealed=[103]; hidden=[104]" in text
+        assert 'pending_source_hashes={"51": "sha256:pending"}' in text
+        assert "emby_request_outcome=pending; pending_emby=true" in text
+        assert "Free text" not in text
+        for reason in _guide_details()["reason_codes"]:
+            assert reason in text
+        assert [call.args[0].name for call in client.call_endpoint.await_args_list] == [
+            "dummy_epg_generate",
+            "tasks_execution",
+        ]
+        assert client.call_endpoint.await_args_list[1].kwargs == {
+            "path_args": {"task_id": "dummy_epg_refresh", "execution_id": 31},
+            "query": {"started_at": "2026-09-20T15:00:00Z"},
+            "timeout": 30.0,
+        }
+        from _endpoint_contracts import ENDPOINTS
+        assert ENDPOINTS["dummy_epg_generate"].response_fields == frozenset(
+            {"status", "task_id", "execution_id", "started_at"}
+        )
 
 class TestSearchEpgChannels:
     @pytest.mark.asyncio

@@ -1,53 +1,88 @@
-"""Focused checks for the quick hidden-event visibility task."""
-from datetime import datetime, timezone
+"""Focused checks for the configured profile reconciliation workflow."""
+import asyncio
+import copy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from services.epg_publication import PublicationResult
 from task_scheduler import ScheduleType
 from tasks.event_visibility import (
     CHECK_INTERVAL_SECONDS,
     EventVisibilityTask,
-    _espn_slot,
+    _await_preparation,
+    _fetch_match_streams,
+    _delivery_plan,
+    _generated_scope,
     _guide_name,
-    _link_dummy_epg,
+    _plan_profile,
     _slot_key,
-    _ufc_slot,
+    reconcile_profiles,
 )
 
 
-def _coverage(current: bool = True):
+def _config(scopes=None):
     return {
-        "sources": [{"status": "ready"}],
-        "channels": [{
-            "channel_id": 10,
-            "current": {"title": "Current event"} if current else None,
+        "secondary": list(scopes or []),
+        "time_window_minutes": 30,
+        "enforce_time_window": True,
+        "attach_threshold": 0.8,
+        "assume_current_date": True,
+        "demote_stale_dateless": True,
+        "use_default_patterns": True,
+        "slot_patterns": [{
+            "name": "Arena",
+            "channel_pattern": r"Arena (?P<slot>\d+)",
+            "fallback_pattern": r"Backup (?P<slot>\d+)",
+            "event_patterns": [r"LIVE (?P<slot>\d+) .+"],
+            "bootstrap": True,
         }],
     }
 
 
-def _profile(stream_match_group_ids=None, pattern_variants=None, **overrides):
+def _profile(**overrides):
     values = {
         "id": 1,
+        "name": "Arena",
         "enabled": True,
-        "hide_empty_group_ids": [16, 65, 2479],
-        "stream_match_group_ids": stream_match_group_ids or [],
-        "pattern_variants": pattern_variants or [],
-        "event_timezone": "US/Eastern",
+        "channel_group_ids": [7],
+        "hide_empty_group_ids": [7],
+        "stream_match_group_ids": [],
+        "event_sync_config": _config(),
+        "event_timezone": "UTC",
+        "output_timezone": "UTC",
         "program_duration": 180,
-        "tvg_id_template": "ecm-{channel_id}",
+        "pattern_variants": [],
+        "epg_source_ids": [],
+        "tvg_id_template": "custom-{channel_id}",
+        "channel_assignments": [
+            {"channel_id": 10, "channel_name": "Arena 1"},
+            {"channel_id": 20, "channel_name": "Arena 2"},
+        ],
     }
     values.update(overrides)
-    return SimpleNamespace(to_dict=lambda: dict(values))
+    return values
 
 
-def _session(profile=None, profiles=None):
-    session = MagicMock()
-    session.query.return_value.filter.return_value.all.return_value = (
-        profiles if profiles is not None else [profile or _profile()]
-    )
-    return session
+def _publication(scope, *, revision=1, pending=True, confirmed=None, channels=None):
+    value_hash = "a" * 64
+    return {
+        "scope": scope,
+        "xmltv": "<tv/>",
+        "revision": revision,
+        "state": {
+            "published_at": "2026-09-20T12:00:00+00:00",
+            "xmltv_hash": value_hash,
+            "channels": list(channels or []),
+            "delivery": {
+                "required_dispatcharr_hashes": {},
+                "confirmed_dispatcharr_hashes": dict(confirmed or {}),
+                "pending_emby": pending,
+            },
+        },
+    }
 
 
 def test_default_schedule_checks_every_five_minutes():
@@ -58,1317 +93,731 @@ def test_default_schedule_checks_every_five_minutes():
     assert task.schedule_config.timezone == "America/Chicago"
 
 
-@pytest.mark.parametrize("name, stream, expected", [
-    ("ESPN+ 00", False, 0),
-    ("ESPN+ 62", False, 62),
-    ("ESPN PLUS 62:", True, 62),
-    ("NCAAF 54: Murray State at Oklahoma State 7pm", True, None),
-])
-def test_espn_slot_uses_only_numbered_iptorrents_names(name, stream, expected):
-    assert _espn_slot(name, stream=stream) == expected
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("http://ecm/api/dummy-epg/xmltv", "all"),
+        ("http://ecm/api/dummy-epg/xmltv/?key=1", "all"),
+        ("http://ecm/api/dummy-epg/xmltv/42?key=1", "profile:42"),
+        ("http://ecm/api/dummy-epg/xmltv/0", None),
+        ("http://ecm/prefix/api/dummy-epg/xmltv/42", None),
+        ("http://ecm/api/dummy-epg/xmltv/42/extra", None),
+        ("http://ecm/not-api/dummy-epg/xmltv/42", None),
+    ],
+)
+def test_generated_scope_requires_an_exact_path(url, expected):
+    assert _generated_scope({"url": url}) == expected
 
 
-@pytest.mark.parametrize("name, stream, expected", [
-    ("UFC01", False, 1),
-    ("UFC 09", False, 9),
-    ("UFC 02:", True, 2),
-    ("UFC INT09", True, 9),
-    ("UFC 02 : CRYPTO.COM UFC 331", True, None),
-])
-def test_ufc_slot_uses_only_numbered_names(name, stream, expected):
-    assert _ufc_slot(name, stream=stream) == expected
-
-
-def test_slot_key_keeps_channel_families_separate():
-    assert _slot_key("ESPN+ 01") == ("espn", 1)
-    assert _slot_key("UFC01") == ("ufc", 1)
-
-
-def test_rtv_programme_matches_trex_event_name():
-    from services.event_sync_resolver import SecondaryStream, resolve_event_sync
-
-    guide_name = _guide_name({
-        "title": "The Pat McAfee Show  ᴸᶦᵛᵉ",
-        "start": "2026-09-14T15:55:00+00:00",
-    }, "US/Eastern")
-    resolution = resolve_event_sync(
-        {
-            "master_group_id": 0,
-            "secondary_group_ids": [1558],
-            "time_window_minutes": 30,
-            "enforce_time_window": True,
-            "attach_threshold": 0.8,
-            "assume_current_date": False,
-        },
-        [guide_name],
-        [SecondaryStream(
-            name=(
-                "NEXT | THE PAT MCAFEE SHOW | Mon 14 Sep 12:00 EDT (US) | "
-                "8K EXCLUSIVE | US: ESPN+ PPV 8"
-            ),
-            group_id=1558,
-            stream_id=210,
-        )],
-        now=datetime(2026, 9, 14, 18, tzinfo=timezone.utc),
+def test_unchanged_confirmed_hash_does_not_import_again():
+    row = _publication(
+        "profile:1",
+        confirmed={"46": "a" * 64},
     )
 
-    assert resolution.resolved[0].disposition == "would_attach"
+    required, confirmed, pending = _delivery_plan(row, [{"id": 46}])
+
+    assert required == {"46": "a" * 64}
+    assert confirmed == required
+    assert pending == {}
 
 
-def test_rtv_programme_matches_dateless_trex_event_name_today():
-    from services.event_sync_resolver import SecondaryStream, resolve_event_sync
-
-    guide_name = _guide_name({
-        "title": "Murray State vs. Oklahoma State",
-        "start": "2026-09-19T22:55:00+00:00",
-    }, "US/Eastern")
-    resolution = resolve_event_sync(
-        {
-            "master_group_id": 0,
-            "secondary_group_ids": [1520],
-            "time_window_minutes": 30,
-            "enforce_time_window": True,
-            "attach_threshold": 0.8,
-            "assume_current_date": True,
-        },
-        [guide_name],
-        [SecondaryStream(
-            name="NCAAF 54: Murray State at Oklahoma State 7pm",
-            group_id=1520,
-            stream_id=2126837,
-        )],
-        now=datetime(2026, 9, 19, 23, tzinfo=timezone.utc),
+def test_changed_hash_remains_pending_until_confirmed():
+    row = _publication(
+        "profile:1",
+        confirmed={"46": "b" * 64},
     )
 
-    assert resolution.resolved[0].disposition == "would_attach"
+    required, confirmed, pending = _delivery_plan(row, [{"id": 46}])
+
+    assert required == {"46": "a" * 64}
+    assert confirmed == {}
+    assert pending == {46: "a" * 64}
 
 
-def test_ufc_guide_matches_titled_iptorrents_event():
-    from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
-    from services.event_sync_resolver import SecondaryStream, resolve_event_sync
+def test_slot_key_uses_configured_families_and_normalizes_numbers():
+    config = _config()
 
-    guide_name = _guide_name({
-        "title": "UFC 331: Van vs. Pantoja 2",
+    assert _slot_key("Arena 007", config) == ("Arena", "7")
+    assert _slot_key("Backup 07", config, role="fallback") == ("Arena", "7")
+    assert _slot_key("LIVE 7 Main Event", config, role="event") == ("Arena", "7")
+    assert _slot_key("UFC07", config) is None
+
+
+def test_guide_name_uses_profile_timezone_and_rejects_placeholders():
+    current = {
+        "title": "The Main Event ᴸᶦᵛᵉ",
         "start": "2026-09-20T01:00:00+00:00",
-    }, "US/Eastern")
-    resolution = resolve_event_sync(
-        {
-            "master_group_id": 0,
-            "secondary_group_ids": [2462],
-            "time_window_minutes": 30,
-            "enforce_time_window": True,
-            "attach_threshold": 0.8,
-            "assume_current_date": True,
-            "patterns": list(DEFAULT_EVENT_PATTERNS),
-        },
-        [guide_name],
-        [SecondaryStream(
-            name="LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
-            group_id=2462,
-            stream_id=2134594,
-        )],
-        now=datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc),
-    )
+    }
 
-    assert resolution.resolved[0].disposition == "would_attach"
+    assert _guide_name(current, "US/Eastern") == "The Main Event @ Sep 19 9:00 PM"
+    assert _guide_name({**current, "title": "No events scheduled"}, "UTC") is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reverse", [False, True])
-async def test_keeps_numbered_slots_in_their_match_groups(reverse):
-    task = EventVisibilityTask()
-    client = AsyncMock()
+async def test_fetch_match_streams_honors_account_scope_and_pagination():
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(return_value="Events")
+    client.get_streams = AsyncMock(side_effect=[
+        {
+            "results": [{
+                "id": 11,
+                "name": "LIVE 1 Main Event",
+                "m3u_account": {"id": 4},
+            }],
+            "next": "page-2",
+        },
+        {
+            "results": [{
+                "id": 12,
+                "name": "Backup 1",
+                "m3u_account": 4,
+            }],
+            "next": None,
+        },
+    ])
+
+    streams, complete, failures = await _fetch_match_streams(
+        client, [{"group_id": 9, "m3u_account_id": 4}],
+    )
+
+    assert [stream.stream_id for stream in streams] == [11, 12]
+    assert all(stream.provider_id == 4 for stream in streams)
+    assert complete == {(9, 4)}
+    assert failures == {}
+    assert client.get_streams.await_args_list[0].kwargs["m3u_account"] == 4
+    assert client.get_streams.await_args_list[1].kwargs["page"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_streams_isolates_a_failed_scope():
+    client = MagicMock()
+    client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
+    client.get_streams = AsyncMock(side_effect=[
+        RuntimeError("first unavailable"),
+        {"results": [{"id": 22, "name": "Backup 2"}], "next": None},
+    ])
+
+    streams, complete, failures = await _fetch_match_streams(
+        client,
+        [
+            {"group_id": 1, "m3u_account_id": None},
+            {"group_id": 2, "m3u_account_id": None},
+        ],
+    )
+
+    assert [stream.stream_id for stream in streams] == [22]
+    assert complete == {(2, None)}
+    assert failures == {(1, None): "RuntimeError"}
+
+
+def test_profile_plan_keeps_incomplete_inventory_unknown():
+    profile = _profile(
+        event_sync_config=_config([{"group_id": 9, "m3u_account_id": 4}]),
+    )
     channels = {
         10: {
             "id": 10,
-            "name": "ESPN+ 06",
-            "channel_number": 8006,
-            "channel_group_id": 65,
-            "epg_data_id": 1,
+            "name": "Arena 1",
+            "channel_group_id": 7,
             "hidden_from_output": False,
-            "streams": [{"id": 9010, "name": "Fallback A", "channel_group_id": 900}],
+            "streams": [{"id": 11, "channel_group_id": 9, "m3u_account": 4}],
+        },
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile,
+        profile["event_sync_config"],
+        channels,
+        coverage,
+        [],
+        set(),
+        None,
+        datetime(2026, 9, 20, tzinfo=timezone.utc),
+    )
+
+    assert result["states"] == {10: "unknown"}
+    assert result["desired"] == {}
+    assert result["observations"] is None
+
+
+def test_profile_plan_marks_complete_empty_inventory_idle_and_keeps_outside_streams():
+    scope = {"group_id": 9, "m3u_account_id": 4}
+    profile = _profile(event_sync_config=_config([scope]))
+    channels = {
+        10: {
+            "id": 10,
+            "name": "Arena 1",
+            "channel_group_id": 7,
+            "hidden_from_output": False,
+            "epg_data": {"id": 900, "epg_source": 46, "tvg_id": "custom-10"},
+            "streams": [
+                {"id": 11, "channel_group_id": 9, "m3u_account": 4},
+                {"id": 50, "channel_group_id": 5, "m3u_account": 8},
+            ],
+        },
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile,
+        profile["event_sync_config"],
+        channels,
+        coverage,
+        [],
+        {(9, 4)},
+        None,
+        datetime(2026, 9, 20, tzinfo=timezone.utc),
+        {46},
+    )
+
+    assert result["states"] == {10: "idle"}
+    assert result["desired"] == {10: [50]}
+    assert result["observations"] == []
+
+
+@pytest.mark.parametrize(
+    "guide_row, expected",
+    [
+        (None, "unknown"),
+        ({"id": 900, "epg_source": 99, "tvg_id": "custom-10"}, "unknown"),
+        ({"id": 900, "epg_source": 46, "tvg_id": "other-10"}, "unknown"),
+        ({"id": 900, "epg_source": 46, "tvg_id": "custom-10"}, "idle"),
+    ],
+)
+def test_first_publication_idle_requires_exact_generated_guide_link(guide_row, expected):
+    profile = _profile(channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}])
+    channel = {
+        "id": 10,
+        "name": "Arena 1",
+        "channel_group_id": 7,
+        "hidden_from_output": False,
+        "streams": [],
+    }
+    if guide_row is not None:
+        channel["epg_data"] = guide_row
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile,
+        profile["event_sync_config"],
+        {10: channel},
+        coverage,
+        [],
+        set(),
+        None,
+        datetime(2026, 9, 20, tzinfo=timezone.utc),
+        {46},
+    )
+
+    assert result["states"] == {10: expected}
+    assert result["desired"] == ({10: []} if expected == "idle" else {})
+
+
+@pytest.mark.parametrize("bootstrap, expected", [(False, "unknown"), (True, "active")])
+def test_event_stream_activation_honors_family_bootstrap_without_current_guide(bootstrap, expected):
+    from services.event_slots import classify_event_slot
+    from services.event_sync_resolver import SecondaryStream
+
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    config = _config([{"group_id": 9, "m3u_account_id": None}])
+    config["slot_patterns"][0]["bootstrap"] = bootstrap
+    profile = _profile(
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+        event_sync_config=config,
+    )
+    channels = {
+        10: {
+            "id": 10,
+            "name": "Arena 1",
+            "channel_group_id": 7,
+            "hidden_from_output": False,
+            "streams": [],
+        },
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+    parsed = SimpleNamespace(
+        start=now - timedelta(minutes=10),
+        title="Main Event",
+        matched_pattern="test-pattern",
+    )
+    preview = classify_event_slot("LIVE 1 Main Event", config, role="event")
+
+    with patch("services.event_sync_matcher.parse_event_name", return_value=parsed):
+        result = _plan_profile(
+            profile,
+            config,
+            channels,
+            coverage,
+            [SecondaryStream(
+                name="LIVE 1 Main Event",
+                group_id=9,
+                stream_id=90,
+                is_stale=False,
+            )],
+            {(9, None)},
+            None,
+            now,
+        )
+
+    assert preview == {
+        "family": "Arena",
+        "slot": "1",
+        "role": "event",
+        "validation_issues": [],
+    }
+    assert result["states"] == {10: expected}
+    assert result["observations"] == ([] if not bootstrap else [{
+        "family": "Arena",
+        "slot": "1",
+        "stream_id": 90,
+        "normalized_name": "live 1 main event",
+        "start": (now - timedelta(minutes=10)).isoformat(),
+        "expires_at": (now + timedelta(minutes=170)).isoformat(),
+        "title": "Main Event",
+        "matched_variant": "test-pattern",
+        "provisional": False,
+    }])
+
+
+def test_conflicting_event_slots_are_unknown_and_stale_fallbacks_are_not_attached():
+    from services.event_sync_resolver import SecondaryStream
+
+    scope = {"group_id": 9, "m3u_account_id": None}
+    config = _config([scope])
+    config["slot_patterns"].append({
+        "name": "Second",
+        "channel_pattern": r"Second (?P<slot>\d+)",
+        "fallback_pattern": None,
+        "event_patterns": [r"LIVE (?P<slot>\d+) .+"],
+        "bootstrap": True,
+    })
+    profile = _profile(event_sync_config=config)
+    channels = {
+        10: {
+            "id": 10,
+            "name": "Arena 1",
+            "channel_group_id": 7,
+            "hidden_from_output": False,
+            "streams": [],
+        },
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+    streams = [
+        SecondaryStream(
+            name="LIVE 1 Main Event", group_id=9, stream_id=90, is_stale=False,
+        ),
+        SecondaryStream(
+            name="Backup 1", group_id=9, stream_id=91, is_stale=True,
+        ),
+    ]
+
+    result = _plan_profile(
+        profile,
+        config,
+        channels,
+        coverage,
+        streams,
+        {(9, None)},
+        None,
+        datetime(2026, 9, 20, tzinfo=timezone.utc),
+    )
+
+    assert result["states"] == {10: "unknown"}
+    assert result["desired"] == {}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_orders_hide_import_link_reveal_and_emby():
+    profile = _profile()
+    prepared = _profile()
+    channels = {
+        10: {
+            "id": 10,
+            "name": "Arena 1",
+            "channel_number": 101,
+            "channel_group_id": 7,
+            "hidden_from_output": True,
+            "epg_data_id": None,
+            "streams": [{"id": 501, "channel_group_id": 5}],
         },
         20: {
             "id": 20,
-            "name": "ESPN+ 06",
-            "channel_number": 9006,
-            "channel_group_id": 2479,
-            "epg_data_id": 2,
+            "name": "Arena 2",
+            "channel_number": 102,
+            "channel_group_id": 7,
             "hidden_from_output": False,
-            "streams": [{"id": 9020, "name": "Fallback B", "channel_group_id": 900}],
-        },
-    }
-    first = _profile(
-        [101, 303], id=1, hide_empty_group_ids=[65], channel_group_ids=[65],
-    )
-    second = _profile(
-        [202, 303], id=2, hide_empty_group_ids=[2479], channel_group_ids=[2479],
-    )
-    profiles = [second, first] if reverse else [first, second]
-    streams = [
-        SimpleNamespace(name="ESPN PLUS 06:", group_id=101, stream_id=1101),
-        SimpleNamespace(name="ESPN PLUS 06:", group_id=202, stream_id=2202),
-        SimpleNamespace(name="ESPN PLUS 06:", group_id=303, stream_id=3303),
-    ]
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [
-            {"channel_id": 10, "current": {"title": "Event A"}},
-            {"channel_id": 20, "current": {"title": "Event B"}},
-        ],
-    }
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profiles=profiles)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([row.to_dict() for row in profiles], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             streams, {1101: 101, 2202: 202, 3303: 303},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync"), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    assert client.update_channel.await_args_list == [
-        ((10, {"streams": [9010, 1101, 3303]}),),
-        ((20, {"streams": [9020, 2202, 3303]}),),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_resolves_guide_names_within_each_target_group():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10, "name": "PPV 10", "channel_number": 10,
-            "channel_group_id": 65, "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{"id": 9010, "name": "Fallback A", "channel_group_id": 900}],
-        },
-        20: {
-            "id": 20, "name": "ESPN event", "channel_number": 20,
-            "channel_group_id": 2479, "epg_data_id": 2,
-            "hidden_from_output": False,
-            "streams": [{"id": 9020, "name": "Fallback B", "channel_group_id": 900}],
-        },
-    }
-    first = _profile(
-        [102, 101], id=1, hide_empty_group_ids=[65], channel_group_ids=[65],
-        event_timezone="US/Pacific",
-    )
-    second = _profile(
-        [202, 201], id=2, hide_empty_group_ids=[2479], channel_group_ids=[2479],
-        event_timezone="US/Eastern",
-    )
-    profiles = [first, second]
-    currents = {
-        10: {"title": "Target A", "start": "2026-09-20T01:00:00+00:00"},
-        20: {"title": "Target B", "start": "2026-09-20T01:00:00+00:00"},
-    }
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [
-            {"channel_id": channel_id, "current": current}
-            for channel_id, current in currents.items()
-        ],
-    }
-    streams = [
-        SimpleNamespace(name="Target B @ Sep 19 09:00 PM", group_id=201, stream_id=2101),
-        SimpleNamespace(name="Target A @ Sep 19 06:00 PM", group_id=101, stream_id=1101),
-        SimpleNamespace(name="Target B @ Sep 19 09:00 PM", group_id=202, stream_id=2202),
-        SimpleNamespace(name="Target A @ Sep 19 06:00 PM", group_id=102, stream_id=1202),
-    ]
-    calls = []
-
-    def resolve(config, names, candidates, *, now):
-        calls.append((config, names, candidates, now))
-        return SimpleNamespace(resolved=[
-            SimpleNamespace(
-                disposition="would_attach",
-                best=SimpleNamespace(master_name=names[0]),
-                stream=stream,
-            )
-            for stream in candidates
-        ])
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profiles=profiles)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([row.to_dict() for row in profiles], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             streams, {stream.stream_id: stream.group_id for stream in streams},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync", side_effect=resolve), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    assert len(calls) == 2
-    assert calls[0][0]["secondary_group_ids"] == [102, 101]
-    assert calls[1][0]["secondary_group_ids"] == [202, 201]
-    assert calls[0][1] == ["Target A @ Sep 19 6:00 PM"]
-    assert calls[1][1] == ["Target B @ Sep 19 9:00 PM"]
-    assert [stream.stream_id for stream in calls[0][2]] == [1101, 1202]
-    assert [stream.stream_id for stream in calls[1][2]] == [2101, 2202]
-    assert client.update_channel.await_args_list == [
-        ((10, {"streams": [1202, 1101, 9010]}),),
-        ((20, {"streams": [2202, 2101, 9020]}),),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_keeps_profile_patterns_in_its_target_groups():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {"id": 10, "name": "PPV 10", "channel_number": 10, "channel_group_id": 65,
-             "epg_data_id": 1, "hidden_from_output": False, "streams": []},
-        20: {"id": 20, "name": "ESPN event", "channel_number": 20, "channel_group_id": 2479,
-             "epg_data_id": 2, "hidden_from_output": False, "streams": []},
-    }
-    first_pattern = {"name": "first-format", "title_pattern": r"^FIRST (?P<title>.+)$"}
-    second_pattern = {"name": "second-format", "title_pattern": r"^SECOND (?P<title>.+)$"}
-    profiles = [
-        _profile([101], [first_pattern], id=1, hide_empty_group_ids=[65], event_timezone="US/Pacific"),
-        _profile([202], [second_pattern], id=2, hide_empty_group_ids=[2479], event_timezone="US/Eastern"),
-    ]
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [
-            {"channel_id": 10, "current": {"title": "A", "start": "2026-09-20T01:00:00+00:00"}},
-            {"channel_id": 20, "current": {"title": "B", "start": "2026-09-20T01:00:00+00:00"}},
-        ],
-    }
-    streams = [
-        SimpleNamespace(name="FIRST A", group_id=101, stream_id=1101),
-        SimpleNamespace(name="SECOND B", group_id=202, stream_id=2202),
-    ]
-    configs = []
-
-    def resolve(config, names, candidates, *, now):
-        configs.append(config)
-        return SimpleNamespace(resolved=[])
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profiles=profiles)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([row.to_dict() for row in profiles], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             streams, {1101: 101, 2202: 202},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync", side_effect=resolve), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    assert len(configs) == 2
-    assert first_pattern in configs[0]["patterns"]
-    assert second_pattern not in configs[0]["patterns"]
-    assert second_pattern in configs[1]["patterns"]
-    assert first_pattern not in configs[1]["patterns"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure_site", ["scan", "resolve"])
-async def test_keeps_streams_when_profile_matching_fails(failure_site):
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10, "name": "PPV 10", "channel_number": 10,
-            "channel_group_id": 65, "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 9010, "name": "Fallback", "channel_group_id": 900}],
-        },
-    }
-    profile = _profile([101], hide_empty_group_ids=[65], channel_group_ids=[65])
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{
-            "channel_id": 10,
-            "current": {"title": "Target A", "start": "2026-09-20T01:00:00+00:00"},
-        }],
-    }
-    stream = SimpleNamespace(name="Target A @ Sep 19 09:00 PM", group_id=101, stream_id=1101)
-    fetched = AsyncMock(return_value=([stream], {1101: 101}))
-    resolve_error = None
-    if failure_site == "scan":
-        fetched.side_effect = RuntimeError("scan failed")
-    else:
-        resolve_error = RuntimeError("resolve failed")
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=fetched), \
-         patch("services.event_sync_resolver.resolve_event_sync", side_effect=resolve_error), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": False})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("title, event_timezone, now", [
-    (
-        "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
-        "US/Eastern",
-        datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc),
-    ),
-    pytest.param(
-        "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
-        "US/Eastern",
-        datetime(2026, 9, 20, 5, 30, tzinfo=timezone.utc),
-        id="dateless-event-crosses-midnight",
-    ),
-    (
-        "UFC 02 : CRYPTO.COM UFC 331: PRELIMS start:2026 09 20 01:00:00 stop:2026 09 20 04:00:00",
-        "UTC",
-        datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc),
-    ),
-])
-async def test_bootstraps_active_ufc_titled_slot_before_numbered_fallback(
-    title, event_timezone, now,
-):
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 46,
-        "name": "ECM Dummy EPG",
-        "url": "http://ecm/api/dummy-epg/xmltv/2",
-        "is_active": True,
-    }]
-    channels = {
-        10: {
-            "id": 10, "name": "UFC02", "channel_number": 8102,
-            "channel_group_id": 16, "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 1868499, "name": "UFC 02", "channel_group_id": 2462}],
-        },
-    }
-    profile = _profile(
-        [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
-        event_timezone=event_timezone, program_duration=360,
-    )
-    titled = SimpleNamespace(name=title, group_id=2462, stream_id=2134594)
-    fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": None}],
-    }
-    clock = MagicMock(wraps=datetime)
-    clock.now.return_value = now
-    refresh_emby = AsyncMock()
-    wait_refresh = AsyncMock(return_value=True)
-    guide_cache = MagicMock()
-
-    with patch("tasks.event_visibility.datetime", clock), \
-         patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [fallback, titled], {1868499: 2462, 2134594: 2462},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync") as resolve, \
-         patch("cache.get_cache", return_value=guide_cache), \
-         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=wait_refresh), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10, {"streams": [2134594, 1868499], "hidden_from_output": False},
-    )
-    assert result.details["stream_updated_channel_ids"] == [10]
-    resolve.assert_not_called()
-    guide_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
-    wait_refresh.assert_awaited_once_with(
-        client,
-        46,
-        "ECM Dummy EPG",
-        cancelled=wait_refresh.await_args.kwargs["cancelled"],
-    )
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "hidden, update_fails, attempts, source_completes, refreshes_emby",
-    [
-        pytest.param(True, False, True, True, True, id="visibility-only"),
-        pytest.param(False, False, True, True, True, id="idempotent-channel"),
-        pytest.param(True, True, False, True, False, id="failed-channel-update"),
-        pytest.param(False, False, True, False, False, id="source-incomplete"),
-    ],
-)
-async def test_retries_active_ufc_guide_publication(
-    hidden, update_fails, attempts, source_completes, refreshes_emby,
-):
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 46,
-        "name": "ECM Dummy EPG",
-        "url": "http://ecm/api/dummy-epg/xmltv/2",
-        "is_active": True,
-    }]
-    title = "LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2"
-    channels = {
-        10: {
-            "id": 10, "name": "UFC02", "channel_number": 8102,
-            "channel_group_id": 16, "epg_data_id": 1,
-            "hidden_from_output": hidden,
-            "streams": [
-                {"id": 2134594, "name": title, "channel_group_id": 2462},
-                {"id": 1868499, "name": "UFC 02", "channel_group_id": 2462},
-            ],
-        },
-    }
-    profile = _profile(
-        [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
-        event_timezone="US/Eastern", program_duration=180,
-    )
-    titled = SimpleNamespace(name=title, group_id=2462, stream_id=2134594)
-    fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": None}],
-    }
-    if update_fails:
-        client.update_channel.side_effect = RuntimeError("update failed")
-    clock = MagicMock(wraps=datetime)
-    clock.now.return_value = datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc)
-    guide_cache = MagicMock()
-    wait_refresh = AsyncMock(return_value=source_completes)
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.datetime", clock), \
-         patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [fallback, titled], {1868499: 2462, 2134594: 2462},
-         ))), \
-         patch("cache.get_cache", return_value=guide_cache), \
-         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=wait_refresh), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        await task.execute()
-
-    if hidden:
-        client.update_channel.assert_awaited_once_with(
-            10, {"hidden_from_output": False},
-        )
-    else:
-        client.update_channel.assert_not_awaited()
-    if attempts:
-        guide_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
-        wait_refresh.assert_awaited_once_with(
-            client,
-            46,
-            "ECM Dummy EPG",
-            cancelled=wait_refresh.await_args.kwargs["cancelled"],
-        )
-    else:
-        guide_cache.invalidate_prefix.assert_not_called()
-        wait_refresh.assert_not_awaited()
-    if refreshes_emby:
-        refresh_emby.assert_awaited_once_with()
-    else:
-        refresh_emby.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("now", [
-    datetime(2026, 9, 20, 0, 59, tzinfo=timezone.utc),
-    datetime(2026, 9, 20, 4, 0, tzinfo=timezone.utc),
-])
-async def test_keeps_ufc_titled_slot_outside_profile_window(now):
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    title = (
-        "UFC 02 : CRYPTO.COM UFC 331: PRELIMS "
-        "start:2026 09 20 01:00:00 stop:2026 09 20 04:00:00"
-    )
-    channels = {
-        10: {
-            "id": 10, "name": "UFC02", "channel_number": 8102,
-            "channel_group_id": 16, "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [
-                {"id": 2134594, "name": title, "channel_group_id": 2462},
-                {"id": 1868499, "name": "UFC 02", "channel_group_id": 2462},
-            ],
-        },
-    }
-    profile = _profile(
-        [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
-        event_timezone="UTC", program_duration=180,
-    )
-    streams = [
-        SimpleNamespace(name=title, group_id=2462, stream_id=2134594),
-        SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499),
-    ]
-    coverage = {"sources": [{"status": "ready"}], "channels": [{"channel_id": 10, "current": None}]}
-    clock = MagicMock(wraps=datetime)
-    clock.now.return_value = now
-
-    with patch("tasks.event_visibility.datetime", clock), \
-         patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             streams, {2134594: 2462, 1868499: 2462},
-         ))), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10, {"hidden_from_output": True, "streams": [1868499]},
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("name, group_id", [
-    ("LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2", 9999),
-    ("9pm UFC 331 Van v Pantoja 2", 2462),
-    pytest.param(
-        "LIVE EVENT 02   9pm Boxing Championship",
-        2462,
-        id="non-ufc-live-event",
-    ),
-])
-async def test_rejects_ufc_bootstrap_without_owned_slot(name, group_id):
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10, "name": "UFC02", "channel_number": 8102,
-            "channel_group_id": 16, "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{"id": 1868499, "name": "UFC 02", "channel_group_id": 2462}],
-        },
-    }
-    profile = _profile([2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16])
-    stream = SimpleNamespace(name=name, group_id=group_id, stream_id=2134594)
-    fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)
-    coverage = {"sources": [{"status": "ready"}], "channels": [{"channel_id": 10, "current": None}]}
-    clock = MagicMock(wraps=datetime)
-    clock.now.return_value = datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc)
-
-    with patch("tasks.event_visibility.datetime", clock), \
-         patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [fallback, stream], {1868499: 2462, 2134594: group_id},
-         ))), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": True})
-
-
-@pytest.mark.asyncio
-async def test_reveals_current_hidden_channel_and_refreshes_emby():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "PPV 10",
-            "channel_number": 900,
-            "channel_group_id": 65,
-            "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 110, "name": "PPV stream"}],
-        }
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage()))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    assert result.success is True
-    assert result.success_count == 1
-    assert result.details == {
-        "revealed_channel_ids": [10],
-        "hidden_channel_ids": [],
-        "stream_updated_channel_ids": [],
-        "epg_linked_channel_ids": [],
-    }
-    client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": False})
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_leaves_idle_hidden_channel_alone_without_probe():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "PPV 10",
-            "channel_number": 900,
-            "channel_group_id": 65,
-            "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 110, "name": "PPV stream"}],
-        }
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    assert result.success is True
-    assert result.total_items == 1
-    client.update_channel.assert_not_awaited()
-    refresh_emby.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_hides_ended_visible_channel_and_refreshes_emby():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "PPV 10",
-            "channel_number": 900,
-            "channel_group_id": 65,
-            "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{"id": 110, "name": "PPV stream"}],
-        }
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    assert result.success_count == 1
-    assert result.details == {
-        "revealed_channel_ids": [],
-        "hidden_channel_ids": [10],
-        "stream_updated_channel_ids": [],
-        "epg_linked_channel_ids": [],
-    }
-    client.update_channel.assert_awaited_once_with(
-        10, {"hidden_from_output": True},
-    )
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_waits_for_ready_source_rows():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 00",
-            "channel_number": 8000,
-            "channel_group_id": 2479,
-            "hidden_from_output": True,
-            "streams": [{"id": 110, "name": "ESPN+ stream"}],
-        }
-    }
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage(False)))), \
-         patch("services.epg_programmes.can_cache", return_value=False), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        result = await task.execute()
-
-    assert result.message == "Published event guide is not ready"
-    client.update_channel.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_ufc_reconciliation_continues_while_another_profile_is_pending():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 52,
-        "name": "UFC Events (auto)",
-        "url": "http://ecm/api/dummy-epg/xmltv/2",
-        "is_active": True,
-    }]
-    channels = {
-        10: {
-            "id": 10, "name": "UFC02", "channel_number": 8102,
-            "channel_group_id": 16, "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 1868499, "name": "UFC 02", "channel_group_id": 2462}],
-        },
-        20: {
-            "id": 20, "name": "ESPN+ 00", "channel_number": 8000,
-            "channel_group_id": 2479, "epg_data_id": 2,
-            "hidden_from_output": True,
-            "streams": [{"id": 110, "name": "ESPN PLUS 00:", "channel_group_id": 754}],
-        },
-    }
-    ufc_profile = _profile(
-        [2462], id=2, hide_empty_group_ids=[16], channel_group_ids=[16],
-        epg_source_ids=[], program_duration=360,
-        channel_assignments=[{"channel_id": 10}],
-    )
-    espn_profile = _profile(
-        [754], id=3, hide_empty_group_ids=[2479], channel_group_ids=[2479],
-        epg_source_ids=[51], channel_assignments=[{"channel_id": 20}],
-    )
-    coverage = {
-        "sources": [{"source_id": 51, "status": "pending", "last_success": None}],
-        "channels": [{
-            "channel_id": 20,
-            "current": None,
-            "warnings": ["schedule_pending"],
-        }],
-    }
-    titled = SimpleNamespace(
-        name="LIVE EVENT 02   9pm UFC 331 Van v Pantoja 2",
-        group_id=2462,
-        stream_id=2134594,
-    )
-    fallback = SimpleNamespace(name="UFC 02", group_id=2462, stream_id=1868499)
-    clock = MagicMock(wraps=datetime)
-    clock.now.return_value = datetime(2026, 9, 20, 1, 30, tzinfo=timezone.utc)
-    guide_cache = MagicMock()
-    wait_refresh = AsyncMock(return_value=True)
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.datetime", clock), \
-         patch("tasks.event_visibility.get_session", return_value=_session(
-             profiles=[ufc_profile, espn_profile],
-         )), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(
-             [ufc_profile.to_dict(), espn_profile.to_dict()], coverage,
-         ))), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [fallback, titled], {1868499: 2462, 2134594: 2462},
-         ))), \
-         patch("cache.get_cache", return_value=guide_cache), \
-         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=wait_refresh), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10, {"streams": [2134594, 1868499], "hidden_from_output": False},
-    )
-    assert result.details["stream_updated_channel_ids"] == [10]
-    assert all(call.args[0] != 20 for call in client.update_channel.await_args_list)
-    guide_cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
-    wait_refresh.assert_awaited_once()
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_reveals_current_channel_without_probe():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "PPV 10",
-            "channel_number": 900,
-            "channel_group_id": 65,
-            "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [{"id": 110, "name": "PPV stream"}],
-        }
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage()))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    assert result.success is True
-    assert result.success_count == 1
-    client.update_channel.assert_awaited_once_with(10, {"hidden_from_output": False})
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_places_guide_matches_in_group_priority_before_fallback():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    current = {
-        "title": "The Pat McAfee Show  ᴸᶦᵛᵉ",
-        "start": "2026-09-14T15:55:00+00:00",
-    }
-    guide_name = _guide_name(current, "US/Eastern")
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 06",
-            "channel_number": 8006,
-            "channel_group_id": 2479,
-            "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{"id": 110, "name": "ESPN PLUS 06:", "channel_group_id": 754}],
-        }
-    }
-    profile = _profile([1558, 1557])
-    primary_match = SimpleNamespace(
-        name="NEXT | THE PAT MCAFEE SHOW | Mon 14 Sep 12:00 EDT | US: ESPN+ PPV 8",
-        group_id=1558,
-        stream_id=210,
-    )
-    secondary_match = SimpleNamespace(
-        name="US (ESPN+ 8) | The Pat McAfee Show (2026-09-14 12:00:00)",
-        group_id=1557,
-        stream_id=220,
-    )
-    resolution = SimpleNamespace(resolved=[
-        SimpleNamespace(
-            disposition="would_attach",
-            best=SimpleNamespace(master_name=guide_name),
-            stream=secondary_match,
-        ),
-        SimpleNamespace(
-            disposition="would_attach",
-            best=SimpleNamespace(master_name=guide_name),
-            stream=primary_match,
-        ),
-    ])
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": current}],
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [secondary_match, primary_match], {210: 1558, 220: 1557},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync", return_value=resolution), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    client.update_channel.assert_awaited_once_with(10, {"streams": [210, 220, 110]})
-    assert result.details["stream_updated_channel_ids"] == [10]
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_places_numbered_iptorrents_slot_without_title_matching():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    current = {
-        "title": "Murray State vs. Oklahoma State",
-        "start": "2026-09-19T22:55:00+00:00",
-    }
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 62",
-            "channel_number": 8062,
-            "channel_group_id": 2479,
-            "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [],
-        }
-    }
-    profile = _profile([754])
-    ipt_slot = SimpleNamespace(
-        name="ESPN PLUS 62:",
-        group_id=754,
-        stream_id=1679941,
-    )
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": current}],
-    }
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([ipt_slot], {1679941: 754}))), \
-         patch("services.event_sync_resolver.resolve_event_sync") as resolve, \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10,
-        {"streams": [1679941], "hidden_from_output": False},
-    )
-    assert result.details["stream_updated_channel_ids"] == [10]
-    resolve.assert_not_called()
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_orders_titled_iptorrents_then_trex_then_numbered_slot():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    current = {
-        "title": "Murray State vs. Oklahoma State",
-        "start": "2026-09-19T22:55:00+00:00",
-    }
-    guide_name = _guide_name(current, "US/Eastern")
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 62",
-            "channel_number": 8062,
-            "channel_group_id": 2479,
-            "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{
-                "id": 1679941,
-                "name": "ESPN PLUS 62:",
-                "channel_group_id": 754,
-            }],
-        }
-    }
-    profile = _profile([754, 1558, 1557, 1520])
-    ipt_title = SimpleNamespace(
-        name="US (ESPN+ 404) | Murray State at Oklahoma State (2026-09-19 19:00:00)",
-        group_id=754,
-        stream_id=220,
-    )
-    trex_title = SimpleNamespace(
-        name="NCAAF 54: Murray State at Oklahoma State 7pm",
-        group_id=1520,
-        stream_id=210,
-    )
-    ipt_slot = SimpleNamespace(
-        name="ESPN PLUS 62:",
-        group_id=754,
-        stream_id=1679941,
-    )
-    resolution = SimpleNamespace(resolved=[
-        SimpleNamespace(
-            disposition="would_attach",
-            best=SimpleNamespace(master_name=guide_name),
-            stream=trex_title,
-        ),
-        SimpleNamespace(
-            disposition="would_attach",
-            best=SimpleNamespace(master_name=guide_name),
-            stream=ipt_title,
-        ),
-    ])
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": current}],
-    }
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [trex_title, ipt_slot, ipt_title],
-             {210: 1520, 220: 754, 1679941: 754},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync", return_value=resolution) as resolve, \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10,
-        {"streams": [220, 210, 1679941]},
-    )
-    passed_streams = resolve.call_args.args[2]
-    assert [stream.stream_id for stream in passed_streams] == [210, 220]
-
-
-@pytest.mark.asyncio
-async def test_ended_channel_keeps_numbered_iptorrents_fallback():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 62",
-            "channel_number": 8062,
-            "channel_group_id": 2479,
-            "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [
-                {"id": 220, "name": "US (ESPN+ 404) | Finished Event", "channel_group_id": 754},
-                {"id": 210, "name": "NCAAF 54: Finished Event", "channel_group_id": 1520},
-                {"id": 1679941, "name": "ESPN PLUS 62:", "channel_group_id": 754},
-            ],
-        }
-    }
-    profile = _profile([754, 1558, 1557, 1520])
-    match_streams = [
-        SimpleNamespace(name=stream["name"], group_id=stream["channel_group_id"], stream_id=stream["id"])
-        for stream in channels[10]["streams"]
-    ]
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], _coverage(False)))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             match_streams,
-             {220: 754, 210: 1520, 1679941: 754},
-         ))), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10,
-        {"hidden_from_output": True, "streams": [1679941]},
-    )
-
-
-@pytest.mark.asyncio
-async def test_orders_titled_ufc_stream_before_numbered_slot():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    current = {
-        "title": "Crypto.com UFC 331: Prelims",
-        "start": "2026-09-20T00:55:00+00:00",
-    }
-    guide_name = _guide_name(current, "US/Eastern")
-    channels = {
-        10: {
-            "id": 10,
-            "name": "UFC02",
-            "channel_number": 8102,
-            "channel_group_id": 16,
-            "epg_data_id": 1,
-            "hidden_from_output": False,
-            "streams": [{
-                "id": 1868499,
-                "name": "UFC 02",
-                "channel_group_id": 2462,
-            }],
-        }
-    }
-    ufc_pattern = {
-        "name": "ufc-parenthesized-date",
-        "title_pattern": (
-            r"^US\s+\(UFC(?:\s+INT)?\s*\d+\)\s*\|\s*(?P<title>.+?)\s*"
-            r"\((?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
-            r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\)\s*$"
-        ),
-    }
-    profile = _profile([2462], [ufc_pattern])
-    titled = SimpleNamespace(
-        name=(
-            "UFC 02 : CRYPTO.COM UFC 331: PRELIMS "
-            "start:2026 09 20 00:55:00 stop:2026 09 20 04:00:00"
-        ),
-        group_id=2462,
-        stream_id=2087027,
-    )
-    fallback = SimpleNamespace(
-        name="UFC 02",
-        group_id=2462,
-        stream_id=1868499,
-    )
-    resolution = SimpleNamespace(resolved=[SimpleNamespace(
-        disposition="would_attach",
-        best=SimpleNamespace(master_name=guide_name),
-        stream=titled,
-    )])
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [{"channel_id": 10, "current": current}],
-    }
-
-    with patch("tasks.event_visibility.get_session", return_value=_session(profile)), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [fallback, titled], {1868499: 2462, 2087027: 2462},
-         ))), \
-         patch("services.event_sync_resolver.resolve_event_sync", return_value=resolution) as resolve, \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        await task.execute()
-
-    client.update_channel.assert_awaited_once_with(
-        10,
-        {"streams": [2087027, 1868499]},
-    )
-    assert resolve.call_args.args[0]["patterns"][-1] == ufc_pattern
-
-
-@pytest.mark.asyncio
-async def test_processes_every_current_channel_in_one_run():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    channels = {
-        channel_id: {
-            "id": channel_id,
-            "name": f"ESPN+ {channel_id}",
-            "channel_number": 8000 + channel_id,
-            "channel_group_id": 2479,
-            "epg_data_id": 1,
-            "hidden_from_output": True,
-            "streams": [1000 + channel_id],
-        }
-        for channel_id in range(1, 21)
-    }
-    coverage = {
-        "sources": [{"status": "ready"}],
-        "channels": [
-            {"channel_id": channel_id, "current": {"title": f"Event {channel_id}"}}
-            for channel_id in channels
-        ],
-    }
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], coverage))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("emby_client.request_guide_refresh", new=AsyncMock()):
-        result = await task.execute()
-
-    assert result.total_items == 20
-    assert result.details["revealed_channel_ids"] == list(range(1, 21))
-    assert client.update_channel.await_count == 20
-
-
-@pytest.mark.asyncio
-async def test_links_generated_epg_rows_and_returns_sources_to_refresh():
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 46,
-        "name": "ECM Dummy EPG",
-        "url": "http://ecm/api/dummy-epg/xmltv/1",
-        "is_active": True,
-    }]
-    client.get_epg_data.return_value = [{
-        "id": 501,
-        "tvg_id": "ecm-10",
-        "epg_source": 46,
-    }]
-    channels = [(10, {"id": 10, "epg_data_id": None})]
-
-    linked, sources = await _link_dummy_epg(client, channels)
-
-    assert linked == [10]
-    assert sources == {46: "ECM Dummy EPG"}
-    assert channels[0][1]["epg_data_id"] == 501
-    client.update_channel.assert_awaited_once_with(10, {"epg_data_id": 501})
-    client.get_epg_data.assert_awaited_once_with(
-        epg_source=46,
-        max_results=10000,
-    )
-
-
-@pytest.mark.asyncio
-async def test_links_generated_epg_row_when_dispatcharr_omits_empty_link():
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 46,
-        "name": "ECM Dummy EPG",
-        "url": "http://ecm/api/dummy-epg/xmltv/1",
-        "is_active": True,
-    }]
-    client.get_epg_data.return_value = [{
-        "id": 501,
-        "tvg_id": "ecm-10",
-        "epg_source": 46,
-    }]
-    channels = [(10, {"id": 10})]
-
-    linked, sources = await _link_dummy_epg(client, channels)
-
-    assert linked == [10]
-    assert sources == {46: "ECM Dummy EPG"}
-    client.update_channel.assert_awaited_once_with(10, {"epg_data_id": 501})
-
-
-@pytest.mark.asyncio
-async def test_new_epg_link_reimports_programmes_before_emby_refresh():
-    task = EventVisibilityTask()
-    client = AsyncMock()
-    client.get_epg_sources.return_value = [{
-        "id": 46,
-        "name": "ECM Dummy EPG",
-        "url": "http://ecm/api/dummy-epg/xmltv/1",
-        "is_active": True,
-    }]
-    client.get_epg_data.return_value = [{
-        "id": 501,
-        "tvg_id": "ecm-10",
-        "epg_source": 46,
-    }]
-    channels = {
-        10: {
-            "id": 10,
-            "name": "ESPN+ 62",
-            "channel_number": 8062,
-            "channel_group_id": 2479,
             "epg_data_id": None,
-            "hidden_from_output": True,
-            "streams": [110],
-        }
+            "streams": [{"id": 502, "channel_group_id": 5}],
+        },
     }
-    wait_refresh = AsyncMock(return_value=True)
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.event_visibility.get_session", return_value=_session()), \
-         patch("tasks.event_visibility.get_client", return_value=client), \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([_profile().to_dict()], _coverage()))), \
-         patch("services.epg_programmes.can_cache", return_value=True), \
-         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=wait_refresh), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-
-    assert result.details["epg_linked_channel_ids"] == [10]
-    assert client.update_channel.await_args_list == [
-        ((10, {"epg_data_id": 501}),),
-        ((10, {"hidden_from_output": False}),),
-    ]
-    wait_refresh.assert_awaited_once_with(
-        client,
-        46,
-        "ECM Dummy EPG",
-        cancelled=wait_refresh.await_args.kwargs["cancelled"],
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [
+            {
+                "profile_id": 1,
+                "channel_id": 10,
+                "current": {
+                    "title": "Main Event",
+                    "start": "2026-09-20T12:00:00+00:00",
+                },
+            },
+            {"profile_id": 1, "channel_id": 20, "current": None},
+        ],
+    }
+    result = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"all": "<tv/>", "profile:1": "<tv/>"},
+        hashes_by_scope={"all": "a" * 64, "profile:1": "a" * 64},
     )
-    refresh_emby.assert_awaited_once_with()
+    publications = {
+        "all": _publication("all"),
+        "profile:1": _publication("profile:1"),
+    }
+
+    def read(scope):
+        return publications.get(scope)
+
+    def update(scope, *, expected_revision, required_dispatcharr_hashes=None,
+               confirmed_dispatcharr_hashes=None, pending_emby=None):
+        row = publications[scope]
+        if row["revision"] != expected_revision:
+            return None
+        if required_dispatcharr_hashes is not None:
+            row["state"]["delivery"]["required_dispatcharr_hashes"] = dict(required_dispatcharr_hashes)
+        if confirmed_dispatcharr_hashes is not None:
+            row["state"]["delivery"]["confirmed_dispatcharr_hashes"] = dict(confirmed_dispatcharr_hashes)
+        if pending_emby is not None:
+            row["state"]["delivery"]["pending_emby"] = pending_emby
+        row["revision"] += 1
+        return row["revision"]
+
+    order = []
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[{
+        "id": 46,
+        "name": "Generated profile",
+        "url": "http://ecm/api/dummy-epg/xmltv/1?key=ignored",
+        "is_active": True,
+    }])
+
+    async def update_channel(channel_id, values):
+        order.append(("channel", channel_id, tuple(sorted(values))))
+
+    async def guide_rows(**kwargs):
+        order.append(("rows", kwargs["epg_source"]))
+        return [{"id": 900, "tvg_id": "custom-10", "epg_source": 46}]
+
+    client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_epg_data = AsyncMock(side_effect=guide_rows)
+    task = EventVisibilityTask()
+
+    async def import_source(*args, **kwargs):
+        order.append(("import", args[1]))
+        return True
+
+    async def emby():
+        order.append(("emby",))
+        return None
+
+    with patch("tasks.event_visibility._load_profiles", side_effect=[
+        ([profile], []), ([profile], []),
+    ]), patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([prepared], coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=result)), \
+         patch("services.epg_publication.read_publication", side_effect=read), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("cache.get_cache"), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=import_source), \
+         patch("emby_client.request_guide_refresh", side_effect=emby):
+        outcome = await reconcile_profiles(task, wait_for_sources=True)
+
+    assert outcome.success is True
+    assert outcome.completed_degraded is False
+    assert outcome.details == {
+        "configured_profile_count": 1,
+        "published_profile_ids": [1],
+        "retained_profile_ids": [],
+        "unavailable_profile_ids": [],
+        "publication_times": {"1": "2026-09-20T12:00:00+00:00"},
+        "source_reason_codes": {"1": []},
+        "idle_channel_count": 1,
+        "active_channel_count": 1,
+        "unknown_channel_count": 0,
+        "stream_updated_channel_ids": [],
+        "epg_linked_channel_ids": [10],
+        "revealed_channel_ids": [10],
+        "hidden_channel_ids": [20],
+        "pending_source_hashes": {},
+        "emby_request_outcome": "disabled",
+        "pending_emby": False,
+        "delivery_pending": False,
+        "reason_codes": [],
+    }
+    assert order == [
+        ("channel", 20, ("hidden_from_output",)),
+        ("import", 46),
+        ("rows", 46),
+        ("channel", 10, ("epg_data_id",)),
+        ("channel", 10, ("hidden_from_output",)),
+        ("emby",),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_keeps_unconfirmed_import_pending():
+    profile = _profile(channel_assignments=[])
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+    publication = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"profile:1": "<tv/>"},
+    )
+    stored = _publication("profile:1", pending=False)
+
+    def update(scope, *, expected_revision, required_dispatcharr_hashes=None,
+               confirmed_dispatcharr_hashes=None, pending_emby=None):
+        assert stored["revision"] == expected_revision
+        if required_dispatcharr_hashes is not None:
+            stored["state"]["delivery"]["required_dispatcharr_hashes"] = dict(required_dispatcharr_hashes)
+        if confirmed_dispatcharr_hashes is not None:
+            stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] = dict(confirmed_dispatcharr_hashes)
+        if pending_emby is not None:
+            stored["state"]["delivery"]["pending_emby"] = pending_emby
+        stored["revision"] += 1
+        return stored["revision"]
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[{
+        "id": 46,
+        "name": "Generated profile",
+        "url": "http://ecm/api/dummy-epg/xmltv/1",
+        "is_active": True,
+    }])
+    task = EventVisibilityTask()
+    with patch("tasks.event_visibility._load_profiles", side_effect=[
+        ([profile], []), ([profile], []),
+    ]), patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([copy.deepcopy(profile)], coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=publication)), \
+         patch("services.epg_publication.read_publication", side_effect=lambda scope: stored), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("cache.get_cache"), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=False)), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock(return_value=None)):
+        outcome = await reconcile_profiles(task, wait_for_sources=False)
+
+    assert outcome.success is False
+    assert outcome.completed_degraded is True
+    assert outcome.error == "GUIDE_IMPORT_PENDING"
+    assert outcome.details["pending_source_hashes"] == {"46": "a" * 64}
+    assert outcome.details["delivery_pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cancellation_prevents_publication_and_mutation():
+    profile = _profile()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock()
+    task = EventVisibilityTask()
+    task._cancel_requested = True
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile], {
+             "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+             "channels": [],
+         }))), patch("services.epg_publication.read_publication", return_value=None), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock()) as publish:
+        outcome = await reconcile_profiles(task, wait_for_sources=False)
+
+    assert outcome.success is False
+    assert outcome.error == "CANCELLED"
+    publish.assert_not_awaited()
+    client.update_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preparation_wait_observes_cancellation_without_cancelling_shared_loads():
+    entered = asyncio.Event()
+    stopped = asyncio.Event()
+    cancel_requested = False
+
+    async def prepare():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    waiting = asyncio.create_task(
+        _await_preparation(prepare(), lambda: cancel_requested)
+    )
+    await entered.wait()
+    cancel_requested = True
+
+    assert await waiting is None
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_publication_preserves_commit_and_stops_external_delivery():
+    profile = _profile(channel_assignments=[])
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+    publication = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"profile:1": "<tv/>"},
+    )
+    stored = _publication("profile:1", pending=True)
+    task = EventVisibilityTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock()
+    cache = MagicMock()
+
+    async def publish(*args, **kwargs):
+        task._cancel_requested = True
+        return publication
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(
+             [copy.deepcopy(profile)], coverage,
+         ))), patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(
+             return_value=([], set(), {}),
+         )), patch("concurrency.run_cpu_bound", side_effect=publish), \
+         patch("services.epg_publication.read_publication", side_effect=[None, stored]), \
+         patch("cache.get_cache", return_value=cache), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()) as emby:
+        outcome = await reconcile_profiles(task, wait_for_sources=True)
+
+    assert outcome.error == "CANCELLED"
+    assert outcome.completed_degraded is True
+    assert outcome.details["published_profile_ids"] == [1]
+    assert outcome.details["pending_emby"] is True
+    cache.invalidate_prefix.assert_not_called()
+    client.update_channel.assert_not_awaited()
+    emby.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_change_persists_emby_retry_across_stop_and_restart():
+    scope = {"group_id": 9, "m3u_account_id": None}
+    profile = _profile(
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+        event_sync_config=_config([scope]),
+    )
+    first_channels = {
+        10: {
+            "id": 10,
+            "name": "Arena 1",
+            "channel_group_id": 7,
+            "hidden_from_output": False,
+            "epg_data_id": 900,
+            "streams": [{"id": 501, "channel_group_id": 9}],
+        },
+    }
+    restarted_channels = copy.deepcopy(first_channels)
+    restarted_channels[10]["streams"] = []
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{
+            "profile_id": 1,
+            "channel_id": 10,
+            "current": {
+                "title": "Main Event",
+                "start": "2026-09-20T12:00:00+00:00",
+            },
+        }],
+    }
+    publication = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"profile:1": "<tv/>"},
+    )
+    stored = _publication("profile:1", pending=False)
+
+    def update(scope_name, *, expected_revision, required_dispatcharr_hashes=None,
+               confirmed_dispatcharr_hashes=None, pending_emby=None):
+        assert scope_name == "profile:1"
+        assert stored["revision"] == expected_revision
+        if required_dispatcharr_hashes is not None:
+            stored["state"]["delivery"]["required_dispatcharr_hashes"] = dict(
+                required_dispatcharr_hashes
+            )
+        if confirmed_dispatcharr_hashes is not None:
+            stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] = dict(
+                confirmed_dispatcharr_hashes
+            )
+        if pending_emby is not None:
+            stored["state"]["delivery"]["pending_emby"] = pending_emby
+        stored["revision"] += 1
+        return stored["revision"]
+
+    stopped_task = EventVisibilityTask()
+    restarted_task = EventVisibilityTask()
+    channel_updates = []
+
+    async def update_channel(channel_id, values):
+        channel_updates.append((channel_id, values))
+        stopped_task._cancel_requested = True
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock(side_effect=update_channel)
+    emby = AsyncMock(return_value=True)
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(side_effect=[
+             first_channels, restarted_channels,
+         ])), patch("services.epg_programmes.prepare_profiles", new=AsyncMock(side_effect=[
+             ([copy.deepcopy(profile)], copy.deepcopy(coverage)),
+             ([copy.deepcopy(profile)], copy.deepcopy(coverage)),
+         ])), patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(
+             return_value=([], {(9, None)}, {}),
+         )), patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=publication)), \
+         patch("services.epg_publication.read_publication", side_effect=lambda name: stored), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("cache.get_cache"), \
+         patch("emby_client.request_guide_refresh", emby):
+        stopped = await reconcile_profiles(stopped_task, wait_for_sources=True)
+        assert stored["state"]["delivery"]["pending_emby"] is True
+        restarted = await reconcile_profiles(restarted_task, wait_for_sources=True)
+
+    assert stopped.error == "CANCELLED"
+    assert stopped.completed_degraded is True
+    assert stopped.details["pending_emby"] is True
+    assert restarted.details["emby_request_outcome"] == "accepted"
+    assert restarted.details["pending_emby"] is False
+    assert stored["state"]["delivery"]["pending_emby"] is False
+    assert channel_updates == [(10, {"streams": []})]
+    emby.assert_awaited_once()

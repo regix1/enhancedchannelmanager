@@ -678,10 +678,13 @@ def parse_event_name(
 
     complete_groups: dict | None = None
     complete_variant: str | None = None
+    dateless_groups: dict | None = None
+    dateless_variant: str | None = None
     fallback_title: str | None = None
     fallback_variant: str | None = None
 
-    for variant in variants:
+    custom_count = len(patterns) if patterns is not None else 0
+    for index, variant in enumerate(variants):
         title_pattern = variant.get("title_pattern")
         if not title_pattern:
             continue
@@ -697,6 +700,15 @@ def parse_event_name(
             complete_groups = groups
             complete_variant = variant.get("name") or title_pattern
             break
+        if (
+            index < custom_count
+            and dateless_groups is None
+            and groups.get("hour") is not None
+            and groups.get("month") is None
+            and groups.get("day") is None
+        ):
+            dateless_groups = groups
+            dateless_variant = variant.get("name") or title_pattern
         if fallback_title is None and groups.get("title"):
             fallback_title = groups["title"]
             fallback_variant = variant.get("name") or title_pattern
@@ -706,20 +718,29 @@ def parse_event_name(
     # so the shipped defaults never inherit the "guess the date" behavior.
     if complete_groups is None and assume_current_date:
         now_local = now.astimezone(tz)
-        for variant in _ASSUME_DATE_PATTERNS:
-            groups = extract_groups(
-                name, variant["title_pattern"], variant.get("time_pattern"),
-            )
-            if groups is None or groups.get("hour") is None:
-                continue
+        if dateless_groups is not None:
             complete_groups = {
-                **groups,
+                **dateless_groups,
                 "day": str(now_local.day),
                 "month": str(now_local.month),
                 "year": str(now_local.year),
             }
-            complete_variant = variant["name"]
-            break
+            complete_variant = dateless_variant
+        else:
+            for variant in _ASSUME_DATE_PATTERNS:
+                groups = extract_groups(
+                    name, variant["title_pattern"], variant.get("time_pattern"),
+                )
+                if groups is None or groups.get("hour") is None:
+                    continue
+                complete_groups = {
+                    **groups,
+                    "day": str(now_local.day),
+                    "month": str(now_local.month),
+                    "year": str(now_local.year),
+                }
+                complete_variant = variant["name"]
+                break
 
     if complete_groups is None:
         title = _cap_title(fallback_title)

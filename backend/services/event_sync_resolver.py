@@ -439,6 +439,7 @@ def _resolve_stream(
     demote_stale_dateless: bool = False,
     patterns: list[dict] | None = None,
     now: datetime | None = None,
+    event_timezone: str = DEFAULT_EVENT_TIMEZONE,
 ) -> ResolvedStream:
     """Classify one stream, applying review-queue decisions (ti939.3.2)
     and operator exclusions (ti939.3.5).
@@ -538,6 +539,7 @@ def _resolve_stream(
         and stream.name_seen_before_today is True
         and parse_event_name(
             stream.name, patterns, now=now, assume_current_date=False,
+            event_timezone=event_timezone,
         ).start is None
     ):
         logger.info(
@@ -606,6 +608,7 @@ def _matched_via(
     enforce_time_window: bool,
     time_window_minutes: int,
     parse_master_from_stream: bool,
+    event_timezone: str = DEFAULT_EVENT_TIMEZONE,
 ) -> tuple[tuple[str, str], ...]:
     """S5 provenance for one resolved stream (bead sf8dj).
 
@@ -625,7 +628,8 @@ def _matched_via(
     # start) proves the flag is what made this stream a candidate at all.
     if assume_current_date and resolved.result.parsed.start is not None:
         without = parse_event_name(
-            resolved.stream.name, patterns, now=now, assume_current_date=False
+            resolved.stream.name, patterns, now=now, assume_current_date=False,
+            event_timezone=event_timezone,
         )
         if without.start is None:
             via.append(MATCHED_VIA_ASSUME_CURRENT_DATE)
@@ -710,6 +714,7 @@ def resolve_event_sync(
     decisions: ReviewDecisions | None = None,
     exclusions: frozenset[tuple[int, str, str]] | None = None,
     attached_stream_ids: set[int] | frozenset[int] | None = None,
+    event_timezone: str = DEFAULT_EVENT_TIMEZONE,
 ) -> EventSyncResolution:
     """Resolve every secondary stream against the master channel names.
 
@@ -755,7 +760,7 @@ def resolve_event_sync(
         produce identical output (acceptance criterion, bead ti939.1.4).
     """
     if now is None:
-        now = datetime.now(pytz.timezone(DEFAULT_EVENT_TIMEZONE))
+        now = datetime.now(pytz.timezone(event_timezone))
 
     # bead krkm4: per-rule opt-out of the time-window candidacy gate.
     # enforce_time_window defaults True (gate on at time_window_minutes);
@@ -795,6 +800,7 @@ def resolve_event_sync(
         if (parsed := parse_event_name(
                 name, master_patterns, now=now,
                 assume_current_date=assume_current_date,
+                event_timezone=event_timezone,
             )).title is None
         or parsed.start is None
     )
@@ -849,13 +855,14 @@ def resolve_event_sync(
             threshold=threshold,
             now=now,
             assume_current_date=assume_current_date,
+            event_timezone=event_timezone,
         )
         for stream, result in zip(streams, results):
             rs = _resolve_stream(
                 stream, result, decisions,
                 exclusions=exclusions,
                 demote_stale_dateless=demote_stale_dateless,
-                patterns=patterns, now=now,
+                patterns=patterns, now=now, event_timezone=event_timezone,
             )
             via = _matched_via(
                 rs,
@@ -865,6 +872,7 @@ def resolve_event_sync(
                 enforce_time_window=enforce_time_window,
                 time_window_minutes=configured_window,
                 parse_master_from_stream=parse_master_from_stream,
+                event_timezone=event_timezone,
             )
             if via:
                 rs = replace(rs, matched_via=via)

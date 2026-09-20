@@ -54,14 +54,64 @@ channel, stream, guide binding, logo, or programme artwork. Apply it only to
 event-slot groups. Ordinary channel groups are not selected automatically and
 remain visible through guide gaps.
 
-For providers that publish event names on different numbered slots, set the
-profile's `stream_match_group_ids` through the MCP profile tool, API, or YAML
-export in preferred order. Every five minutes ECM compares those groups' current
-event names and start times with the real programme on each mapped guide slot,
-probes the matching candidates, and puts working matches first. Streams already
-on the channel from groups you did not select stay attached after them as
-fallbacks. When the programme changes or ends, the old guide-matched stream is
-removed; the stable channel, RTV mapping, and fallback stream remain.
+For providers that publish event names on different numbered slots, configure
+the matching groups in the profile editor as described below. Every five minutes
+ECM compares those groups' current event names and start times with the real
+programme on each mapped guide slot, probes the matching candidates, and puts
+working matches first. Streams already on the channel from groups you did not
+select stay attached after them as fallbacks. When the programme changes or
+ends, the old guide-matched stream is removed; the stable channel, EPG mapping,
+and fallback stream remain.
+
+## Configure a stable event family
+
+This example uses a generic `Arena` family. The stable channels are named
+`Arena 01`, `Arena 02`, and so on. Provider streams carry an event name and the
+same slot number, such as `Arena 02 | City vs United @ Sep 20 7:00 PM ET`.
+
+1. Create or edit a Dummy EPG profile and select the channel group that owns
+   the stable `Arena` channels.
+2. Under **Automatic visibility**, select that group if its unused channels
+   should stay hidden.
+3. Under **Event matching**, select the provider group scopes that publish the
+   event streams. You can select a whole group or one account within a group.
+   Put the scopes in the order ECM should try them.
+4. Open **Matching details**, then add an `Arena` family.
+5. Set **Channel expression** to `^Arena\s+(?P<slot>\d+)$`.
+6. Add the event expression
+   `^Arena\s+(?<slot>\d+)\s*\|\s*.+$`. The editor preserves either Python-style
+   `(?P<slot>...)` or JavaScript-style `(?<slot>...)` named captures exactly.
+7. Add a fallback expression only if fallback stream names also carry the slot
+   number. Turn on **Allow this family to bootstrap a new stable slot** only
+   when an event expression should be allowed to establish the slot identity.
+8. Keep the profile's **Pattern Variants** responsible for parsing the event
+   title, date, and time. In **Batch Test**, enter a sample channel name such as
+   `Arena 02` and one or more provider stream names. Expand a result to confirm
+   the family, slot, role, start and stop times, and any validation issues.
+9. Save the profile, reopen it, and confirm that the account scopes, order, and
+   expressions are unchanged.
+
+The scheduled refresh keeps the stable channel and guide identity. Before an
+event, the channel remains hidden when automatic visibility has no current
+programme or measured flow. When the event enters the guide window and a
+matching stream becomes usable, the refresh attaches that stream and reveals
+the channel. After the event ends and the stream becomes idle, later scheduled
+runs remove the expired match and hide the channel again. The configured
+fallback stream, channel ID, artwork, and guide binding remain in place.
+
+After you save a profile, select **Check saved guide coverage** to compare the
+latest source check with the durable guide publication. **Published** means the
+stored guide matches the current profile and guide window. **Retained** means
+ECM kept an earlier valid guide while a source, profile setting, or guide window
+prevents a fresh publication. **Unavailable** means no durable publication is
+stored. The panel shows the original publication time rather than replacing it
+with the coverage-check time.
+
+Channel evidence is reported separately. **Published evidence** and
+**Retained event evidence** come from the stored guide. **Unknown visibility
+evidence** means the inspection cannot prove the channel's current state; it
+does not mean the channel is hidden or idle. The same panel identifies a
+pending or confirmed Dispatcharr guide import and a pending Emby refresh.
 
 ## What a profile actually produces
 

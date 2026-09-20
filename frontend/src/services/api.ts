@@ -92,6 +92,7 @@ import type {
   DummyEPGPreviewResult,
   DummyEPGBatchPreviewRequest,
   DummyEPGChannelAssignment,
+  DummyEPGGenerationAdmission,
   StaleStreamIdsResponse,
 } from '../types';
 export type { AcceptProfileConflictOutcome } from '../types/profileConflict';
@@ -4085,7 +4086,11 @@ export async function getDummyEPGProfiles(): Promise<DummyEPGProfile[]> {
  * Get a single Dummy EPG profile with channel assignments.
  */
 export async function getDummyEPGCoverage(profileId: number): Promise<DummyEPGCoverage> {
-  return fetchJson<DummyEPGCoverage>(`${API_BASE}/dummy-epg/profiles/${profileId}/coverage`);
+  const coverage = await fetchJson<DummyEPGCoverage>(`${API_BASE}/dummy-epg/profiles/${profileId}/coverage`);
+  if (!coverage.publication || typeof coverage.publication !== 'object') {
+    throw new Error('Guide coverage response is missing publication diagnostics');
+  }
+  return coverage;
 }
 
 export async function getDummyEPGProfile(profileId: number): Promise<DummyEPGProfile> {
@@ -4186,9 +4191,11 @@ export async function importDummyEPGProfilesYAML(
 /**
  * Force regeneration of XMLTV cache.
  */
-export async function regenerateDummyEPG(): Promise<{ status: 'ok' | 'pending' | 'error'; profiles_generated: number; coverage?: DummyEPGCoverage }> {
+export async function regenerateDummyEPG(profileIds?: number[]): Promise<DummyEPGGenerationAdmission> {
   return fetchJson(`${API_BASE}/dummy-epg/generate`, {
     method: 'POST',
+    headers: profileIds?.length ? { 'Content-Type': 'application/json' } : undefined,
+    body: profileIds?.length ? JSON.stringify({ profile_ids: profileIds }) : undefined,
     credentials: 'include',
   });
 }

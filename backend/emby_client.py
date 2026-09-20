@@ -445,7 +445,7 @@ class EmbyClient:
 # ---------------------------------------------------------------------------
 
 
-async def request_guide_refresh() -> None:
+async def request_guide_refresh() -> bool | None:
     """Tell Emby to re-read its guide after ECM changed channels or guide links.
 
     Silent no-op unless the operator has both left
@@ -454,25 +454,27 @@ async def request_guide_refresh() -> None:
     manages Emby elsewhere can switch it off. Every failure is swallowed and
     logged: the caller's write is already done and committed by this point,
     and a media server that is down, slow, or holding a revoked key must not
-    turn a good run red. [41]
+    turn a good run red. ``True`` means Emby accepted a new request, ``False``
+    means no request completed, and ``None`` means refresh is disabled. [41]
     """
     from config import get_settings
 
     settings = get_settings()
     if not getattr(settings, "emby_refresh_guide_after_pipeline", True):
-        return
+        return None
     if not getattr(settings, "emby_enabled", False):
-        return
+        return None
     base_url = getattr(settings, "emby_base_url", "") or ""
     api_key = getattr(settings, "emby_api_key", "") or ""
     if not base_url or not api_key:
-        return
+        return None
 
     client = EmbyClient(base_url=base_url, api_key=api_key)
     try:
-        await client.refresh_guide()
+        return await client.refresh_guide()
     except Exception as e:
         logger.warning("[EMBY] Guide refresh request failed: %s", e)
+        return False
     finally:
         await client.close()
 

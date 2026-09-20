@@ -5092,18 +5092,18 @@ class ChannelPipelineEngine:
         # Build source lookup
         source_by_id = {s["id"]: s for s in epg_sources}
 
-        # Match dummy source IDs to profile IDs via URL pattern
-        import re as _re
+        # Match generated source IDs to their exact publication routes.
+        from tasks.event_visibility import _generated_scope
+
         profile_ids_to_update = set()
         for src_id in dummy_source_ids:
             src = source_by_id.get(src_id)
             if not src:
                 continue
-            url = src.get("url", "")
-            m = _re.search(r'/api/dummy-epg/xmltv/(\d+)', url)
-            if m:
-                profile_ids_to_update.add(int(m.group(1)))
-            else:
+            scope = _generated_scope(src)
+            if scope and scope.startswith("profile:"):
+                profile_ids_to_update.add(int(scope.split(":", 1)[1]))
+            elif scope == "all":
                 profile_ids_to_update = None
                 break
 
@@ -5203,7 +5203,20 @@ class ChannelPipelineEngine:
             try:
                 from tasks.dummy_epg_refresh import DummyEPGRefreshTask
                 task = DummyEPGRefreshTask()
-                profile_count = await task._regenerate_xmltv()
+                publication = await task._regenerate_xmltv()
+                expected_scopes = {
+                    f"profile:{profile_id}" for profile_id in profile_ids_to_update
+                } if profile_ids_to_update is not None else {"all"}
+                missing_scopes = expected_scopes - set(publication.xmltv_by_scope)
+                if publication.superseded or missing_scopes:
+                    reason = ", ".join(publication.reason_codes) or "GUIDE_UNAVAILABLE"
+                    raise RuntimeError(
+                        f"Guide publication unavailable for {sorted(missing_scopes)} ({reason})"
+                    )
+                profile_count = len(
+                    set(publication.published_profile_ids)
+                    | set(publication.retained_profile_ids)
+                )
                 step2_desc = f"Regenerated XMLTV cache for {profile_count} profiles"
                 logger.info("[AUTO-CREATE-ENGINE] Pass 5: %s", step2_desc)
             except Exception as e:

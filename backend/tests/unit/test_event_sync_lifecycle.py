@@ -53,6 +53,7 @@ from sqlalchemy.pool import StaticPool
 
 import database
 from channel_pipeline_engine import ChannelPipelineEngine
+from channel_pipeline_executor import ActionExecutor
 from models import ChannelPipelineRule
 from tests.event_sync_fixtures import (
     FakeDispatcharrState,
@@ -153,6 +154,45 @@ def _mercury_state(master_streams: list | None = None) -> FakeDispatcharrState:
 
 def _config_secondary_a(**overrides) -> dict:
     return event_sync_config(secondary_group_ids=[SECONDARY_A], **overrides)
+
+
+def test_disputed_stable_group_skips_lifecycle_writes():
+    client = MagicMock()
+    client.get_streams_by_ids = AsyncMock()
+    executor = ActionExecutor(
+        client,
+        existing_channels=[{
+            "id": 100,
+            "name": "Arena 1",
+            "channel_group_id": 77,
+            "streams": [9001],
+        }],
+    )
+    rule = MagicMock()
+    rule.get_managed_channel_ids.return_value = [100]
+    profile = MagicMock(enabled=True)
+    profile.to_dict.return_value = {"id": 1}
+    session = MagicMock()
+    session.get.side_effect = lambda model, _key: (
+        rule if model is ChannelPipelineRule else profile
+    )
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[{
+             "code": "ownership_conflict",
+             "group_id": 77,
+             "owners": [],
+         }]):
+        eligible, states = _run(executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (),
+            datetime(2026, 9, 20),
+        ))
+
+    assert eligible == set()
+    assert states == {100: "unknown"}
+    client.get_streams_by_ids.assert_not_awaited()
 
 
 class TestIdempotency:

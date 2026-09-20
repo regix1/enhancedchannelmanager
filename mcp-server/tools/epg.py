@@ -1,4 +1,5 @@
 """EPG (Electronic Program Guide) tools."""
+import json
 import logging
 from typing import Annotated
 
@@ -9,6 +10,51 @@ from _endpoint_contracts import ENDPOINTS
 from ecm_client import get_ecm_client
 
 logger = logging.getLogger(__name__)
+
+
+def _format_dummy_epg_execution(execution: dict) -> str:
+    """Render the typed Dummy EPG task details without interpreting messages."""
+    details = execution["details"]
+    if not isinstance(details, dict):
+        raise ValueError("Dummy EPG task details must be a JSON object")
+
+    render = lambda value: json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True
+    )
+    return "\n".join(
+        [
+            (
+                f"Dummy EPG generation status={execution['status']} "
+                f"(execution_id={execution['id']})."
+            ),
+            (
+                f"Profiles: configured={details['configured_profile_count']}; "
+                f"published={render(details['published_profile_ids'])}; "
+                f"retained={render(details['retained_profile_ids'])}; "
+                f"unavailable={render(details['unavailable_profile_ids'])}."
+            ),
+            f"Publication times: {render(details['publication_times'])}",
+            f"Source reason codes: {render(details['source_reason_codes'])}",
+            (
+                f"Channels: idle={details['idle_channel_count']}; "
+                f"active={details['active_channel_count']}; "
+                f"unknown={details['unknown_channel_count']}."
+            ),
+            (
+                f"Channel changes: streams={render(details['stream_updated_channel_ids'])}; "
+                f"EPG links={render(details['epg_linked_channel_ids'])}; "
+                f"revealed={render(details['revealed_channel_ids'])}; "
+                f"hidden={render(details['hidden_channel_ids'])}."
+            ),
+            (
+                f"Delivery: pending={render(details['delivery_pending'])}; "
+                f"pending_source_hashes={render(details['pending_source_hashes'])}; "
+                f"emby_request_outcome={details['emby_request_outcome']}; "
+                f"pending_emby={render(details['pending_emby'])}."
+            ),
+            f"Reason codes: {render(details['reason_codes'])}",
+        ]
+    )
 
 
 async def _build_channel_uuid_map(client, references: dict | None = None) -> dict:
@@ -908,8 +954,15 @@ def register(mcp: FastMCP):
     @mcp.tool()
     async def generate_dummy_epg(
         plan_profile_ids: list[int] | None = None,
+        wait_for_completion: bool = True,
     ) -> str:
-        """Force regeneration of all dummy EPG XMLTV data from enabled profiles."""
+        """Start Dummy EPG generation and optionally wait for its exact task execution.
+
+        Args:
+            plan_profile_ids: Optional profile IDs to generate.
+            wait_for_completion: Wait for the accepted task execution to reach
+                a terminal state. Set false to return its execution identity.
+        """
         try:
             client = get_ecm_client()
             result = await client.call_endpoint(
@@ -920,6 +973,28 @@ def register(mcp: FastMCP):
                 ),
                 timeout=60.0,
             )
+            if isinstance(result, dict) and result.get("status") == "accepted":
+                from tools.tasks import _validate_acceptance
+
+                task_id = result.get("task_id")
+                if not isinstance(task_id, str) or not task_id:
+                    raise ValueError("task acceptance task_id must be a non-empty string")
+                acceptance = _validate_acceptance(task_id, result)
+                if not wait_for_completion:
+                    return json.dumps(acceptance, sort_keys=True)
+                waited = await mcp.call_tool(
+                    "get_task_execution",
+                    {
+                        "task_id": acceptance["task_id"],
+                        "execution_id": acceptance["execution_id"],
+                        "started_at": acceptance["started_at"],
+                        "wait_for_completion": True,
+                    },
+                )
+                execution = json.loads(waited[0][0].text)
+                if not isinstance(execution, dict):
+                    raise ValueError("task execution must be a JSON object")
+                return _format_dummy_epg_execution(execution)
             if isinstance(result, dict) and result.get("status") == "pending":
                 return "Dummy EPG sources or artwork are still loading. Check get_dummy_epg_coverage again shortly."
             if isinstance(result, dict) and result.get("status") == "error":
@@ -974,6 +1049,11 @@ def register(mcp: FastMCP):
                 f"  epg_source_ids={p.get('epg_source_ids') or []}",
                 f"  channel_mappings={p.get('channel_mappings') or []}",
             ]
+            if "event_sync_config" in p:
+                lines.append(
+                    "  event_sync_config="
+                    + json.dumps(p["event_sync_config"], ensure_ascii=False, allow_nan=False)
+                )
             sub_pairs = p.get("substitution_pairs") or []
             if sub_pairs:
                 lines.append(f"  substitution_pairs: {len(sub_pairs)} configured")
@@ -1031,6 +1111,7 @@ def register(mcp: FastMCP):
         channel_mappings: list[dict] | None = None,
         hide_empty_group_ids: list[int] | None = None,
         stream_match_group_ids: list[int] | None = None,
+        event_sync_config: dict = None,
     ) -> str:
         """Create a new Dummy EPG profile (bd-omxy5).
 
@@ -1082,6 +1163,9 @@ def register(mcp: FastMCP):
             stream_match_group_ids: Ordered event-name stream groups to match
                 against the current real guide. Working matches are placed first;
                 existing streams outside these groups remain attached as fallbacks.
+            event_sync_config: Canonical event slot and lifecycle configuration.
+                An explicit empty object selects the backend defaults. When both
+                aliases are supplied, the backend verifies they agree.
         """
         try:
             client = get_ecm_client()
@@ -1121,6 +1205,7 @@ def register(mcp: FastMCP):
                 "channel_mappings": channel_mappings,
                 "hide_empty_group_ids": hide_empty_group_ids,
                 "stream_match_group_ids": stream_match_group_ids,
+                "event_sync_config": event_sync_config,
             }
             for key, value in optional.items():
                 if value is not None:
@@ -1170,6 +1255,7 @@ def register(mcp: FastMCP):
         channel_mappings: list[dict] | None = None,
         hide_empty_group_ids: list[int] | None = None,
         stream_match_group_ids: list[int] | None = None,
+        event_sync_config: dict = None,
     ) -> str:
         """Update a Dummy EPG profile — only provided fields change (bd-omxy5).
 
@@ -1205,6 +1291,7 @@ def register(mcp: FastMCP):
                 "epg_source_ids": epg_source_ids, "channel_mappings": channel_mappings,
                 "hide_empty_group_ids": hide_empty_group_ids,
                 "stream_match_group_ids": stream_match_group_ids,
+                "event_sync_config": event_sync_config,
             }
             body = {k: v for k, v in fields.items() if v is not None}
 
@@ -1281,6 +1368,8 @@ def register(mcp: FastMCP):
         program_poster_url_template: str | None = None,
         pattern_variants: list[dict] | None = None,
         include_trace: bool = False,
+        event_sync_config: dict = None,
+        sample_channel_name: str | None = None,
     ) -> str:
         """Test a Dummy EPG pattern/template configuration against a sample name (bd-omxy5).
 
@@ -1311,6 +1400,10 @@ def register(mcp: FastMCP):
                 trace of placeholder resolution and pipe transforms (the
                 summary here just notes it was computed — read the raw MCP
                 response for the full trace).
+            event_sync_config: Canonical event slot and lifecycle configuration
+                to classify without changing the saved profile.
+            sample_channel_name: Optional channel name used by event
+                classification when it differs from sample_name.
         """
         try:
             client = get_ecm_client()
@@ -1337,6 +1430,8 @@ def register(mcp: FastMCP):
                 "channel_logo_url_template": channel_logo_url_template,
                 "program_poster_url_template": program_poster_url_template,
                 "pattern_variants": pattern_variants,
+                "event_sync_config": event_sync_config,
+                "sample_channel_name": sample_channel_name,
             }
             for key, value in optional.items():
                 if value is not None:
@@ -1364,6 +1459,11 @@ def register(mcp: FastMCP):
                 lines.append(f"  Fallback description: {rendered['fallback_description']}")
             if include_trace and result.get("traces"):
                 lines.append(f"  Trace: {len(result['traces'])} field(s) traced.")
+            if "event" in result:
+                lines.append(
+                    "  Event: "
+                    + json.dumps(result["event"], ensure_ascii=False, allow_nan=False)
+                )
             return "\n".join(lines)
         except Exception as e:
             logger.error("[MCP] preview_dummy_epg failed: %s", e)

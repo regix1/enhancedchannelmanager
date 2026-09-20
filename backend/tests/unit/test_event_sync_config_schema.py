@@ -908,7 +908,7 @@ class TestPromoteLeadHours:
             assert validate_event_sync_config(config) == []
             assert config["promote_lead_hours"] == good
 
-    @pytest.mark.parametrize("bad", [0, -1, 721, True, "24", 2.5])
+    @pytest.mark.parametrize("bad", [-1, 721, True, "24", 2.5])
     def test_out_of_range_or_wrong_type_rejected(self, bad):
         config = _valid_config(promote_lead_hours=bad)
         errors = validate_event_sync_config(config)
@@ -918,7 +918,7 @@ class TestPromoteLeadHours:
         config = _valid_config(promote_lead_hours=5000)
         errors = validate_event_sync_config(config)
         message = next(e for e in errors if "promote_lead_hours" in e)
-        assert "between 1 and 720" in message
+        assert "between 0 and 720" in message
         assert "already HAS a channel" in message
 
 
@@ -978,3 +978,133 @@ class TestSkipDeadStreams:
         errors = validate_event_sync_config(config)
         message = next(e for e in errors if "skip_dead_streams" in e)
         assert "never deletes a channel" in message
+
+
+class TestProfileEventConfig:
+    def test_explicit_empty_object_selects_generic_defaults(self):
+        config = {}
+        assert validate_event_sync_config(config, profile_group_ids=[]) == []
+        assert config == {
+            "secondary": [],
+            "time_window_minutes": DEFAULT_TIME_WINDOW_MINUTES,
+            "enforce_time_window": True,
+            "attach_threshold": EVENT_ATTACH_FLOOR,
+            "assume_current_date": False,
+            "demote_stale_dateless": True,
+            "use_default_patterns": False,
+            "slot_patterns": [],
+        }
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("master_group_id", 1),
+            ("promote_unmatched", True),
+            ("retire_finished_events", True),
+            ("refresh_providers_before_run", True),
+            ("auto_run", True),
+        ],
+    )
+    def test_pipeline_only_fields_are_rejected(self, field, value):
+        errors = validate_event_sync_config(
+            {field: value}, profile_group_ids=[],
+        )
+        assert any(field in error for error in errors)
+
+    def test_scopes_preserve_order_and_derive_without_widening(self):
+        config = {
+            "secondary": [
+                {"group_id": 20, "m3u_account_id": 7},
+                {"group_id": 20, "m3u_account_id": 8},
+                {"group_id": 30, "m3u_account_id": None},
+            ],
+        }
+        assert validate_event_sync_config(config, profile_group_ids=[40]) == []
+        assert config["secondary"] == [
+            {"group_id": 20, "m3u_account_id": 7},
+            {"group_id": 20, "m3u_account_id": 8},
+            {"group_id": 30, "m3u_account_id": None},
+        ]
+
+    def test_duplicate_and_whole_group_account_scope_are_rejected(self):
+        duplicate = {
+            "secondary": [
+                {"group_id": 20, "m3u_account_id": 7},
+                {"group_id": 20, "m3u_account_id": 7},
+            ],
+        }
+        widened = {
+            "secondary": [
+                {"group_id": 20, "m3u_account_id": None},
+                {"group_id": 20, "m3u_account_id": 7},
+            ],
+        }
+        assert any("already present" in error for error in validate_event_sync_config(
+            duplicate, profile_group_ids=[],
+        ))
+        assert any("not both" in error for error in validate_event_sync_config(
+            widened, profile_group_ids=[],
+        ))
+
+    def test_slot_patterns_preserve_regex_and_named_capture_styles(self):
+        channel_pattern = r"Channel (?<slot>\d+)"
+        event_pattern = r"Event (?P<slot>\d+)"
+        config = {
+            "slot_patterns": [{
+                "name": "event",
+                "channel_pattern": channel_pattern,
+                "fallback_pattern": None,
+                "event_patterns": [event_pattern],
+                "bootstrap": True,
+            }],
+        }
+        assert validate_event_sync_config(config, profile_group_ids=[]) == []
+        assert config["slot_patterns"][0]["channel_pattern"] == channel_pattern
+        assert config["slot_patterns"][0]["event_patterns"] == [event_pattern]
+
+    def test_slot_expression_requires_named_slot_capture(self):
+        errors = validate_event_sync_config({
+            "slot_patterns": [{
+                "name": "event",
+                "channel_pattern": r"Channel (\d+)",
+            }],
+        }, profile_group_ids=[])
+        assert any("named slot capture" in error for error in errors)
+
+    def test_bootstrap_requires_event_expression(self):
+        errors = validate_event_sync_config({
+            "slot_patterns": [{
+                "name": "event",
+                "channel_pattern": r"Channel (?P<slot>\d+)",
+                "bootstrap": True,
+            }],
+        }, profile_group_ids=[])
+        assert any("bootstrap" in error for error in errors)
+
+    @pytest.mark.parametrize("count,valid", [(32, True), (33, False)])
+    def test_slot_count_is_bounded(self, count, valid):
+        config = {
+            "slot_patterns": [
+                {
+                    "name": f"event-{index}",
+                    "channel_pattern": rf"Channel {index} (?P<slot>\d+)",
+                }
+                for index in range(count)
+            ],
+        }
+        errors = validate_event_sync_config(config, profile_group_ids=[])
+        assert (not errors) is valid
+
+    @pytest.mark.parametrize("count,valid", [(16, True), (17, False)])
+    def test_event_expression_count_is_bounded(self, count, valid):
+        config = {
+            "slot_patterns": [{
+                "name": "event",
+                "channel_pattern": r"Channel (?P<slot>\d+)",
+                "event_patterns": [
+                    rf"Event {index} (?P<slot>\d+)" for index in range(count)
+                ],
+            }],
+        }
+        errors = validate_event_sync_config(config, profile_group_ids=[])
+        assert (not errors) is valid

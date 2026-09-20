@@ -149,6 +149,35 @@ class TestCreateRuleEventSyncConfig:
             for e in response.json()["detail"]["errors"]
         )
 
+    def test_create_rejects_profile_owned_master_group(
+        self, test_client, mock_db_session,
+    ):
+        from models import ChannelPipelineRule, DummyEPGProfile
+
+        profile = DummyEPGProfile(id=7, name="Profile Owner", enabled=True)
+        profile.set_hide_empty_group_ids([10])
+        profile_query = MagicMock()
+        profile_query.all.return_value = [profile]
+        rule_query = MagicMock()
+        rule_query.all.return_value = []
+
+        def query(model):
+            if model is DummyEPGProfile:
+                return profile_query
+            if model is ChannelPipelineRule:
+                return rule_query
+            return MagicMock()
+
+        mock_db_session.query.side_effect = query
+        response = test_client.post(
+            "/api/auto-creation/rules",
+            json=_rule_body(event_sync_config=_valid_config()),
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["code"] == "ownership_conflict"
+        mock_db_session.add.assert_not_called()
+
 
 class TestUpdateRuleEventSyncConfig:
     def _mock_rule(self, mock_db_session) -> MagicMock:

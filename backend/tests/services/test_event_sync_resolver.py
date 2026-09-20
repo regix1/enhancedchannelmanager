@@ -129,6 +129,24 @@ class TestDispositions:
         assert by_id[302].disposition == DISPOSITION_PARSE_FAILED
         assert by_id[302].result.unmatchable_reason == REJECT_NO_PARSED_TIME
 
+    def test_effective_timezone_reaches_master_stream_and_provenance_parsing(self):
+        name = "Boxing 05 : FURY vs HALL 6PM"
+        stream = SecondaryStream(name=name, group_id=20, stream_id=205)
+
+        resolution = resolve_event_sync(
+            _config(assume_current_date=True),
+            [name],
+            [stream],
+            now=datetime(2026, 7, 11, 6, 0, tzinfo=pytz.utc),
+            event_timezone="Asia/Tokyo",
+        )
+
+        resolved = resolution.resolved[0]
+        assert resolved.disposition == DISPOSITION_WOULD_ATTACH
+        assert resolved.result.parsed.start.utcoffset().total_seconds() == 9 * 3600
+        assert resolved.best.parsed.start.utcoffset().total_seconds() == 9 * 3600
+        assert MATCHED_VIA_ASSUME_CURRENT_DATE in resolved.matched_via
+
     def test_title_parse_failure_is_parse_failed(self):
         # A pattern set whose title_pattern never matches -> REJECT_PARSE_FAILURE.
         config = _config(patterns=[{

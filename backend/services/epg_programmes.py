@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Mapping
 import hashlib
 import json
 import re
@@ -18,7 +19,7 @@ from cache import get_cache
 from epg_matching import _epg_source_id, build_source_priority_order
 from services.epg_migration import stream_xmltv
 from services.event_sync_matcher import (
-    BAND_ATTACH, EVENT_ATTACH_FLOOR, ParsedEvent, _score_parsed_pair,
+    BAND_ATTACH, ParsedEvent, _score_parsed_pair,
     _split_teams, build_team_alias_index, normalize_alias_term, parse_event_name,
 )
 
@@ -85,7 +86,10 @@ def resolve_sources(epg_source_ids: list[int], sources: list[dict]) -> list[dict
 def _dummy_source(source_id: int, sources: list[dict]) -> bool:
     return any(
         source.get("id") == source_id
-        and re.search(r"/api/dummy-epg/xmltv(?:/|$)", urlsplit(source.get("url") or "").path)
+        and re.fullmatch(
+            r"/api/dummy-epg/xmltv(?:/[1-9]\d*)?/?",
+            urlsplit(source.get("url") or "").path,
+        )
         for source in sources
     )
 
@@ -202,8 +206,15 @@ def _placeholder(programme: ET.Element) -> bool:
     ))
 
 
-def _query(profile: dict, channel: dict, mapping: dict | None, now: datetime) -> dict:
-    from dummy_epg_engine import apply_substitutions
+def _query(
+    profile: dict,
+    channel: dict,
+    mapping: dict | None,
+    now: datetime,
+    assignment: dict | None = None,
+) -> dict:
+    from dummy_epg_engine import apply_substitutions, get_xmltv_id
+    from services.event_slots import classify_event_slot, event_config
 
     streams = [stream for stream in channel.get("streams", []) if isinstance(stream, dict)]
     source_name = channel.get("name", "")
@@ -212,30 +223,45 @@ def _query(profile: dict, channel: dict, mapping: dict | None, now: datetime) ->
         if index < len(streams):
             source_name = streams[index].get("name", source_name)
     substituted, _ = apply_substitutions(source_name, profile.get("substitution_pairs") or [])
+    config = event_config(profile)
     patterns = profile.get("pattern_variants") or None
     if patterns is None and profile.get("title_pattern"):
         patterns = [profile]
     parsed = parse_event_name(
         substituted, patterns, event_timezone=profile.get("event_timezone") or "US/Eastern", now=now,
+        assume_current_date=bool(config.get("assume_current_date", False)),
     )
     if parsed.start is None:
         for stream in streams:
             candidate = parse_event_name(stream.get("name", ""), now=now,
-                                         event_timezone=profile.get("event_timezone") or "US/Eastern")
+                                         event_timezone=profile.get("event_timezone") or "US/Eastern",
+                                         assume_current_date=bool(config.get("assume_current_date", False)))
             if candidate.start is not None:
                 parsed = candidate
                 break
+    slot = classify_event_slot(channel.get("name"), config, role="channel")
+    stream_slots = [
+        classify_event_slot(stream.get("name"), config, role=role)
+        for stream in streams for role in ("fallback", "event")
+    ]
+    if slot["family"] is None:
+        slot = next((candidate for candidate in stream_slots if candidate["family"] is not None), slot)
     identities = {str(channel.get("tvg_id") or "")}
     identities.update(str(stream.get("tvg_id") or "") for stream in streams)
     identities.discard("")
-    identities = {value for value in identities if not value.startswith("ecm-")}
+    assignment = assignment or {"channel_id": channel["id"]}
+    identities.discard(get_xmltv_id(assignment, channel, profile))
     if mapping:
         identities.add(mapping["tvg_id"])
     query = {
         "channel_id": channel["id"], "mapping": mapping, "ids": sorted(identities),
         "name": " ".join(channel.get("name", "").casefold().split()),
         "event": parsed,
-        "dynamic": parsed.start is not None or bool(re.search(r"\b(?:ppv|espn\s*(?:\+|plus))(?:\b|(?=\s|$))", source_name, re.I)),
+        "dynamic": parsed.start is not None or slot["family"] is not None,
+        "slot": slot,
+        "time_window_minutes": config["time_window_minutes"],
+        "enforce_time_window": config["enforce_time_window"],
+        "attach_threshold": config["attach_threshold"],
     }
     identity = {key: value for key, value in query.items() if key != "channel_id"}
     if mapping:
@@ -348,13 +374,16 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                         ended_event = None
                         for query in queries:
                             parsed = query["event"]
+                            window = query["time_window_minutes"] if query["enforce_time_window"] else None
                             if (not query["dynamic"] or parsed.start is None
-                                    or abs((parsed.start - begin).total_seconds()) > 1800):
+                                    or (window is not None and abs((parsed.start - begin).total_seconds()) > window * 60)):
                                 continue
                             if ended_event is None:
                                 ended_event = _event(element, begin)
-                            if _score_parsed_pair(parsed, ended_event, window_minutes=30,
-                                                  threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index).band != BAND_ATTACH:
+                            if _score_parsed_pair(
+                                parsed, ended_event, window_minutes=window,
+                                threshold=query["attach_threshold"], alias_index=alias_index,
+                            ).band != BAND_ATTACH:
                                 continue
                             identity = query["key"]
                             previous = ended.get(identity)
@@ -386,19 +415,20 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                                     if parsed.start is None:
                                         continue
                                     delta = abs((parsed.start - begin).total_seconds())
-                                    if delta > 1800:
+                                    window = query["time_window_minutes"] if query["enforce_time_window"] else None
+                                    if window is not None and delta > window * 60:
                                         if event_terms is None:
                                             event_terms = set(normalize_alias_term(event_title.title or ""))
                                         common = query_terms[id(query)] & event_terms
                                         if len(common) >= 2 and _score_parsed_pair(
                                             parsed, event_title, window_minutes=None,
-                                            threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index,
+                                            threshold=query["attach_threshold"], alias_index=alias_index,
                                         ).band == BAND_ATTACH:
                                             reason = "event_date_conflict" if delta >= 43200 else "event_start_conflict"
                                             channel_warnings.setdefault(query["key"], set()).add(reason)
                                         continue
-                                    if _score_parsed_pair(parsed, event_title, window_minutes=30,
-                                                          threshold=EVENT_ATTACH_FLOOR,
+                                    if _score_parsed_pair(parsed, event_title, window_minutes=window,
+                                                          threshold=query["attach_threshold"],
                                                           alias_index=alias_index).band == BAND_ATTACH:
                                         wanted = True
                                         break
@@ -659,6 +689,12 @@ def can_cache(coverage: dict) -> bool:
     source was never asked for it, not because it has nothing on. Serving that is fine;
     storing it is not, because the entry outlives the scan that would have filled it in.
     """
+    profiles = coverage.get("profiles")
+    if isinstance(profiles, Mapping):
+        return all(
+            isinstance(profile, Mapping) and profile.get("can_publish") is True
+            for profile in profiles.values()
+        )
     sources = coverage.get("sources", [])
     if not sources:
         return True
@@ -729,10 +765,13 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
                 begin, end = programme_times(programme)
                 match = identity
                 if query["dynamic"] and parsed.start is not None:
-                    if abs((parsed.start - begin).total_seconds()) > 1800:
+                    window = query["time_window_minutes"] if query["enforce_time_window"] else None
+                    if window is not None and abs((parsed.start - begin).total_seconds()) > window * 60:
                         continue
-                    pair = _score_parsed_pair(parsed, _event(programme, begin), window_minutes=30,
-                                              threshold=EVENT_ATTACH_FLOOR, alias_index=alias_index)
+                    pair = _score_parsed_pair(
+                        parsed, _event(programme, begin), window_minutes=window,
+                        threshold=query["attach_threshold"], alias_index=alias_index,
+                    )
                     if pair.band != BAND_ATTACH:
                         continue
                     match = 0 if identity == 0 else 1
@@ -825,12 +864,13 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
     now = now or datetime.now(timezone.utc)
     deadline = time.monotonic() + HTTP_WAIT
     enriched, coverage = [], {"generated_at": now.isoformat(), "window_start": None, "window_stop": None,
-                              "sources": [], "channels": []}
+                              "sources": [], "channels": [], "profiles": {}}
     profiles = sorted(profiles, key=lambda profile: (profile.get("id") is None, profile.get("id") or 0))
     selected_ids = {source for profile in profiles if profile.get("enabled", True)
                     for source in profile.get("epg_source_ids") or []}
-    sources, epg_rows, source_error = [], [], None
+    sources, epg_rows, catalogue_error = [], [], None
     unresolved_links = set()
+    pending_links = set()
     catalogue_status = "pending"
     if selected_ids:
         channel_ids = set()
@@ -865,11 +905,14 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         for key in keys:
             entry = catalogue.get(key, {})
             if key in _CATALOGUE_LOADS or entry.get("error") or "value" not in entry:
-                source_error = "Configured EPG sources are temporarily unavailable."
-                if key not in _CATALOGUE_LOADS:
-                    catalogue_status = "error"
+                if key[1] is None:
+                    catalogue_error = "Configured EPG sources are temporarily unavailable."
+                    if key not in _CATALOGUE_LOADS:
+                        catalogue_status = "error"
                 if key[1] is not None and not entry.get("value"):
                     unresolved_links.add(key[1])
+                if key[1] is not None:
+                    pending_links.add(key[1])
             if key[1] is not None and entry.get("value"):
                 epg_rows.append(entry["value"])
     jobs, prepared = {}, []
@@ -880,7 +923,25 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             profile["channel_assignments"] = _resolve_group_assignments(groups, channel_map)
         assignments = profile.get("channel_assignments") or []
         enriched.append(profile)
-        if not profile.get("enabled", True) or not profile.get("epg_source_ids"):
+        if not profile.get("enabled", True):
+            continue
+        profile_id = profile.get("id")
+        profile_coverage = {
+            "profile_id": profile_id,
+            "source_ids": [],
+            "sources": [],
+            "owned_channel_ids": sorted({
+                item["channel_id"] for item in assignments
+                if item.get("channel_id") in channel_map
+            }),
+            "can_publish": not bool(profile.get("epg_source_ids")),
+            "reason_codes": [],
+        }
+        if any(item.get("channel_id") not in channel_map for item in assignments):
+            profile_coverage["can_publish"] = False
+            profile_coverage["reason_codes"].append("GUIDE_CHANNEL_UNAVAILABLE")
+        coverage["profiles"][str(profile_id)] = profile_coverage
+        if not profile.get("epg_source_ids"):
             continue
         tz = pytz.timezone(profile.get("event_timezone") or "US/Eastern")
         local = now.astimezone(tz)
@@ -892,6 +953,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         coverage["window_stop"] = max(coverage["window_stop"] or stop.isoformat(), stop.isoformat())
         try:
             resolved = resolve_sources(profile["epg_source_ids"], sources)
+            profile_coverage["source_ids"] = [source["id"] for source in resolved]
             mappings = {item["channel_id"]: item for item in capture_mappings(profile, channel_map, epg_rows, sources)}
             for channel_id in list(mappings):
                 channel = channel_map.get(channel_id, {})
@@ -900,14 +962,33 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
                     mappings.pop(channel_id)
         except ValueError as exc:
             resolved, mappings = [], {}
+            profile_coverage["reason_codes"].append("GUIDE_SOURCES_PENDING")
+            profile_coverage["sources"].extend(
+                {"source_id": source, "status": "error", "last_success": None, "error": str(exc)}
+                for source in profile["epg_source_ids"]
+            )
             coverage["sources"].extend(
                 {"source_id": source, "status": "error", "last_success": None, "error": str(exc)}
                 for source in profile["epg_source_ids"]
             )
-        queries = [_query(profile, {**channel_map[item["channel_id"]], "id": item["channel_id"]},
-                          mappings.get(item["channel_id"]), now)
-                   for item in assignments if item.get("channel_id") in channel_map]
-        prepared.append((profile, resolved, queries, start, stop))
+        try:
+            queries = [_query(profile, {**channel_map[item["channel_id"]], "id": item["channel_id"]},
+                              mappings.get(item["channel_id"]), now, item)
+                       for item in assignments if item.get("channel_id") in channel_map]
+        except ValueError:
+            queries = []
+            profile_coverage["reason_codes"].append("GUIDE_CONFIG_INVALID")
+        if any(
+            isinstance((link := (
+                channel_map[item["channel_id"]].get("epg_data_id")
+                or channel_map[item["channel_id"]].get("epg_data")
+            )), int) and not isinstance(link, bool) and link in pending_links
+            for item in assignments if item.get("channel_id") in channel_map
+        ):
+            profile_coverage["reason_codes"].extend([
+                "GUIDE_MAPPING_UNAVAILABLE", "GUIDE_SOURCES_PENDING",
+            ])
+        prepared.append((profile, resolved, queries, start, stop, profile_coverage))
         for query in queries:
             channel = channel_map[query["channel_id"]]
             link = channel.get("epg_data_id") or channel.get("epg_data")
@@ -980,28 +1061,89 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
                                     "diagnostics": entry.get("diagnostics", {})})
         if entry.get("warnings"):
             coverage["sources"][-1]["warnings"] = entry["warnings"]
-    if source_error:
-        coverage["sources"] = [{"source_id": source, "status": catalogue_status, "last_success": None, "error": source_error}
+    if catalogue_error:
+        coverage["sources"] = [{"source_id": source, "status": catalogue_status, "last_success": None, "error": catalogue_error}
                                for source in sorted(selected_ids)]
-    owners, used_ids, collisions = {}, set(), set()
+    for profile, resolved, queries, start, stop, profile_coverage in prepared:
+        reasons = set(profile_coverage["reason_codes"])
+        for query in queries:
+            if query.get("blocked"):
+                reasons.add("GUIDE_QUERY_PENDING")
+                if query["blocked"] == "mapping_unavailable":
+                    reasons.add("GUIDE_MAPPING_UNAVAILABLE")
+                elif query["blocked"] == "source_not_selected":
+                    reasons.add("GUIDE_SOURCE_NOT_SELECTED")
+        diagnostics = []
+        for source in resolved:
+            entry = entries.get(source["id"], {})
+            success = entry.get("success")
+            selection = entry.get("selection") or {}
+            applicable = [query for query in queries if not query.get("blocked")]
+            covered = (
+                success is not None
+                and all(query["key"] in selection.get("queries", ()) for query in applicable)
+                and selection.get("start", stop) <= start
+                and selection.get("stop", start) >= stop
+            )
+            stale = success is not None and (
+                datetime.now(timezone.utc) - success
+            ).total_seconds() > SOURCE_MAX_AGE
+            retained = covered and bool(entry.get("error"))
+            status = "stale" if stale else "retained" if retained else "ready" if covered else (
+                "pending" if any(job.get("key") in _SOURCE_LOADS for job in jobs.values() if job["source"]["id"] == source["id"])
+                else "error"
+            )
+            diagnostics.append({
+                "source_id": source["id"],
+                "status": status,
+                "last_success": success.isoformat() if success else None,
+                "error": entry.get("error"),
+                "diagnostics": entry.get("diagnostics", {}),
+            })
+            if not covered or stale:
+                reasons.add("GUIDE_SOURCES_PENDING")
+                reasons.add("GUIDE_SOURCE_STALE" if stale else "GUIDE_QUERY_PENDING")
+        profile_coverage["sources"] = diagnostics or profile_coverage["sources"]
+        profile_coverage["reason_codes"] = sorted(reasons)
+        profile_coverage["can_publish"] = not reasons and len(resolved) == len(profile_coverage["source_ids"])
+
+    owners, xmltv_owners, collisions, owner_conflicts = {}, {}, set(), set()
     for item in enriched:
         if not item.get("enabled", True):
             continue
         for assignment in item.get("channel_assignments") or []:
             channel_id = assignment.get("channel_id")
-            if channel_id not in channel_map or channel_id in owners:
+            if channel_id not in channel_map:
+                continue
+            if channel_id in owners:
+                owner_conflicts.add(channel_id)
                 continue
             owners[channel_id] = item
             xmltv_id = get_xmltv_id(assignment, channel_map[channel_id], item)
-            if xmltv_id in used_ids:
+            if xmltv_id in xmltv_owners:
                 collisions.add(channel_id)
-            used_ids.add(xmltv_id)
+                collisions.add(xmltv_owners[xmltv_id])
+            else:
+                xmltv_owners[xmltv_id] = channel_id
+    for item in enriched:
+        profile_id = item.get("id")
+        record = coverage["profiles"].get(str(profile_id))
+        if record is None:
+            continue
+        owned = set(record["owned_channel_ids"])
+        reasons = set(record["reason_codes"])
+        if owned & owner_conflicts:
+            reasons.add("GUIDE_OWNERSHIP_CONFLICT")
+        if owned & collisions:
+            reasons.add("GUIDE_XMLTV_ID_COLLISION")
+        record["reason_codes"] = sorted(reasons)
+        record["can_publish"] = record["can_publish"] and not reasons
     seen_channels = set()
     if prepared:
         from config import CONFIG_DIR
         from services.epg_artwork import ArtworkCache
         artwork_cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
-    for profile, resolved, queries, start, stop in prepared:
+    for profile, resolved, queries, start, stop, profile_coverage in prepared:
         for query in queries:
             channel_id = query["channel_id"]
             programmes, result = await asyncio.to_thread(
@@ -1013,6 +1155,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             channel = channel_map[channel_id]
             xmltv_id = get_xmltv_id(assignment, channel, profile)
             result["xmltv_id"] = xmltv_id
+            result["profile_id"] = profile.get("id")
             profile["source_programmes"][channel_id] = programmes
             if result["source_id"]:
                 header = entries.get(result["source_id"], {}).get("headers", {}).get(result["source_tvg_id"])
@@ -1020,11 +1163,15 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
                     profile["source_channels"][channel_id] = copy.deepcopy(header)
             if channel_id in seen_channels or owners.get(channel_id) is not profile:
                 result["warnings"].append("overlapping_profile")
+                profile_coverage["can_publish"] = False
+                profile_coverage["reason_codes"] = sorted(set(profile_coverage["reason_codes"]) | {"GUIDE_OWNERSHIP_CONFLICT"})
                 continue
             seen_channels.add(channel_id)
             if channel_id in collisions:
                 result["warnings"].append("xmltv_id_collision")
                 result["match"] = "collision"
+                profile_coverage["can_publish"] = False
+                profile_coverage["reason_codes"] = sorted(set(profile_coverage["reason_codes"]) | {"GUIDE_XMLTV_ID_COLLISION"})
                 coverage["channels"].append(result)
                 continue
             if programmes:

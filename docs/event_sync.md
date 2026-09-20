@@ -1124,6 +1124,71 @@ rule reference a [dummy EPG profile](template_engine.md) that gets
 assigned to the master group's channels on **every** run, manual and
 auto-run, so new events show programme information automatically.
 
+### Profile-owned event slots
+
+A Dummy EPG profile can own stable target channels and their automatic
+visibility. Store that matching contract in the profile's
+`event_sync_config`; do not copy it into a pipeline rule. The profile contract
+uses these fields:
+
+| Field | Meaning |
+|---|---|
+| `secondary` | Ordered matching scopes. Each item contains `group_id` and a nullable `m3u_account_id`. A null account selects the whole group. Do not combine a whole-group scope with an account-specific scope for the same group. |
+| `time_window_minutes` | Match window from 1 through 1440 minutes. The default is 30. |
+| `enforce_time_window` | Require a candidate event to fall inside the configured match window. The default is true. |
+| `attach_threshold` | Matching floor from 0 through 1. The default is the Event Sync attachment floor. |
+| `assume_current_date` | Allow a dateless event name to use the current local date. Explicit new configs default to false. |
+| `demote_stale_dateless` | Demote a dateless match after its stored interval becomes stale. The default is true. |
+| `use_default_patterns` | Use the compatibility match expressions. Explicit new configs default to false. |
+| `slot_patterns` | Ordered stable-slot definitions. |
+
+Each `slot_patterns` entry contains a unique nonempty `name`, a required
+`channel_pattern`, an optional `fallback_pattern`, ordered `event_patterns`,
+and a `bootstrap` flag. Every expression uses full-match semantics and must
+capture a named `slot`. Numeric captures use the same identity with or without
+leading zeros. A bootstrap slot needs at least one event expression. One
+profile can have at most 32 slot entries and 16 event expressions in each
+entry.
+
+An explicit `{}` means generic defaults and no slots. Existing profiles that
+have only `stream_match_group_ids` keep compatibility behavior:
+`assume_current_date` and `use_default_patterns` are true, and each ID becomes
+a whole-group `secondary` scope. The legacy ID list remains available to older
+clients and is derived from the ordered canonical scopes.
+
+Enabled profiles own their automatic-visibility target groups. Two enabled
+profiles cannot own the same target. An enabled Event Sync rule also blocks a
+profile from claiming the rule's master or promotion target, and the same
+check applies in the other direction. Matching-source scopes can overlap.
+Disabled owners do not claim groups. ECM retains existing conflicts for
+compatibility, reports `ownership_conflict`, and skips disputed groups at run
+time; an unrelated edit does not add a new claim.
+
+Profile preview accepts `sample_channel_name` and the same event config. Its
+additive `event` result reports the selected family, normalized slot, role,
+parsed bounds, matched expression, and validation issues. Preview does not
+write an observation or change a channel.
+
+### Complete guide publication
+
+ECM stores the last complete combined guide and each complete profile guide in
+SQLite. The XMLTV routes return that durable document after process-cache
+expiry or restart. A cold request publishes only a complete candidate; it
+returns HTTP 503 with `GUIDE_UNAVAILABLE` when no complete document exists.
+It never returns a provisional guide.
+
+A source failure or configuration edit keeps the prior complete XML readable
+until a valid replacement is ready. The retained configuration hash prevents
+old evidence from revealing channels under changed ownership or matching
+rules. A disabled profile URL returns `GUIDE_UNAVAILABLE` instead of its
+retained event output.
+
+`POST /api/dummy-epg/generate` admits the existing durable background task and
+returns HTTP 202 with its task and execution IDs. It does not compose XML in
+the request process. Concurrent admission returns 409, and a stopping engine
+returns 503. The HTTPS subprocess forwards this exact POST path to the primary
+task engine.
+
 ### Setup
 
 1. **Create a dummy EPG profile** (EPG Manager → Dummy EPG) whose

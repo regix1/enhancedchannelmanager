@@ -62,14 +62,17 @@ SNAPSHOT_MAX_STREAM_NAMES = 500
 StalenessLookup = dict[int, dict[str, frozenset]]
 
 
-def local_midnight_utc(now: datetime | None = None) -> datetime:
+def local_midnight_utc(
+    now: datetime | None = None,
+    event_timezone: str = DEFAULT_EVENT_TIMEZONE,
+) -> datetime:
     """Naive-UTC instant of TODAY's local midnight in the event timezone.
 
     ``M3USnapshot.snapshot_time`` is stored naive UTC (``datetime.utcnow``),
     so the comparison boundary must be converted to the same convention.
     ``now`` (tz-aware) is injectable for tests; default is the current time.
     """
-    tz = pytz.timezone(DEFAULT_EVENT_TIMEZONE)
+    tz = pytz.timezone(event_timezone)
     local_now = datetime.now(tz) if now is None else now.astimezone(tz)
     midnight = tz.localize(
         datetime(local_now.year, local_now.month, local_now.day)

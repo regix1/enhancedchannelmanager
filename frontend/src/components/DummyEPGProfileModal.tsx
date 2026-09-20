@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, memo, useRef } from 'react';
+import { useState, useEffect, useCallback, memo, useMemo, useRef } from 'react';
 import type {
   DummyEPGProfile,
   DummyEPGProfileCreateRequest,
@@ -8,7 +8,13 @@ import type {
   SubstitutionPair,
   PatternVariant,
   ChannelGroup,
+  GuideReasonCode,
+  GuidePublicationReasonCode,
 } from '../types';
+import type {
+  EventSlotPattern,
+  ProfileEventSyncConfig,
+} from '../types/eventSync';
 import * as api from '../services/api';
 import { useAsyncOperation } from '../hooks/useAsyncOperation';
 import { ModalOverlay } from './ModalOverlay';
@@ -16,11 +22,55 @@ import { useOwnedDialog } from '../hooks/useOwnedDialog';
 import { SubstitutionPairsEditor } from './SubstitutionPairsEditor';
 import { PatternBuilder } from './patternBuilder';
 import { VariantTabs } from './patternBuilder/VariantTabs';
+import { ProviderScopedGroupPicker } from './channelPipeline/ProviderScopedGroupPicker';
+import {
+  joinProviderRows,
+  type GroupProviderRow,
+} from './channelPipeline/providerScopedGroups';
 import './ModalBase.css';
 import './DummyEPGProfileModal.css';
 
 const ENDED_TEMPLATE_HINT =
   'Without programme sources, ended templates use the inferred event duration. This is a scheduled end, not confirmation that playback has finished.';
+
+const GUIDE_REASON_TEXT: Record<GuideReasonCode, string> = {
+  GUIDE_SOURCES_PENDING: 'One or more programme sources are not ready.',
+  GUIDE_CHANNEL_UNAVAILABLE: 'A configured channel is not available.',
+  GUIDE_CONFIG_INVALID: 'The saved profile configuration is not valid.',
+  GUIDE_MAPPING_UNAVAILABLE: 'A saved channel mapping is not available.',
+  GUIDE_QUERY_PENDING: 'A programme lookup is still pending.',
+  GUIDE_SOURCE_NOT_SELECTED: 'A mapped programme source is not selected.',
+  GUIDE_SOURCE_STALE: 'A programme source is stale.',
+  GUIDE_OWNERSHIP_CONFLICT: 'More than one enabled profile owns a channel.',
+  GUIDE_XMLTV_ID_COLLISION: 'More than one channel resolves to the same XMLTV ID.',
+  PROFILE_DISABLED: 'This profile is disabled, so fresh guide sources were not inspected.',
+};
+
+const PUBLICATION_REASON_TEXT: Record<GuidePublicationReasonCode, string> = {
+  GUIDE_UNAVAILABLE: 'No durable guide publication is available.',
+  GUIDE_CONFIG_CHANGED: 'The stored publication belongs to an earlier profile configuration.',
+  GUIDE_WINDOW_EXPIRED: 'The stored guide window has ended.',
+  GUIDE_WINDOW_PENDING: 'The stored guide window has not started.',
+  PROFILE_DISABLED: 'This publication is retained as history for a disabled profile.',
+};
+
+const PUBLICATION_STATUS_TEXT = {
+  published: 'Published',
+  retained: 'Retained',
+  unavailable: 'Unavailable',
+} as const;
+
+const VISIBILITY_EVIDENCE_TEXT = {
+  published: 'Published evidence',
+  retained: 'Retained event evidence',
+  unknown: 'Unknown visibility evidence',
+} as const;
+
+const DISPATCHARR_STATUS_TEXT = {
+  pending: 'Guide import pending',
+  confirmed: 'Guide import confirmed',
+  unknown: 'Guide import not confirmed',
+} as const;
 
 const TIMEZONES = [
   { value: '', label: '-- None --' },
@@ -99,6 +149,56 @@ function extractGroupNames(pattern: string | null): string[] {
   return names;
 }
 
+function makeEventSyncConfig(
+  config?: ProfileEventSyncConfig | null,
+  compatibilityIds: number[] = [],
+): ProfileEventSyncConfig {
+  if (config) {
+    return {
+      secondary: config.secondary.map(scope => ({ ...scope })),
+      time_window_minutes: config.time_window_minutes,
+      enforce_time_window: config.enforce_time_window,
+      attach_threshold: config.attach_threshold,
+      assume_current_date: config.assume_current_date,
+      demote_stale_dateless: config.demote_stale_dateless,
+      use_default_patterns: config.use_default_patterns,
+      slot_patterns: config.slot_patterns.map(slot => ({
+        ...slot,
+        event_patterns: [...slot.event_patterns],
+      })),
+    };
+  }
+  const legacyCompatibility = compatibilityIds.length > 0;
+  return {
+    secondary: compatibilityIds.map(groupId => ({ group_id: groupId, m3u_account_id: null })),
+    time_window_minutes: 30,
+    enforce_time_window: true,
+    attach_threshold: 0.8,
+    assume_current_date: legacyCompatibility,
+    demote_stale_dateless: true,
+    use_default_patterns: legacyCompatibility,
+    slot_patterns: [],
+  };
+}
+
+function makeEventSlot(index: number): EventSlotPattern {
+  return {
+    name: `Family ${index + 1}`,
+    channel_pattern: '',
+    fallback_pattern: null,
+    event_patterns: [],
+    bootstrap: false,
+  };
+}
+
+function moveItem<T>(items: T[], index: number, direction: -1 | 1): T[] {
+  const target = index + direction;
+  if (target < 0 || target >= items.length) return items;
+  const next = [...items];
+  [next[index], next[target]] = [next[target], next[index]];
+  return next;
+}
+
 interface CollapsibleSectionProps {
   title: string;
   isOpen: boolean;
@@ -109,8 +209,8 @@ interface CollapsibleSectionProps {
 const CollapsibleSection = memo(function CollapsibleSection({ title, isOpen, onToggle, children }: CollapsibleSectionProps) {
   return (
     <div className="modal-collapsible">
-      <button type="button" className="modal-collapsible-header" onClick={onToggle}>
-        <span className="material-icons">{isOpen ? 'expand_less' : 'expand_more'}</span>
+      <button type="button" className="modal-collapsible-header" onClick={onToggle} aria-expanded={isOpen}>
+        <span className="material-icons" aria-hidden="true">{isOpen ? 'expand_less' : 'expand_more'}</span>
         <span>{title}</span>
       </button>
       {isOpen && <div className="modal-collapsible-content">{children}</div>}
@@ -140,9 +240,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
   // Channel Groups
   const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>([]);
+  const [groupRows, setGroupRows] = useState<GroupProviderRow[]>([]);
   const [channelGroupIds, setChannelGroupIds] = useState<number[]>([]);
   const [hideEmptyGroupIds, setHideEmptyGroupIds] = useState<number[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
+  const [groupsError, setGroupsError] = useState(false);
   const [groupSearchTerm, setGroupSearchTerm] = useState('');
   const [epgSources, setEpgSources] = useState<EPGSource[]>([]);
   const [epgSourceIds, setEpgSourceIds] = useState<number[]>([]);
@@ -152,6 +254,10 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const [coverageLoading, setCoverageLoading] = useState(false);
   const [coverageError, setCoverageError] = useState(false);
   const coverageRequest = useRef(0);
+  const catalogueRequest = useRef(0);
+
+  // Stable event-slot matching
+  const [eventSyncConfig, setEventSyncConfig] = useState<ProfileEventSyncConfig>(makeEventSyncConfig());
 
   // Substitution Pairs (profile-level)
   const [substitutionPairs, setSubstitutionPairs] = useState<SubstitutionPair[]>([]);
@@ -184,9 +290,13 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
   // Batch test
   const [batchInput, setBatchInput] = useState('');
+  const [sampleChannelName, setSampleChannelName] = useState('');
   const [batchResults, setBatchResults] = useState<DummyEPGPreviewResult[]>([]);
   const [batchLoading, setBatchLoading] = useState(false);
+  const [batchError, setBatchError] = useState(false);
   const [expandedBatchRows, setExpandedBatchRows] = useState<Set<number>>(new Set());
+  const batchRequest = useRef(0);
+  const draftIdentity = useRef<string | null>(null);
 
   // UI State
   const { loading: saving, error, execute, setError, clearError } = useAsyncOperation();
@@ -198,6 +308,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const [epgTagsOpen, setEpgTagsOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [variantOverridesOpen, setVariantOverridesOpen] = useState(false);
+  const [eventMatchingOpen, setEventMatchingOpen] = useState(false);
 
   // Timezone dropdowns
   const [eventTimezoneDropdownOpen, setEventTimezoneDropdownOpen] = useState(false);
@@ -228,16 +339,37 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Load channel groups when modal opens
+  const loadGroupCatalogue = useCallback(async () => {
+    const request = ++catalogueRequest.current;
+    setGroupsLoading(true);
+    try {
+      const [groups, scopes] = await Promise.all([
+        api.getChannelGroups(),
+        api.getProviderGroupSettingsByProvider(),
+      ]);
+      if (catalogueRequest.current !== request) return;
+      setChannelGroups(groups);
+      setGroupRows(joinProviderRows(
+        scopes,
+        groupId => groups.find(group => group.id === groupId)?.name,
+      ));
+      setGroupsError(false);
+    } catch {
+      if (catalogueRequest.current === request) setGroupsError(true);
+    } finally {
+      if (catalogueRequest.current === request) setGroupsLoading(false);
+    }
+  }, []);
+
+  // Load both catalogues without allowing an old open/profile response to
+  // replace the current modal state.
   useEffect(() => {
     if (isOpen) {
-      setGroupsLoading(true);
-      api.getChannelGroups()
-        .then(groups => setChannelGroups(groups))
-        .catch(() => setChannelGroups([]))
-        .finally(() => setGroupsLoading(false));
+      void loadGroupCatalogue();
+      return () => { catalogueRequest.current += 1; };
     }
-  }, [isOpen]);
+    catalogueRequest.current += 1;
+  }, [isOpen, profile?.id, loadGroupCatalogue]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -257,8 +389,16 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
   // Load profile data when modal opens
   useEffect(() => {
-    if (isOpen) {
-      if (profile) {
+    if (!isOpen) {
+      draftIdentity.current = null;
+      batchRequest.current += 1;
+      return;
+    }
+    const identity = profile ? `profile:${profile.id}` : importData ? 'import' : 'new';
+    if (draftIdentity.current === identity) return;
+    draftIdentity.current = identity;
+
+    if (profile) {
         setName(profile.name);
         setEnabled(profile.enabled);
         setChannelGroupIds(profile.channel_group_ids || []);
@@ -297,13 +437,21 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setIncludeDateTag(profile.include_date_tag || false);
         setIncludeLiveTag(profile.include_live_tag || false);
         setIncludeNewTag(profile.include_new_tag || false);
+        setEventSyncConfig(makeEventSyncConfig(
+          profile.event_sync_config,
+          profile.stream_match_group_ids,
+        ));
 
         setSubsOpen((profile.substitution_pairs || []).length > 0);
         setUpcomingEndedOpen(Boolean(profile.upcoming_title_template || profile.upcoming_description_template || profile.ended_title_template || profile.ended_description_template));
         setFallbackOpen(Boolean(profile.fallback_title_template || profile.fallback_description_template));
         setEpgTagsOpen(Boolean(profile.include_date_tag || profile.include_live_tag || profile.include_new_tag));
         setAdvancedOpen(Boolean(profile.tvg_id_template && profile.tvg_id_template !== 'ecm-{channel_id}'));
-      } else if (importData) {
+        setEventMatchingOpen(Boolean(
+          profile.event_sync_config
+          || profile.stream_match_group_ids?.length,
+        ));
+    } else if (importData) {
         // Import mode: pre-fill from Dispatcharr source data
         const d = importData;
         setName(d.name || '');
@@ -347,6 +495,10 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setIncludeDateTag(d.include_date_tag || false);
         setIncludeLiveTag(d.include_live_tag || false);
         setIncludeNewTag(d.include_new_tag || false);
+        setEventSyncConfig(makeEventSyncConfig(
+          d.event_sync_config,
+          d.stream_match_group_ids,
+        ));
 
         // Open sections that have data
         setSubsOpen((d.substitution_pairs || []).length > 0);
@@ -354,7 +506,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setFallbackOpen(Boolean(d.fallback_title_template || d.fallback_description_template));
         setEpgTagsOpen(Boolean(d.include_date_tag || d.include_live_tag || d.include_new_tag));
         setAdvancedOpen(false);
-      } else {
+        setEventMatchingOpen(Boolean(
+          d.event_sync_config
+          || d.stream_match_group_ids?.length,
+        ));
+    } else {
         setName('');
         setEnabled(true);
         setChannelGroupIds([]);
@@ -379,19 +535,23 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         setIncludeDateTag(false);
         setIncludeLiveTag(false);
         setIncludeNewTag(false);
+        setEventSyncConfig(makeEventSyncConfig());
         setSubsOpen(false);
         setUpcomingEndedOpen(false);
         setFallbackOpen(false);
         setEpgTagsOpen(false);
         setAdvancedOpen(false);
-      }
-      setBatchInput('');
-      setBatchResults([]);
-      setExpandedBatchRows(new Set());
-      setVariantOverridesOpen(false);
-      setGroupSearchTerm('');
-      clearError();
+        setEventMatchingOpen(false);
     }
+    setBatchInput('');
+    setSampleChannelName('');
+    setBatchResults([]);
+    setBatchError(false);
+    batchRequest.current += 1;
+    setExpandedBatchRows(new Set());
+    setVariantOverridesOpen(false);
+    setGroupSearchTerm('');
+    clearError();
   }, [isOpen, profile, importData, clearError]);
 
   // Active variant helpers
@@ -400,6 +560,27 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const updateActiveVariant = useCallback((updates: Partial<PatternVariant>) => {
     setVariants(prev => prev.map((v, i) => i === activeVariantIndex ? { ...v, ...updates } : v));
   }, [activeVariantIndex]);
+
+  const updateEventSlot = useCallback((index: number, updates: Partial<EventSlotPattern>) => {
+    setEventSyncConfig(current => ({
+      ...current,
+      slot_patterns: current.slot_patterns.map((slot, slotIndex) =>
+        slotIndex === index ? { ...slot, ...updates } : slot
+      ),
+    }));
+  }, []);
+
+  const readiness = profile && coverage?.profiles
+    ? coverage.profiles[String(profile.id)]
+    : undefined;
+  const invalidField = useMemo(() => {
+    if (!error) return null;
+    return error.match(/event_sync_config\.([^:]+)/)?.[1] ?? null;
+  }, [error]);
+
+  useEffect(() => {
+    if (invalidField) setEventMatchingOpen(true);
+  }, [invalidField]);
 
   // Variant tab handlers
   const handleAddVariant = useCallback(() => {
@@ -424,15 +605,19 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
   const handleBatchTest = useCallback(async () => {
     const names = batchInput.split('\n').map(s => s.trim()).filter(Boolean);
     if (!names.length) return;
+    const request = ++batchRequest.current;
     setBatchLoading(true);
+    setBatchError(false);
     try {
       const v = variants[0]; // Use first variant's flat fields for backward compat
       const results = await api.previewDummyEPGBatch({
         sample_names: names,
+        sample_channel_name: sampleChannelName || undefined,
+        event_sync_config: eventSyncConfig,
         substitution_pairs: substitutionPairs,
-        title_pattern: v?.title_pattern || undefined,
-        time_pattern: v?.time_pattern || undefined,
-        date_pattern: v?.date_pattern || undefined,
+        title_pattern: v?.title_pattern ?? undefined,
+        time_pattern: v?.time_pattern ?? undefined,
+        date_pattern: v?.date_pattern ?? undefined,
         title_template: v?.title_template || undefined,
         description_template: v?.description_template || undefined,
         upcoming_title_template: upcomingTitleTemplate || undefined,
@@ -446,36 +631,22 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         program_duration: programDuration,
         channel_logo_url_template: v?.channel_logo_url_template || undefined,
         program_poster_url_template: v?.program_poster_url_template || undefined,
-        pattern_variants: variants.length > 1 || (variants[0]?.title_pattern)
-          ? variants.map(vr => ({
-              ...vr,
-              title_pattern: vr.title_pattern || undefined,
-              time_pattern: vr.time_pattern || undefined,
-              date_pattern: vr.date_pattern || undefined,
-            } as PatternVariant))
+        pattern_variants: variants.length > 1 || variants[0]?.title_pattern
+          ? variants
           : undefined,
       });
-      setBatchResults(results);
-      setExpandedBatchRows(new Set());
+      if (batchRequest.current === request) {
+        setBatchResults(results);
+        setExpandedBatchRows(new Set());
+      }
     } catch {
-      setBatchResults([]);
-      setExpandedBatchRows(new Set());
+      if (batchRequest.current === request) setBatchError(true);
     } finally {
-      setBatchLoading(false);
+      if (batchRequest.current === request) setBatchLoading(false);
     }
   }, [batchInput, variants, substitutionPairs, upcomingTitleTemplate, upcomingDescriptionTemplate,
       endedTitleTemplate, endedDescriptionTemplate, fallbackTitleTemplate, fallbackDescriptionTemplate,
-      eventTimezone, outputTimezone, programDuration]);
-
-  const validateRegex = useCallback((pattern: string | null) => {
-    if (!pattern) return true;
-    try {
-      new RegExp(pattern);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
+      eventTimezone, outputTimezone, programDuration, sampleChannelName, eventSyncConfig]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -490,18 +661,6 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
     for (const v of variants) {
       if (!v.title_pattern?.trim() && epgSourceIds.length === 0) {
         setError(`Variant "${v.name}" needs a Title Pattern`);
-        return;
-      }
-      if (v.title_pattern && !validateRegex(v.title_pattern)) {
-        setError(`Variant "${v.name}" has an invalid Title Pattern regex`);
-        return;
-      }
-      if (v.time_pattern && !validateRegex(v.time_pattern)) {
-        setError(`Variant "${v.name}" has an invalid Time Pattern regex`);
-        return;
-      }
-      if (v.date_pattern && !validateRegex(v.date_pattern)) {
-        setError(`Variant "${v.name}" has an invalid Date Pattern regex`);
         return;
       }
       // The min and max on the input are checked by the browser only for
@@ -528,9 +687,9 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         enabled,
         name_source: nameSource,
         stream_index: streamIndex,
-        title_pattern: v0.title_pattern?.trim() || undefined,
-        time_pattern: v0.time_pattern?.trim() || undefined,
-        date_pattern: v0.date_pattern?.trim() || undefined,
+        title_pattern: v0.title_pattern ?? undefined,
+        time_pattern: v0.time_pattern ?? undefined,
+        date_pattern: v0.date_pattern ?? undefined,
         substitution_pairs: substitutionPairs,
         title_template: v0.title_template?.trim() || undefined,
         description_template: v0.description_template?.trim() || undefined,
@@ -554,6 +713,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
         pattern_variants: variants,
         channel_group_ids: channelGroupIds,
         hide_empty_group_ids: hideEmptyGroupIds,
+        event_sync_config: eventSyncConfig,
         epg_source_ids: epgSourceIds,
         ...(!profile && importData?.channel_mappings ? { channel_mappings: importData.channel_mappings } : {}),
       };
@@ -591,7 +751,6 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="My Sports EPG"
-                autoFocus
               />
             </div>
 
@@ -716,6 +875,169 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
               </fieldset>
             )}
 
+            <fieldset className="dep-event-matching" aria-describedby="depEventMatchingHelp">
+              <legend>Event matching</legend>
+              <p id="depEventMatchingHelp" className="modal-section-description">
+                Match provider event names to stable numbered channels. The existing <a href="#depPatternVariants">Pattern Variants</a> parse each event title and start time.
+              </p>
+
+              {groupsError && (
+                <div className="dep-catalogue-error" role="alert">
+                  <span>Group accounts could not be loaded. Saved scopes remain selected, and you can keep editing other fields.</span>
+                  <button type="button" className="modal-btn modal-btn-secondary" onClick={() => void loadGroupCatalogue()} disabled={groupsLoading}>
+                    {groupsLoading ? 'Retrying…' : 'Retry groups'}
+                  </button>
+                </div>
+              )}
+              {groupsLoading && <p role="status">Loading group accounts…</p>}
+
+              <ProviderScopedGroupPicker
+                role="secondary"
+                rows={groupRows}
+                value={eventSyncConfig.secondary}
+                onChange={next => setEventSyncConfig(current => ({
+                  ...current,
+                  secondary: Array.isArray(next) ? next : [],
+                }))}
+                showAll={false}
+                disabled={groupsLoading}
+              />
+
+              {eventSyncConfig.secondary.length > 0 && (
+                <ol className="dep-scope-order" aria-label="Event matching scope order">
+                  {eventSyncConfig.secondary.map((scope, index) => {
+                    const group = channelGroups.find(item => item.id === scope.group_id);
+                    const account = groupRows.find(row =>
+                      row.groupId === scope.group_id
+                      && row.m3uAccountId === scope.m3u_account_id
+                    );
+                    return (
+                      <li key={`${scope.group_id}:${scope.m3u_account_id ?? 'all'}`}>
+                        <span>{group?.name ?? `Group ${scope.group_id}`}{scope.m3u_account_id === null ? ' · Any provider' : account ? ` · ${account.m3uAccountName}` : ` · Account ${scope.m3u_account_id}`}</span>
+                        <div className="dep-order-actions">
+                          <button type="button" aria-label={`Move scope ${index + 1} up`} disabled={index === 0} onClick={() => setEventSyncConfig(current => ({ ...current, secondary: moveItem(current.secondary, index, -1) }))}>
+                            <span className="material-icons" aria-hidden="true">arrow_upward</span>
+                          </button>
+                          <button type="button" aria-label={`Move scope ${index + 1} down`} disabled={index === eventSyncConfig.secondary.length - 1} onClick={() => setEventSyncConfig(current => ({ ...current, secondary: moveItem(current.secondary, index, 1) }))}>
+                            <span className="material-icons" aria-hidden="true">arrow_downward</span>
+                          </button>
+                          <button type="button" aria-label={`Remove scope ${index + 1}`} onClick={() => setEventSyncConfig(current => ({ ...current, secondary: current.secondary.filter((_, scopeIndex) => scopeIndex !== index) }))}>
+                            <span className="material-icons" aria-hidden="true">delete</span>
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+
+              <CollapsibleSection
+                title="Matching details"
+                isOpen={eventMatchingOpen}
+                onToggle={() => setEventMatchingOpen(!eventMatchingOpen)}
+              >
+                <div className="dep-collapsible-inner dep-event-details">
+                  <div className="modal-form-row">
+                    <div className="modal-form-group">
+                      <label htmlFor="depMatchWindow">Time window (minutes)</label>
+                      <input
+                        id="depMatchWindow"
+                        type="number"
+                        min="1"
+                        max="1440"
+                        value={eventSyncConfig.time_window_minutes}
+                        aria-invalid={invalidField === 'time_window_minutes' || undefined}
+                        aria-describedby={invalidField === 'time_window_minutes' ? 'depSaveError' : undefined}
+                        onChange={event => setEventSyncConfig(current => ({ ...current, time_window_minutes: Number(event.target.value) }))}
+                      />
+                    </div>
+                    <div className="modal-form-group">
+                      <label htmlFor="depAttachThreshold">Attach threshold</label>
+                      <input
+                        id="depAttachThreshold"
+                        type="number"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={eventSyncConfig.attach_threshold}
+                        aria-invalid={invalidField === 'attach_threshold' || undefined}
+                        aria-describedby={invalidField === 'attach_threshold' ? 'depSaveError' : undefined}
+                        onChange={event => setEventSyncConfig(current => ({ ...current, attach_threshold: Number(event.target.value) }))}
+                      />
+                    </div>
+                  </div>
+                  <label className="modal-checkbox-label">
+                    <input type="checkbox" checked={eventSyncConfig.enforce_time_window} onChange={event => setEventSyncConfig(current => ({ ...current, enforce_time_window: event.target.checked }))} />
+                    <span>Enforce the time window</span>
+                  </label>
+                  <label className="modal-checkbox-label">
+                    <input type="checkbox" checked={eventSyncConfig.use_default_patterns} onChange={event => setEventSyncConfig(current => ({ ...current, use_default_patterns: event.target.checked }))} />
+                    <span>Also use built-in event patterns</span>
+                  </label>
+                  <label className="modal-checkbox-label">
+                    <input type="checkbox" checked={eventSyncConfig.assume_current_date} onChange={event => setEventSyncConfig(current => ({ ...current, assume_current_date: event.target.checked }))} />
+                    <span>Place dateless events on the current date</span>
+                  </label>
+                  <label className="modal-checkbox-label">
+                    <input type="checkbox" checked={eventSyncConfig.demote_stale_dateless} onChange={event => setEventSyncConfig(current => ({ ...current, demote_stale_dateless: event.target.checked }))} />
+                    <span>Keep stale dateless events out of automatic matches</span>
+                  </label>
+
+                  <div className="dep-slot-heading">
+                    <div>
+                      <h3>Stable slot families</h3>
+                      <p className="form-hint">Expressions use a named <code>slot</code> capture. Python <code>(?P&lt;slot&gt;…)</code> and JavaScript <code>(?&lt;slot&gt;…)</code> forms are stored exactly as entered.</p>
+                    </div>
+                    <button type="button" className="modal-btn modal-btn-secondary" disabled={eventSyncConfig.slot_patterns.length >= 32} onClick={() => setEventSyncConfig(current => ({ ...current, slot_patterns: [...current.slot_patterns, makeEventSlot(current.slot_patterns.length)] }))}>
+                      Add family
+                    </button>
+                  </div>
+
+                  {eventSyncConfig.slot_patterns.length === 0 ? (
+                    <p className="dep-groups-empty">No stable slot families configured.</p>
+                  ) : eventSyncConfig.slot_patterns.map((slot, slotIndex) => (
+                    <fieldset className="dep-slot-card" key={slotIndex}>
+                      <legend>Family {slotIndex + 1}</legend>
+                      <div className="dep-slot-actions">
+                        <button type="button" aria-label={`Move family ${slotIndex + 1} up`} disabled={slotIndex === 0} onClick={() => setEventSyncConfig(current => ({ ...current, slot_patterns: moveItem(current.slot_patterns, slotIndex, -1) }))}><span className="material-icons" aria-hidden="true">arrow_upward</span></button>
+                        <button type="button" aria-label={`Move family ${slotIndex + 1} down`} disabled={slotIndex === eventSyncConfig.slot_patterns.length - 1} onClick={() => setEventSyncConfig(current => ({ ...current, slot_patterns: moveItem(current.slot_patterns, slotIndex, 1) }))}><span className="material-icons" aria-hidden="true">arrow_downward</span></button>
+                        <button type="button" aria-label={`Remove family ${slotIndex + 1}`} onClick={() => setEventSyncConfig(current => ({ ...current, slot_patterns: current.slot_patterns.filter((_, index) => index !== slotIndex) }))}><span className="material-icons" aria-hidden="true">delete</span></button>
+                      </div>
+                      <div className="modal-form-group">
+                        <label htmlFor={`depSlotName-${slotIndex}`}>Family key</label>
+                        <input id={`depSlotName-${slotIndex}`} type="text" value={slot.name} aria-invalid={invalidField === `slot_patterns[${slotIndex}].name` || undefined} aria-describedby={invalidField === `slot_patterns[${slotIndex}].name` ? 'depSaveError' : undefined} onChange={event => updateEventSlot(slotIndex, { name: event.target.value })} />
+                      </div>
+                      <div className="modal-form-group">
+                        <label htmlFor={`depChannelPattern-${slotIndex}`}>Channel expression</label>
+                        <input id={`depChannelPattern-${slotIndex}`} type="text" className="dep-expression" value={slot.channel_pattern} aria-invalid={invalidField === `slot_patterns[${slotIndex}].channel_pattern` || undefined} aria-describedby={invalidField === `slot_patterns[${slotIndex}].channel_pattern` ? 'depSaveError' : undefined} onChange={event => updateEventSlot(slotIndex, { channel_pattern: event.target.value })} />
+                      </div>
+                      <div className="modal-form-group">
+                        <label htmlFor={`depFallbackPattern-${slotIndex}`}>Fallback expression (optional)</label>
+                        <input id={`depFallbackPattern-${slotIndex}`} type="text" className="dep-expression" value={slot.fallback_pattern ?? ''} aria-invalid={invalidField === `slot_patterns[${slotIndex}].fallback_pattern` || undefined} aria-describedby={invalidField === `slot_patterns[${slotIndex}].fallback_pattern` ? 'depSaveError' : undefined} onChange={event => updateEventSlot(slotIndex, { fallback_pattern: event.target.value === '' ? null : event.target.value })} />
+                      </div>
+                      <div className="dep-event-expressions">
+                        <span className="dep-field-label">Event expressions</span>
+                        {slot.event_patterns.map((expression, expressionIndex) => (
+                          <div className="dep-expression-row" key={expressionIndex}>
+                            <label className="sr-only" htmlFor={`depEventPattern-${slotIndex}-${expressionIndex}`}>Family {slotIndex + 1} event expression {expressionIndex + 1}</label>
+                            <input id={`depEventPattern-${slotIndex}-${expressionIndex}`} type="text" className="dep-expression" value={expression} aria-invalid={invalidField === `slot_patterns[${slotIndex}].event_patterns[${expressionIndex}]` || undefined} aria-describedby={invalidField === `slot_patterns[${slotIndex}].event_patterns[${expressionIndex}]` ? 'depSaveError' : undefined} onChange={event => updateEventSlot(slotIndex, { event_patterns: slot.event_patterns.map((item, index) => index === expressionIndex ? event.target.value : item) })} />
+                            <button type="button" aria-label={`Move event expression ${expressionIndex + 1} up`} disabled={expressionIndex === 0} onClick={() => updateEventSlot(slotIndex, { event_patterns: moveItem(slot.event_patterns, expressionIndex, -1) })}><span className="material-icons" aria-hidden="true">arrow_upward</span></button>
+                            <button type="button" aria-label={`Move event expression ${expressionIndex + 1} down`} disabled={expressionIndex === slot.event_patterns.length - 1} onClick={() => updateEventSlot(slotIndex, { event_patterns: moveItem(slot.event_patterns, expressionIndex, 1) })}><span className="material-icons" aria-hidden="true">arrow_downward</span></button>
+                            <button type="button" aria-label={`Remove event expression ${expressionIndex + 1}`} onClick={() => updateEventSlot(slotIndex, { event_patterns: slot.event_patterns.filter((_, index) => index !== expressionIndex) })}><span className="material-icons" aria-hidden="true">delete</span></button>
+                          </div>
+                        ))}
+                        <button type="button" className="modal-btn modal-btn-secondary" disabled={slot.event_patterns.length >= 16} onClick={() => updateEventSlot(slotIndex, { event_patterns: [...slot.event_patterns, ''] })}>Add event expression</button>
+                      </div>
+                      <label className="modal-checkbox-label">
+                        <input type="checkbox" checked={slot.bootstrap} onChange={event => updateEventSlot(slotIndex, { bootstrap: event.target.checked })} />
+                        <span>Allow this family to bootstrap a new stable slot</span>
+                      </label>
+                    </fieldset>
+                  ))}
+                </div>
+              </CollapsibleSection>
+            </fieldset>
+
             <div className="modal-section-divider"><span>Programme Sources</span></div>
             <p className="modal-section-description">
               Select existing XMLTV sources for real schedules. Their configured priority breaks ties between equivalent mappings.
@@ -780,10 +1102,69 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 {coverageError && <p role="alert">Guide coverage could not be loaded. Try checking again.</p>}
                 {coverage && !coverageError && (
                   <div aria-live="polite">
+                    <section className={`dep-publication ${coverage.publication.status}`} aria-label="Stored guide publication">
+                      <div className="dep-publication-heading">
+                        <h3>{PUBLICATION_STATUS_TEXT[coverage.publication.status]}</h3>
+                        <span>Coverage checked {new Date(coverage.generated_at).toLocaleString()}</span>
+                      </div>
+                      <p>
+                        <strong>Original publication time:</strong>{' '}
+                        {coverage.publication.published_at
+                          ? new Date(coverage.publication.published_at).toLocaleString()
+                          : 'Unavailable'}
+                      </p>
+                      {coverage.publication.window_start && (
+                        <p><strong>Stored window starts:</strong> {new Date(coverage.publication.window_start).toLocaleString()}</p>
+                      )}
+                      {coverage.publication.window_stop && (
+                        <p><strong>Stored window ends:</strong> {new Date(coverage.publication.window_stop).toLocaleString()}</p>
+                      )}
+                      {coverage.publication.reason_codes.map(reason => (
+                        <p key={reason}>{PUBLICATION_REASON_TEXT[reason]}</p>
+                      ))}
+                      {coverage.publication.delivery && (
+                        <div className="dep-publication-delivery">
+                          <strong>{DISPATCHARR_STATUS_TEXT[coverage.publication.delivery.dispatcharr_status]}</strong>
+                          {coverage.publication.delivery.pending_emby && <span>Emby refresh pending</span>}
+                        </div>
+                      )}
+                      {coverage.publication.channels.length > 0 && (
+                        <ul className="dep-publication-channels">
+                          {coverage.publication.channels.map(channel => (
+                            <li key={channel.channel_id}>
+                              <div className="dep-publication-channel-heading">
+                                <span>Channel {channel.channel_id}{channel.xmltv_id && <> · {channel.xmltv_id}</>}</span>
+                                <strong className={`dep-evidence ${channel.visibility_evidence}`}>
+                                  {VISIBILITY_EVIDENCE_TEXT[channel.visibility_evidence]}
+                                </strong>
+                              </div>
+                              {channel.events.map(event => (
+                                <p key={`${event.start}:${event.stop}:${event.title}`}>
+                                  {event.title}<br />
+                                  <span>{new Date(event.start).toLocaleString()} – {new Date(event.stop).toLocaleString()}</span>
+                                </p>
+                              ))}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {coverage.publication.channels.some(channel => channel.visibility_evidence === 'unknown') && (
+                        <p className="form-hint">Unknown evidence does not mean a channel is hidden, idle, or unavailable.</p>
+                      )}
+                    </section>
+                    {readiness && (
+                      <div className={`dep-readiness ${readiness.can_publish ? 'ready' : 'blocked'}`}>
+                        <strong>{readiness.can_publish ? 'Ready to publish' : 'Publication is waiting'}</strong>
+                        {readiness.reason_codes.map(reason => (
+                          <p key={reason}>{GUIDE_REASON_TEXT[reason]}</p>
+                        ))}
+                      </div>
+                    )}
                     {coverage.sources.map(source => (
                       <p key={source.source_id}>
                         {epgSources.find(item => item.id === source.source_id)?.name ?? `Source ${source.source_id}`}: {source.status}
                         {source.error ? ` — ${source.error}` : ''}
+                        {source.last_success ? ` · last complete ${new Date(source.last_success).toLocaleString()}` : ''}
                       </p>
                     ))}
                     {coverage.sources.some(source => source.status === 'pending') && <p>Sources are still loading. Check again shortly; gaps remain neutral.</p>}
@@ -873,12 +1254,12 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                   value={streamIndex}
                   onChange={(e) => setStreamIndex(parseInt(e.target.value) || 1)}
                 />
-                <p className="form-hint">Which stream's name to use (1 = first stream)</p>
+                <p className="form-hint">Which stream&apos;s name to use (1 = first stream)</p>
               </div>
             )}
 
             {/* Variant Tabs */}
-            <div className="modal-section-divider">
+            <div className="modal-section-divider" id="depPatternVariants">
               <span>Pattern Variants</span>
             </div>
             <p className="modal-section-description">
@@ -1354,7 +1735,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                     onChange={(e) => setTvgIdTemplate(e.target.value)}
                     placeholder="ecm-{channel_id}"
                   />
-                  <p className="form-hint">Template for tvg-id in XMLTV output. Keep &#123;channel_id&#125; in it, and make sure it matches the tvg-id used in Dispatcharr for channel matching. Channel ids are never reused, but channel numbers start over at 1 whenever channels are rebuilt, so a template built on the number hands the previous channel's programmes to whatever event now holds that number.</p>
+                  <p className="form-hint">Template for tvg-id in XMLTV output. Keep &#123;channel_id&#125; in it, and make sure it matches the tvg-id used in Dispatcharr for channel matching. Channel ids are never reused, but channel numbers start over at 1 whenever channels are rebuilt, so a template built on the number hands the previous channel&apos;s programmes to whatever event now holds that number.</p>
                 </div>
               </div>
             </CollapsibleSection>
@@ -1367,6 +1748,18 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
             <p className="modal-section-description">
               Paste multiple channel/stream names (one per line) to test which variant matches each.
             </p>
+
+            <div className="modal-form-group">
+              <label htmlFor="depSampleChannelName">Sample channel name (optional)</label>
+              <input
+                id="depSampleChannelName"
+                type="text"
+                value={sampleChannelName}
+                onChange={event => setSampleChannelName(event.target.value)}
+                placeholder="Arena 07"
+              />
+              <p className="form-hint">The preview stays local to ECM and does not contact Dispatcharr.</p>
+            </div>
 
             <div className="modal-form-group">
               <label htmlFor="depBatchInput">Sample Names</label>
@@ -1384,11 +1777,15 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
               type="button"
               className="modal-btn modal-btn-secondary"
               onClick={handleBatchTest}
-              disabled={batchLoading || !batchInput.trim()}
+              disabled={!batchInput.trim()}
               style={{ marginBottom: '0.75rem' }}
             >
-              {batchLoading ? 'Testing...' : 'Test All'}
+              {batchLoading ? 'Test again' : 'Test All'}
             </button>
+
+            {batchLoading && <span role="status" className="dep-preview-status">Testing the latest samples…</span>}
+
+            {batchError && <p role="alert">The preview could not be generated. Your samples and matching settings are unchanged.</p>}
 
             {batchResults.length > 0 && (
               <div className="dep-batch-results">
@@ -1427,7 +1824,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
 
                   return (
                     <div key={i} className={`dep-batch-row-wrap ${r.matched ? 'dep-batch-match' : 'dep-batch-no-match'}`}>
-                      <div className="dep-batch-summary" onClick={toggleRow}>
+                      <button type="button" className="dep-batch-summary" onClick={toggleRow} aria-expanded={isExpanded}>
                         <span className="dep-batch-name" title={r.original_name}>
                           {r.original_name.length > 40 ? r.original_name.slice(0, 40) + '...' : r.original_name}
                         </span>
@@ -1438,11 +1835,11 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                           {r.matched ? (r.rendered?.title || '—') : (r.rendered?.fallback_title || '—')}
                         </span>
                         <span className="dep-batch-status">
-                          <span className={`material-icons ${r.matched ? 'dep-batch-icon-match' : 'dep-batch-icon-fail'}`}>
+                          <span className={`material-icons ${r.matched ? 'dep-batch-icon-match' : 'dep-batch-icon-fail'}`} aria-hidden="true">
                             {r.matched ? 'check_circle' : 'cancel'}
                           </span>
                         </span>
-                      </div>
+                      </button>
                       {isExpanded && (
                         <div className="dep-batch-detail">
                           {(hasGroups || hasTimeVars) && (
@@ -1464,6 +1861,19 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                               <span className="dep-batch-detail-value">{value}</span>
                             </div>
                           ))}
+                          {r.event && (
+                            <>
+                              {r.event.family && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Event family</span><span className="dep-batch-detail-value">{r.event.family}</span></div>}
+                              {r.event.slot && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Slot</span><span className="dep-batch-detail-value">{r.event.slot}</span></div>}
+                              {r.event.role && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Role</span><span className="dep-batch-detail-value">{r.event.role}</span></div>}
+                              {r.event.start && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Starts</span><span className="dep-batch-detail-value">{r.event.start}</span></div>}
+                              {r.event.stop && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Stops</span><span className="dep-batch-detail-value">{r.event.stop}</span></div>}
+                              {r.event.matched_pattern && <div className="dep-batch-detail-row"><span className="dep-batch-detail-label">Matched expression</span><span className="dep-batch-detail-value">{r.event.matched_pattern}</span></div>}
+                              {r.event.validation_issues.map(issue => (
+                                <div className="dep-batch-detail-row" key={issue}><span className="dep-batch-detail-label">Issue</span><span className="dep-batch-detail-value">{issue}</span></div>
+                              ))}
+                            </>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1472,7 +1882,7 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
               </div>
             )}
 
-            {error && <div className="modal-error-banner">{error}</div>}
+            {error && <div className="modal-error-banner" id="depSaveError" role="alert">{error}</div>}
           </div>
 
           <div className="modal-footer modal-footer-spread">

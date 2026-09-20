@@ -8,6 +8,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import type {
+  DummyEPGCoverage,
+  DummyEPGPublication,
   DummyEPGProfile,
   DummyEPGProfileCreateRequest,
   PatternVariant,
@@ -16,6 +18,7 @@ import { DummyEPGProfileModal } from './DummyEPGProfileModal';
 
 const mocks = vi.hoisted(() => ({
   getChannelGroups: vi.fn().mockResolvedValue([]),
+  getProviderGroupSettingsByProvider: vi.fn().mockResolvedValue([]),
   updateDummyEPGProfile: vi.fn(),
   createDummyEPGProfile: vi.fn(),
   getEPGSources: vi.fn().mockResolvedValue([]),
@@ -24,6 +27,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../services/api', () => ({
   getChannelGroups: mocks.getChannelGroups,
+  getProviderGroupSettingsByProvider: mocks.getProviderGroupSettingsByProvider,
   getEPGSources: mocks.getEPGSources,
   getDummyEPGCoverage: mocks.getDummyEPGCoverage,
   previewDummyEPGBatch: vi.fn().mockResolvedValue([]),
@@ -100,6 +104,54 @@ function makeProfile(variants: PatternVariant[]): DummyEPGProfile {
   };
 }
 
+function makeCoverage(
+  overrides: Partial<Omit<DummyEPGCoverage, 'publication'>> & {
+    publication?: Partial<DummyEPGPublication>;
+  } = {},
+): DummyEPGCoverage {
+  const publication: DummyEPGPublication = {
+    status: 'published',
+    published_at: '2026-09-05T00:30:00Z',
+    revision: 7,
+    window_start: '2026-09-05T00:00:00Z',
+    window_stop: '2026-09-07T00:00:00Z',
+    config_matches: true,
+    reason_codes: [],
+    delivery: { dispatcharr_status: 'confirmed', pending_emby: false },
+    channels: [{
+      channel_id: 10,
+      xmltv_id: 'ecm-10',
+      visibility_evidence: 'published',
+      events: [{
+        start: '2026-09-05T01:00:00Z',
+        stop: '2026-09-05T05:00:00Z',
+        title: 'ONE Fight Night 47',
+      }],
+    }],
+    ...overrides.publication,
+  };
+  return {
+    generated_at: '2026-09-05T01:00:00Z',
+    window_start: '2026-09-05T00:00:00Z',
+    window_stop: '2026-09-07T00:00:00Z',
+    sources: [{ source_id: 51, status: 'ready', last_success: '2026-09-05T00:55:00Z', error: null }],
+    channels: [],
+    profiles: {
+      '1': {
+        profile_id: 1,
+        source_ids: [51],
+        sources: [{ source_id: 51, status: 'ready', last_success: '2026-09-05T00:55:00Z', error: null }],
+        owned_channel_ids: [10],
+        can_publish: true,
+        reason_codes: [],
+      },
+    },
+    artwork_pending: false,
+    ...overrides,
+    publication,
+  };
+}
+
 /** Renders the modal and waits for the channel-group load to settle, so the
  * duration assertions never race the effect. Returns the duration input. */
 async function renderModal(
@@ -130,6 +182,7 @@ describe('DummyEPGProfileModal per-variant program duration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getChannelGroups.mockResolvedValue([]);
+    mocks.getProviderGroupSettingsByProvider.mockResolvedValue([]);
     mocks.updateDummyEPGProfile.mockResolvedValue({});
     mocks.createDummyEPGProfile.mockResolvedValue({});
   });
@@ -236,6 +289,7 @@ describe('Dummy EPG programme sources and coverage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getChannelGroups.mockResolvedValue([]);
+    mocks.getProviderGroupSettingsByProvider.mockResolvedValue([]);
     mocks.getEPGSources.mockResolvedValue([
       { id: 51, name: 'USA 3-day', source_type: 'xmltv', is_active: true, url: 'https://guide.example/private-key' },
       { id: 49, name: 'Portrait sports', source_type: 'xmltv', is_active: true, url: '/api/epg/artwork-proxy/42' },
@@ -308,24 +362,143 @@ describe('Dummy EPG programme sources and coverage', () => {
   });
 
   it('shows pending coverage and allows a second check to show current programmes', async () => {
-    const coverage = {
-      generated_at: '2026-09-05T01:00:00Z', window_start: '2026-09-05T00:00:00Z', window_stop: '2026-09-07T00:00:00Z',
-      sources: [{ source_id: 51, status: 'pending', last_success: null, error: null }], channels: [],
-    };
-    mocks.getDummyEPGCoverage.mockResolvedValueOnce(coverage).mockResolvedValueOnce({
-      ...coverage, sources: [{ source_id: 51, status: 'ready', last_success: coverage.generated_at, error: null }],
+    const retained = makeCoverage({
+      sources: [{ source_id: 51, status: 'pending', last_success: '2026-09-04T20:00:00Z', error: 'Provider refresh failed' }],
+      profiles: {
+        '1': {
+          profile_id: 1,
+          source_ids: [51],
+          sources: [{ source_id: 51, status: 'pending', last_success: '2026-09-04T20:00:00Z', error: 'Provider refresh failed' }],
+          owned_channel_ids: [10],
+          can_publish: false,
+          reason_codes: ['GUIDE_SOURCES_PENDING'],
+        },
+      },
+      publication: {
+        status: 'retained',
+        delivery: { dispatcharr_status: 'pending', pending_emby: true },
+        channels: [{
+          channel_id: 10,
+          xmltv_id: 'ecm-10',
+          visibility_evidence: 'retained',
+          events: [{
+            start: '2026-09-05T01:00:00Z',
+            stop: '2026-09-05T05:00:00Z',
+            title: 'ONE Fight Night 47 retained after a failed provider refresh',
+          }],
+        }],
+      },
+    });
+    mocks.getDummyEPGCoverage.mockResolvedValueOnce(retained).mockResolvedValueOnce(makeCoverage({
       channels: [{ channel_id: 10, xmltv_id: 'ecm-10', source_id: 51, source_tvg_id: 'PPV10.art', match: 'event',
         current: { start: '2026-09-05T01:00:00Z', stop: '2026-09-05T05:00:00Z', title: 'ONE Fight Night 47' },
         next: null, real_minutes: 240, gap_minutes: 2640, warnings: [] }],
-    });
+    }));
     render(<DummyEPGProfileModal isOpen profile={{ ...makeProfile([legacyVariant]), epg_source_ids: [51] }} onClose={vi.fn()} onSave={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
     expect(await screen.findByText(/Sources are still loading/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Retained' })).toBeInTheDocument();
+    expect(screen.getByText('Retained event evidence')).toBeInTheDocument();
+    expect(screen.getByText('Guide import pending')).toBeInTheDocument();
+    expect(screen.getByText('Emby refresh pending')).toBeInTheDocument();
+    expect(screen.getByText(/Provider refresh failed/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Stored guide publication')).not.toHaveTextContent('Original publication time: Unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
-    expect(await screen.findByText(/ONE Fight Night 47/)).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Published' })).toBeInTheDocument();
+    expect((await screen.findAllByText(/ONE Fight Night 47/)).length).toBeGreaterThan(0);
     expect(screen.getByText('240 / 2640')).toBeInTheDocument();
     expect(mocks.getDummyEPGCoverage).toHaveBeenCalledTimes(2);
     expect(mocks.updateDummyEPGProfile).not.toHaveBeenCalled();
+  });
+
+  it('keeps fresh readiness separate from an unavailable publication', async () => {
+    mocks.getDummyEPGCoverage.mockResolvedValueOnce(makeCoverage({
+      publication: {
+        status: 'unavailable',
+        published_at: null,
+        revision: null,
+        window_start: null,
+        window_stop: null,
+        config_matches: null,
+        reason_codes: ['GUIDE_UNAVAILABLE'],
+        delivery: null,
+        channels: [{
+          channel_id: 10,
+          xmltv_id: null,
+          visibility_evidence: 'unknown',
+          events: [],
+        }],
+      },
+    }));
+    render(<DummyEPGProfileModal isOpen profile={{ ...makeProfile([legacyVariant]), epg_source_ids: [51] }} onClose={vi.fn()} onSave={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    expect(await screen.findByRole('heading', { name: 'Unavailable' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Stored guide publication')).toHaveTextContent('Original publication time: Unavailable');
+    expect(screen.getByText('No durable guide publication is available.')).toBeInTheDocument();
+    expect(screen.getByText('Unknown visibility evidence')).toBeInTheDocument();
+    expect(screen.getByText('Ready to publish')).toBeInTheDocument();
+  });
+
+  it('shows historical events without claiming visibility after a config change', async () => {
+    mocks.getDummyEPGCoverage.mockResolvedValueOnce(makeCoverage({
+      publication: {
+        status: 'retained',
+        config_matches: false,
+        reason_codes: ['GUIDE_CONFIG_CHANGED'],
+        delivery: { dispatcharr_status: 'unknown', pending_emby: false },
+        channels: [{
+          channel_id: 10,
+          xmltv_id: 'ecm-10',
+          visibility_evidence: 'unknown',
+          events: [{
+            start: '2026-09-05T01:00:00Z',
+            stop: '2026-09-05T05:00:00Z',
+            title: 'A historical programme title that stays readable even when current visibility cannot be proven',
+          }],
+        }],
+      },
+    }));
+    render(<DummyEPGProfileModal isOpen profile={{ ...makeProfile([legacyVariant]), epg_source_ids: [51] }} onClose={vi.fn()} onSave={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    expect(await screen.findByText('The stored publication belongs to an earlier profile configuration.')).toBeInTheDocument();
+    expect(screen.getByText('Guide import not confirmed')).toBeInTheDocument();
+    expect(screen.getByText('Unknown visibility evidence')).toBeInTheDocument();
+    expect(screen.getByText(/A historical programme title/)).toBeInTheDocument();
+    expect(screen.getByText(/Unknown evidence does not mean/)).toBeInTheDocument();
+  });
+
+  it('ignores a late coverage response after switching profiles', async () => {
+    let resolveFirst!: (coverage: DummyEPGCoverage) => void;
+    let resolveSecond!: (coverage: DummyEPGCoverage) => void;
+    mocks.getDummyEPGCoverage
+      .mockReturnValueOnce(new Promise(resolve => { resolveFirst = resolve; }))
+      .mockReturnValueOnce(new Promise(resolve => { resolveSecond = resolve; }));
+    const first = { ...makeProfile([legacyVariant]), epg_source_ids: [51] };
+    const second = { ...first, id: 2, name: 'Second profile' };
+    const { rerender } = render(<DummyEPGProfileModal isOpen profile={first} onClose={vi.fn()} onSave={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    rerender(<DummyEPGProfileModal isOpen profile={second} onClose={vi.fn()} onSave={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Check saved guide coverage' }));
+    resolveSecond(makeCoverage());
+    expect(await screen.findByRole('heading', { name: 'Published' })).toBeInTheDocument();
+    resolveFirst(makeCoverage({
+      publication: {
+        status: 'unavailable',
+        published_at: null,
+        revision: null,
+        window_start: null,
+        window_stop: null,
+        config_matches: null,
+        reason_codes: ['GUIDE_UNAVAILABLE'],
+        delivery: null,
+        channels: [],
+      },
+    }));
+    await Promise.resolve();
+    expect(screen.queryByRole('heading', { name: 'Unavailable' })).not.toBeInTheDocument();
   });
 
   it('shows source-load and coverage errors without clearing saved selection', async () => {

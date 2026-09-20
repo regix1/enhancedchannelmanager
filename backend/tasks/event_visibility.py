@@ -1,16 +1,20 @@
-"""Keep event-channel visibility aligned with current guide coverage."""
+"""Reconcile configured event profiles with their published guide and channels."""
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import pytz
 
 from database import get_session
 from dispatcharr_client import get_client
-from models import DummyEPGProfile
+from models import ChannelPipelineRule, DummyEPGProfile
 from task_registry import register_task
 from task_scheduler import ScheduleConfig, ScheduleType, TaskResult, TaskScheduler
 
@@ -23,53 +27,35 @@ EPG_LINK_MAX_RESULTS = 10000
 
 
 def _stream_id(stream) -> int | None:
-    return stream.get("id") if isinstance(stream, dict) else stream
+    if isinstance(stream, dict):
+        return stream.get("id")
+    return getattr(stream, "stream_id", stream if isinstance(stream, int) else None)
 
 
 def _stream_group_id(stream) -> int | None:
     if not isinstance(stream, dict):
-        return None
+        return getattr(stream, "group_id", None)
     group = stream.get("channel_group_id")
     if group is None:
         group = stream.get("channel_group")
     return group.get("id") if isinstance(group, dict) else group
 
 
-def _espn_slot(name: str | None, *, stream: bool = False) -> int | None:
-    """Read an ESPN+ slot from a channel or its numbered IPTorrents stream."""
-    pattern = r"^ESPN PLUS\s+(\d+):?$" if stream else r"^ESPN\+\s*(\d+)$"
-    match = re.fullmatch(pattern, str(name or "").strip(), flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
+def _stream_account_id(stream) -> int | None:
+    if not isinstance(stream, dict):
+        return getattr(stream, "provider_id", None)
+    from stream_prober import extract_m3u_account_id
+
+    return extract_m3u_account_id(stream.get("m3u_account"))
 
 
-def _ufc_slot(
-    name: str | None, *, stream: bool = False, titled: bool = False,
-) -> int | None:
-    """Read a UFC slot from a channel or its numbered IPTV stream."""
-    value = str(name or "").strip()
-    if titled:
-        patterns = (
-            r"^LIVE\s+EVENT\s+(\d{1,2})(?=\s|:|-|\|).*\bUFC\b",
-            r"^UFC\s*(?:INT\s*)?(\d{1,2})\s*:\s*\S",
-            r"^US\s+\(UFC(?:\s+INT)?\s*(\d{1,2})\)\s*\|",
-        )
-        for pattern in patterns:
-            match = re.match(pattern, value, flags=re.IGNORECASE)
-            if match:
-                return int(match.group(1))
-        return None
-    pattern = r"^UFC\s*(?:INT\s*)?(\d+):?$" if stream else r"^UFC\s*(\d+)$"
-    match = re.fullmatch(pattern, value, flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
+def _slot_key(
+    name: str | None, config: dict, *, role: str = "channel",
+) -> tuple[str, str] | None:
+    """Keep the established helper name while using configured slot patterns."""
+    from services.event_slots import _slot_key as configured_slot_key
 
-
-def _slot_key(name: str | None, *, stream: bool = False) -> tuple[str, int] | None:
-    """Identify a stable event slot without mixing different channel families."""
-    for family, reader in (("espn", _espn_slot), ("ufc", _ufc_slot)):
-        slot = reader(name, stream=stream)
-        if slot is not None:
-            return family, slot
-    return None
+    return configured_slot_key(name, config, role=role)
 
 
 def _guide_name(current: dict | None, event_timezone: str) -> str | None:
@@ -93,9 +79,7 @@ def _guide_name(current: dict | None, event_timezone: str) -> str | None:
     if _placeholder(marker):
         return None
     try:
-        start = datetime.fromisoformat(
-            str(current["start"]).replace("Z", "+00:00")
-        )
+        start = datetime.fromisoformat(str(current["start"]).replace("Z", "+00:00"))
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
         local = start.astimezone(pytz.timezone(event_timezone))
@@ -105,118 +89,1207 @@ def _guide_name(current: dict | None, event_timezone: str) -> str | None:
     return f"{title} @ {local.strftime('%b')} {local.day} {clock}"
 
 
-async def _fetch_match_streams(client, group_ids: list[int]) -> tuple[list, dict[int, int]]:
-    """Fetch the configured event-name stream groups without partial results."""
+def _scope_key(scope: dict) -> tuple[int, int | None]:
+    return scope["group_id"], scope.get("m3u_account_id")
+
+
+async def _fetch_match_streams(client, scopes: list[dict]):
+    """Fetch each configured group/account scope once with bounded pagination."""
     from services.event_sync_resolver import SecondaryStream
 
-    streams = []
-    groups_by_stream = {}
-    for group_id in group_ids:
-        group_name = await client._channel_group_name_for_id(group_id)
-        if not group_name:
-            raise ValueError(f"Stream group {group_id} no longer exists.")
-        page = 1
-        while True:
-            response = await client.get_streams(
-                page=page,
-                page_size=MATCH_STREAM_PAGE_SIZE,
-                channel_group_name=group_name,
-            )
-            rows = (
-                response.get("results", [])
-                if isinstance(response, dict)
-                else (response or [])
-            )
-            for row in rows:
-                stream_id = row.get("id")
-                name = row.get("name")
-                if stream_id is None or not name:
-                    continue
-                streams.append(SecondaryStream(
-                    name=name,
-                    group_id=group_id,
-                    stream_id=stream_id,
-                    is_stale=row.get("is_stale"),
-                ))
-                groups_by_stream[stream_id] = group_id
-            if len(streams) > MAX_MATCH_STREAMS:
-                raise ValueError(
-                    f"Guide-match stream scan exceeds {MAX_MATCH_STREAMS} streams."
-                )
-            if not isinstance(response, dict) or not response.get("next"):
-                break
-            page += 1
-    return streams, groups_by_stream
-
-
-async def _link_dummy_epg(client, event_channels: list[tuple[int, dict]]) -> tuple[list[int], dict[int, str]]:
-    """Link unassigned event channels to their generated Dummy EPG rows."""
-    missing = {
-        channel_id: channel
-        for channel_id, channel in event_channels
-        if channel.get("epg_data_id") is None and channel.get("epg_data") is None
-    }
-    if not missing:
-        return [], {}
-
-    from services.epg_programmes import _dummy_source, _epg_source_id
-
-    sources = await client.get_epg_sources()
-    if isinstance(sources, dict):
-        sources = sources.get("results", sources.get("sources", []))
-    dummy_sources = sorted(
-        (
-            source for source in sources or []
-            if isinstance(source, dict)
-            and source.get("id") is not None
-            and source.get("is_active", True)
-            and _dummy_source(source["id"], sources)
-        ),
-        key=lambda source: source["id"],
-    )
-    if not dummy_sources:
-        return [], {}
-
-    wanted = {f"ecm-{channel_id}" for channel_id in missing}
-    rows_by_tvg = {}
-    for source in dummy_sources:
-        rows = await client.get_epg_data(
-            epg_source=source["id"],
-            max_results=EPG_LINK_MAX_RESULTS,
+    normalized = []
+    seen_scopes = set()
+    for scope in scopes:
+        item = (
+            {"group_id": scope, "m3u_account_id": None}
+            if isinstance(scope, int) else dict(scope)
         )
-        for row in rows:
-            tvg_id = row.get("tvg_id")
-            if tvg_id in wanted and row.get("id") is not None:
-                rows_by_tvg.setdefault(tvg_id, row)
+        key = _scope_key(item)
+        if key not in seen_scopes:
+            normalized.append(item)
+            seen_scopes.add(key)
 
-    linked = []
-    linked_sources = {}
-    for channel_id, channel in sorted(missing.items()):
-        row = rows_by_tvg.get(f"ecm-{channel_id}")
-        if row is None:
+    streams = []
+    complete = set()
+    failures = {}
+    group_names = {}
+    seen_ids = set()
+    for scope in normalized:
+        key = _scope_key(scope)
+        try:
+            group_id, account_id = key
+            if group_id not in group_names:
+                group_names[group_id] = await client._channel_group_name_for_id(group_id)
+            group_name = group_names[group_id]
+            if not group_name:
+                raise ValueError("Configured stream group no longer exists.")
+            page = 1
+            while True:
+                response = await client.get_streams(
+                    page=page,
+                    page_size=MATCH_STREAM_PAGE_SIZE,
+                    channel_group_name=group_name,
+                    m3u_account=account_id,
+                )
+                rows = (
+                    response.get("results", [])
+                    if isinstance(response, dict) else (response or [])
+                )
+                for row in rows:
+                    stream_id = row.get("id")
+                    name = row.get("name")
+                    if stream_id is None or not name:
+                        continue
+                    actual_account = _stream_account_id(row)
+                    if account_id is not None and actual_account != account_id:
+                        continue
+                    identity = (key, stream_id)
+                    if identity in seen_ids:
+                        continue
+                    seen_ids.add(identity)
+                    streams.append(SecondaryStream(
+                        name=name,
+                        group_id=group_id,
+                        stream_id=stream_id,
+                        provider_id=actual_account,
+                        is_stale=row.get("is_stale"),
+                    ))
+                if len(streams) > MAX_MATCH_STREAMS:
+                    raise ValueError(
+                        f"Guide-match stream scan exceeds {MAX_MATCH_STREAMS} streams."
+                    )
+                if not isinstance(response, dict) or not response.get("next"):
+                    break
+                page += 1
+            complete.add(key)
+        except Exception as exc:
+            failures[key] = type(exc).__name__
+            logger.warning(
+                "[EVENT-WORKFLOW] Could not read stream scope group=%s account=%s: %s",
+                key[0], key[1], exc,
+            )
+    return streams, complete, failures
+
+
+def _generated_scope(source: dict) -> str | None:
+    """Return the exact publication scope selected by one generated source URL."""
+    try:
+        path = urlparse(str(source.get("url") or "")).path.rstrip("/")
+    except (TypeError, ValueError):
+        return None
+    if path == "/api/dummy-epg/xmltv":
+        return "all"
+    match = re.fullmatch(r"/api/dummy-epg/xmltv/([1-9]\d*)", path)
+    return f"profile:{int(match.group(1))}" if match else None
+
+
+def _profile_token(profiles: list[dict]) -> str:
+    value = json.dumps(profiles, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _rule_token(rules: list) -> str:
+    values = [
+        {
+            "id": getattr(rule, "id", None),
+            "enabled": getattr(rule, "enabled", None),
+            "event_sync_config": getattr(rule, "event_sync_config", None),
+            "updated_at": getattr(rule, "updated_at", None),
+        }
+        for rule in rules
+    ]
+    value = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _load_profiles() -> tuple[list[dict], list]:
+    session = get_session()
+    try:
+        profiles = [
+            row.to_dict()
+            for row in session.query(DummyEPGProfile).filter(
+                DummyEPGProfile.enabled == True  # noqa: E712
+            ).all()
+        ]
+        rules = session.query(ChannelPipelineRule).filter(
+            ChannelPipelineRule.enabled == True  # noqa: E712
+        ).all()
+        return profiles, rules
+    finally:
+        session.close()
+
+
+def _source_rows(value) -> list[dict]:
+    if isinstance(value, dict):
+        return value.get("results", value.get("sources", [])) or []
+    return value or []
+
+
+def _stored_active(publication: dict | None, channel_id: int, now: datetime) -> bool:
+    if publication is None:
+        return False
+    for channel in publication["state"].get("channels", []):
+        if channel.get("channel_id") != channel_id:
             continue
-        await client.update_channel(channel_id, {"epg_data_id": row["id"]})
-        channel["epg_data_id"] = row["id"]
-        linked.append(channel_id)
-        source_id = _epg_source_id(row.get("epg_source") or row.get("epg_source_id"))
-        if source_id is not None:
-            source = next(
-                (candidate for candidate in dummy_sources if candidate["id"] == source_id),
-                None,
+        for event in channel.get("events", []):
+            try:
+                start = datetime.fromisoformat(event["start"])
+                stop = datetime.fromisoformat(event["stop"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start <= now < stop:
+                return True
+    return False
+
+
+def _first_publication_link_matches(
+    profile: dict,
+    assignment: dict | None,
+    channel: dict,
+    generated_source_ids: set[int],
+) -> bool:
+    """Require exact generated-guide ownership before a first idle transition."""
+    if assignment is None or not generated_source_ids:
+        return False
+    guide_row = channel.get("epg_data")
+    if not isinstance(guide_row, dict):
+        return False
+
+    from dummy_epg_engine import get_xmltv_id
+    from services.epg_programmes import _epg_source_id
+
+    source_id = _epg_source_id(
+        guide_row.get("epg_source") or guide_row.get("epg_source_id")
+    )
+    return (
+        source_id in generated_source_ids
+        and guide_row.get("tvg_id") == get_xmltv_id(assignment, channel, profile)
+    )
+
+
+def _matches_scope(stream, scope: dict) -> bool:
+    if _stream_group_id(stream) != scope["group_id"]:
+        return False
+    account_id = scope.get("m3u_account_id")
+    return account_id is None or _stream_account_id(stream) == account_id
+
+
+def _ordered_ids(streams, scopes: list[dict]) -> list[int]:
+    if not scopes:
+        values = []
+        for stream in streams:
+            stream_id = _stream_id(stream)
+            if stream_id is not None and stream_id not in values:
+                values.append(stream_id)
+        return values
+    rank = {_scope_key(scope): index for index, scope in enumerate(scopes)}
+    ordered = sorted(
+        streams,
+        key=lambda stream: (
+            rank.get((_stream_group_id(stream), _stream_account_id(stream)),
+                     rank.get((_stream_group_id(stream), None), len(rank))),
+            _stream_id(stream) or 0,
+        ),
+    )
+    values = []
+    for stream in ordered:
+        stream_id = _stream_id(stream)
+        if stream_id is not None and stream_id not in values:
+            values.append(stream_id)
+    return values
+
+
+def _patterns(profile: dict, config: dict) -> list[dict]:
+    from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
+
+    values = list(DEFAULT_EVENT_PATTERNS) if config.get("use_default_patterns") else []
+    seen = {
+        (row.get("title_pattern"), row.get("time_pattern"), row.get("date_pattern"))
+        for row in values
+    }
+    for row in profile.get("pattern_variants") or []:
+        if not isinstance(row, dict) or not row.get("title_pattern"):
+            continue
+        key = (row.get("title_pattern"), row.get("time_pattern"), row.get("date_pattern"))
+        if key not in seen:
+            values.append(row)
+            seen.add(key)
+    return values
+
+
+def _plan_profile(
+    profile: dict,
+    config: dict,
+    channel_map: dict,
+    coverage: dict,
+    streams: list,
+    complete_scopes: set,
+    retained: dict | None,
+    now: datetime,
+    generated_source_ids: set[int] | None = None,
+) -> dict:
+    """Prepare profile-local event evidence without external mutations."""
+    from services.event_sync_matcher import (
+        SYNTHESIZED_DATE_PATTERN_NAMES,
+        parse_event_name,
+    )
+    from services.event_slots import classify_event_slot
+    from services.event_sync_resolver import (
+        DISPOSITION_AMBIGUOUS,
+        DISPOSITION_WOULD_ATTACH,
+        resolve_event_sync,
+    )
+
+    profile_id = profile["id"]
+    generated_source_ids = generated_source_ids or set()
+    scopes = config.get("secondary") or []
+    scope_keys = {_scope_key(scope) for scope in scopes}
+    scan_complete = scope_keys <= complete_scopes
+    selected_streams = [
+        stream for stream in streams if any(_matches_scope(stream, scope) for scope in scopes)
+    ]
+    profile_coverage = coverage.get("profiles", {}).get(str(profile_id), {})
+    publication_complete = profile_coverage.get("can_publish") is True
+    rows = {
+        row["channel_id"]: row
+        for row in coverage.get("channels", [])
+        if row.get("profile_id") in {None, profile_id}
+    }
+    targets = set(profile.get("hide_empty_group_ids") or [])
+    channels = {
+        channel_id: channel
+        for channel_id, channel in channel_map.items()
+        if channel.get("channel_group_id") in targets
+    }
+    match_patterns = _patterns(profile, config)
+    event_timezone = profile.get("event_timezone") or "US/Eastern"
+    duration = timedelta(minutes=profile.get("program_duration") or 180)
+    observations = []
+    intervals = {}
+    desired = {}
+    states = {}
+    ambiguous_ids = set()
+    assignments = {
+        assignment["channel_id"]: assignment
+        for assignment in profile.get("channel_assignments") or []
+        if assignment.get("channel_id") is not None
+    }
+
+    direct_by_slot = {}
+    fallback_by_slot = {}
+    conflicting_event_slots = False
+    for stream in selected_streams:
+        if stream.is_stale is True:
+            continue
+        classification = classify_event_slot(stream.name, config, role="event")
+        if classification["validation_issues"]:
+            conflicting_event_slots = True
+            continue
+        event_slot = _slot_key(stream.name, config, role="event")
+        fallback_slot = _slot_key(stream.name, config, role="fallback")
+        if event_slot is not None:
+            direct_by_slot.setdefault(event_slot, []).append(stream)
+        elif fallback_slot is not None:
+            fallback_by_slot.setdefault(fallback_slot, []).append(stream)
+
+    titled_by_channel = {}
+    if scan_complete:
+        names = {}
+        for channel_id, channel in channels.items():
+            guide_name = _guide_name((rows.get(channel_id) or {}).get("current"), event_timezone)
+            if guide_name:
+                names.setdefault(guide_name, []).append(channel_id)
+        titled = [
+            stream for stream in selected_streams
+            if stream.is_stale is not True
+            and _slot_key(stream.name, config, role="fallback") is None
+            and _slot_key(stream.name, config, role="event") is None
+        ]
+        if names and titled:
+            resolver_config = {
+                "master_group_id": 0,
+                "secondary_group_ids": list(dict.fromkeys(scope["group_id"] for scope in scopes)),
+                "time_window_minutes": config["time_window_minutes"],
+                "enforce_time_window": config["enforce_time_window"],
+                "attach_threshold": config["attach_threshold"],
+                "assume_current_date": config["assume_current_date"],
+                "demote_stale_dateless": config["demote_stale_dateless"],
+                "patterns": match_patterns or None,
+            }
+            resolution = resolve_event_sync(
+                resolver_config,
+                sorted(names),
+                titled,
+                now=now,
+                event_timezone=event_timezone,
             )
-            linked_sources[source_id] = (
-                source.get("name") if source else f"Source {source_id}"
+            for resolved in resolution.resolved:
+                if resolved.disposition == DISPOSITION_WOULD_ATTACH:
+                    for channel_id in names.get(resolved.best.master_name, []):
+                        titled_by_channel.setdefault(channel_id, []).append(resolved.stream)
+                elif resolved.disposition == DISPOSITION_AMBIGUOUS:
+                    for candidate in resolved.result.candidates:
+                        ambiguous_ids.update(names.get(candidate.master_name, []))
+
+    for channel_id, channel in channels.items():
+        slot = _slot_key(channel.get("name"), config, role="channel")
+        direct = list(direct_by_slot.get(slot, [])) if slot is not None else []
+        current = (rows.get(channel_id) or {}).get("current")
+        bootstrap = next((
+            item.get("bootstrap") is True
+            for item in config.get("slot_patterns", [])
+            if slot is not None and item.get("name") == slot[0]
+        ), False)
+        active_direct = []
+        for stream in direct if current is not None or bootstrap else []:
+            parsed = parse_event_name(
+                stream.name,
+                match_patterns or None,
+                event_timezone=event_timezone,
+                now=now,
+                assume_current_date=config["assume_current_date"],
             )
-    return linked, linked_sources
+            if parsed.start is None:
+                continue
+            stop = parsed.start + duration
+            if not parsed.start <= now < stop:
+                continue
+            active_direct.append(stream)
+            title = parsed.title or stream.name
+            interval = {
+                "channel_id": channel_id,
+                "title": title,
+                "start": parsed.start.isoformat(),
+                "stop": stop.isoformat(),
+            }
+            intervals.setdefault(channel_id, []).append(interval)
+            observations.append({
+                "family": slot[0],
+                "slot": slot[1],
+                "stream_id": stream.stream_id,
+                "normalized_name": " ".join(stream.name.split()).casefold(),
+                "start": parsed.start.isoformat(),
+                "expires_at": stop.isoformat(),
+                "title": title,
+                "matched_variant": parsed.matched_pattern,
+                "provisional": parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES,
+            })
+
+        active = current is not None or bool(active_direct) or _stored_active(retained, channel_id, now)
+        if channel_id in ambiguous_ids or conflicting_event_slots or not scan_complete:
+            state = "unknown"
+        elif active:
+            state = "active"
+        elif publication_complete and (
+            retained is not None
+            or _first_publication_link_matches(
+                profile,
+                assignments.get(channel_id),
+                channel,
+                generated_source_ids,
+            )
+        ):
+            state = "idle"
+        else:
+            state = "unknown"
+        states[channel_id] = state
+
+        attached = channel.get("streams") or []
+        outside = [
+            stream for stream in attached
+            if not any(_matches_scope(stream, scope) for scope in scopes)
+        ]
+        fallback = fallback_by_slot.get(slot, []) if slot is not None else []
+        titled_matches = [*active_direct, *titled_by_channel.get(channel_id, [])]
+        if state == "active":
+            desired[channel_id] = _ordered_ids(titled_matches, scopes)
+        elif state == "idle":
+            desired[channel_id] = []
+        else:
+            continue
+        for stream_id in [*_ordered_ids(outside, []), *_ordered_ids(fallback, scopes)]:
+            if stream_id not in desired[channel_id]:
+                desired[channel_id].append(stream_id)
+
+    profile["event_intervals"] = intervals
+    return {
+        "profile": profile,
+        "observations": observations if scan_complete else None,
+        "states": states,
+        "desired": desired,
+        "scan_complete": scan_complete,
+    }
+
+
+def _result_details(profile_count: int) -> dict:
+    return {
+        "configured_profile_count": profile_count,
+        "published_profile_ids": [],
+        "retained_profile_ids": [],
+        "unavailable_profile_ids": [],
+        "publication_times": {},
+        "source_reason_codes": {},
+        "idle_channel_count": 0,
+        "active_channel_count": 0,
+        "unknown_channel_count": 0,
+        "stream_updated_channel_ids": [],
+        "epg_linked_channel_ids": [],
+        "revealed_channel_ids": [],
+        "hidden_channel_ids": [],
+        "pending_source_hashes": {},
+        "emby_request_outcome": "not_required",
+        "pending_emby": False,
+        "delivery_pending": False,
+        "reason_codes": [],
+    }
+
+
+def _delivery_plan(publication: dict, sources: list[dict]) -> tuple[dict, dict, dict]:
+    document_hash = publication["state"]["xmltv_hash"]
+    required = {str(source["id"]): document_hash for source in sources}
+    confirmed = {
+        key: value
+        for key, value in publication["state"]["delivery"]["confirmed_dispatcharr_hashes"].items()
+        if required.get(key) == value
+    }
+    pending = {
+        int(source_id): document_hash
+        for source_id in required
+        if confirmed.get(source_id) != document_hash
+    }
+    return required, confirmed, pending
+
+
+async def _await_preparation(awaitable, cancelled):
+    """Stop waiting promptly without cancelling shared source-load tasks."""
+    preparation = asyncio.create_task(awaitable)
+    while not preparation.done():
+        if cancelled():
+            preparation.cancel()
+            try:
+                await preparation
+            except asyncio.CancelledError:
+                pass
+            return None
+        await asyncio.wait({preparation}, timeout=0.05)
+    if cancelled():
+        return None
+    return preparation.result()
+
+
+def _store_emby_pending(
+    publications: dict,
+    *,
+    pending: bool,
+    read_publication,
+    update_delivery,
+) -> bool:
+    """Persist one Emby delivery decision across every published scope."""
+    for scope, row in list(publications.items()):
+        if row["state"]["delivery"].get("pending_emby") == pending:
+            continue
+        next_revision = update_delivery(
+            scope,
+            expected_revision=row["revision"],
+            pending_emby=pending,
+        )
+        if next_revision is None:
+            return False
+        current = read_publication(scope)
+        if current is None:
+            return False
+        publications[scope] = current
+    return True
+
+
+def _finish(
+    started_at: datetime,
+    details: dict,
+    *,
+    success: bool,
+    message: str,
+    error: str | None = None,
+    degraded: bool = False,
+) -> TaskResult:
+    changed = set(details["stream_updated_channel_ids"])
+    changed.update(details["epg_linked_channel_ids"])
+    changed.update(details["revealed_channel_ids"])
+    changed.update(details["hidden_channel_ids"])
+    total = (
+        details["idle_channel_count"]
+        + details["active_channel_count"]
+        + details["unknown_channel_count"]
+    )
+    return TaskResult(
+        success=success,
+        completed_degraded=degraded,
+        message=message,
+        error=error,
+        started_at=started_at,
+        completed_at=datetime.utcnow(),
+        total_items=total,
+        success_count=len(changed),
+        failed_count=len(details["unavailable_profile_ids"]),
+        skipped_count=max(0, total - len(changed)),
+        details=details,
+    )
+
+
+def _finish_cancelled(
+    started_at: datetime,
+    details: dict,
+    publications: dict | None = None,
+) -> TaskResult:
+    if publications:
+        details["pending_emby"] = any(
+            row["state"]["delivery"].get("pending_emby")
+            for row in publications.values()
+        )
+    details["delivery_pending"] = bool(
+        details["delivery_pending"]
+        or details["pending_source_hashes"]
+        or details["pending_emby"]
+    )
+    details["reason_codes"] = ["CANCELLED"]
+    return _finish(
+        started_at,
+        details,
+        success=False,
+        message="Guide reconciliation cancelled",
+        error="CANCELLED",
+        degraded=bool(
+            details["published_profile_ids"]
+            or details["retained_profile_ids"]
+            or details["hidden_channel_ids"]
+            or details["stream_updated_channel_ids"]
+            or details["epg_linked_channel_ids"]
+            or details["revealed_channel_ids"]
+        ),
+    )
+
+
+async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> TaskResult:
+    """Publish and deliver every configured event profile through one workflow."""
+    from cache import get_cache
+    from concurrency import run_cpu_bound
+    from dummy_epg_engine import get_xmltv_id
+    from services.epg_programmes import _epg_source_id, _fetch_all_channels, prepare_profiles
+    from services.epg_publication import (
+        publication_lock,
+        publish_profiles,
+        read_publication,
+        update_delivery,
+    )
+    from services.event_slots import event_config, validate_ownership
+
+    started_at = datetime.utcnow()
+    now = datetime.now(timezone.utc)
+    client = get_client()
+
+    for attempt in range(2):
+        try:
+            profiles, rules = _load_profiles()
+            details = _result_details(len(profiles))
+            if not profiles:
+                return _finish(
+                    started_at, details, success=True,
+                    message="No enabled guide profiles require reconciliation",
+                )
+            token = (_profile_token(profiles), _rule_token(rules))
+            conflicts = validate_ownership(profiles, rules)
+            disputed_groups = {row["group_id"] for row in conflicts}
+            retained = {}
+            for profile in profiles:
+                retained[profile["id"]] = read_publication(f"profile:{profile['id']}")
+
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            channel_map = await _fetch_all_channels(client)
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            preparation = await _await_preparation(
+                prepare_profiles(
+                    profiles,
+                    channel_map,
+                    client,
+                    now=now,
+                    wait_for_sources=wait_for_sources,
+                ),
+                lambda: task._cancel_requested,
+            )
+            if preparation is None:
+                return _finish_cancelled(started_at, details)
+            prepared, coverage = preparation
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            configs = {}
+            scopes = []
+            invalid_profiles = set()
+            for profile in prepared:
+                profile_id = profile["id"]
+                try:
+                    config = event_config(profile)
+                except ValueError:
+                    invalid_profiles.add(profile_id)
+                    continue
+                configs[profile_id] = config
+                scopes.extend(config.get("secondary") or [])
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            streams, complete_scopes, scope_failures = await _fetch_match_streams(client, scopes)
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            source_rows = _source_rows(await client.get_epg_sources())
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+
+            plans = {}
+            observations = {}
+            for profile in prepared:
+                profile_id = profile["id"]
+                record = coverage.get("profiles", {}).setdefault(str(profile_id), {
+                    "profile_id": profile_id,
+                    "can_publish": False,
+                    "reason_codes": [],
+                })
+                reasons = set(record.get("reason_codes") or [])
+                if profile_id in invalid_profiles:
+                    reasons.add("GUIDE_CONFIG_INVALID")
+                    record["can_publish"] = False
+                target_groups = set(profile.get("hide_empty_group_ids") or [])
+                if target_groups & disputed_groups:
+                    reasons.add("GUIDE_OWNERSHIP_CONFLICT")
+                    record["can_publish"] = False
+                record["reason_codes"] = sorted(reasons)
+                if profile_id not in configs:
+                    continue
+                plan = _plan_profile(
+                    profile,
+                    configs[profile_id],
+                    channel_map,
+                    coverage,
+                    streams,
+                    complete_scopes,
+                    retained.get(profile_id),
+                    now,
+                    {
+                        source["id"]
+                        for source in source_rows
+                        if isinstance(source, dict)
+                        and source.get("id") is not None
+                        and source.get("is_active", True)
+                        and _generated_scope(source) in {"all", f"profile:{profile_id}"}
+                    },
+                )
+                if target_groups & disputed_groups:
+                    plan["states"] = {
+                        channel_id: "unknown" for channel_id in plan["states"]
+                    }
+                    plan["desired"] = {}
+                if not plan["scan_complete"]:
+                    record["can_publish"] = False
+                    record["reason_codes"] = sorted(
+                        set(record.get("reason_codes") or []) | {"GUIDE_SOURCES_PENDING"}
+                    )
+                plans[profile_id] = plan
+                if plan["observations"] is not None:
+                    observations[profile_id] = plan["observations"]
+            for profile in prepared:
+                profile_id = profile["id"]
+                details["source_reason_codes"][str(profile_id)] = list(
+                    coverage.get("profiles", {}).get(str(profile_id), {}).get("reason_codes") or []
+                )
+            for key in scope_failures:
+                for profile in prepared:
+                    if key in {_scope_key(scope) for scope in configs.get(profile["id"], {}).get("secondary", [])}:
+                        details["source_reason_codes"][str(profile["id"])] = sorted(
+                            set(details["source_reason_codes"][str(profile["id"])]) | {"GUIDE_SOURCES_PENDING"}
+                        )
+        except Exception as exc:
+            logger.exception("[EVENT-WORKFLOW] Could not prepare reconciliation: %s", exc)
+            details = _result_details(0)
+            details["reason_codes"] = ["GUIDE_UNAVAILABLE"]
+            return _finish(
+                started_at, details, success=False,
+                message="Guide reconciliation could not prepare complete input",
+                error="GUIDE_UNAVAILABLE",
+            )
+
+        if task._cancel_requested:
+            return _finish_cancelled(started_at, details)
+
+        async with publication_lock:
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            current_profiles, current_rules = _load_profiles()
+            if (_profile_token(current_profiles), _rule_token(current_rules)) != token:
+                if attempt == 0:
+                    continue
+                details["reason_codes"] = ["GUIDE_SOURCES_PENDING"]
+                return _finish(
+                    started_at, details, success=False,
+                    message="Guide profile configuration changed during reconciliation",
+                    error="GUIDE_SOURCES_PENDING",
+                    degraded=any(retained.values()),
+                )
+
+            states = {
+                channel_id: state
+                for plan in plans.values()
+                for channel_id, state in plan["states"].items()
+            }
+            details["idle_channel_count"] = sum(value == "idle" for value in states.values())
+            details["active_channel_count"] = sum(value == "active" for value in states.values())
+            details["unknown_channel_count"] = sum(value == "unknown" for value in states.values())
+
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details)
+            try:
+                publication = await run_cpu_bound(
+                    publish_profiles,
+                    prepared,
+                    channel_map,
+                    coverage,
+                    observations=observations,
+                    now=now,
+                )
+            except Exception as exc:
+                logger.exception("[EVENT-WORKFLOW] Could not commit publication: %s", exc)
+                details["reason_codes"] = ["GUIDE_PUBLICATION_FAILED"]
+                return _finish(
+                    started_at, details, success=False,
+                    message="Guide publication failed",
+                    error="GUIDE_PUBLICATION_FAILED",
+                )
+
+            details["published_profile_ids"] = list(publication.published_profile_ids)
+            details["retained_profile_ids"] = list(publication.retained_profile_ids)
+            details["unavailable_profile_ids"] = list(publication.unavailable_profile_ids)
+            if publication.superseded:
+                details["reason_codes"] = sorted(set(publication.reason_codes) | {"GUIDE_IMPORT_PENDING"})
+                details["delivery_pending"] = True
+                return _finish(
+                    started_at, details, success=False,
+                    message="A newer guide publication superseded this run",
+                    error="GUIDE_IMPORT_PENDING",
+                    degraded=bool(publication.xmltv_by_scope),
+                )
+
+            publications = {}
+            for scope in publication.xmltv_by_scope:
+                row = read_publication(scope)
+                if row is not None:
+                    publications[scope] = row
+                    if scope.startswith("profile:"):
+                        details["publication_times"][scope.split(":", 1)[1]] = row["state"]["published_at"]
+
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details, publications)
+
+            cache = get_cache()
+            cache.invalidate_prefix("dummy_epg_xmltv")
+            for scope, document in publication.xmltv_by_scope.items():
+                key = "dummy_epg_xmltv_all" if scope == "all" else f"dummy_epg_xmltv_{scope.split(':', 1)[1]}"
+                cache.set(key, document)
+
+            generated_sources = {}
+            for source in source_rows:
+                if not isinstance(source, dict) or source.get("id") is None or not source.get("is_active", True):
+                    continue
+                scope = _generated_scope(source)
+                if scope in publications:
+                    generated_sources.setdefault(scope, []).append(source)
+
+            pending = {}
+            confirmed_source_ids = set()
+            for scope, row in sorted(publications.items()):
+                required, confirmed, scope_pending = _delivery_plan(
+                    row, generated_sources.get(scope, []),
+                )
+                delivery = row["state"]["delivery"]
+                if (
+                    delivery["required_dispatcharr_hashes"] != required
+                    or delivery["confirmed_dispatcharr_hashes"] != confirmed
+                ):
+                    next_revision = update_delivery(
+                        scope,
+                        expected_revision=row["revision"],
+                        required_dispatcharr_hashes=required,
+                        confirmed_dispatcharr_hashes=confirmed,
+                    )
+                    if next_revision is None:
+                        details["reason_codes"] = ["GUIDE_IMPORT_PENDING"]
+                        details["delivery_pending"] = True
+                        return _finish(
+                            started_at, details, success=False,
+                            message="Guide delivery state changed during reconciliation",
+                            error="GUIDE_IMPORT_PENDING",
+                            degraded=True,
+                        )
+                    row = read_publication(scope)
+                    publications[scope] = row
+                confirmed_source_ids.update(
+                    int(source_id) for source_id in confirmed
+                )
+                pending.update({
+                    source_id: (scope, document_hash)
+                    for source_id, document_hash in scope_pending.items()
+                })
+
+            details["pending_source_hashes"] = {
+                str(source_id): document_hash
+                for source_id, (_, document_hash) in sorted(pending.items())
+                if source_id not in confirmed_source_ids
+            }
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details, publications)
+
+            for channel_id, state in sorted(states.items()):
+                channel = channel_map[channel_id]
+                if state != "idle" or channel.get("hidden_from_output"):
+                    continue
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+                try:
+                    await client.update_channel(channel_id, {"hidden_from_output": True})
+                except Exception:
+                    logger.exception("[EVENT-WORKFLOW] Could not hide idle channel %s", channel_id)
+                    continue
+                channel["hidden_from_output"] = True
+                details["hidden_channel_ids"].append(channel_id)
+                try:
+                    stored_pending = _store_emby_pending(
+                        publications,
+                        pending=True,
+                        read_publication=read_publication,
+                        update_delivery=update_delivery,
+                    )
+                except Exception:
+                    logger.exception("[EVENT-WORKFLOW] Could not persist Emby delivery state")
+                    stored_pending = False
+                if not stored_pending:
+                    details["pending_emby"] = True
+                    details["delivery_pending"] = True
+                    details["reason_codes"] = ["GUIDE_EMBY_PENDING"]
+                    return _finish(
+                        started_at,
+                        details,
+                        success=False,
+                        degraded=True,
+                        message="Guide delivery state changed during reconciliation",
+                        error="GUIDE_EMBY_PENDING",
+                    )
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+
+            from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+
+            for source_id, (scope, document_hash) in sorted(pending.items()):
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+                source = next(
+                    item for item in generated_sources[scope] if item["id"] == source_id
+                )
+                completed = await wait_for_epg_source_refresh(
+                    client,
+                    source_id,
+                    source.get("name") or f"Source {source_id}",
+                    cancelled=lambda: task._cancel_requested,
+                )
+                if not completed:
+                    continue
+                current = read_publication(scope)
+                if current is None or current["state"]["xmltv_hash"] != document_hash:
+                    continue
+                confirmed = dict(current["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                confirmed[str(source_id)] = document_hash
+                next_revision = update_delivery(
+                    scope,
+                    expected_revision=current["revision"],
+                    confirmed_dispatcharr_hashes=confirmed,
+                )
+                if next_revision is not None:
+                    confirmed_source_ids.add(source_id)
+                    publications[scope] = read_publication(scope)
+                    details["pending_source_hashes"] = {
+                        str(key): value[1]
+                        for key, value in sorted(pending.items())
+                        if key not in confirmed_source_ids
+                    }
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+
+            if task._cancel_requested:
+                return _finish_cancelled(started_at, details, publications)
+
+            details["pending_source_hashes"] = {
+                str(source_id): document_hash
+                for source_id, (_, document_hash) in sorted(pending.items())
+                if source_id not in confirmed_source_ids
+            }
+
+            guide_rows = {}
+            source_by_id = {
+                source["id"]: source
+                for values in generated_sources.values() for source in values
+                if source["id"] in confirmed_source_ids
+            }
+            for source_id in sorted(source_by_id):
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+                try:
+                    resolved_rows = await client.get_epg_data(
+                        epg_source=source_id,
+                        max_results=EPG_LINK_MAX_RESULTS,
+                    )
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+                    for row in resolved_rows:
+                        if row.get("id") is not None and row.get("tvg_id"):
+                            guide_rows.setdefault(row["tvg_id"], []).append((source_id, row))
+                except Exception:
+                    logger.exception("[EVENT-WORKFLOW] Could not resolve guide rows for source %s", source_id)
+
+            linked_rows = {}
+            for profile_id, plan in sorted(plans.items()):
+                profile = plan["profile"]
+                available_source_ids = {
+                    source["id"]
+                    for scope in (f"profile:{profile_id}", "all")
+                    for source in generated_sources.get(scope, [])
+                    if source["id"] in confirmed_source_ids
+                }
+                for assignment in profile.get("channel_assignments") or []:
+                    channel_id = assignment.get("channel_id")
+                    if channel_id not in plan["states"] or plan["states"][channel_id] != "active":
+                        continue
+                    channel = channel_map[channel_id]
+                    xmltv_id = get_xmltv_id(assignment, channel, profile)
+                    candidates = [
+                        (source_id, row)
+                        for source_id, row in guide_rows.get(xmltv_id, [])
+                        if source_id in available_source_ids
+                    ]
+                    if len(candidates) != 1:
+                        continue
+                    source_id, guide_row = candidates[0]
+                    current_link = channel.get("epg_data_id") or channel.get("epg_data")
+                    current_source = None
+                    if isinstance(channel.get("epg_data"), dict):
+                        current_source = _epg_source_id(
+                            channel["epg_data"].get("epg_source")
+                            or channel["epg_data"].get("epg_source_id")
+                        )
+                    if current_link is not None and current_link != guide_row["id"]:
+                        if current_source not in source_by_id:
+                            continue
+                    if current_link != guide_row["id"]:
+                        if task._cancel_requested:
+                            return _finish_cancelled(started_at, details, publications)
+                        try:
+                            await client.update_channel(channel_id, {"epg_data_id": guide_row["id"]})
+                        except Exception:
+                            logger.exception("[EVENT-WORKFLOW] Could not link guide row for channel %s", channel_id)
+                            continue
+                        channel["epg_data_id"] = guide_row["id"]
+                        details["epg_linked_channel_ids"].append(channel_id)
+                        try:
+                            stored_pending = _store_emby_pending(
+                                publications,
+                                pending=True,
+                                read_publication=read_publication,
+                                update_delivery=update_delivery,
+                            )
+                        except Exception:
+                            logger.exception("[EVENT-WORKFLOW] Could not persist Emby delivery state")
+                            stored_pending = False
+                        if not stored_pending:
+                            details["pending_emby"] = True
+                            details["delivery_pending"] = True
+                            details["reason_codes"] = ["GUIDE_EMBY_PENDING"]
+                            return _finish(
+                                started_at,
+                                details,
+                                success=False,
+                                degraded=True,
+                                message="Guide delivery state changed during reconciliation",
+                                error="GUIDE_EMBY_PENDING",
+                            )
+                        if task._cancel_requested:
+                            return _finish_cancelled(started_at, details, publications)
+                    linked_rows[channel_id] = (source_id, guide_row["id"])
+
+            link_pending = False
+            for plan in plans.values():
+                for channel_id, state in plan["states"].items():
+                    if state != "active" or channel_id in linked_rows:
+                        continue
+                    channel = channel_map[channel_id]
+                    if channel.get("epg_data_id") is None and channel.get("epg_data") is None:
+                        link_pending = True
+
+            for profile_id, plan in sorted(plans.items()):
+                for channel_id, desired_ids in sorted(plan["desired"].items()):
+                    state = plan["states"][channel_id]
+                    channel = channel_map[channel_id]
+                    attached_ids = [
+                        stream_id for stream_id in (_stream_id(row) for row in channel.get("streams") or [])
+                        if stream_id is not None
+                    ]
+                    update = {}
+                    if desired_ids != attached_ids:
+                        update["streams"] = desired_ids
+                    if state == "active" and channel_id in linked_rows and channel.get("hidden_from_output"):
+                        update["hidden_from_output"] = False
+                    if not update:
+                        continue
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+                    try:
+                        await client.update_channel(channel_id, update)
+                    except Exception:
+                        logger.exception("[EVENT-WORKFLOW] Could not apply channel %s", channel_id)
+                        continue
+                    if "streams" in update:
+                        details["stream_updated_channel_ids"].append(channel_id)
+                    if update.get("hidden_from_output") is False:
+                        details["revealed_channel_ids"].append(channel_id)
+                    try:
+                        stored_pending = _store_emby_pending(
+                            publications,
+                            pending=True,
+                            read_publication=read_publication,
+                            update_delivery=update_delivery,
+                        )
+                    except Exception:
+                        logger.exception("[EVENT-WORKFLOW] Could not persist Emby delivery state")
+                        stored_pending = False
+                    if not stored_pending:
+                        details["pending_emby"] = True
+                        details["delivery_pending"] = True
+                        details["reason_codes"] = ["GUIDE_EMBY_PENDING"]
+                        return _finish(
+                            started_at,
+                            details,
+                            success=False,
+                            degraded=True,
+                            message="Guide delivery state changed during reconciliation",
+                            error="GUIDE_EMBY_PENDING",
+                        )
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+
+            changed = any(
+                details[name]
+                for name in (
+                    "stream_updated_channel_ids",
+                    "epg_linked_channel_ids",
+                    "revealed_channel_ids",
+                    "hidden_channel_ids",
+                )
+            )
+            pending_emby = any(
+                row["state"]["delivery"].get("pending_emby")
+                for row in publications.values()
+            )
+            if changed or pending_emby:
+                from emby_client import request_guide_refresh
+
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+                outcome = await request_guide_refresh()
+                details["emby_request_outcome"] = (
+                    "accepted" if outcome is True else "disabled" if outcome is None else "pending"
+                )
+                details["pending_emby"] = outcome is False
+                if not _store_emby_pending(
+                    publications,
+                    pending=outcome is False,
+                    read_publication=read_publication,
+                    update_delivery=update_delivery,
+                ):
+                    details["pending_emby"] = True
+                    details["delivery_pending"] = True
+                if task._cancel_requested:
+                    return _finish_cancelled(started_at, details, publications)
+
+            reasons = set(publication.reason_codes)
+            reasons.update(
+                reason
+                for values in details["source_reason_codes"].values()
+                for reason in values
+            )
+            if details["unavailable_profile_ids"]:
+                reasons.add("GUIDE_UNAVAILABLE")
+            if details["pending_source_hashes"]:
+                reasons.add("GUIDE_IMPORT_PENDING")
+            if link_pending:
+                reasons.add("GUIDE_IMPORT_PENDING")
+            if details["pending_emby"]:
+                reasons.add("GUIDE_EMBY_PENDING")
+            details["delivery_pending"] = bool(
+                details["pending_source_hashes"] or link_pending or details["pending_emby"]
+            )
+            details["reason_codes"] = sorted(reasons)
+
+            degraded = bool(
+                details["retained_profile_ids"]
+                or details["unavailable_profile_ids"]
+                or details["delivery_pending"]
+                or any("PENDING" in reason or "STALE" in reason for reason in reasons)
+            )
+            usable = bool(
+                details["published_profile_ids"] or details["retained_profile_ids"]
+            )
+            safe_work = bool(
+                details["hidden_channel_ids"]
+                or details["stream_updated_channel_ids"]
+                or details["epg_linked_channel_ids"]
+                or details["revealed_channel_ids"]
+            )
+            if degraded and (usable or safe_work):
+                error = (
+                    "GUIDE_EMBY_PENDING" if details["pending_emby"]
+                    else "GUIDE_IMPORT_PENDING" if "GUIDE_IMPORT_PENDING" in reasons
+                    else "GUIDE_OWNERSHIP_CONFLICT" if "GUIDE_OWNERSHIP_CONFLICT" in reasons
+                    else "GUIDE_SOURCES_PENDING" if "GUIDE_SOURCES_PENDING" in reasons
+                    else "GUIDE_UNAVAILABLE"
+                )
+                return _finish(
+                    started_at,
+                    details,
+                    success=False,
+                    degraded=True,
+                    message="Guide reconciliation completed with retained or pending work",
+                    error=error,
+                )
+            if not usable and not safe_work:
+                error = (
+                    "GUIDE_OWNERSHIP_CONFLICT" if "GUIDE_OWNERSHIP_CONFLICT" in reasons
+                    else "GUIDE_UNAVAILABLE"
+                )
+                return _finish(
+                    started_at, details, success=False,
+                    message="No complete guide publication was available",
+                    error=error,
+                )
+            return _finish(
+                started_at,
+                details,
+                success=True,
+                message="Guide profiles, channels, and delivery state are reconciled",
+            )
+
+    raise RuntimeError("Guide reconciliation did not settle profile revisions.")
 
 
 @register_task
 class EventVisibilityTask(TaskScheduler):
-    """Show current event slots and hide slots whose events ended."""
+    """Reconcile event profiles on the short recurring schedule."""
 
     task_id = "event_visibility"
     task_name = "Event Visibility Check"
-    task_description = "Keep PPV, ESPN+, and UFC visibility aligned with active guide events"
+    task_description = "Keep configured event channels aligned with the published guide"
 
     def __init__(self, schedule_config: Optional[ScheduleConfig] = None):
         if schedule_config is None:
@@ -228,592 +1301,4 @@ class EventVisibilityTask(TaskScheduler):
         super().__init__(schedule_config)
 
     async def execute(self) -> TaskResult:
-        started_at = datetime.utcnow()
-        now = datetime.now(timezone.utc)
-
-        session = get_session()
-        try:
-            profiles = [
-                profile.to_dict()
-                for profile in session.query(DummyEPGProfile).filter(
-                    DummyEPGProfile.enabled == True  # noqa: E712
-                ).all()
-            ]
-        finally:
-            session.close()
-
-        wanted = {
-            group_id
-            for profile in profiles
-            for group_id in profile.get("hide_empty_group_ids") or []
-        }
-        if not wanted:
-            return TaskResult(
-                success=True,
-                message="No event groups use automatic visibility",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-            )
-
-        from services.epg_programmes import _fetch_all_channels, can_cache, prepare_profiles
-
-        client = get_client()
-        channel_map = await _fetch_all_channels(client)
-        profiles, coverage = await prepare_profiles(profiles, channel_map, client)
-        coverage_rows = coverage.get("channels", ())
-        ready_profiles = []
-        for profile in profiles:
-            assignment_ids = {
-                item.get("channel_id")
-                for item in profile.get("channel_assignments") or []
-                if item.get("channel_id") is not None
-            }
-            if not assignment_ids:
-                profile_groups = set(profile.get("channel_group_ids") or [])
-                assignment_ids = {
-                    channel_id
-                    for channel_id, channel in channel_map.items()
-                    if channel.get("channel_group_id") in profile_groups
-                }
-            profile_coverage = {
-                "sources": (
-                    coverage.get("sources", ())
-                    if profile.get("epg_source_ids") else []
-                ),
-                "channels": [
-                    row for row in coverage_rows
-                    if row.get("channel_id") in assignment_ids
-                ],
-            }
-            if can_cache(profile_coverage):
-                ready_profiles.append(profile)
-
-        profiles = ready_profiles
-        wanted = {
-            group_id
-            for profile in profiles
-            for group_id in profile.get("hide_empty_group_ids") or []
-        }
-        if not wanted:
-            return TaskResult(
-                success=True,
-                message="Published event guide is not ready",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-            )
-        coverage_by_channel = {
-            row["channel_id"]: row for row in coverage.get("channels", ())
-        }
-        current_channel_ids = {
-            channel_id for channel_id, row in coverage_by_channel.items()
-            if row.get("current") is not None
-        }
-
-        match_groups_by_target = {}
-        patterns_by_target = {}
-        timezone_by_target = {}
-        duration_by_target = {}
-        from services.event_sync_matcher import DEFAULT_EVENT_PATTERNS
-
-        for profile in sorted(profiles, key=lambda row: row.get("id") or 0):
-            match_patterns = list(DEFAULT_EVENT_PATTERNS)
-            pattern_keys = {
-                (
-                    pattern.get("title_pattern"),
-                    pattern.get("time_pattern"),
-                    pattern.get("date_pattern"),
-                )
-                for pattern in match_patterns
-            }
-            for pattern in profile.get("pattern_variants") or []:
-                if not isinstance(pattern, dict) or not pattern.get("title_pattern"):
-                    continue
-                key = (
-                    pattern.get("title_pattern"),
-                    pattern.get("time_pattern"),
-                    pattern.get("date_pattern"),
-                )
-                if key in pattern_keys:
-                    continue
-                match_patterns.append(pattern)
-                pattern_keys.add(key)
-            match_group_ids = profile.get("stream_match_group_ids") or []
-            for group_id in profile.get("hide_empty_group_ids") or []:
-                if match_group_ids:
-                    match_groups_by_target.setdefault(group_id, match_group_ids)
-                    patterns_by_target.setdefault(group_id, match_patterns)
-                    timezone_by_target.setdefault(
-                        group_id, profile.get("event_timezone") or "US/Eastern",
-                    )
-                    duration_by_target.setdefault(
-                        group_id, profile.get("program_duration", 180),
-                    )
-
-        event_channels = [
-            (channel_id, channel)
-            for channel_id, channel in channel_map.items()
-            if channel.get("channel_group_id") in wanted
-        ]
-        failed = 0
-        linked_channel_ids = []
-        linked_sources = {}
-        try:
-            linked_channel_ids, linked_sources = await _link_dummy_epg(
-                client, event_channels,
-            )
-        except Exception as exc:
-            failed += 1
-            logger.warning(
-                "[%s] Could not link generated event guide rows: %s",
-                self.task_id,
-                exc,
-            )
-        ended = [
-            (channel_id, channel)
-            for channel_id, channel in event_channels
-            if channel_id not in current_channel_ids
-        ]
-        candidates = [
-            (channel_id, channel)
-            for channel_id, channel in event_channels
-            if channel_id in current_channel_ids
-        ]
-
-        candidates.sort(key=lambda row: (row[1].get("channel_number") or 999999, row[0]))
-        selected = candidates
-        if not selected and not ended and not linked_channel_ids:
-            return TaskResult(
-                success=True,
-                message="No event channel visibility changes are needed",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-            )
-
-        all_match_group_ids = list(dict.fromkeys(
-            group_id
-            for group_ids in match_groups_by_target.values()
-            for group_id in group_ids
-        ))
-        match_streams = []
-        groups_by_stream = {}
-        match_streams_by_id = {}
-        match_scan_ready = True
-        if all_match_group_ids:
-            try:
-                match_streams, groups_by_stream = await _fetch_match_streams(
-                    client, all_match_group_ids,
-                )
-                match_streams_by_id = {
-                    stream.stream_id: stream
-                    for stream in match_streams
-                    if stream.stream_id is not None
-                }
-            except Exception as exc:
-                match_scan_ready = False
-                logger.warning(
-                    "[%s] Could not load guide-match stream groups: %s",
-                    self.task_id,
-                    exc,
-                )
-
-        bootstrap_matches_by_channel = {}
-        if match_scan_ready and match_streams:
-            from services.event_sync_matcher import (
-                SYNTHESIZED_DATE_PATTERN_NAMES,
-                parse_event_name,
-            )
-
-            for channel_id, channel in ended:
-                target_group_id = channel.get("channel_group_id")
-                group_ids = match_groups_by_target.get(target_group_id, [])
-                if not group_ids:
-                    continue
-                slot = _slot_key(channel.get("name"))
-                if slot is None or slot[0] != "ufc":
-                    continue
-                match_patterns = patterns_by_target.get(target_group_id)
-                event_timezone = timezone_by_target.get(
-                    target_group_id, "US/Eastern",
-                )
-                duration = duration_by_target.get(target_group_id, 180)
-                allowed = set(group_ids)
-                for stream in match_streams:
-                    if stream.group_id not in allowed:
-                        continue
-                    if _ufc_slot(stream.name, titled=True) != slot[1]:
-                        continue
-                    parsed = parse_event_name(
-                        stream.name,
-                        match_patterns,
-                        event_timezone=event_timezone,
-                        now=now,
-                        assume_current_date=True,
-                    )
-                    if (
-                        parsed.start is not None
-                        and parsed.start > now
-                        and parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES
-                    ):
-                        prior = parse_event_name(
-                            stream.name,
-                            match_patterns,
-                            event_timezone=event_timezone,
-                            now=now - timedelta(minutes=duration),
-                            assume_current_date=True,
-                        )
-                        if prior.start is not None:
-                            parsed = prior
-                    if (
-                        parsed.start is not None
-                        and parsed.start <= now
-                        and now < parsed.start + timedelta(minutes=duration)
-                    ):
-                        bootstrap_matches_by_channel.setdefault(
-                            channel_id, [],
-                        ).append(stream)
-
-        if bootstrap_matches_by_channel:
-            bootstrap_ids = set(bootstrap_matches_by_channel)
-            selected.extend(
-                row for row in ended if row[0] in bootstrap_ids
-            )
-            ended = [row for row in ended if row[0] not in bootstrap_ids]
-            selected.sort(
-                key=lambda row: (
-                    row[1].get("channel_number") or 999999,
-                    row[0],
-                )
-            )
-
-        hidden_now = []
-        stream_updates = []
-        bootstrap_updates = []
-        bootstrap_source_ids = set()
-        bootstrap_refresh_ready = False
-        for channel_id, channel in ended:
-            update = {}
-            if not channel.get("hidden_from_output"):
-                update["hidden_from_output"] = True
-            group_ids = match_groups_by_target.get(channel.get("channel_group_id"), [])
-            if match_scan_ready and group_ids:
-                fallback_ids = [
-                    _stream_id(stream)
-                    for stream in channel.get("streams") or []
-                    if (
-                        (_stream_group_id(stream) or groups_by_stream.get(_stream_id(stream)))
-                        not in set(group_ids)
-                        or _slot_key(
-                            stream.get("name") if isinstance(stream, dict)
-                            else getattr(match_streams_by_id.get(_stream_id(stream)), "name", None),
-                            stream=True,
-                        ) is not None
-                    )
-                ]
-                fallback_ids = [stream_id for stream_id in fallback_ids if stream_id is not None]
-                if fallback_ids != [
-                    _stream_id(stream) for stream in channel.get("streams") or []
-                ]:
-                    update["streams"] = fallback_ids
-            if not update:
-                continue
-            try:
-                await client.update_channel(channel_id, update)
-                if "hidden_from_output" in update:
-                    hidden_now.append(channel_id)
-                if "streams" in update:
-                    stream_updates.append(channel_id)
-            except Exception as exc:
-                failed += 1
-                logger.warning(
-                    "[%s] Could not hide channel %s: %s",
-                    self.task_id,
-                    channel_id,
-                    exc,
-                )
-
-        slot_matches_by_channel = {}
-        streams_by_slot = {}
-        for stream in match_streams:
-            slot = _slot_key(stream.name, stream=True)
-            if slot is not None:
-                streams_by_slot.setdefault(slot, []).append(stream)
-        for channel_id, channel in selected:
-            slot = _slot_key(channel.get("name"))
-            if slot is not None and slot in streams_by_slot:
-                allowed = set(match_groups_by_target.get(
-                    channel.get("channel_group_id"), [],
-                ))
-                matches = [
-                    stream for stream in streams_by_slot[slot]
-                    if stream.group_id in allowed
-                ]
-                if matches:
-                    slot_matches_by_channel[channel_id] = matches
-
-        matches_by_channel = {
-            channel_id: list(streams)
-            for channel_id, streams in bootstrap_matches_by_channel.items()
-        }
-        if match_scan_ready:
-            from services.event_sync_resolver import (
-                DISPOSITION_WOULD_ATTACH,
-                resolve_event_sync,
-            )
-            from concurrency import run_cpu_bound
-
-            for target_group_id, group_ids in match_groups_by_target.items():
-                guide_name_to_ids = {}
-                for channel_id, channel in selected:
-                    if channel.get("channel_group_id") != target_group_id:
-                        continue
-                    guide_name = _guide_name(
-                        (coverage_by_channel.get(channel_id) or {}).get("current"),
-                        timezone_by_target.get(target_group_id, "US/Eastern"),
-                    )
-                    if guide_name:
-                        guide_name_to_ids.setdefault(guide_name, []).append(
-                            channel_id,
-                        )
-                allowed = set(group_ids)
-                titled_match_streams = [
-                    stream for stream in match_streams
-                    if stream.group_id in allowed
-                    and _slot_key(stream.name, stream=True) is None
-                ]
-                if not guide_name_to_ids or not titled_match_streams:
-                    continue
-                match_patterns = patterns_by_target.get(target_group_id)
-                try:
-                    resolution = await run_cpu_bound(
-                        resolve_event_sync,
-                        {
-                            "master_group_id": 0,
-                            "secondary_group_ids": group_ids,
-                            "time_window_minutes": 30,
-                            "enforce_time_window": True,
-                            "attach_threshold": 0.8,
-                            "assume_current_date": True,
-                            "patterns": match_patterns,
-                        },
-                        sorted(guide_name_to_ids),
-                        titled_match_streams,
-                        now=now,
-                    )
-                except Exception as exc:
-                    match_scan_ready = False
-                    logger.warning(
-                        "[%s] Could not match streams to the current guide: %s",
-                        self.task_id,
-                        exc,
-                    )
-                    break
-                for resolved in resolution.resolved:
-                    if resolved.disposition != DISPOSITION_WOULD_ATTACH:
-                        continue
-                    for channel_id in guide_name_to_ids.get(
-                        resolved.best.master_name, [],
-                    ):
-                        channel = channel_map.get(channel_id)
-                        if channel is None:
-                            continue
-                        allowed = match_groups_by_target.get(
-                            channel.get("channel_group_id"), [],
-                        )
-                        if resolved.stream.group_id not in allowed:
-                            continue
-                        matches_by_channel.setdefault(channel_id, []).append(
-                            resolved.stream
-                        )
-
-        if selected:
-            self._set_progress(
-                total=len(selected) + len(ended),
-                current=len(ended),
-                success_count=len(set(hidden_now) | set(linked_channel_ids)),
-                failed_count=failed,
-                status="matching",
-                current_item="Matching scheduled event channels",
-            )
-        if self._cancel_requested:
-            if hidden_now or stream_updates or linked_channel_ids:
-                from emby_client import request_guide_refresh
-
-                await request_guide_refresh()
-            return TaskResult(
-                success=False,
-                message="Event visibility check cancelled",
-                error="CANCELLED",
-                started_at=started_at,
-                completed_at=datetime.utcnow(),
-                total_items=len(selected) + len(ended),
-            )
-
-        shown = []
-        hidden_failed = []
-        for index, (channel_id, channel) in enumerate(selected, start=1):
-            attached_ids = [
-                _stream_id(stream) for stream in channel.get("streams") or []
-            ]
-            target_group_id = channel.get("channel_group_id")
-            group_ids = (
-                match_groups_by_target.get(target_group_id, [])
-                if match_scan_ready else []
-            )
-            group_set = set(group_ids)
-            rank = {group_id: position for position, group_id in enumerate(group_ids)}
-            fallback_ids = [
-                stream_id
-                for stream, stream_id in zip(channel.get("streams") or [], attached_ids)
-                if stream_id is not None
-                and (_stream_group_id(stream) or groups_by_stream.get(stream_id))
-                not in group_set
-            ]
-            matched = sorted(
-                matches_by_channel.get(channel_id, []),
-                key=lambda row: (rank.get(row.group_id, len(rank)), row.stream_id or 0),
-            )
-            primary_ids = [
-                row.stream_id for row in matched
-                if row.stream_id is not None
-            ]
-            slot_ids = [
-                row.stream_id
-                for row in sorted(
-                    slot_matches_by_channel.get(channel_id, []),
-                    key=lambda row: row.stream_id or 0,
-                )
-                if row.stream_id is not None
-            ]
-            desired_ids = primary_ids + [
-                stream_id for stream_id in fallback_ids
-                if stream_id not in primary_ids
-            ] + [
-                stream_id for stream_id in slot_ids
-                if stream_id not in primary_ids and stream_id not in fallback_ids
-            ]
-            update = {}
-            if match_scan_ready and group_ids and desired_ids != attached_ids:
-                update["streams"] = desired_ids
-
-            hide = (
-                channel_id in bootstrap_matches_by_channel
-                and not match_scan_ready
-            )
-            if bool(channel.get("hidden_from_output")) is not hide:
-                update["hidden_from_output"] = hide
-
-            if update:
-                try:
-                    await client.update_channel(channel_id, update)
-                    if "streams" in update:
-                        stream_updates.append(channel_id)
-                    if "hidden_from_output" in update:
-                        (hidden_failed if hide else shown).append(channel_id)
-                    if channel_id in bootstrap_matches_by_channel:
-                        bootstrap_updates.append(channel_id)
-                except Exception as exc:
-                    failed += 1
-                    logger.warning(
-                        "[%s] Could not update event channel %s: %s",
-                        self.task_id, channel_id, exc,
-                    )
-            elif channel_id in bootstrap_matches_by_channel:
-                bootstrap_updates.append(channel_id)
-            self._set_progress(
-                total=len(selected) + len(ended),
-                current=index + len(ended),
-                success_count=len(
-                    set(shown)
-                    | set(hidden_now)
-                    | set(hidden_failed)
-                    | set(stream_updates)
-                    | set(linked_channel_ids)
-                ),
-                failed_count=failed,
-                status="matching",
-            )
-
-        if bootstrap_updates:
-            from cache import get_cache
-
-            get_cache().invalidate_prefix("dummy_epg_xmltv")
-            try:
-                sources = await client.get_epg_sources()
-                if isinstance(sources, dict):
-                    sources = sources.get("results", sources.get("sources", []))
-                for source in sources or []:
-                    if (
-                        isinstance(source, dict)
-                        and source.get("id") is not None
-                        and source.get("is_active", True)
-                        and "/api/dummy-epg/xmltv" in (source.get("url") or "")
-                    ):
-                        bootstrap_source_ids.add(source["id"])
-                        linked_sources.setdefault(
-                            source["id"],
-                            source.get("name") or f"Source {source['id']}",
-                        )
-            except Exception as exc:
-                failed += 1
-                logger.warning(
-                    "[%s] Could not load generated guide sources: %s",
-                    self.task_id,
-                    exc,
-                )
-            bootstrap_refresh_ready = bool(bootstrap_source_ids)
-
-        if linked_sources:
-            from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
-
-            for source_id, source_name in sorted(linked_sources.items()):
-                completed = await wait_for_epg_source_refresh(
-                    client,
-                    source_id,
-                    source_name,
-                    cancelled=lambda: self._cancel_requested,
-                )
-                if not completed:
-                    if source_id in bootstrap_source_ids:
-                        bootstrap_refresh_ready = False
-                    failed += 1
-                    logger.warning(
-                        "[%s] Linked guide source %s did not refresh successfully",
-                        self.task_id,
-                        source_id,
-                    )
-
-        changed_channel_ids = (
-            set(shown)
-            | set(hidden_now)
-            | set(hidden_failed)
-            | set(stream_updates)
-            | set(linked_channel_ids)
-        )
-        ordinary_changes = changed_channel_ids - set(bootstrap_updates)
-        if ordinary_changes or (bootstrap_updates and bootstrap_refresh_ready):
-            from emby_client import request_guide_refresh
-
-            await request_guide_refresh()
-
-        total_items = len(selected) + len(ended)
-        return TaskResult(
-            success=True,
-            message=(
-                f"Checked {len(selected)} active event channel(s), "
-                f"revealed {len(shown)}, hid {len(hidden_now) + len(hidden_failed)}, "
-                f"updated streams on {len(stream_updates)} channel(s), "
-                f"linked guide rows on {len(linked_channel_ids)} channel(s)"
-            ),
-            started_at=started_at,
-            completed_at=datetime.utcnow(),
-            total_items=total_items,
-            success_count=len(changed_channel_ids),
-            failed_count=failed,
-            skipped_count=max(0, total_items - len(changed_channel_ids) - failed),
-            details={
-                "revealed_channel_ids": shown,
-                "hidden_channel_ids": hidden_now + hidden_failed,
-                "stream_updated_channel_ids": stream_updates,
-                "epg_linked_channel_ids": linked_channel_ids,
-            },
-        )
+        return await reconcile_profiles(self, wait_for_sources=False)

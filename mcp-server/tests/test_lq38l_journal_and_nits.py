@@ -826,6 +826,15 @@ class TestDummyEpgProfile:
             "pattern_builder_examples": [], "channel_group_ids": [65],
             "hide_empty_group_ids": [65],
             "stream_match_group_ids": [754, 1558],
+            "event_sync_config": {
+                "promote_lead_hours": 0,
+                "automatic_visibility": False,
+                "secondary": [
+                    {"group_id": 754, "m3u_account_id": None},
+                    {"group_id": 1558, "m3u_account_id": 3},
+                ],
+                "slot_patterns": [{"pattern": "^(?P<slot>\\\\d+)$"}],
+            },
             "epg_source_ids": [49, 50],
             "channel_mappings": [{"channel_id": 1, "source_id": 42, "tvg_id": "11207"}],
             "substitution_pairs": [{"find": "a\\\\b", "replace": "é", "is_regex": False}],

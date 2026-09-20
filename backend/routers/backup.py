@@ -6028,6 +6028,54 @@ class YamlRestoreRequest(BaseModel):
     sections: list[str]
 
 
+def _validate_restore_ownership(archive: dict, selected_sections: list[str]) -> None:
+    """Reject lifecycle conflicts in the final selected restore candidate."""
+    from services.event_slots import validate_ownership
+
+    session = get_session()
+    try:
+        prior = validate_ownership(
+            session.query(DummyEPGProfile).all(),
+            session.query(ChannelPipelineRule).all(),
+        )
+        database_sections = archive.get("database", {})
+        profiles = (
+            database_sections.get("dummy_epg_profiles", [])
+            if "dummy_epg_profiles" in selected_sections
+            else session.query(DummyEPGProfile).all()
+        )
+        rules = (
+            database_sections.get("auto_creation_rules", [])
+            if "auto_creation_rules" in selected_sections
+            else session.query(ChannelPipelineRule).all()
+        )
+        prior_keys = {
+            (
+                conflict["group_id"],
+                tuple(sorted(
+                    (owner["kind"], owner.get("name") or "")
+                    for owner in conflict["owners"]
+                )),
+            )
+            for conflict in prior
+        }
+        conflicts = validate_ownership(profiles, rules)
+        introduced = [
+            conflict for conflict in conflicts
+            if (
+                conflict["group_id"],
+                tuple(sorted(
+                    (owner["kind"], owner.get("name") or "")
+                    for owner in conflict["owners"]
+                )),
+            ) not in prior_keys
+        ]
+        if introduced:
+            raise HTTPException(status_code=422, detail=introduced)
+    finally:
+        session.close()
+
+
 @router.post("/restore-yaml")
 async def restore_from_yaml(
     file: UploadFile = File(...),
@@ -6079,6 +6127,10 @@ async def restore_from_yaml(
 
     content = await file.read()
     data = _parse_yaml_export(content)
+    if {
+        "auto_creation_rules", "dummy_epg_profiles",
+    }.intersection(selected_sections):
+        _validate_restore_ownership(data, selected_sections)
 
     sections_restored = []
     sections_failed = []
@@ -6625,7 +6677,10 @@ def _restore_dummy_epg_profiles(items: list) -> dict:
                 channel_group_ids=json.dumps(item["channel_group_ids"]) if item.get("channel_group_ids") else None,
                 hide_empty_group_ids=json.dumps(item["hide_empty_group_ids"]) if item.get("hide_empty_group_ids") else None,
             )
-            profile.set_stream_match_group_ids(item.get("stream_match_group_ids", []))
+            if "event_sync_config" in item:
+                profile.set_event_sync_config(item["event_sync_config"])
+            else:
+                profile.set_stream_match_group_ids(item.get("stream_match_group_ids", []))
             profile.set_epg_source_ids(item.get("epg_source_ids", []))
             profile.set_channel_mappings(item.get("channel_mappings", []))
             session.add(profile)

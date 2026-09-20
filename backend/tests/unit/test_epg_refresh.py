@@ -1,10 +1,12 @@
-"""Refresh completion follows observed source state, including cancellation."""
-
+"""Refresh polling and task entry points share confirmed workflow outcomes."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+from services.epg_publication import PublicationResult
+from task_scheduler import TaskResult
+from tasks.dummy_epg_refresh import DummyEPGRefreshTask, wait_for_epg_source_refresh
+from tasks.event_visibility import EventVisibilityTask
 
 
 @pytest.mark.asyncio
@@ -76,125 +78,74 @@ async def test_existing_processing_state_can_complete_without_timestamps():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dummy", [False, True])
-@pytest.mark.parametrize("outcome", ["timeout", "cancelled", "success"])
-async def test_tasks_count_only_completed_sources(dummy, outcome):
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-    from tasks.epg_refresh import EPGRefreshTask
+@pytest.mark.parametrize(
+    "task, wait_for_sources",
+    [(EventVisibilityTask(), False), (DummyEPGRefreshTask(), True)],
+)
+async def test_both_tasks_use_the_shared_reconciliation(task, wait_for_sources):
+    expected = TaskResult(success=True, message="done")
+    shared = AsyncMock(return_value=expected)
 
-    task = DummyEPGRefreshTask() if dummy else EPGRefreshTask()
-    module = "tasks.dummy_epg_refresh" if dummy else "tasks.epg_refresh"
-    client = MagicMock()
-    client.get_epg_sources = AsyncMock(return_value=[{
-        "id": 1, "name": "Guide", "is_active": True,
-        "url": "http://ecm/api/dummy-epg/xmltv",
-    }])
-
-    async def finish(*args, **kwargs):
-        task._cancel_requested = outcome == "cancelled"
-        return outcome == "success"
-
-    refresh_emby = AsyncMock()
-    with patch(module + ".get_client", return_value=client), \
-         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=finish), \
-         patch.object(DummyEPGRefreshTask, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        result = await task.execute()
-    assert result.success_count == (1 if outcome == "success" else 0)
-    assert result.success is (outcome == "success")
-    assert result.failed_count == (1 if outcome == "timeout" else 0)
-    assert refresh_emby.await_count == (1 if dummy and outcome == "success" else 0)
-
-
-@pytest.mark.asyncio
-async def test_dummy_refresh_retains_guide_while_sources_are_loading():
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-
-    task = DummyEPGRefreshTask()
-    client = MagicMock()
-    client.get_epg_sources = AsyncMock()
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
-         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=None)), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
+    with patch("tasks.event_visibility.reconcile_profiles", new=shared):
         result = await task.execute()
 
-    assert result.success is False
-    assert result.error == "GUIDE_SOURCES_PENDING"
-    client.get_epg_sources.assert_not_awaited()
-    refresh_emby.assert_not_awaited()
+    assert result is expected
+    shared.assert_awaited_once_with(task, wait_for_sources=wait_for_sources)
 
 
 @pytest.mark.asyncio
-async def test_dummy_refresh_notifies_emby_after_visibility_changes():
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-
-    task = DummyEPGRefreshTask()
-    task._visibility_updates = 2
-    client = MagicMock()
-    client.get_epg_sources = AsyncMock(return_value=[])
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
-         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        # The regeneration stand-in represents two completed visibility writes.
-        task._regenerate_xmltv.side_effect = lambda: setattr(task, "_visibility_updates", 2) or 1
-        await task.execute()
-
-    refresh_emby.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_dummy_refresh_skips_emby_when_visibility_is_unchanged():
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-
-    task = DummyEPGRefreshTask()
-    client = MagicMock()
-    client.get_epg_sources = AsyncMock(return_value=[])
-    refresh_emby = AsyncMock()
-
-    with patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
-         patch.object(task, "_regenerate_xmltv", new=AsyncMock(return_value=1)), \
-         patch("emby_client.request_guide_refresh", new=refresh_emby):
-        await task.execute()
-
-    refresh_emby.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", [None, "ready", "pending", "error", "stale", "artwork"])
-async def test_scheduled_generation_uses_shared_preparation_once(status):
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
-
+async def test_publication_only_entry_returns_explicit_result_and_updates_cache_after_commit():
     profile = MagicMock()
-    profile.to_dict.return_value = {"id": 7, "channel_group_ids": [4]}
-    db = MagicMock()
-    db.query.return_value.filter.return_value.all.return_value = [profile]
-    channels = {9: {"id": 9, "name": "Station", "channel_group": 4, "streams": []}}
-    prepared = [{"id": 7, "channel_assignments": [{"channel_id": 9}]}]
-    coverage = {"sources": [] if status is None else [{"source_id": 1, "status": "ready" if status == "artwork" else status}],
-                "artwork_pending": status == "artwork"}
+    profile.to_dict.return_value = {"id": 7, "enabled": True}
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [profile]
     client = MagicMock()
-    with patch("database.get_session", return_value=db), \
+    channels = {9: {"id": 9, "name": "Station", "channel_group_id": 4}}
+    prepared = [{"id": 7, "enabled": True, "channel_assignments": [{"channel_id": 9}]}]
+    coverage = {"profiles": {"7": {"can_publish": True, "reason_codes": []}}}
+    publication = PublicationResult(
+        published_profile_ids=(7,),
+        xmltv_by_scope={"all": "<tv/>", "profile:7": "<tv/>"},
+    )
+    cache = MagicMock()
+
+    with patch("database.get_session", return_value=session), \
          patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
-         patch("cache.get_cache") as cache, \
-         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)) as fetch, \
-         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(prepared, coverage))) as prepare, \
-         patch("concurrency.run_cpu_bound", new=AsyncMock(return_value="<tv/>")) as render:
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(prepared, coverage))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=publication)) as publish, \
+         patch("cache.get_cache", return_value=cache):
         result = await DummyEPGRefreshTask()._regenerate_xmltv()
-    fetch.assert_awaited_once_with(client)
-    prepare.assert_awaited_once_with([profile.to_dict.return_value], channels, client, wait_for_sources=True)
-    if status in {None, "ready", "artwork"}:
-        assert result == 1
-        assert render.await_count == 2
-        assert render.await_args_list[0].args[1:] == (prepared, channels)
-        cache.return_value.set.assert_any_call("dummy_epg_xmltv_all", "<tv/>")
-        cache.return_value.set.assert_any_call("dummy_epg_xmltv_7", "<tv/>")
-        cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
-    else:
-        assert result is None
-        render.assert_not_awaited()
-        cache.return_value.set.assert_not_called()
-        cache.return_value.invalidate_prefix.assert_not_called()
+
+    assert result is publication
+    publish.assert_awaited_once()
+    cache.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
+    cache.set.assert_any_call("dummy_epg_xmltv_all", "<tv/>")
+    cache.set.assert_any_call("dummy_epg_xmltv_7", "<tv/>")
+
+
+@pytest.mark.asyncio
+async def test_superseded_publication_does_not_update_cache():
+    profile = MagicMock()
+    profile.to_dict.return_value = {"id": 7, "enabled": True}
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [profile]
+    publication = PublicationResult(superseded=True, reason_codes=("GUIDE_PUBLICATION_SUPERSEDED",))
+    cache = MagicMock()
+
+    with patch("database.get_session", return_value=session), \
+         patch("tasks.dummy_epg_refresh.get_client", return_value=MagicMock()), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile.to_dict.return_value], {
+             "profiles": {"7": {"can_publish": True, "reason_codes": []}},
+         }))), patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=publication)), \
+         patch("cache.get_cache", return_value=cache):
+        result = await DummyEPGRefreshTask()._regenerate_xmltv()
+
+    assert result.superseded is True
+    cache.invalidate_prefix.assert_not_called()
+    cache.set.assert_not_called()
+
+
+def test_dummy_task_has_no_duplicate_visibility_writer():
+    assert not hasattr(DummyEPGRefreshTask, "_apply_empty_channel_visibility")

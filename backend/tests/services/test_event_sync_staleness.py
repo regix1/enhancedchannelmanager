@@ -77,6 +77,11 @@ class TestLocalMidnightUtc:
     def test_result_is_naive(self):
         assert local_midnight_utc(LOCAL_NOON).tzinfo is None
 
+    def test_profile_timezone_sets_its_own_midnight_boundary(self):
+        now = datetime(2026, 7, 16, 3, 0, tzinfo=pytz.utc)
+
+        assert local_midnight_utc(now, "Asia/Tokyo") == datetime(2026, 7, 15, 15, 0)
+
 
 class TestPreviousDayNames:
     def test_latest_qualifying_snapshot_wins(self, test_session):

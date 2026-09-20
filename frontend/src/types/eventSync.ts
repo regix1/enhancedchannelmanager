@@ -36,6 +36,27 @@ export interface EventSyncGroupScope {
   m3u_account_id: number | null;
 }
 
+/** One stable event-slot family owned by a Dummy EPG profile. */
+export interface EventSlotPattern {
+  name: string;
+  channel_pattern: string;
+  fallback_pattern: string | null;
+  event_patterns: string[];
+  bootstrap: boolean;
+}
+
+/** Profile-owned matching settings returned in canonical backend form. */
+export interface ProfileEventSyncConfig {
+  secondary: EventSyncGroupScope[];
+  time_window_minutes: number;
+  enforce_time_window: boolean;
+  attach_threshold: number;
+  assume_current_date: boolean;
+  demote_stale_dateless: boolean;
+  use_default_patterns: boolean;
+  slot_patterns: EventSlotPattern[];
+}
+
 export interface EventSyncConfig {
   /**
    * bead 3p2af / 38dzi: canonical provider-scoped shape. The editor (P4)

@@ -548,6 +548,7 @@ def generate_channel_xml(
     tvg_id: str,
     profile: dict,
     streams: list[dict] = None,
+    event_intervals: list[dict] | None = None,
 ) -> tuple[ET.Element, list[ET.Element]]:
     """
     Generate XMLTV <channel> and <programme> elements for one channel.
@@ -559,6 +560,7 @@ def generate_channel_xml(
         tvg_id: The tvg-id to use for this channel.
         profile: Profile dict (from DummyEPGProfile.to_dict()).
         streams: Optional list of stream dicts with "name" keys.
+        event_intervals: Prepared absolute event intervals for a managed slot.
 
     Returns:
         Tuple of (channel_element, list_of_programme_elements).
@@ -630,6 +632,68 @@ def generate_channel_xml(
 
     def _render_url(template: str, groups: dict) -> str:
         return render_url_template(template, groups)
+
+    managed = event_intervals
+    if managed is None and not profile.get("epg_source_ids") and "event_intervals" in profile:
+        prepared = profile["event_intervals"]
+        if isinstance(prepared, dict):
+            managed = prepared.get(channel_id, prepared.get(str(channel_id), []))
+        elif isinstance(prepared, list):
+            managed = [
+                interval for interval in prepared
+                if isinstance(interval, dict) and interval.get("channel_id") == channel_id
+            ]
+        else:
+            raise ValueError("Prepared event intervals must be a list or object.")
+    if managed is not None and not profile.get("epg_source_ids"):
+        if not isinstance(managed, list):
+            raise ValueError("Prepared event intervals for a channel must be a list.")
+        for interval in managed:
+            if not isinstance(interval, dict):
+                raise ValueError("Prepared event interval must be an object.")
+            try:
+                start_dt = datetime.fromisoformat(str(interval["start"]).replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(str(interval["stop"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError) as exc:
+                raise ValueError("Prepared event interval requires valid start and stop values.") from exc
+            if start_dt.tzinfo is None or end_dt.tzinfo is None or end_dt <= start_dt:
+                raise ValueError("Prepared event interval requires ordered offset-aware bounds.")
+            display_start = start_dt
+            display_end = end_dt
+            if output_timezone:
+                display_tz = pytz.timezone(output_timezone)
+                display_start = start_dt.astimezone(display_tz)
+                display_end = end_dt.astimezone(display_tz)
+            interval_groups = {
+                **base_groups,
+                **(groups or {}),
+                "title": interval.get("title", (groups or {}).get("title", "")),
+                "starttime": display_start.strftime("%-I %p"),
+                "starttime12": display_start.strftime("%-I:%M %p"),
+                "starttime24": display_start.strftime("%H:%M"),
+                "endtime": display_end.strftime("%-I %p"),
+                "endtime24": display_end.strftime("%H:%M"),
+                "date": display_start.strftime("%B %-d"),
+                "month": MONTH_FULL_NAMES[display_start.month],
+                "day": str(display_start.day),
+                "year": str(display_start.year),
+            }
+            title = _render(get_template("title_template"), interval_groups)
+            if not title:
+                title = str(interval_groups["title"])
+            description = _render(get_template("description_template"), interval_groups)
+            poster_url = _render_url(get_template("program_poster_url_template"), interval_groups)
+            programmes.append(_make_programme(
+                start_dt, end_dt, channel_id_str, title, description,
+                categories, poster_url, include_date_tag, include_live_tag,
+                include_new_tag,
+            ))
+        logo_groups = {**base_groups, **(groups or {})}
+        logo_url = _render_url(get_template("channel_logo_url_template"), logo_groups)
+        if logo_url:
+            ET.SubElement(channel_el, "icon", src=logo_url)
+        programmes.sort(key=lambda programme: programme.get("start", ""))
+        return channel_el, programmes
 
     if profile.get("epg_source_ids"):
         from services.epg_programmes import programme_times

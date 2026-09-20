@@ -636,6 +636,48 @@ def test_generate_xmltv_programme_elements():
     assert programmes[0].find("title").text is not None
 
 
+def test_prepared_event_intervals_keep_absolute_bounds_and_rendered_timezone():
+    profiles = [{
+        "id": 1,
+        "enabled": True,
+        "title_pattern": r"(?P<title>.+)",
+        "title_template": "{title} at {starttime24}",
+        "event_timezone": "America/Los_Angeles",
+        "output_timezone": "Asia/Tokyo",
+        "program_duration": 0,
+        "tvg_id_template": "arena-{channel_id}",
+        "channel_assignments": [{"channel_id": 1}],
+        "event_intervals": {1: [{
+            "start": "2026-09-20T23:30:00+00:00",
+            "stop": "2026-09-21T01:15:00+00:00",
+            "title": "Falcons vs Wolves",
+        }]},
+    }]
+    channel_data = {1: {"name": "Arena Slot 1", "channel_number": 100, "streams": []}}
+
+    root = ET.fromstring(generate_xmltv(profiles, channel_data))
+    programme = root.find("programme")
+
+    assert programme.get("start") == "20260920233000 +0000"
+    assert programme.get("stop") == "20260921011500 +0000"
+    assert programme.find("title").text == "Falcons vs Wolves at 08:30"
+
+
+def test_managed_slot_without_a_stored_interval_emits_no_guessed_event():
+    profile = {
+        "enabled": True,
+        "title_pattern": r"(?P<title>.+)",
+        "title_template": "{title}",
+        "event_timezone": "UTC",
+        "program_duration": 180,
+        "channel_assignments": [{"channel_id": 1}],
+        "event_intervals": {1: []},
+    }
+    channel_data = {1: {"name": "Arena Slot 1", "channel_number": 100, "streams": []}}
+
+    assert ET.fromstring(generate_xmltv([profile], channel_data)).findall("programme") == []
+
+
 def test_generate_xmltv_disabled_profile_skipped():
     """Disabled profiles produce no output."""
     profiles = [

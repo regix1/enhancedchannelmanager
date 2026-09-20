@@ -3848,8 +3848,12 @@ class TestPass5DeferredEpgRetryFailureAggregation:
     green. Drives the real ``_refresh_dummy_epg_and_retry`` retry loop with a
     failing ``_execute_assign_epg``."""
 
-    def _run_pass5(self, retry_result, *, source_refresh=None, query_raises=False):
+    def _run_pass5(
+        self, retry_result, *, source_refresh=None, query_raises=False,
+        publication_result=None,
+    ):
         from channel_pipeline_executor import ActionResult  # noqa: F401
+        from services.epg_publication import PublicationResult
 
         client = MagicMock()
         client.get_epg_data = AsyncMock(return_value=[])
@@ -3873,7 +3877,12 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         results = {"execution_log": [], "dry_run_results": []}
 
         fake_task = MagicMock()
-        fake_task._regenerate_xmltv = AsyncMock(return_value=1)
+        fake_task._regenerate_xmltv = AsyncMock(return_value=(
+            publication_result if publication_result is not None else PublicationResult(
+                published_profile_ids=(1,),
+                xmltv_by_scope={"profile:1": "<tv/>"},
+            )
+        ))
         sess = MagicMock()
         if query_raises:
             # WARN #2: Step 1 profile-group update raises.
@@ -3916,6 +3925,23 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         failed = results.get("failed_actions", [])
         assert any(fa["action_type"] == "assign_epg" for fa in failed)
         assert len(failed) == 1
+
+    def test_unavailable_publication_aborts_before_refresh_and_retry(self):
+        from channel_pipeline_executor import ActionResult
+        from services.epg_publication import PublicationResult
+
+        results = self._run_pass5(
+            ActionResult(success=True, action_type="assign_epg", description="unused"),
+            publication_result=PublicationResult(
+                unavailable_profile_ids=(1,),
+                reason_codes=("GUIDE_SOURCES_PENDING",),
+            ),
+        )
+
+        failed = results.get("failed_actions", [])
+        assert any(row["action_type"] == "dummy_epg_refresh" for row in failed)
+        assert not self._log_entries(results, "refresh_epg_source")
+        assert not self._log_entries(results, "assign_epg")
 
     def test_successful_retry_aggregates_nothing(self):
         from channel_pipeline_executor import ActionResult

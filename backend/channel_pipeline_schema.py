@@ -947,6 +947,28 @@ _EVENT_SYNC_PATTERN_KEYS = frozenset({
 # must route through the exact same compiler.
 _EVENT_SYNC_PATTERN_REGEX_FIELDS = ("title_pattern", "time_pattern", "date_pattern")
 
+_PROFILE_EVENT_SYNC_ALLOWED_KEYS = frozenset({
+    "secondary",
+    "time_window_minutes",
+    "enforce_time_window",
+    "attach_threshold",
+    "assume_current_date",
+    "demote_stale_dateless",
+    "use_default_patterns",
+    "slot_patterns",
+})
+
+_EVENT_SLOT_ALLOWED_KEYS = frozenset({
+    "name",
+    "channel_pattern",
+    "fallback_pattern",
+    "event_patterns",
+    "bootstrap",
+})
+
+_MAX_EVENT_SLOT_PATTERNS = 32
+_MAX_EVENT_EXPRESSIONS = 16
+
 
 def _event_sync_error(field: str, got: Any, expected: str) -> str:
     """Teaching validation error: field, got, expected, doc link."""
@@ -1049,7 +1071,249 @@ def _normalize_scope(raw: Any) -> dict | None:
     return None
 
 
-def validate_event_sync_config(config: Any) -> list[str]:
+def _validate_slot_expression(expression: Any, field: str) -> list[str]:
+    """Validate one full-match expression and its required slot capture."""
+    if not isinstance(expression, str) or not expression:
+        return [_event_sync_error(
+            field, expression, "a non-empty regex string with a named slot capture",
+        )]
+
+    from dummy_epg_engine import _js_to_python_named_groups
+
+    try:
+        compiled = safe_regex.compile(
+            _js_to_python_named_groups(expression), flags=re.IGNORECASE,
+        )
+    except safe_regex.SafeRegexError as exc:
+        return [_event_sync_error(
+            field, expression,
+            f"a regex that compiles under safe_regex ({exc})",
+        )]
+    if "slot" not in compiled.groupindex:
+        return [_event_sync_error(
+            field, expression,
+            "a regex with a named slot capture, using (?P<slot>...) or (?<slot>...)",
+        )]
+    return []
+
+
+def _validate_profile_event_sync_config(
+    config: Any, profile_group_ids: list[int] | tuple[int, ...] | set[int],
+) -> list[str]:
+    """Validate and normalize profile-owned event matching configuration."""
+    from services.event_sync_matcher import (
+        DEFAULT_TIME_WINDOW_MINUTES,
+        EVENT_ATTACH_FLOOR,
+    )
+
+    if not isinstance(config, dict):
+        return [_event_sync_error(
+            "", config, "a JSON object for profile-owned event matching",
+        )]
+
+    errors: list[str] = []
+    unknown = sorted(set(config) - _PROFILE_EVENT_SYNC_ALLOWED_KEYS)
+    if unknown:
+        errors.append(_event_sync_error(
+            "", unknown, f"only the keys {sorted(_PROFILE_EVENT_SYNC_ALLOWED_KEYS)}",
+        ))
+
+    for group_id in profile_group_ids:
+        if not _is_group_id(group_id):
+            errors.append(_event_sync_error(
+                "profile_group_ids", group_id,
+                "positive integer automatic-visibility group ids",
+            ))
+
+    raw_secondary = config.get("secondary", [])
+    secondary: list[dict] = []
+    seen_scopes: set[tuple[int, int | None]] = set()
+    scopes_by_group: dict[int, set[int | None]] = {}
+    if not isinstance(raw_secondary, list):
+        errors.append(_event_sync_error(
+            "secondary", raw_secondary,
+            'an ordered list of {"group_id": int, "m3u_account_id": int|null}',
+        ))
+    else:
+        for index, raw_scope in enumerate(raw_secondary):
+            scope = _normalize_scope(raw_scope)
+            if scope is None:
+                errors.append(_event_sync_error(
+                    f"secondary[{index}]", raw_scope,
+                    '{"group_id": positive int, "m3u_account_id": positive int|null}',
+                ))
+                continue
+            key = (scope["group_id"], scope["m3u_account_id"])
+            if key in seen_scopes:
+                errors.append(_event_sync_error(
+                    f"secondary[{index}]", raw_scope,
+                    "a scope not already present in secondary",
+                ))
+                continue
+            providers = scopes_by_group.setdefault(scope["group_id"], set())
+            if (scope["m3u_account_id"] is None and providers) or (
+                scope["m3u_account_id"] is not None and None in providers
+            ):
+                errors.append(_event_sync_error(
+                    f"secondary[{index}]", raw_scope,
+                    "either one whole-group scope or account-specific scopes for a group, not both",
+                ))
+                continue
+            seen_scopes.add(key)
+            providers.add(scope["m3u_account_id"])
+            secondary.append(scope)
+    config["secondary"] = secondary
+
+    time_window_minutes = config.get("time_window_minutes")
+    if time_window_minutes is None:
+        config["time_window_minutes"] = DEFAULT_TIME_WINDOW_MINUTES
+    elif (
+        isinstance(time_window_minutes, bool)
+        or not isinstance(time_window_minutes, int)
+        or not 1 <= time_window_minutes <= 1440
+    ):
+        errors.append(_event_sync_error(
+            "time_window_minutes", time_window_minutes,
+            f"an integer between 1 and 1440 (default {DEFAULT_TIME_WINDOW_MINUTES})",
+        ))
+
+    enforce_time_window = config.get("enforce_time_window")
+    if enforce_time_window is None:
+        config["enforce_time_window"] = True
+    elif not isinstance(enforce_time_window, bool):
+        errors.append(_event_sync_error(
+            "enforce_time_window", enforce_time_window, "a boolean (default true)",
+        ))
+
+    attach_threshold = config.get("attach_threshold")
+    if attach_threshold is None:
+        config["attach_threshold"] = EVENT_ATTACH_FLOOR
+    elif (
+        isinstance(attach_threshold, bool)
+        or not isinstance(attach_threshold, (int, float))
+        or not 0.0 <= float(attach_threshold) <= 1.0
+    ):
+        errors.append(_event_sync_error(
+            "attach_threshold", attach_threshold, "a number in [0.0, 1.0]",
+        ))
+
+    for field, default in (
+        ("assume_current_date", False),
+        ("demote_stale_dateless", True),
+        ("use_default_patterns", False),
+    ):
+        value = config.get(field)
+        if value is None:
+            config[field] = default
+        elif not isinstance(value, bool):
+            errors.append(_event_sync_error(
+                field, value, f"a boolean (default {str(default).lower()})",
+            ))
+
+    raw_slots = config.get("slot_patterns", [])
+    if not isinstance(raw_slots, list):
+        errors.append(_event_sync_error(
+            "slot_patterns", raw_slots,
+            f"an ordered list of at most {_MAX_EVENT_SLOT_PATTERNS} slot objects",
+        ))
+        raw_slots = []
+    elif len(raw_slots) > _MAX_EVENT_SLOT_PATTERNS:
+        errors.append(_event_sync_error(
+            "slot_patterns", len(raw_slots),
+            f"at most {_MAX_EVENT_SLOT_PATTERNS} slot objects",
+        ))
+
+    slots: list[dict] = []
+    names: set[str] = set()
+    for index, raw_slot in enumerate(raw_slots[:_MAX_EVENT_SLOT_PATTERNS]):
+        field = f"slot_patterns[{index}]"
+        if not isinstance(raw_slot, dict):
+            errors.append(_event_sync_error(
+                field, raw_slot, "an object describing one event-slot family",
+            ))
+            continue
+        unknown_slot_keys = sorted(set(raw_slot) - _EVENT_SLOT_ALLOWED_KEYS)
+        if unknown_slot_keys:
+            errors.append(_event_sync_error(
+                field, unknown_slot_keys,
+                f"only the keys {sorted(_EVENT_SLOT_ALLOWED_KEYS)}",
+            ))
+
+        name = raw_slot.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(_event_sync_error(
+                f"{field}.name", name, "a unique non-empty string",
+            ))
+            normalized_name = ""
+        else:
+            normalized_name = name.strip()
+            name_key = normalized_name.casefold()
+            if name_key in names:
+                errors.append(_event_sync_error(
+                    f"{field}.name", name, "a unique slot-family name",
+                ))
+            names.add(name_key)
+
+        channel_pattern = raw_slot.get("channel_pattern")
+        errors.extend(_validate_slot_expression(
+            channel_pattern, f"{field}.channel_pattern",
+        ))
+
+        fallback_pattern = raw_slot.get("fallback_pattern")
+        if fallback_pattern is not None:
+            errors.extend(_validate_slot_expression(
+                fallback_pattern, f"{field}.fallback_pattern",
+            ))
+
+        event_patterns = raw_slot.get("event_patterns", [])
+        if not isinstance(event_patterns, list):
+            errors.append(_event_sync_error(
+                f"{field}.event_patterns", event_patterns,
+                f"an ordered list of at most {_MAX_EVENT_EXPRESSIONS} regex strings",
+            ))
+            event_patterns = []
+        elif len(event_patterns) > _MAX_EVENT_EXPRESSIONS:
+            errors.append(_event_sync_error(
+                f"{field}.event_patterns", len(event_patterns),
+                f"at most {_MAX_EVENT_EXPRESSIONS} regex strings",
+            ))
+        for pattern_index, expression in enumerate(event_patterns[:_MAX_EVENT_EXPRESSIONS]):
+            errors.extend(_validate_slot_expression(
+                expression, f"{field}.event_patterns[{pattern_index}]",
+            ))
+
+        bootstrap = raw_slot.get("bootstrap", False)
+        if not isinstance(bootstrap, bool):
+            errors.append(_event_sync_error(
+                f"{field}.bootstrap", bootstrap, "a boolean (default false)",
+            ))
+            bootstrap = False
+        elif bootstrap and not event_patterns:
+            errors.append(_event_sync_error(
+                f"{field}.bootstrap", bootstrap,
+                "false when event_patterns is empty, or at least one event expression",
+            ))
+
+        slots.append({
+            "name": normalized_name,
+            "channel_pattern": channel_pattern,
+            "fallback_pattern": fallback_pattern,
+            "event_patterns": event_patterns,
+            "bootstrap": bootstrap,
+        })
+    config["slot_patterns"] = slots
+
+    if errors:
+        logger.warning(
+            "[AUTO-CREATE-SCHEMA] profile event_sync_config validation failed "
+            "with %s error(s): %s", len(errors), errors,
+        )
+    return errors
+
+
+def validate_event_sync_config(
+    config: Any, *, profile_group_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+) -> list[str]:
     """Validate (and default-fill) an event_sync rule config at save time.
 
     Event Sync (epic ti939): one channel per live event — Dispatcharr owns
@@ -1077,6 +1341,9 @@ def validate_event_sync_config(config: Any) -> list[str]:
     explicit. Returns a list of teaching error strings (field, got,
     expected, doc link) — empty when valid.
     """
+    if profile_group_ids is not None:
+        return _validate_profile_event_sync_config(config, profile_group_ids)
+
     # Floor/defaults live in the matcher service (single source of truth —
     # do NOT redeclare them here). Imported lazily to keep the heavy matcher
     # module (rapidfuzz, pytz, dummy-EPG engine) off this module's load path,

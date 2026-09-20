@@ -1693,11 +1693,11 @@ different port or be unavailable during recovery.
 | `GET /api/dummy-epg/profiles/{id}` | Get dummy EPG profile |
 | `PATCH /api/dummy-epg/profiles/{id}` | Update dummy EPG profile |
 | `DELETE /api/dummy-epg/profiles/{id}` | Delete dummy EPG profile |
-| `POST /api/dummy-epg/generate` | Generate dummy EPG data |
-| `POST /api/dummy-epg/preview` | Preview dummy EPG output |
-| `POST /api/dummy-epg/preview/batch` | Batch preview dummy EPG (zero-write). Each result also carries `event_sync_start_valid`: true only when the Event Sync matcher would build a real start time from the captured groups (valid month, hour ≤ 23, real calendar date; never guessed) |
-| `GET /api/dummy-epg/xmltv` | Get combined XMLTV output |
-| `GET /api/dummy-epg/xmltv/{id}` | Get XMLTV output for a profile |
+| `POST /api/dummy-epg/generate` | Admit a durable Dummy EPG refresh and return `202 Accepted`. An optional `profile_ids` array limits the task input. The response identifies the admitted task execution; `409` means the task is already running, and `503` means the task engine is stopping. |
+| `POST /api/dummy-epg/preview` | Preview dummy EPG output without writing state. |
+| `POST /api/dummy-epg/preview/batch` | Batch preview dummy EPG without writing state. Each result also carries `event_sync_start_valid`: true only when the Event Sync matcher would build a real start time from the captured groups (valid month, hour at most 23, and a real calendar date; never guessed). |
+| `GET /api/dummy-epg/xmltv` | Get the last complete combined XMLTV publication. Returns `503` with `detail.code = "GUIDE_UNAVAILABLE"` when no complete publication can be served. |
+| `GET /api/dummy-epg/xmltv/{id}` | Get the last complete XMLTV publication for one enabled profile. Returns `503` with `detail.code = "GUIDE_UNAVAILABLE"` when no complete publication can be served. |
 | `GET /api/dummy-epg/profiles/export/yaml` | Export profiles as YAML |
 | `POST /api/dummy-epg/profiles/import/yaml` | Import profiles from YAML |
 | `GET /api/dummy-epg/lint-findings` | Read-only view of saved dummy-EPG templates that fail the current write-time linter (bd-eio04.7) |
@@ -1705,6 +1705,98 @@ different port or be unavailable during recovery.
 `POST /api/dummy-epg/preview` accepts the full profile config plus:
 
 - `include_trace: bool`. When true, the response carries a `traces` dict keyed by template field (`title_template`, `description_template`, …). Trace entries describe literals, placeholders (with per-pipe input/output), and conditionals (taken/skipped + branch kind).
+- `sample_channel_name: string`. When supplied with `event_sync_config`, the response adds `event` classification with `family`, normalized `slot`, `role`, parsed `start` and `stop`, `matched_pattern`, and `validation_issues`.
+
+Dummy EPG profile create, update, and read objects include `event_sync_config`.
+The profile form accepts these keys:
+
+- `secondary`: an ordered list of `{group_id, m3u_account_id}` scopes. A null account selects the whole group. A profile cannot contain both a whole-group scope and an account-specific scope for the same group.
+- `time_window_minutes` from 1 through 1440, `enforce_time_window`, `attach_threshold` from 0 through 1, `assume_current_date`, `demote_stale_dateless`, and `use_default_patterns`.
+- `slot_patterns`: at most 32 ordered entries. Each entry has `name`, `channel_pattern`, optional `fallback_pattern`, at most 16 `event_patterns`, and `bootstrap`. Every expression must contain a named `slot` capture. `bootstrap` requires at least one event expression.
+
+An explicit empty object selects generic defaults and no slot patterns. An explicit
+null is invalid. If a request supplies only `stream_match_group_ids`, ECM converts
+the IDs to whole-group `secondary` scopes and preserves the other stored settings.
+If a request supplies only `event_sync_config`, ECM derives
+`stream_match_group_ids`. If it supplies both, their ordered unique group IDs must
+match.
+
+Profile YAML remains version 1. Exports add `stream_match_group_names`,
+`hide_empty_group_names`, and ordered `stream_match_scopes` with group and optional
+M3U account names. On import, names take precedence over numeric IDs and must resolve
+uniquely without widening an account scope. Old numeric-only YAML remains valid.
+
+Enabled Dummy EPG profiles own their automatic-visibility target groups. An enabled
+profile cannot share a target with another enabled profile or with an enabled Event
+Sync rule's master or promotion target. A conflicting write returns an
+`ownership_conflict` record. Disabled owners do not claim groups, and unrelated edits
+to existing legacy conflicts remain available.
+
+The XMLTV GET routes read complete publications from durable storage. They never
+serve a provisional document. A complete prior publication remains readable while a
+configuration change or source failure awaits replacement. Process-cache expiry and
+backend restart do not remove that retained document. A disabled profile URL returns
+`GUIDE_UNAVAILABLE` instead of exposing retained events.
+
+`GET /api/dummy-epg/profiles/{id}/coverage` keeps the fresh preparation fields
+`generated_at`, `window_start`, `window_stop`, `sources`, `channels`,
+`artwork_pending`, and `profiles`. Its required `publication` object is a read-only
+projection of the last durable profile publication:
+
+```json
+{
+  "status": "published",
+  "published_at": "2026-09-20T14:00:00+00:00",
+  "revision": 7,
+  "window_start": "2026-09-20T00:00:00+00:00",
+  "window_stop": "2026-09-22T00:00:00+00:00",
+  "config_matches": true,
+  "reason_codes": [],
+  "delivery": {
+    "dispatcharr_status": "pending",
+    "pending_emby": false
+  },
+  "channels": [
+    {
+      "channel_id": 10,
+      "xmltv_id": "ecm-10",
+      "visibility_evidence": "published",
+      "events": [
+        {
+          "start": "2026-09-20T14:00:00+00:00",
+          "stop": "2026-09-20T17:00:00+00:00",
+          "title": "Stored event"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`generated_at` is the fresh coverage inspection time. `publication.published_at` and
+the nested window are the original stored values and do not advance when this endpoint
+is read. `published` means the stored config, channel identity, window, and fresh
+profile-local readiness apply at the inspection instant. `retained` means a valid
+historical publication remains but fresh readiness or another applicability check is
+not current. `unavailable` means no durable profile row exists. Channel evidence is
+separate: a degraded fresh read needs a currently active stored event for `retained`
+evidence, and an expired window, changed config, disabled profile, old channel, or
+outward-ID mismatch produces `unknown` evidence.
+
+A missing durable row is a successful HTTP 200 diagnostic. Its publication status is
+`unavailable`; time, revision, config match, and delivery fields are null, and current
+channels have unknown evidence. A disabled saved profile receives a required
+`profiles[id]` readiness record with `PROFILE_DISABLED`; any stored publication stays
+historical and its channel evidence is unknown.
+
+Invalid stored publication state returns HTTP 500 with
+`detail.code = "GUIDE_PUBLICATION_FAILED"` and
+`detail.reason_codes = ["GUIDE_STATE_CORRUPT"]`. A missing readiness record for an
+enabled profile returns the same code with `GUIDE_COVERAGE_INVALID`. These responses
+do not include stored XML, source URLs, hashes, or raw exception text. Inventory and
+fresh-source inspection failures keep the existing HTTP 502 behavior. The coverage
+read does not publish XML, update observations or delivery, refresh a source, or change
+channel visibility.
 
 Both preview endpoints are zero-write **and** zero-read: the request carries
 everything the engine needs.
