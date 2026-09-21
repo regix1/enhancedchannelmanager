@@ -1314,4 +1314,4 @@ class EventVisibilityTask(TaskScheduler):
         super().__init__(schedule_config)
 
     async def execute(self) -> TaskResult:
-        return await reconcile_profiles(self, wait_for_sources=False)
+        return await reconcile_profiles(self, wait_for_sources=True)

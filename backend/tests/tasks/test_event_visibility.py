@@ -94,6 +94,20 @@ def test_default_schedule_checks_every_five_minutes():
 
 
 @pytest.mark.asyncio
+async def test_default_execution_waits_for_guide_sources():
+    task = EventVisibilityTask()
+    outcome = MagicMock()
+
+    with patch(
+        "tasks.event_visibility.reconcile_profiles",
+        new=AsyncMock(return_value=outcome),
+    ) as reconcile:
+        assert await task.execute() is outcome
+
+    reconcile.assert_awaited_once_with(task, wait_for_sources=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wait_for_sources", [False, True])
 async def test_reconciliation_requests_recovery_without_changing_wait_mode(wait_for_sources):
     profile = _profile()

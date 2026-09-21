@@ -97,6 +97,7 @@ def _stored(scope, document, *, channels=None):
 @pytest.mark.asyncio
 async def test_retained_placeholder_continues_safe_profile_work():
     """The immutable base fails this fixed-behavior assertion at its early return."""
+    from services import epg_publication
     from tasks import dummy_epg_refresh
     from tasks import event_visibility
 
@@ -157,9 +158,7 @@ async def test_retained_placeholder_continues_safe_profile_work():
         stack.enter_context(patch("emby_client.request_guide_refresh", new=emby))
 
         if hasattr(event_visibility, "reconcile_profiles"):
-            from services.epg_publication import PublicationResult
-
-            result = PublicationResult(
+            result = epg_publication.PublicationResult(
                 published_profile_ids=(2,),
                 retained_profile_ids=(1,),
                 xmltv_by_scope={
@@ -222,7 +221,7 @@ async def test_retained_placeholder_continues_safe_profile_work():
 
 
 @pytest.mark.asyncio
-async def test_visibility_task_recovers_missing_source_without_waiting_and_reveals_next_cycle(monkeypatch):
+async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch):
     from services import epg_programmes as guides
     from services.epg_publication import publish_profiles, read_publication
     from tasks import event_visibility
@@ -306,7 +305,7 @@ async def test_visibility_task_recovers_missing_source_without_waiting_and_revea
     source_started = asyncio.Event()
     source_release = asyncio.Event()
     source_calls = []
-    link_ready = False
+    link_ready = True
     oversized = False
 
     async def stream_xmltv(source, **options):
@@ -395,38 +394,30 @@ async def test_visibility_task_recovers_missing_source_without_waiting_and_revea
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
          patch("emby_client.request_guide_refresh", side_effect=emby_refresh), \
          patch("tasks.event_visibility.MAX_MATCH_STREAMS", 2):
-        first = await event_visibility.EventVisibilityTask().execute()
-        await asyncio.wait_for(source_started.wait(), timeout=0.2)
-
-        assert first.details["retained_profile_ids"] == [1]
-        assert first.details["published_profile_ids"] == [2]
-        assert first.details["hidden_channel_ids"] == [20]
-        assert read_publication("profile:1")["xmltv"] == before_profile
-        assert read_publication("all")["xmltv"] == before_all
-        assert all(channel_id not in {10, 11} for channel_id, _ in updates)
-        assert len(source_calls) == 2
-        assert guides._SOURCE_LOADS
-
+        run = asyncio.create_task(event_visibility.EventVisibilityTask().execute())
+        await asyncio.wait_for(source_started.wait(), timeout=1)
+        assert run.done() is False
         source_release.set()
-        await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
-        link_ready = True
-        guides._CATALOGUE_CACHE[(client, 501)]["checked"] -= guides.SOURCE_RETRY + 1
-        second = await event_visibility.EventVisibilityTask().execute()
+        first = await asyncio.wait_for(run, timeout=2)
 
-        second_profile = read_publication("profile:1")["xmltv"]
+        first_profile = read_publication("profile:1")["xmltv"]
         update_count = len(updates)
         oversized = True
-        third = await event_visibility.EventVisibilityTask().execute()
+        second = await event_visibility.EventVisibilityTask().execute()
 
-    assert second.details["published_profile_ids"] == [1, 2]
-    assert second.details["revealed_channel_ids"] == [11]
+    assert first.details["published_profile_ids"] == [1, 2]
+    assert first.details["retained_profile_ids"] == []
+    assert first.details["revealed_channel_ids"] == [11]
+    assert first.details["hidden_channel_ids"] == [10, 20]
     assert channels[11]["hidden_from_output"] is False
     assert channels[11]["epg_data_id"] == 501
     assert channels[11]["streams"] == [101, 50, 102]
-    assert read_publication("profile:1")["xmltv"] != before_profile
-    assert third.details["retained_profile_ids"] == [1]
-    assert third.details["published_profile_ids"] == [2]
-    assert read_publication("profile:1")["xmltv"] == second_profile
+    assert first_profile != before_profile
+    assert read_publication("all")["xmltv"] != before_all
+    assert len(source_calls) == 2
+    assert second.details["retained_profile_ids"] == [1]
+    assert second.details["published_profile_ids"] == [2]
+    assert read_publication("profile:1")["xmltv"] == first_profile
     assert len(updates) == update_count
     assert len(source_calls) == 2
 
