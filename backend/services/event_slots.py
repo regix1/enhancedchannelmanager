@@ -154,6 +154,8 @@ def _owner(kind: str, item: Any) -> dict:
 def validate_ownership(profiles: Iterable[Any], rules: Iterable[Any]) -> list[dict]:
     """Return every enabled lifecycle-target ownership conflict."""
     claims: dict[int, dict[str, dict]] = {}
+    profile_claims: dict[int, tuple[str, set[int]]] = {}
+    linked: dict[int, set[frozenset[str]]] = {}
 
     for profile in profiles:
         if not bool(_value(profile, "enabled", True)):
@@ -163,9 +165,14 @@ def validate_ownership(profiles: Iterable[Any], rules: Iterable[Any]) -> list[di
         else:
             group_ids = profile.get_hide_empty_group_ids()
         owner = _owner("profile", profile)
+        owned_groups = set()
         for group_id in group_ids:
             if isinstance(group_id, int) and not isinstance(group_id, bool) and group_id > 0:
                 claims.setdefault(group_id, {})[owner["key"]] = owner
+                owned_groups.add(group_id)
+        profile_id = _value(profile, "id")
+        if isinstance(profile_id, int) and not isinstance(profile_id, bool):
+            profile_claims[profile_id] = (owner["key"], owned_groups)
 
     for rule in rules:
         if not bool(_value(rule, "enabled", True)):
@@ -182,13 +189,21 @@ def validate_ownership(profiles: Iterable[Any], rules: Iterable[Any]) -> list[di
         if config.get("promote_unmatched"):
             group_ids.append(config.get("promote_target_group_id"))
         owner = _owner("rule", rule)
+        profile_claim = profile_claims.get(config.get("dummy_epg_profile_id"))
         for group_id in group_ids:
             if isinstance(group_id, int) and not isinstance(group_id, bool) and group_id > 0:
                 claims.setdefault(group_id, {})[owner["key"]] = owner
+                if profile_claim and group_id in profile_claim[1]:
+                    linked.setdefault(group_id, set()).add(frozenset((
+                        profile_claim[0], owner["key"],
+                    )))
 
     conflicts = []
     for group_id in sorted(claims):
         owners = list(claims[group_id].values())
+        owner_keys = frozenset(owner["key"] for owner in owners)
+        if len(owners) == 2 and owner_keys in linked.get(group_id, set()):
+            continue
         if len(owners) > 1:
             conflicts.append({
                 "code": "ownership_conflict",

@@ -567,6 +567,39 @@ class TestUpdateProfile:
         assert response.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_linked_rule_allows_idle_visibility_for_its_event_group(
+        self, async_client, test_session,
+    ):
+        from models import ChannelPipelineRule
+
+        profile = _create_profile(test_session)
+        profile.set_channel_group_ids([10])
+        rule = ChannelPipelineRule(
+            name="Event Rule",
+            enabled=True,
+            priority=0,
+            conditions="[]",
+            actions="[]",
+        )
+        rule.set_event_sync_config({
+            "master_group_id": 40,
+            "promote_unmatched": True,
+            "promote_target_group_id": 10,
+            "dummy_epg_profile_id": profile.id,
+        })
+        test_session.add(rule)
+        test_session.commit()
+
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.patch(
+                f"/api/dummy-epg/profiles/{profile.id}",
+                json={"hide_empty_group_ids": [10]},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["hide_empty_group_ids"] == [10]
+
+    @pytest.mark.asyncio
     async def test_rejects_duplicate_name(self, async_client, test_session):
         """Returns 409 when renaming to an existing name."""
         _create_profile(test_session, name="Taken Name")

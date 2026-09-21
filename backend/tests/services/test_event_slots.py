@@ -104,6 +104,61 @@ def test_enabled_profiles_and_rules_conflict_on_lifecycle_targets():
     assert all(conflict["code"] == "ownership_conflict" for conflict in conflicts)
 
 
+def test_linked_profile_and_rule_share_one_lifecycle_target():
+    profile = {
+        "id": 1,
+        "name": "Guide",
+        "enabled": True,
+        "hide_empty_group_ids": [20],
+    }
+    rule = {
+        "id": 2,
+        "name": "Events",
+        "enabled": True,
+        "event_sync_config": {
+            "master_group_id": 40,
+            "promote_unmatched": True,
+            "promote_target_group_id": 20,
+            "dummy_epg_profile_id": 1,
+        },
+    }
+
+    assert validate_ownership([profile], [rule]) == []
+
+
+def test_linked_pair_still_conflicts_with_a_third_owner():
+    profile = {
+        "id": 1,
+        "name": "Guide",
+        "enabled": True,
+        "hide_empty_group_ids": [20],
+    }
+    other = {
+        "id": 3,
+        "name": "Other Guide",
+        "enabled": True,
+        "hide_empty_group_ids": [20],
+    }
+    rule = {
+        "id": 2,
+        "name": "Events",
+        "enabled": True,
+        "event_sync_config": {
+            "master_group_id": 40,
+            "promote_unmatched": True,
+            "promote_target_group_id": 20,
+            "dummy_epg_profile_id": 1,
+        },
+    }
+
+    conflicts = validate_ownership([profile, other], [rule])
+
+    assert len(conflicts) == 1
+    assert {owner["key"] for owner in conflicts[0]["owners"]} == {
+        "profile:1", "profile:3", "rule:2",
+    }
+
+
 def test_disabled_owners_and_matching_scopes_do_not_claim_groups():
     profile = {
         "id": 1,
