@@ -1035,11 +1035,14 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
             queries = []
             profile_coverage["reason_codes"].append("GUIDE_CONFIG_INVALID")
         if any(
-            isinstance((link := (
-                channel_map[item["channel_id"]].get("epg_data_id")
-                or channel_map[item["channel_id"]].get("epg_data")
-            )), int) and not isinstance(link, bool) and link in pending_links
-            for item in assignments if item.get("channel_id") in channel_map
+            not query["dynamic"]
+            and isinstance((link := (
+                channel_map[query["channel_id"]].get("epg_data_id")
+                or channel_map[query["channel_id"]].get("epg_data")
+            )), int)
+            and not isinstance(link, bool)
+            and link in pending_links
+            for query in queries
         ):
             profile_coverage["reason_codes"].extend([
                 "GUIDE_MAPPING_UNAVAILABLE", "GUIDE_SOURCES_PENDING",
@@ -1048,7 +1051,9 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         for query in queries:
             channel = channel_map[query["channel_id"]]
             link = channel.get("epg_data_id") or channel.get("epg_data")
-            if isinstance(link, int) and link in unresolved_links:
+            # Dynamic slots never consume the previous guide binding. They
+            # match parsed event evidence or remain unresolved without it.
+            if isinstance(link, int) and link in unresolved_links and not query["dynamic"]:
                 query["blocked"] = "mapping_unavailable"
             else:
                 row = link if isinstance(link, dict) else next((row for row in epg_rows if row.get("id") == link), None)

@@ -860,6 +860,31 @@ async def test_changed_unresolved_mapping_never_uses_the_remembered_source(monke
 
 
 @pytest.mark.asyncio
+async def test_dynamic_event_ignores_unresolved_previous_guide_link(monkeypatch):
+    upstream = client()
+    upstream.get_epg_data_by_id.side_effect = RuntimeError("generated link pending")
+    install_feed(monkeypatch, feed(programme(
+        tvg="PPV10.art",
+        title="ONE FIGHT NIGHT 47 STAMP V FLORES",
+    )))
+    channels = {1: channel(
+        name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM",
+        tvg_id="",
+        epg_data_id=91,
+    )}
+
+    prepared, coverage = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+
+    assert prepared[0]["source_programmes"][1][0].findtext("title") == "ONE FIGHT NIGHT 47 STAMP V FLORES"
+    assert coverage["channels"][0]["match"] == "event"
+    assert "mapping_unavailable" not in coverage["channels"][0]["warnings"]
+    assert "GUIDE_MAPPING_UNAVAILABLE" not in coverage["profiles"]["1"]["reason_codes"]
+    assert coverage["profiles"]["1"]["can_publish"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("link_field", ["epg_data_id", "epg_data"])
 async def test_current_unselected_mapping_does_not_restore_an_old_binding(monkeypatch, link_field):
     upstream = client(sources=[source(), source(id=51)], rows=[{"id": 91, "epg_source": 51, "tvg_id": "222"}])
