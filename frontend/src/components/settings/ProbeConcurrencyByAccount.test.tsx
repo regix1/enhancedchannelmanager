@@ -1,18 +1,12 @@
 /**
- * Tests for the two probe settings on the Maintenance page: the minimum
- * stream bitrate and the per-account probe limit.
+ * Tests for the per-account probe limit on the Maintenance page.
  *
- * Both are plumbing, and plumbing breaks quietly. A field missing from the
- * save literal reads back fine and is only noticed later, when the operator
- * saves something unrelated and their value has gone back to the default.
- * These pin the round trip for both:
- *   - the control renders and shows what GET /api/settings returned
- *   - an edit reaches the saveSettings payload
- *   - for the account list: a row can be added and removed, and a row the
- *     operator half filled in is dropped rather than stored
+ * The legacy minimum-bitrate field remains in the API but is not editable in
+ * this UI. These tests pin that boundary and the account-limit round trip,
+ * including dirty, pending, success, error, and incomplete-row states.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 
 let mockUser: { is_admin: boolean; username: string } = { is_admin: true, username: 'admin' };
 
@@ -230,7 +224,7 @@ async function save(): Promise<Parameters<typeof api.saveSettings>[0]> {
   return vi.mocked(api.saveSettings).mock.calls[0][0];
 }
 
-describe('Minimum stream bitrate', () => {
+describe('Legacy minimum stream bitrate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockUser = { is_admin: true, username: 'admin' };
@@ -241,34 +235,12 @@ describe('Minimum stream bitrate', () => {
     vi.mocked(api.getM3UAccounts).mockResolvedValue([]);
   });
 
-  it('shows the floor the settings were loaded with', async () => {
+  it('does not render an editor for the legacy field', async () => {
     vi.mocked(api.getSettings).mockResolvedValue(makeSettings({ min_stream_bitrate_kbps: 3500 }));
     renderOnMaintenance();
 
-    // The input renders from its useState default, so it exists before the
-    // mocked getSettings() promise resolves. Read the value inside waitFor.
-    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
-    await waitFor(() => expect(input.value).toBe('3500'));
-  });
-
-  it('sends an edited floor on save', async () => {
-    renderOnMaintenance();
-
-    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
-    await waitFor(() => expect(input.value).toBe('2000'));
-    fireEvent.change(input, { target: { value: '1500' } });
-
-    expect((await save()).min_stream_bitrate_kbps).toBe(1500);
-  });
-
-  it('sends a floor of 0, which is how the check is turned off', async () => {
-    renderOnMaintenance();
-
-    const input = await screen.findByLabelText(/Minimum stream bitrate/i) as HTMLInputElement;
-    await waitFor(() => expect(input.value).toBe('2000'));
-    fireEvent.change(input, { target: { value: '0' } });
-
-    expect((await save()).min_stream_bitrate_kbps).toBe(0);
+    await screen.findByText(/Per-account probe limit/i);
+    expect(screen.queryByLabelText(/Minimum stream bitrate/i)).not.toBeInTheDocument();
   });
 });
 
@@ -301,6 +273,69 @@ describe('Per-account probe limit', () => {
     expect((screen.getByLabelText(/Streams at a time 1/i) as HTMLInputElement).value).toBe('1');
     expect((screen.getByLabelText(/Account id 2/i) as HTMLInputElement).value).toBe('7');
     expect((screen.getByLabelText(/Streams at a time 2/i) as HTMLInputElement).value).toBe('3');
+  });
+
+  it('marks an edit pending and preserves unrelated settings without sending the legacy field', async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
+      ...CAPPED,
+      min_stream_bitrate_kbps: 3500,
+      stream_probe_timeout: 45,
+    }));
+    renderOnMaintenance();
+
+    const limit = await screen.findByLabelText(/Streams at a time 2/i) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe('3'));
+    fireEvent.change(limit, { target: { value: '2' } });
+
+    expect(await screen.findByRole('status', { name: 'Unsaved settings' })).toBeInTheDocument();
+    const request = await save();
+    expect(request.probe_concurrency_by_account).toEqual({ '4': 1, '7': 2 });
+    expect(request.stream_probe_timeout).toBe(45);
+    expect('min_stream_bitrate_kbps' in request).toBe(false);
+    expect(await screen.findByText('Settings saved successfully')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'Unsaved settings' })).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps the pending state visible while an account-limit save is in flight', async () => {
+    let resolveSave: ((value: Awaited<ReturnType<typeof api.saveSettings>>) => void) | undefined;
+    vi.mocked(api.saveSettings).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.saveSettings>>>((resolve) => {
+        resolveSave = resolve;
+      })
+    );
+    renderOnMaintenance();
+
+    const limit = await screen.findByLabelText(/Streams at a time 2/i) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe('3'));
+    fireEvent.change(limit, { target: { value: '2' } });
+
+    const pending = await screen.findByRole('status', { name: 'Unsaved settings' });
+    const saveButton = within(pending).getByRole('button', { name: 'Save changes' });
+    fireEvent.click(saveButton);
+
+    await waitFor(() => expect(saveButton).toBeDisabled());
+    expect(within(pending).getByText('Saving…')).toBeInTheDocument();
+    resolveSave!({ status: 'ok', configured: true, server_changed: false });
+    expect(await screen.findByText('Settings saved successfully')).toBeInTheDocument();
+  });
+
+  it('keeps the edited account limit available after a failed save', async () => {
+    vi.mocked(api.saveSettings).mockRejectedValueOnce(new Error('Request failed'));
+    renderOnMaintenance();
+
+    const limit = await screen.findByLabelText(/Streams at a time 2/i) as HTMLInputElement;
+    await waitFor(() => expect(limit.value).toBe('3'));
+    fireEvent.change(limit, { target: { value: '2' } });
+
+    const pending = await screen.findByRole('status', { name: 'Unsaved settings' });
+    fireEvent.click(within(pending).getByRole('button', { name: 'Save changes' }));
+
+    expect(await screen.findByText('Settings could not be saved. Your changes are still available.')).toBeInTheDocument();
+    expect(limit.value).toBe('2');
+    expect(screen.getByRole('status', { name: 'Unsaved settings' })).toBeInTheDocument();
+    expect(vi.mocked(api.saveSettings).mock.calls[0][0].probe_concurrency_by_account).toEqual({ '4': 1, '7': 2 });
   });
 
   it('sends an edited limit on save', async () => {

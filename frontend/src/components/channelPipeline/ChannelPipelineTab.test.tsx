@@ -4,7 +4,7 @@
  * These tests define the expected behavior of the main channel pipeline tab BEFORE implementation.
  */
 import type * as React from 'react';
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -38,6 +38,13 @@ function expectDialogLabelledByVisibleHeading(dialog: HTMLElement, expectedName:
 
 // Setup MSW server
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeEach(() => {
+  server.use(
+    http.post('/api/auth/refresh', () => (
+      HttpResponse.json({ detail: 'Not authenticated' }, { status: 401 })
+    )),
+  );
+});
 afterEach(() => {
   server.resetHandlers();
   resetMockDataStore();

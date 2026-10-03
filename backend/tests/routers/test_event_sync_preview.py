@@ -1348,9 +1348,8 @@ class TestPromotionPreview:
     async def test_an_unprobed_event_carries_no_retirement_verdict(
         self, async_client
     ):
-        """Almost no stream on a real instance has ever been probed. An
-        absent verdict promotes the event as usual, so the row must not
-        carry a retirement flag at all. [24]"""
+        """An absent verdict blocks admission without becoming retirement
+        evidence. The provider row remains intact and no write occurs. [24]"""
         client = _mock_client(
             master_channels=MASTER_CHANNELS + [
                 {"id": 900,
@@ -1368,11 +1367,11 @@ class TestPromotionPreview:
         assert resp.status_code == 200
         data = resp.json()
         _assert_zero_writes(client)
-        assert data["promotion"]["skipped_all_dead"] == 0
+        assert data["promotion"]["skipped_all_dead"] == 1
         row = next(r for r in data["unmatched_streams"]
                    if r["stream_id"] == 301)
-        assert row["would_promote"] is True
-        assert "promote_channel_retired" not in row
+        assert row["would_promote"] is False
+        assert row["promote_channel_retired"] is False
 
     @pytest.mark.asyncio
     async def test_a_dateless_event_says_so_on_the_row(self, async_client):

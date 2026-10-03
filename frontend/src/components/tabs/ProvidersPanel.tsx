@@ -312,7 +312,7 @@ export function formatBucketTick(
     const timePart = new Intl.DateTimeFormat(locale ?? getDateLocale(), {
       hour: '2-digit',
       minute: '2-digit',
-      hour12: false,
+      hourCycle: 'h23',
       timeZone,
     }).format(d);
     return `${datePart} ${timePart}`;

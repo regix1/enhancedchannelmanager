@@ -14,7 +14,7 @@
  * Scaffolding follows ./SettingsTab.notificationRedaction.test.tsx.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 
 const notificationMocks = vi.hoisted(() => ({
   notify: vi.fn().mockReturnValue('toast-id'),
@@ -268,7 +268,9 @@ describe('SettingsTab public base URL (bead qsqfv)', () => {
 
     renderEmailPage();
 
-    await waitFor(() => expect(api.getSettings).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(screen.getByLabelText('SMTP Host')).toHaveValue(settingsBase.smtp_host);
+    });
     expect(publicBaseUrlBadge()).toHaveTextContent('Not set');
   });
 
@@ -276,7 +278,10 @@ describe('SettingsTab public base URL (bead qsqfv)', () => {
     vi.mocked(api.getSettings).mockResolvedValue(makeSettings({ public_base_url: '' }));
 
     renderEmailPage();
-    await waitFor(() => expect(screen.getByLabelText('Public Base URL')).toHaveValue(''));
+    await waitFor(() => {
+      expect(screen.getByLabelText('SMTP Host')).toHaveValue(settingsBase.smtp_host);
+    });
+    expect(screen.getByLabelText('Public Base URL')).toHaveValue('');
 
     fireEvent.change(screen.getByLabelText('Public Base URL'), {
       target: { value: '  https://ecm.example.com  ' },
@@ -302,7 +307,11 @@ describe('SettingsTab public base URL (bead qsqfv)', () => {
   });
 
   it('shows the restart action when the backend reports a pending log policy', async () => {
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings());
+    let complete!: () => void;
+    const request = new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+      complete = () => resolve(makeSettings());
+    });
+    vi.mocked(api.getSettings).mockReturnValueOnce(request);
     vi.mocked(api.saveSettings).mockResolvedValue({
       status: 'ok',
       configured: true,
@@ -312,6 +321,17 @@ describe('SettingsTab public base URL (bead qsqfv)', () => {
 
     renderEmailPage();
     await waitFor(() => expect(api.getSettings).toHaveBeenCalled());
+    expect(screen.getByLabelText('SMTP Host')).toHaveValue('');
+    expect(api.saveSettings).not.toHaveBeenCalled();
+
+    const completion = waitFor(() => {
+      expect(screen.getByLabelText('SMTP Host')).toHaveValue(settingsBase.smtp_host);
+    });
+    await act(async () => {
+      complete();
+      await request;
+    });
+    await completion;
     await saveSettingsPage();
 
     expect(notificationMocks.notify).toHaveBeenCalledWith(

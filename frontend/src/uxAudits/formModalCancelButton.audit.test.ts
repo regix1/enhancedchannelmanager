@@ -44,7 +44,7 @@
  * relevant allowlist below with a one-line justification. Do not allowlist
  * to make a real gap go away.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as ts from 'typescript';
@@ -198,7 +198,7 @@ function findViolationsInFile(file: string): Violation[] {
       if (mutating.length > 0 && !hasSecondary) {
         const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
         violations.push({
-          file: path.relative(SRC_DIR, file),
+          file: path.relative(SRC_DIR, file).split(path.sep).join('/'),
           line: line + 1,
           mutatingButtons: mutating,
         });
@@ -250,4 +250,49 @@ describe('form modal footers pair a mutating action with a Cancel/secondary (bea
   // thanks to the modal-footer prefilter above); if it ever legitimately takes
   // that long, something is actually wrong (bead enhancedchannelmanager-hw4ny).
   30_000);
+
+  it('reports a portable synthetic violation and accepts its paired Cancel footer', () => {
+    const portableFile = path.join(COMPONENTS_DIR, 'PortableModal.tsx');
+    const mutatingOnly = `
+      export function PortableModal() {
+        return <div className="modal-footer"><button className="modal-btn-primary">Save</button></div>;
+      }
+    `;
+    const withCancel = `
+      export function PortableModal() {
+        return <div className="modal-footer">
+          <button className="modal-btn-secondary">Cancel</button>
+          <button className="modal-btn-primary">Save</button>
+        </div>;
+      }
+    `;
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    let portableSource = mutatingOnly;
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      if (path.resolve(String(args[0])) === portableFile) return portableSource;
+      return Reflect.apply(originalReadFileSync, fs, args);
+    }) as typeof fs.readFileSync);
+
+    try {
+      const violations = findViolationsInFile(portableFile);
+      expect(violations).toHaveLength(1);
+      expect(violations[0].file).toBe('components/PortableModal.tsx');
+      expect(violations[0].file in ALLOWLIST).toBe(false);
+
+      portableSource = withCancel;
+      expect(findViolationsInFile(portableFile)).toEqual([]);
+    } finally {
+      readFileSpy.mockRestore();
+    }
+  });
+
+  it('matches the existing dirty-guard allowlist keys with portable paths', () => {
+    const violations = [
+      ...findViolationsInFile(path.join(COMPONENTS_DIR, 'EditChannelModal.tsx')),
+      ...findViolationsInFile(path.join(COMPONENTS_DIR, 'M3UGroupsModal.tsx')),
+    ];
+    expect(new Set(violations.map(({ file }) => file))).toEqual(
+      new Set(Object.keys(DIRTY_GUARD_ALLOWLIST)),
+    );
+  });
 });

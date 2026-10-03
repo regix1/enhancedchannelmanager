@@ -33,7 +33,10 @@ deletes channels and never toggles Dispatcharr group settings.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -42,6 +45,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import database
+# Freeze the real auth session dependency before schema tests patch get_session.
+from auth import RequireAdminIfEnabled  # noqa: F401
 from channel_pipeline_engine import ChannelPipelineEngine
 from models import ChannelPipelineRule, DummyEPGProfile
 from tests.event_sync_fixtures import (
@@ -163,7 +168,12 @@ def _mercury_state() -> FakeDispatcharrState:
     )
 
 
-def _dummy_entry(entry_id: int, channel_id: int, channel_name: str) -> dict:
+def _dummy_entry(
+    entry_id: int,
+    channel_id: int,
+    channel_name: str,
+    source_id: int = DUMMY_SOURCE_ID,
+) -> dict:
     """One EPG data entry as Dispatcharr serves it for the dummy source.
 
     The tvg_id carries the XMLTV channel key, which the dummy engine derives
@@ -174,44 +184,201 @@ def _dummy_entry(entry_id: int, channel_id: int, channel_name: str) -> dict:
         "id": entry_id,
         "tvg_id": f"ecm-{channel_id}",
         "name": channel_name,
-        "epg_source": DUMMY_SOURCE_ID,
+        "epg_source": source_id,
     }
 
 
-def _wire_epg(client, initial_entries: list[dict] | None = None,
-              source_url: str = f"http://ecm:8000/api/dummy-epg/xmltv/{PROFILE_ID}",
-              regenerated_entries: list[dict] | None = None):
-    """Wire EPG reads onto the stateful client + a mutable entry store.
+def _wire_epg(state, client, session_factory,
+              initial_entries: list[dict] | None = None,
+              source_url: str | None = None,
+              regenerated_entries: list[dict] | None = None,
+              *, profile_id: int = PROFILE_ID,
+              source_id: int = DUMMY_SOURCE_ID,
+              now: datetime | None = None):
+    """Wire explicit source, header, programme, and publication evidence.
 
-    ``regenerated_entries`` land in the store when Pass 5's XMLTV
-    regeneration runs — simulating the profile covering the master
-    channels after regen + source refresh. Returns (epg_store,
-    regenerate_mock, wait_mock) for assertions.
+    Regeneration commits only XMLTV. The first successful source import adds
+    headers, and a later import adds programmes after linking. Returns the
+    mutable header store plus the regeneration and import mocks.
     """
-    epg_store: list[dict] = list(initial_entries or [])
+    if source_url is None:
+        source_url = f"http://ecm:8000/api/dummy-epg/xmltv/{profile_id}"
+    state.guide_sources[:] = [{
+        "id": source_id,
+        "name": "ECM Dummy EPG",
+        "url": source_url,
+        "status": "ready",
+        "updated_at": "2026-07-11T15:00:00+00:00",
+    }]
+    state.guide_rows[:] = copy.deepcopy(initial_entries or [])
+    headers = copy.deepcopy(regenerated_entries or [])
+    now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
 
-    async def _get_epg_data():
-        return [dict(e) for e in epg_store]
+    from services.epg_publication import begin_delivery, publish_profiles
 
-    client.get_epg_data = AsyncMock(side_effect=_get_epg_data)
-    client.get_epg_sources = AsyncMock(return_value=[
-        {"id": DUMMY_SOURCE_ID, "name": "ECM Dummy EPG", "url": source_url},
-    ])
+    def available_headers():
+        return [
+            row for row in headers
+            if int(row["tvg_id"].split("-", 1)[1]) in state.channels
+        ]
 
-    from services.epg_publication import PublicationResult
-    from tasks.event_visibility import _generated_scope
+    def publication_values(rows, publication=None):
+        session = session_factory()
+        try:
+            profile = session.get(DummyEPGProfile, profile_id).to_dict()
+        finally:
+            session.close()
+        channel_ids = [
+            int(row["tvg_id"].split("-", 1)[1])
+            for row in rows
+        ]
+        profile["channel_assignments"] = [
+            {
+                "channel_id": channel_id,
+                "channel_name": state.channels[channel_id]["name"],
+            }
+            for channel_id in channel_ids
+        ]
+        receipts = {
+            receipt.get("channel_id"): receipt
+            for receipt in (
+                (publication or {}).get("state", {}).get("delivery", {})
+                .get("pending_channels", {}).values()
+            )
+            if receipt.get("channel_id") is not None
+        }
+        profile["event_intervals"] = {
+            channel_id: ([{
+                "start": receipts[channel_id]["start"],
+                "stop": receipts[channel_id]["stop"],
+                "title": receipts[channel_id]["title"],
+            }] if channel_id in receipts else [{
+                "start": (now - timedelta(minutes=15)).isoformat(),
+                "stop": (now + timedelta(hours=2)).isoformat(),
+                "title": state.channels[channel_id]["name"],
+            }])
+            for channel_id in channel_ids
+        }
+        channels = {
+            channel_id: copy.deepcopy(state.channels[channel_id])
+            for channel_id in channel_ids
+        }
+        coverage = {"profiles": {str(profile_id): {
+            "profile_id": profile_id,
+            "can_publish": True,
+            "reason_codes": [],
+        }}}
+        return profile, channels, coverage
 
-    async def publish():
-        epg_store.extend(regenerated_entries or [])
-        scope = _generated_scope({"url": source_url})
-        return PublicationResult(
-            published_profile_ids=(PROFILE_ID,),
-            xmltv_by_scope={scope: "<tv/>"} if scope else {},
+    async def publish(*, publications, wait_for_sources=True):
+        assert wait_for_sources is False
+        admitted = publications[profile_id]
+        attempt = admitted["state"]["delivery"]["guide_attempt"]
+        assert attempt is not None
+        profile, channels, coverage = publication_values(
+            available_headers(), admitted,
+        )
+        expected = {
+            f"profile:{profile_id}": {
+                "revision": admitted["revision"],
+                "xmltv_hash": admitted["state"]["xmltv_hash"],
+                "config_hash": admitted["state"]["config_hash"],
+                "attempt_id": attempt["attempt_id"],
+            },
+        }
+        return publish_profiles(
+            [profile],
+            channels,
+            coverage,
+            observations={},
+            now=now,
+            expected=expected,
         )
 
+    if initial_entries:
+        session = session_factory()
+        try:
+            saved = session.get(DummyEPGProfile, profile_id)
+            if saved.enabled:
+                saved.set_channel_group_ids([MASTER_GROUP_ID])
+                session.commit()
+                admitted_profile = saved.to_dict()
+            else:
+                admitted_profile = None
+        finally:
+            session.close()
+        if admitted_profile is not None:
+            with patch(
+                "services.epg_publication.get_session",
+                side_effect=session_factory,
+            ):
+                admitted = begin_delivery(
+                    f"profile:{profile_id}",
+                    expected_revision=0,
+                    expected_hash=None,
+                    profile=admitted_profile,
+                    now=now,
+                )
+                profile, channels, coverage = publication_values(initial_entries)
+                attempt = admitted["state"]["delivery"]["guide_attempt"]
+                publish_profiles(
+                    [profile],
+                    channels,
+                    coverage,
+                    observations={},
+                    now=now,
+                    expected={f"profile:{profile_id}": {
+                        "revision": admitted["revision"],
+                        "xmltv_hash": admitted["state"]["xmltv_hash"],
+                        "config_hash": admitted["state"]["config_hash"],
+                        "attempt_id": attempt["attempt_id"],
+                    }},
+                )
+
+    async def complete_refresh(*args, **kwargs):
+        served_headers = available_headers()
+        known_tvg_ids = {row["tvg_id"] for row in state.guide_rows}
+        missing_headers = [
+            row for row in served_headers if row["tvg_id"] not in known_tvg_ids
+        ]
+        if missing_headers:
+            state.guide_rows.extend(copy.deepcopy(missing_headers))
+        else:
+            from services.epg_publication import read_publication
+
+            publication = read_publication(f"profile:{profile_id}")
+            receipts = {
+                receipt.get("channel_id"): receipt
+                for receipt in (
+                    (publication or {}).get("state", {}).get("delivery", {})
+                    .get("pending_channels", {}).values()
+                )
+                if receipt.get("channel_id") is not None
+            }
+            state.guide_programmes[:] = [
+                {
+                    "tvg_id": row["tvg_id"],
+                    "title": (
+                        receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
+                        .get("title", row["name"])
+                    ),
+                    "start": (
+                        receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
+                        .get("start", (now - timedelta(minutes=15)).isoformat())
+                    ),
+                    "stop": (
+                        receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
+                        .get("stop", (now + timedelta(hours=2)).isoformat())
+                    ),
+                }
+                for row in served_headers
+            ]
+        return True
+
     regenerate = AsyncMock(side_effect=publish)
-    wait_refresh = AsyncMock()
-    return epg_store, regenerate, wait_refresh
+    wait_refresh = AsyncMock(side_effect=complete_refresh)
+    wait_refresh.complete_refresh = complete_refresh
+    return headers, regenerate, wait_refresh
 
 
 def _manual_run(client, session_factory, regenerate, wait_refresh,
@@ -227,6 +394,8 @@ def _manual_run(client, session_factory, regenerate, wait_refresh,
     with patch("channel_pipeline_engine.get_session",
                side_effect=session_factory), \
          patch("database.get_session", side_effect=session_factory), \
+         patch("services.epg_publication.get_session",
+               side_effect=session_factory), \
          patch("tasks.dummy_epg_refresh.DummyEPGRefreshTask", task_cls), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
                wait_refresh), \
@@ -235,6 +404,121 @@ def _manual_run(client, session_factory, regenerate, wait_refresh,
             dry_run=dry_run, triggered_by="manual"
         ))
     return result
+
+
+def _refresh_executor(source_ids=(), publications=None):
+    return SimpleNamespace(
+        _epg_import_sources=set(source_ids),
+        _epg_import_attempts=set(),
+        _event_pending={},
+        _event_publications=dict(publications or {}),
+        _finish_event_promotions=AsyncMock(return_value=set()),
+    )
+
+
+def _refresh_results():
+    return {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+
+
+def _seed_publications(session_factory, sources):
+    from services.epg_publication import (
+        begin_delivery,
+        publish_profiles,
+        read_publication,
+    )
+    from tasks.event_visibility import _generated_scope
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    session = session_factory()
+    try:
+        profiles = []
+        for source in sources:
+            scope = _generated_scope(source)
+            assert scope is not None and scope.startswith("profile:")
+            profile_id = int(scope.split(":", 1)[1])
+            profile = DummyEPGProfile(
+                id=profile_id,
+                name=f"Guide {profile_id}",
+                enabled=True,
+                name_source="channel",
+                event_timezone="UTC",
+                output_timezone="UTC",
+                program_duration=180,
+            )
+            profile.set_channel_group_ids([MASTER_GROUP_ID])
+            profile.set_epg_source_ids([source["id"]])
+            session.add(profile)
+            profiles.append(profile)
+        session.commit()
+        saved = [profile.to_dict() for profile in profiles]
+    finally:
+        session.close()
+
+    channels = {}
+    coverage = {"profiles": {}}
+    expected = {}
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=session_factory,
+    ):
+        for profile in saved:
+            profile_id = profile["id"]
+            channel_id = 900 + profile_id
+            admitted = begin_delivery(
+                f"profile:{profile_id}",
+                expected_revision=0,
+                expected_hash=None,
+                profile=profile,
+                now=now,
+            )
+            assert admitted is not None
+            attempt = admitted["state"]["delivery"]["guide_attempt"]
+            expected[f"profile:{profile_id}"] = {
+                "revision": admitted["revision"],
+                "xmltv_hash": admitted["state"]["xmltv_hash"],
+                "config_hash": admitted["state"]["config_hash"],
+                "attempt_id": attempt["attempt_id"],
+            }
+            profile["channel_assignments"] = [{
+                "channel_id": channel_id,
+                "channel_name": f"Arena {profile_id}",
+            }]
+            profile["event_intervals"] = {channel_id: [{
+                "start": (now - timedelta(minutes=15)).isoformat(),
+                "stop": (now + timedelta(hours=2)).isoformat(),
+                "title": f"Event {profile_id}",
+            }]}
+            channels[channel_id] = {
+                "id": channel_id,
+                "name": f"Arena {profile_id}",
+                "channel_number": channel_id,
+                "channel_group_id": MASTER_GROUP_ID,
+                "streams": [],
+            }
+            coverage["profiles"][str(profile_id)] = {
+                "profile_id": profile_id,
+                "can_publish": True,
+                "reason_codes": [],
+            }
+        publish_profiles(
+            saved,
+            channels,
+            coverage,
+            observations={},
+            now=now,
+            expected=expected,
+        )
+        return {
+            profile["id"]: read_publication(f'profile:{profile["id"]}')
+            for profile in saved
+        }
 
 
 class TestPass5RetryPath:
@@ -251,7 +535,7 @@ class TestPass5RetryPath:
         # Empty source: the profile has never generated XMLTV covering the
         # master group. Pass 5's regeneration produces the entry.
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
@@ -296,7 +580,7 @@ class TestPass5RetryPath:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
@@ -326,12 +610,13 @@ class TestPass5RetryPath:
         state = _mercury_state()
         client = make_stateful_client(state)
         _store, regenerate, wait_refresh = _wire_epg(
-            client, initial_entries=[],
+            state, client, db_session_factory, initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
         programmes = []
 
         async def import_linked(*args, **kwargs):
+            await wait_refresh.complete_refresh(*args, **kwargs)
             if state.channels[100].get("epg_data_id") == 501:
                 programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
             return True
@@ -348,11 +633,13 @@ class TestPass5RetryPath:
         state = _mercury_state()
         client = make_stateful_client(state)
         _store, regenerate, wait_refresh = _wire_epg(
-            client, initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+            state, client, db_session_factory,
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
         programmes = []
 
         async def import_linked(*args, **kwargs):
+            await wait_refresh.complete_refresh(*args, **kwargs)
             if state.channels[100].get("epg_data_id") == 501:
                 programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
             return True
@@ -370,9 +657,10 @@ class TestPass5RetryPath:
         state = _mercury_state()
         client = make_stateful_client(state)
         _store, regenerate, wait_refresh = _wire_epg(
-            client, initial_entries=[],
+            state, client, db_session_factory, initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
+        wait_refresh.side_effect = None
         wait_refresh.return_value = False
         result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
         assert state.channels[100].get("epg_data_id") is None
@@ -385,10 +673,15 @@ class TestPass5RetryPath:
         state = _mercury_state()
         client = make_stateful_client(state)
         _store, regenerate, wait_refresh = _wire_epg(
-            client, initial_entries=[],
+            state, client, db_session_factory, initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
-        wait_refresh.side_effect = [True, False]
+        async def fail_programme(*args, **kwargs):
+            if not state.guide_rows:
+                return await wait_refresh.complete_refresh(*args, **kwargs)
+            return False
+
+        wait_refresh.side_effect = fail_programme
         result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
         assert state.channels[100].get("epg_data_id") == 501
         assert result["failed_actions"]
@@ -401,8 +694,12 @@ class TestPass5RetryPath:
         _add_event_rule(db_session_factory, _config())
         state = _mercury_state()
         client = make_stateful_client(state)
-        _store, regenerate, wait_refresh = _wire_epg(client, initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)])
+        _store, regenerate, wait_refresh = _wire_epg(
+            state, client, db_session_factory,
+            initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
+        )
         programmes = []
+        wait_refresh.side_effect = None
         wait_refresh.return_value = False
         if cancelled:
             wait_refresh.side_effect = asyncio.CancelledError
@@ -413,6 +710,7 @@ class TestPass5RetryPath:
             assert first["failed_actions"]
         assert state.channels[100].get("epg_data_id") == 501
         async def import_linked(*args, **kwargs):
+            await wait_refresh.complete_refresh(*args, **kwargs)
             programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
             return True
         wait_refresh.side_effect = import_linked
@@ -423,91 +721,188 @@ class TestPass5RetryPath:
         assert len(programmes) == 1
 
 
-    def test_cancelled_import_retains_sources_not_yet_attempted(self):
-        from types import SimpleNamespace
-        from cache import Cache
-        client = MagicMock()
+    def test_cancelled_import_retains_sources_not_yet_attempted(
+        self, db_session_factory
+    ):
+        sources = [
+            {
+                "id": 100,
+                "name": "Guide one",
+                "url": "http://ecm/api/dummy-epg/xmltv/1",
+                "status": "ready",
+                "updated_at": "2026-07-11T15:00:00+00:00",
+            },
+            {
+                "id": 101,
+                "name": "Guide two",
+                "url": "http://ecm/api/dummy-epg/xmltv/2",
+                "status": "ready",
+                "updated_at": "2026-07-11T15:00:00+00:00",
+            },
+        ]
+        publications = _seed_publications(db_session_factory, sources)
+        state = FakeDispatcharrState(guide_sources=sources)
+        client = make_stateful_client(state)
         engine = ChannelPipelineEngine(client)
-        sources = [{"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"}, {"id": 101, "url": "http://ecm/api/dummy-epg/xmltv/2"}]
-        cache = Cache()
-        with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
+        with patch(
+            "services.epg_publication.get_session",
+            side_effect=db_session_factory,
+        ), patch(
+            "tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
+            new_callable=AsyncMock,
+        ) as wait:
+            wait.return_value = True
+            for profile_id, source in zip((1, 2), sources):
+                expires_at = datetime.fromisoformat(
+                    publications[profile_id]["state"]["delivery"]
+                    ["guide_attempt"]["expires_at"]
+                )
+                assert _run(engine._refresh_epg_source(
+                    source,
+                    {profile_id: publications[profile_id]},
+                    expires_at=expires_at,
+                )) is True
+
+            wait.reset_mock()
             wait.side_effect = asyncio.CancelledError
             with pytest.raises(asyncio.CancelledError):
-                _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources={100, 101}), {}, sources))
+                _run(engine._refresh_linked_epg(
+                    _refresh_executor(), _refresh_results(), sources,
+                ))
+
             wait.side_effect = None
             wait.return_value = True
             wait.reset_mock()
-            _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, sources))
+            restarted = ChannelPipelineEngine(make_stateful_client(state))
+            _run(restarted._refresh_linked_epg(
+                _refresh_executor(), _refresh_results(), sources,
+            ))
             assert [call.args[1] for call in wait.await_args_list] == [100, 101]
-            assert cache.get("dummy_epg_import_retries") is None
 
     @pytest.mark.parametrize("change", ["client", "source_id", "source_url"])
-    def test_failed_import_retry_stays_with_its_client_and_source(self, change):
-        from types import SimpleNamespace
-        from cache import Cache
-        client = MagicMock()
+    def test_failed_import_retry_stays_with_its_client_and_source(
+        self, db_session_factory, change
+    ):
+        source = {
+            "id": 100,
+            "name": "Guide one",
+            "url": "http://ecm/api/dummy-epg/xmltv/1",
+            "status": "ready",
+            "updated_at": "2026-07-11T15:00:00+00:00",
+        }
+        _seed_publications(db_session_factory, [source])
+        state = FakeDispatcharrState(guide_sources=[source])
+        client = make_stateful_client(state)
         engine = ChannelPipelineEngine(client)
-        source = {"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"}
-        cache = Cache()
-        executor = SimpleNamespace(_epg_import_sources={100})
-        with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
+        executor = _refresh_executor({100})
+        with patch(
+            "services.epg_publication.get_session",
+            side_effect=db_session_factory,
+        ), patch(
+            "tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
+            new_callable=AsyncMock,
+        ) as wait:
             wait.return_value = False
-            _run(engine._refresh_linked_epg(executor, {}, [source]))
-            assert cache.get("dummy_epg_import_retries")
-            _run(engine._refresh_linked_epg(executor, {}, [source]))
+            _run(engine._refresh_linked_epg(
+                executor, _refresh_results(), [source],
+            ))
+            _run(engine._refresh_linked_epg(
+                executor, _refresh_results(), [source],
+            ))
             assert wait.await_count == 1
 
             other = dict(source)
             other_engine = engine
             if change == "client":
-                other_engine = ChannelPipelineEngine(MagicMock())
+                other_client = make_stateful_client(state)
+                other_client.base_url = "http://other.dispatcharr.test"
+                other_engine = ChannelPipelineEngine(other_client)
             elif change == "source_id":
                 other["id"] = 101
             else:
-                other["url"] = "http://ecm/api/dummy-epg/xmltv/2"
+                other["url"] = "http://other-ecm/api/dummy-epg/xmltv/1"
             wait.return_value = True
-            _run(other_engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, [other]))
+            _run(other_engine._refresh_linked_epg(
+                _refresh_executor(), _refresh_results(), [other],
+            ))
             assert wait.await_count == 1
-            assert cache.get("dummy_epg_import_retries")
-            _run(engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources=set()), {}, [source]))
+            restarted = ChannelPipelineEngine(make_stateful_client(state))
+            _run(restarted._refresh_linked_epg(
+                _refresh_executor(), _refresh_results(), [source],
+            ))
             assert wait.await_count == 2
-            assert cache.get("dummy_epg_import_retries") is None
+            from services.epg_publication import read_publication
+            current = read_publication("profile:1")
+            assert current["state"]["delivery"][
+                "confirmed_dispatcharr_hashes"
+            ] == {"100": current["state"]["xmltv_hash"]}
 
     @pytest.mark.parametrize("late_success", [True, False])
-    def test_concurrent_imports_preserve_each_source_retry(self, late_success):
-        from types import SimpleNamespace
-        from cache import Cache
-        client = MagicMock()
-        engine = ChannelPipelineEngine(client)
+    def test_concurrent_imports_preserve_each_source_retry(
+        self, db_session_factory, late_success
+    ):
         sources = [
-            {"id": 100, "url": "http://ecm/api/dummy-epg/xmltv/1"},
-            {"id": 101, "url": "http://ecm/api/dummy-epg/xmltv/2"},
+            {
+                "id": 100,
+                "name": "Guide one",
+                "url": "http://ecm/api/dummy-epg/xmltv/1",
+                "status": "ready",
+                "updated_at": "2026-07-11T15:00:00+00:00",
+            },
+            {
+                "id": 101,
+                "name": "Guide two",
+                "url": "http://ecm/api/dummy-epg/xmltv/2",
+                "status": "ready",
+                "updated_at": "2026-07-11T15:00:00+00:00",
+            },
         ]
-        cache = Cache()
+        _seed_publications(db_session_factory, sources)
+        state = FakeDispatcharrState(guide_sources=sources)
+        first_engine = ChannelPipelineEngine(make_stateful_client(state))
+        second_engine = ChannelPipelineEngine(make_stateful_client(state))
 
         async def run():
-            executor = SimpleNamespace(_epg_import_sources={100})
-            with patch("cache.get_cache", return_value=cache), patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new_callable=AsyncMock) as wait:
-                if not late_success:
-                    wait.return_value = False
-                    executor._epg_import_sources = {101}
-                    await engine._refresh_linked_epg(executor, {}, sources)
-                    executor._epg_import_sources = {100}
+            with patch(
+                "services.epg_publication.get_session",
+                side_effect=db_session_factory,
+            ), patch(
+                "tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
+                new_callable=AsyncMock,
+            ) as wait:
                 started, release = asyncio.Event(), asyncio.Event()
+
                 async def finish(_client, source_id, *_args, **_kwargs):
                     if source_id == 100:
                         started.set()
                         await release.wait()
                         return late_success
                     return not late_success
+
                 wait.side_effect = finish
-                task = asyncio.create_task(engine._refresh_linked_epg(executor, {}, sources))
-                await started.wait()
-                await engine._refresh_linked_epg(SimpleNamespace(_epg_import_sources={101}), {}, [sources[1]])
+                task = asyncio.create_task(first_engine._refresh_linked_epg(
+                    _refresh_executor({100}),
+                    _refresh_results(),
+                    [sources[0]],
+                ))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await second_engine._refresh_linked_epg(
+                    _refresh_executor({101}),
+                    _refresh_results(),
+                    [sources[1]],
+                )
                 release.set()
                 await task
-                pending = cache.get("dummy_epg_import_retries") or {}
-                assert {key[1] for key in pending} == ({101} if late_success else {100})
+                from services.epg_publication import read_publication
+                pending = set()
+                for profile_id, source_id in ((1, 100), (2, 101)):
+                    current = read_publication(f"profile:{profile_id}")
+                    delivery = current["state"]["delivery"]
+                    if delivery["confirmed_dispatcharr_hashes"].get(
+                        str(source_id)
+                    ) != current["state"]["xmltv_hash"]:
+                        pending.add(source_id)
+                assert pending == ({101} if late_success else {100})
         _run(run())
 
 
@@ -522,7 +917,7 @@ class TestDirectAssignment:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
@@ -550,7 +945,7 @@ class TestDirectAssignment:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
             source_url="http://ecm:8000/api/dummy-epg/xmltv",
         )
@@ -586,7 +981,7 @@ class TestNonClobbering:
         )
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
@@ -620,7 +1015,7 @@ class TestUnattendedRuns:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[],
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
@@ -644,6 +1039,8 @@ class TestUnattendedRuns:
              patch("channel_pipeline_engine.get_session",
                    side_effect=db_session_factory), \
              patch("database.get_session", side_effect=db_session_factory), \
+             patch("services.epg_publication.get_session",
+                   side_effect=db_session_factory), \
              patch("tasks.channel_pipeline.get_client", return_value=client), \
              patch("tasks.dummy_epg_refresh.DummyEPGRefreshTask", task_cls), \
              patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
@@ -678,7 +1075,7 @@ class TestGracefulDegradation:
         # A dummy source exists — but for a DIFFERENT profile, and there is
         # no combined source.
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[],
             source_url="http://ecm:8000/api/dummy-epg/xmltv/99",
         )
@@ -709,7 +1106,7 @@ class TestGracefulDegradation:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client,
+            state, client, db_session_factory,
             initial_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
 
@@ -735,7 +1132,7 @@ class TestGracefulDegradation:
         state = _mercury_state()
         client = make_stateful_client(state)
         _epg_store, regenerate, wait_refresh = _wire_epg(
-            client, initial_entries=[],
+            state, client, db_session_factory, initial_entries=[],
         )
 
         result = _manual_run(

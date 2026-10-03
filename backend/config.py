@@ -625,10 +625,9 @@ class DispatcharrSettings(BaseModel):
     # reports nothing, so this is the only way to tell ECM about one. An
     # account with no entry and nothing published uses max_concurrent_probes.
     probe_concurrency_by_account: dict[str, int] = {}
-    # Sustained throughput below this is treated as a stream carrying nothing.
-    # Measured across 21 event streams: content ran 4.97-12.16 Mbps, a provider
-    # offline card 0.45-0.90 Mbps, and a stream sending nothing 0.00 Mbps.
-    # Nothing landed in between, so 2000 kbps sits in empty space.
+    # Legacy setting retained for config and API compatibility. Event stream
+    # health no longer treats positive measured throughput below this value as
+    # proof that a stream is dead.
     min_stream_bitrate_kbps: int = 2000
     # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     profile_distribution_strategy: str = "fill_first"

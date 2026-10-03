@@ -2,7 +2,7 @@
  * Unit tests for BackupRestoreSection component.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { BackupRestoreSection } from './BackupRestoreSection';
 import { settingsSectionHeading } from '../settingsSections';
 
@@ -538,53 +538,167 @@ describe('BackupRestoreSection', () => {
     });
 
     it('calls restoreBackup on valid file upload', async () => {
-      const mockResult = {
+      const mockResult: api.RestoreResult = {
         status: 'ok',
         backup_version: '0.15.0',
         backup_date: '2026-01-01T00:00:00Z',
         restored_files: ['settings.json', 'journal.db'],
       };
-      vi.mocked(api.restoreBackup).mockResolvedValue(mockResult);
+      let resolveRestore!: (value: api.RestoreResult) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((resolve) => {
+        resolveRestore = resolve;
+      });
+      vi.mocked(api.restoreBackup).mockReturnValueOnce(restoreRequest);
 
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
       const reloadMock = vi.fn();
       Object.defineProperty(window, 'location', {
         value: { ...window.location, reload: reloadMock },
         writable: true,
+        configurable: true,
       });
 
-      render(<BackupRestoreSection isAdmin={true} />);
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText('Settings');
 
       const file = new File(['zip-content'], 'backup.zip', { type: 'application/zip' });
       const input = document.querySelector('input[type="file"]') as HTMLInputElement;
       Object.defineProperty(input, 'files', { value: [file] });
 
       fireEvent.click(screen.getByText('Restore'));
+      const confirmationInput = screen.getByLabelText(/type backup\.zip to confirm/i);
+      await waitFor(() => expect(confirmationInput).toHaveFocus());
       confirmFullRestoreOf('backup.zip');
 
       await waitFor(() => {
-        expect(api.restoreBackup).toHaveBeenCalledWith(file);
+        expect(api.restoreBackup).toHaveBeenCalledTimes(1);
       });
+      expect(api.restoreBackup).toHaveBeenCalledWith(file);
 
-      await waitFor(() => {
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          resolveRestore(mockResult);
+          await restoreRequest;
+        });
+
         expect(mockSuccess).toHaveBeenCalledWith('Restored 2 files from backup');
-      });
+        expect(screen.getByText('Restore Complete')).toBeInTheDocument();
+        expect(reloadMock).not.toHaveBeenCalled();
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(2999); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
 
     it('shows error on restore failure', async () => {
-      vi.mocked(api.restoreBackup).mockRejectedValue(new Error('Server error'));
+      let rejectRestore!: (reason: Error) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((_resolve, reject) => {
+        rejectRestore = reject;
+      });
+      vi.mocked(api.restoreBackup).mockReturnValueOnce(restoreRequest);
 
-      render(<BackupRestoreSection isAdmin={true} />);
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText('Settings');
 
       const file = new File(['zip-content'], 'backup.zip', { type: 'application/zip' });
       const input = document.querySelector('input[type="file"]') as HTMLInputElement;
       Object.defineProperty(input, 'files', { value: [file] });
 
       fireEvent.click(screen.getByText('Restore'));
+      const confirmationInput = screen.getByLabelText(/type backup\.zip to confirm/i);
+      await waitFor(() => expect(confirmationInput).toHaveFocus());
       confirmFullRestoreOf('backup.zip');
 
       await waitFor(() => {
-        expect(mockError).toHaveBeenCalledWith('Server error', 'Restore Failed');
+        expect(api.restoreBackup).toHaveBeenCalledTimes(1);
       });
+      expect(api.restoreBackup).toHaveBeenCalledWith(file);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          rejectRestore(new Error('Server error'));
+          await expect(restoreRequest).rejects.toThrow('Server error');
+        });
+
+        expect(mockError).toHaveBeenCalledWith('Server error', 'Restore Failed');
+        expect(mockSuccess).not.toHaveBeenCalled();
+        expect(mockWarning).not.toHaveBeenCalled();
+        expect(screen.queryByRole('dialog', { name: 'Restore Full Backup' })).not.toBeInTheDocument();
+        expect(screen.getByLabelText(/choose ecm full-backup zip/i)).toBeEnabled();
+        expect(screen.getByRole('button', { name: /^Restore$/ })).toBeEnabled();
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+
+        unmount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(3001); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
+    });
+
+    it('does not reload when the uploaded restore is cancelled', async () => {
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText('Settings');
+
+      const file = new File(['zip-content'], 'backup.zip', { type: 'application/zip' });
+      const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+      Object.defineProperty(input, 'files', { value: [file] });
+      fireEvent.click(screen.getByText('Restore'));
+
+      const confirmationInput = screen.getByLabelText(/type backup\.zip to confirm/i);
+      await waitFor(() => expect(confirmationInput).toHaveFocus());
+
+      vi.useFakeTimers();
+      try {
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+        expect(screen.queryByRole('dialog', { name: 'Restore Full Backup' })).not.toBeInTheDocument();
+        expect(api.restoreBackup).not.toHaveBeenCalled();
+        expect(api.restoreSavedBackup).not.toHaveBeenCalled();
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+
+        unmount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(3001); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
 
     // Bead enhancedchannelmanager-gi4zn. A standard artifact carries no ECM
@@ -596,48 +710,143 @@ describe('BackupRestoreSection', () => {
       const notice =
         'This instance has no ECM user account. Create your admin account ' +
         'through first-run setup.';
-      vi.mocked(api.restoreBackup).mockResolvedValue({
+      const guideNotice =
+        'Guide-promotion rules paused: 2. This backup has no event recovery records. ' +
+        'Inspect the external channels and recovery state before you re-enable these rules.';
+      const mockResult: api.RestoreResult = {
         status: 'ok',
         backup_version: '0.18.1',
         backup_date: '2026-08-17T00:00:00Z',
         restored_files: ['settings.json', 'journal.db'],
-        notices: [notice],
+        notices: [notice, guideNotice],
+      };
+      let resolveRestore!: (value: api.RestoreResult) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((resolve) => {
+        resolveRestore = resolve;
+      });
+      vi.mocked(api.restoreBackup).mockReturnValueOnce(restoreRequest);
+
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
       });
 
-      render(<BackupRestoreSection isAdmin={true} />);
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText('Settings');
       const file = new File(['zip-content'], 'backup.zip', { type: 'application/zip' });
       const input = document.querySelector('input[type="file"]') as HTMLInputElement;
       Object.defineProperty(input, 'files', { value: [file] });
       fireEvent.click(screen.getByText('Restore'));
+      const confirmationInput = screen.getByLabelText(/type backup\.zip to confirm/i);
+      await waitFor(() => expect(confirmationInput).toHaveFocus());
       confirmFullRestoreOf('backup.zip');
 
       await waitFor(() => {
-        expect(mockWarning).toHaveBeenCalledWith(notice, 'Account Setup Required');
+        expect(api.restoreBackup).toHaveBeenCalledTimes(1);
       });
-      expect(await screen.findByText(notice)).toBeInTheDocument();
+      expect(api.restoreBackup).toHaveBeenCalledWith(file);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          resolveRestore(mockResult);
+          await restoreRequest;
+        });
+
+        expect(mockSuccess).toHaveBeenCalledWith('Restored 2 files from backup');
+        expect(mockWarning).toHaveBeenNthCalledWith(1, notice, 'Restore Follow-up Required');
+        expect(mockWarning).toHaveBeenNthCalledWith(2, guideNotice, 'Restore Follow-up Required');
+        expect(mockWarning).toHaveBeenCalledTimes(2);
+        expect(screen.getByText(notice)).toBeInTheDocument();
+        expect(screen.getByText(guideNotice)).toBeInTheDocument();
+        expect(screen.getByText('Restore Complete')).toBeInTheDocument();
+        expect(reloadMock).not.toHaveBeenCalled();
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(2999); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
 
     // The same restore against a backend that predates the field: `notices` is
     // absent, not empty, and the component must not warn or throw on it.
     it('warns about nothing when the response carries no notices', async () => {
-      vi.mocked(api.restoreBackup).mockResolvedValue({
+      const mockResult: api.RestoreResult = {
         status: 'ok',
         backup_version: '0.18.1',
         backup_date: '2026-08-17T00:00:00Z',
         restored_files: ['settings.json'],
+      };
+      let resolveRestore!: (value: api.RestoreResult) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((resolve) => {
+        resolveRestore = resolve;
+      });
+      vi.mocked(api.restoreBackup).mockReturnValueOnce(restoreRequest);
+
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
       });
 
-      render(<BackupRestoreSection isAdmin={true} />);
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText('Settings');
       const file = new File(['zip-content'], 'backup.zip', { type: 'application/zip' });
       const input = document.querySelector('input[type="file"]') as HTMLInputElement;
       Object.defineProperty(input, 'files', { value: [file] });
       fireEvent.click(screen.getByText('Restore'));
+      const confirmationInput = screen.getByLabelText(/type backup\.zip to confirm/i);
+      await waitFor(() => expect(confirmationInput).toHaveFocus());
       confirmFullRestoreOf('backup.zip');
 
       await waitFor(() => {
-        expect(mockSuccess).toHaveBeenCalledWith('Restored 1 files from backup');
+        expect(api.restoreBackup).toHaveBeenCalledTimes(1);
       });
-      expect(mockWarning).not.toHaveBeenCalled();
+      expect(api.restoreBackup).toHaveBeenCalledWith(file);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          resolveRestore(mockResult);
+          await restoreRequest;
+        });
+
+        expect(mockSuccess).toHaveBeenCalledWith('Restored 1 files from backup');
+        expect(mockWarning).not.toHaveBeenCalled();
+        expect(screen.getByText('Restore Complete')).toBeInTheDocument();
+        expect(reloadMock).not.toHaveBeenCalled();
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(2999); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
   });
 
@@ -677,10 +886,22 @@ describe('BackupRestoreSection', () => {
         backup_date: '2026-01-01T00:00:00Z',
         restored_files: ['settings.json'],
       };
-      vi.mocked(api.restoreSavedBackup).mockResolvedValue(mockResult);
+      let resolveRestore!: (value: api.RestoreResult) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((resolve) => {
+        resolveRestore = resolve;
+      });
+      vi.mocked(api.restoreSavedBackup).mockReturnValueOnce(restoreRequest);
 
-      render(<BackupRestoreSection isAdmin={true} />);
-      await waitFor(() => screen.getByLabelText('Restore as legacy full backup'));
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText(savedZip.filename);
 
       fireEvent.click(screen.getByLabelText('Restore as legacy full backup'));
 
@@ -688,26 +909,210 @@ describe('BackupRestoreSection', () => {
       expect(confirmBtn).toBeDisabled();
       expect(api.restoreSavedBackup).not.toHaveBeenCalled();
 
-      const input = screen.getByLabelText(/type/i);
+      const input = screen.getByLabelText(new RegExp(`type ${savedZip.filename} to confirm`, 'i'));
+      await waitFor(() => expect(input).toHaveFocus());
+      fireEvent.change(input, { target: { value: savedZip.filename } });
+      expect(confirmBtn).toBeEnabled();
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() => {
+        expect(api.restoreSavedBackup).toHaveBeenCalledTimes(1);
+      });
+      expect(api.restoreSavedBackup).toHaveBeenCalledWith(savedZip.filename);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          resolveRestore(mockResult);
+          await restoreRequest;
+        });
+
+        expect(mockSuccess).toHaveBeenCalledWith(`Restored 1 files from ${savedZip.filename}`);
+        expect(mockWarning).not.toHaveBeenCalled();
+        expect(reloadMock).not.toHaveBeenCalled();
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(2999); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
+    });
+
+    it('surfaces a saved restore follow-up notice without adding an inline result', async () => {
+      vi.mocked(api.listSavedBackups).mockResolvedValue([savedZip]);
+      const guideNotice =
+        'Guide-promotion rules paused: 2. This backup has no event recovery records. ' +
+        'Inspect the external channels and recovery state before you re-enable these rules.';
+      const mockResult = {
+        status: 'ok',
+        filename: savedZip.filename,
+        backup_version: '0.15.0',
+        backup_date: '2026-01-01T00:00:00Z',
+        restored_files: ['settings.json'],
+        notices: [guideNotice],
+      };
+      let resolveRestore!: (value: api.RestoreResult) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((resolve) => {
+        resolveRestore = resolve;
+      });
+      vi.mocked(api.restoreSavedBackup).mockReturnValueOnce(restoreRequest);
+
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText(savedZip.filename);
+      fireEvent.click(screen.getByLabelText('Restore as legacy full backup'));
+
+      const input = screen.getByLabelText(new RegExp(`type ${savedZip.filename} to confirm`, 'i'));
+      const confirmBtn = screen.getByRole('button', { name: 'Restore this backup' });
+      await waitFor(() => expect(input).toHaveFocus());
       fireEvent.change(input, { target: { value: savedZip.filename } });
       fireEvent.click(confirmBtn);
 
       await waitFor(() => {
-        expect(api.restoreSavedBackup).toHaveBeenCalledWith(savedZip.filename);
+        expect(api.restoreSavedBackup).toHaveBeenCalledTimes(1);
       });
+      expect(api.restoreSavedBackup).toHaveBeenCalledWith(savedZip.filename);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          resolveRestore(mockResult);
+          await restoreRequest;
+        });
+
+        expect(mockSuccess).toHaveBeenCalledWith(`Restored 1 files from ${savedZip.filename}`);
+        expect(mockWarning).toHaveBeenCalledWith(guideNotice, 'Restore Follow-up Required');
+        expect(screen.queryByText('Restore Complete')).not.toBeInTheDocument();
+        expect(screen.queryByText(guideNotice)).not.toBeInTheDocument();
+        expect(reloadMock).not.toHaveBeenCalled();
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+        expect(reloadMock).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
+    });
+
+    it('does not reload when the saved restore fails', async () => {
+      vi.mocked(api.listSavedBackups).mockResolvedValue([savedZip]);
+      let rejectRestore!: (reason: Error) => void;
+      const restoreRequest = new Promise<api.RestoreResult>((_resolve, reject) => {
+        rejectRestore = reject;
+      });
+      vi.mocked(api.restoreSavedBackup).mockReturnValueOnce(restoreRequest);
+
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText(savedZip.filename);
+      fireEvent.click(screen.getByLabelText('Restore as legacy full backup'));
+
+      const input = screen.getByLabelText(new RegExp(`type ${savedZip.filename} to confirm`, 'i'));
+      const confirmBtn = screen.getByRole('button', { name: 'Restore this backup' });
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(confirmBtn).toBeDisabled();
+      expect(api.restoreSavedBackup).not.toHaveBeenCalled();
+      fireEvent.change(input, { target: { value: savedZip.filename } });
+      expect(confirmBtn).toBeEnabled();
+      fireEvent.click(confirmBtn);
+
+      await waitFor(() => {
+        expect(api.restoreSavedBackup).toHaveBeenCalledTimes(1);
+      });
+      expect(api.restoreSavedBackup).toHaveBeenCalledWith(savedZip.filename);
+
+      vi.useFakeTimers();
+      try {
+        await act(async () => {
+          rejectRestore(new Error('Server error'));
+          await expect(restoreRequest).rejects.toThrow('Server error');
+        });
+
+        expect(mockError).toHaveBeenCalledWith('Server error', 'Restore Failed');
+        expect(mockSuccess).not.toHaveBeenCalled();
+        expect(mockWarning).not.toHaveBeenCalled();
+        expect(screen.getByRole('dialog', { name: 'Restore Saved Backup' })).toBeInTheDocument();
+        expect(input).toHaveValue(savedZip.filename);
+        expect(confirmBtn).toBeEnabled();
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+
+        unmount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(3001); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
 
     it('cancelling the legacy restore dialog does not call the API', async () => {
       vi.mocked(api.listSavedBackups).mockResolvedValue([savedZip]);
 
-      render(<BackupRestoreSection isAdmin={true} />);
-      await waitFor(() => screen.getByLabelText('Restore as legacy full backup'));
+      const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      const reloadMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: reloadMock },
+        writable: true,
+        configurable: true,
+      });
+
+      const { unmount } = render(<BackupRestoreSection isAdmin={true} />);
+      await screen.findByText(savedZip.filename);
 
       fireEvent.click(screen.getByLabelText('Restore as legacy full backup'));
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-
+      const input = screen.getByLabelText(new RegExp(`type ${savedZip.filename} to confirm`, 'i'));
+      const confirmBtn = screen.getByRole('button', { name: 'Restore this backup' });
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(confirmBtn).toBeDisabled();
       expect(api.restoreSavedBackup).not.toHaveBeenCalled();
-      expect(screen.queryByLabelText(/type/i)).not.toBeInTheDocument();
+
+      vi.useFakeTimers();
+      try {
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+        expect(api.restoreBackup).not.toHaveBeenCalled();
+        expect(api.restoreSavedBackup).not.toHaveBeenCalled();
+        expect(screen.queryByRole('dialog', { name: 'Restore Saved Backup' })).not.toBeInTheDocument();
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+
+        unmount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(3001); });
+        expect(reloadMock).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        if (locationDescriptor) Object.defineProperty(window, 'location', locationDescriptor);
+      }
     });
 
     it('opens the DBAS-saved restore modal with the clicked filename', async () => {

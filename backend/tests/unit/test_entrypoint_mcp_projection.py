@@ -27,6 +27,7 @@ environment seam is introduced (contrast ``ECM_MOUNTINFO``, bead
 import grp
 import os
 import pwd
+import shlex
 import shutil
 import stat
 import subprocess
@@ -39,7 +40,7 @@ ENTRYPOINT = BACKEND_DIR / "entrypoint.sh"
 SH = shutil.which("sh") or "/bin/sh"
 
 
-def _run_prepare(projection_dir, config_dir="/config", runner="env"):
+def _run_prepare(projection_dir, config_dir="/config", runner="env", setup=""):
     """Execute the real prepare_mcp_projection_dir() out of entrypoint.sh.
 
     ``runner`` stands in for production's ``gosu appuser``: the tests run it as
@@ -56,6 +57,7 @@ def _run_prepare(projection_dir, config_dir="/config", runner="env"):
     group = grp.getgrgid(os.getgid()).gr_name
     harness = (
         script[: script.index(marker)]
+        + setup
         + f'\nprepare_mcp_projection_dir "$PROJECTION_DIR" '
         + f'"{user}" "{group}" {runner}\n'
     )
@@ -76,23 +78,53 @@ class TestFirstRunUnprovisionedMount:
     """The invariant: a brand-new mount needs no manual privilege step."""
 
     def test_a_directory_the_backend_cannot_write_is_repaired(self, tmp_path):
-        """The production symptom, reproduced by mode rather than by uid.
-
-        A fresh Docker named volume is ``root:root 0755``: the ECM account has
-        r-x and no w, so it cannot create the projection files. 0500 here is
-        the same property — "this account cannot create a file in this
-        directory" — expressed without needing root in the test runner.
-        """
+        """The production repair must run before the backend write probe."""
         projection = tmp_path / "run" / "secrets" / "ecm-mcp"
         projection.mkdir(parents=True)
         projection.chmod(0o500)
-        with pytest.raises(PermissionError):
-            (projection / "api-key").write_text("x")
+        repair_log = tmp_path / "repair.log"
+        initial_probe = projection / ".before-repair"
+        setup = f"""
+repair_log={shlex.quote(str(repair_log))}
+chown() {{
+    command chown "$@"
+    status=$?
+    printf 'chown\\n' >> "$repair_log"
+    return "$status"
+}}
+chmod() {{
+    command chmod "$@"
+    status=$?
+    printf 'chmod\\n' >> "$repair_log"
+    return "$status"
+}}
+permission_probe() {{
+    if ! grep -qx chown "$repair_log" 2>/dev/null \
+        || ! grep -qx chmod "$repair_log" 2>/dev/null; then
+        printf 'probe refused before repairs\\n'
+        return 13
+    fi
+    "$@"
+}}
+if permission_probe touch {shlex.quote(str(initial_probe))}; then
+    printf 'probe unexpectedly passed before repairs\\n'
+    exit 97
+fi
+"""
 
-        rc, out = _run_prepare(projection)
+        rc, out = _run_prepare(
+            projection,
+            runner="permission_probe",
+            setup=setup,
+        )
 
         assert rc == 0, out
+        assert "probe refused before repairs" in out
         assert "is writable" in out
+        assert repair_log.read_text(encoding="utf-8").splitlines() == [
+            "chown",
+            "chmod",
+        ]
         assert stat.S_IMODE(projection.stat().st_mode) == 0o700
         # The property that matters is not the mode digits but that the
         # producer can now write the two projection files.
@@ -148,16 +180,24 @@ class TestGenuineFailureIsANamedPreflightError:
     """A failure that preparation cannot fix must name itself, not stack-trace."""
 
     def test_an_uncreatable_directory_fails_preflight_by_name(self, tmp_path):
-        parent = tmp_path / "readonly"
+        parent = tmp_path / "mkdir-failure"
         parent.mkdir()
-        parent.chmod(0o555)
-        try:
-            rc, out = _run_prepare(parent / "ecm-mcp")
-        finally:
-            parent.chmod(0o755)
+        projection = parent / "ecm-mcp"
+        target = shlex.quote(str(projection))
+        setup = f"""
+mkdir() {{
+    if [ "$#" -eq 2 ] && [ "$1" = "-p" ] && [ "$2" = {target} ]; then
+        return 13
+    fi
+    command mkdir "$@"
+}}
+"""
+
+        rc, out = _run_prepare(projection, setup=setup)
 
         assert rc == 1
         assert "Failed to create MCP credential projection directory" in out
+        assert not projection.exists()
 
     def test_an_unwritable_directory_fails_preflight_by_name(self, tmp_path):
         """``false`` stands in for an account that cannot write the mount."""

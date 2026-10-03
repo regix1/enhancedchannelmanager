@@ -799,9 +799,9 @@ describe('ProvidersPanel — a11y', () => {
  * The en-US + UTC combination produces exactly the fixed-width numeric
  * labels the format string targets ("MM/DD HH:mm" / "MM/DD").
  *
- * Intl.DateTimeFormat hour12:false produces "24:00" for midnight in some
- * runtimes instead of "00:00". The midnight test covers this boundary so a
- * regression in the formatter surfaces here before it reaches the chart.
+ * Intl.DateTimeFormat with an h23 hour cycle keeps midnight at "00:00"
+ * across supported runtimes. The midnight tests cover this boundary before
+ * a regression reaches the chart.
  */
 describe('formatBucketTick — compact X-axis tick formatter (bd-qk2zy)', () => {
   // --- hour granularity ---
@@ -818,9 +818,34 @@ describe('formatBucketTick — compact X-axis tick formatter (bd-qk2zy)', () => 
 
   it('formats a midnight UTC ISO string (boundary case) for hour bucket', () => {
     // Midnight is the most common boundary value (e.g. daily-rollover buckets).
-    // Intl.DateTimeFormat hour12:false renders 00:00 — not "24:00".
+    // The h23 hour cycle renders 00:00, not "24:00".
     const result = formatBucketTick('2026-05-14T00:00:00Z', 'hour', 'en-US', 'UTC');
     expect(result).toBe('05/14 00:00');
+  });
+
+  it('formats midnight with the locale-specific date order and h23 time', () => {
+    const result = formatBucketTick('2026-05-14T00:00:00Z', 'hour', 'en-GB', 'UTC');
+    expect(result).toBe('14/05 00:00');
+  });
+
+  it('formats New York midnight without rolling to the previous day', () => {
+    const result = formatBucketTick(
+      '2026-05-14T04:00:00Z',
+      'hour',
+      'en-US',
+      'America/New_York',
+    );
+    expect(result).toBe('05/14 00:00');
+  });
+
+  it('formats a New York local-time day rollover', () => {
+    const result = formatBucketTick(
+      '2026-05-14T03:30:00Z',
+      'hour',
+      'en-US',
+      'America/New_York',
+    );
+    expect(result).toBe('05/13 23:30');
   });
 
   it('handles trailing Z (UTC suffix) correctly for hour bucket', () => {

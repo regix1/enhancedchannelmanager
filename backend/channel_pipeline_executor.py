@@ -515,8 +515,12 @@ class ActionExecutor:
 
         # Deferred EPG assignments (populated when dummy source has no data yet)
         self._deferred_epg_assignments: list[tuple] = []  # (channel_id, action, stream_ctx, exec_ctx)
+        self._deferred_epg_profiles: dict[int, int] = {}
         self._epg_import_sources: set[int] = set()
         self._epg_sources = epg_sources or []
+        self._event_publications: dict[int, dict] = {}
+        self._event_pending: dict[str, dict] = {}
+        self._replayed_event_work: list[dict] = []
 
         # Pending EPG verifications for newly created channels (channel_id, payload)
         self._pending_epg_verifications: list[tuple[int, dict]] = []
@@ -1252,7 +1256,8 @@ class ActionExecutor:
                                        rule_scope_group_id: int = None,
                                        allow_manual_channel_merge: bool = False,
                                        fold_match_key: bool = False,
-                                       enqueue_pending_merge: bool = True) -> ActionResult:
+                                       enqueue_pending_merge: bool = True,
+                                       staged: bool = False) -> ActionResult:
         """Execute create_channel action."""
         params = action.params
         name_template = params.get("name_template", "{stream_name}")
@@ -1546,13 +1551,16 @@ class ActionExecutor:
             dry_id = self._next_dry_run_id
             self._next_dry_run_id -= 1
             simulated = {"id": dry_id, "name": channel_name, "channel_number": channel_number,
-                         "channel_group_id": group_id, "streams": [stream_ctx.stream_id],
+                         "channel_group_id": group_id,
+                         "streams": [] if staged else [stream_ctx.stream_id],
                          # enhancedchannelmanager-orzck (W1): a channel the engine
                          # creates in THIS run is an auto channel — mark it so the
                          # manual-channel gate lets later streams in the same run
                          # dedup-merge into it (otherwise the missing key would be
                          # read as "manual/protected" and block the merge).
                          "auto_created": True}
+            if staged:
+                simulated["hidden_from_output"] = True
             if stream_ctx.tvg_id:
                 simulated["tvg_id"] = stream_ctx.tvg_id
             self._created_channels[channel_name.lower()] = simulated
@@ -1590,8 +1598,10 @@ class ActionExecutor:
                 "name": channel_name,
                 "channel_number": channel_number,
                 "channel_group_id": group_id,
-                "streams": [stream_ctx.stream_id]
+                "streams": [] if staged else [stream_ctx.stream_id],
             }
+            if staged:
+                channel_data["hidden_from_output"] = True
 
             # Resolve logo URL to a Dispatcharr logo_id
             if stream_ctx.logo_url:
@@ -1602,6 +1612,9 @@ class ActionExecutor:
                 channel_data["tvg_id"] = stream_ctx.tvg_id
 
             new_channel = await self.client.create_channel(channel_data)
+            if staged:
+                new_channel["streams"] = []
+                new_channel["hidden_from_output"] = True
 
             # Observability (bd-eio04.9) — one counter increment per real
             # channel creation. Wrapped in try/except so a missing
@@ -5054,13 +5067,17 @@ class ActionExecutor:
         now,
         *,
         probe_missing,
+        expires_at,
     ):
         """Read bounded health evidence for promotion and owned attachments."""
         from database import get_session
         from models import ChannelPipelineRule, DummyEPGProfile
         from services.event_sync_matcher import parse_event_name
         from services.event_sync_promote import event_has_started
-        from services.event_sync_stream_health import find_dead_streams
+        from services.event_sync_stream_health import (
+            collect_stream_flow,
+            find_dead_streams,
+        )
 
         unit_ids = {
             row.stream.stream_id
@@ -5073,20 +5090,8 @@ class ActionExecutor:
             for row in resolved
             if row.stream.is_stale and row.stream.stream_id is not None
         }
-        started = {
-            row.stream.stream_id: unit.rows[0].result.parsed.start
-            for unit in units
-            if event_has_started(
-                unit.rows[0].result.parsed,
-                now,
-                since=(
-                    now - timedelta(hours=24)
-                    if config.get("retire_finished_events") else None
-                ),
-            )
-            for row in unit.rows
-            if row.stream.stream_id is not None
-        }
+        event_start_by_stream = {}
+        stream_names = {}
         probe_first = {
             row.stream.stream_id
             for unit in units
@@ -5094,6 +5099,23 @@ class ActionExecutor:
             for row in unit.rows
             if row.stream.stream_id is not None
         }
+        for unit in units:
+            event_start = unit.rows[0].result.parsed.start
+            started = event_has_started(
+                unit.rows[0].result.parsed,
+                now,
+                since=(
+                    now - timedelta(hours=24)
+                    if config.get("retire_finished_events") else None
+                ),
+            )
+            for row in unit.rows:
+                stream_id = row.stream.stream_id
+                if stream_id is None:
+                    continue
+                stream_names[stream_id] = row.stream.name
+                if started:
+                    event_start_by_stream[stream_id] = event_start
 
         if config.get("retire_finished_events") and rule_id is not None:
             try:
@@ -5157,7 +5179,7 @@ class ActionExecutor:
                                 }
                                 if any(start > now for start in current_starts):
                                     stale_ids.discard(stream_id)
-                                    started.pop(stream_id, None)
+                                    event_start_by_stream.pop(stream_id, None)
                                     continue
                                 if len(current_starts) > 1:
                                     continue
@@ -5166,16 +5188,23 @@ class ActionExecutor:
                                     if current_starts else None
                                 )
                                 if (current_start is not None
-                                        and stream_id not in started):
+                                        and stream_id not in event_start_by_stream):
                                     continue
                                 evidence_start = max(
                                     start for start in (channel_start, current_start)
                                     if start is not None
                                 )
-                                previous_start = started.get(stream_id)
+                                current_names = {
+                                    row.stream.name for row in current_rows
+                                    if row.stream.name
+                                }
+                                if len(current_names) != 1:
+                                    continue
+                                stream_names[stream_id] = next(iter(current_names))
+                                previous_start = event_start_by_stream.get(stream_id)
                                 if (previous_start is None
                                         or evidence_start > previous_start):
-                                    started[stream_id] = evidence_start
+                                    event_start_by_stream[stream_id] = evidence_start
                     else:
                         logger.warning(
                             "[EVENT-SYNC] Rule id=%s: owned attachment health "
@@ -5199,19 +5228,53 @@ class ActionExecutor:
                     e,
                 )
 
-        return await find_dead_streams(
-            stream_ids,
+        checked_after = now - timedelta(minutes=5)
+        probe_ids = (
+            probe_first
+            if probe_missing and probe_first
+            else (unit_ids or stream_ids)
+        )
+        flow = await collect_stream_flow(
+            probe_ids,
             client=self.client,
             probe_missing=probe_missing,
-            stale_stream_ids=stale_ids,
-            event_start_by_stream=started,
-            **({
-                "probe_before": now - timedelta(minutes=5),
-                "probe_first": probe_first,
-            } if config.get("retire_finished_events") else {}),
+            checked_after=checked_after,
+            event_start_by_stream=event_start_by_stream,
+            stream_names=stream_names,
+            expires_at=expires_at,
         )
+        read_only_ids = stream_ids - set(probe_ids)
+        if read_only_ids:
+            flow.update(await collect_stream_flow(
+                read_only_ids,
+                client=self.client,
+                probe_missing=False,
+                checked_after=checked_after,
+                event_start_by_stream=event_start_by_stream,
+                stream_names=stream_names,
+                expires_at=None,
+            ))
+        retirement_confirmed = await find_dead_streams(
+            stream_ids,
+            stream_names=stream_names,
+            stale_stream_ids=stale_ids,
+            event_start_by_stream=event_start_by_stream,
+            probe_before=(checked_after if config.get("retire_finished_events") else None),
+            probe_missing=False,
+        )
+        return flow, retirement_confirmed
 
-    async def _event_lifecycle(self, rule_id, config, units, now, dead_stream_ids=frozenset()):
+    async def _event_lifecycle(
+        self,
+        rule_id,
+        config,
+        units,
+        now,
+        dead_stream_ids=frozenset(),
+        *,
+        flow,
+        expires_at,
+    ):
         """Read one bounded evidence batch for event creation and retirement."""
         import asyncio
         import copy
@@ -5222,7 +5285,6 @@ class ActionExecutor:
         from services.epg_programmes import prepare_profiles, SOURCE_MAX_AGE, _placeholder
         from services.event_slots import validate_ownership
         from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
-        from services.event_sync_stream_health import _load_stats, _min_stream_bitrate_bps
         from services.event_sync_resolver import effective_patterns
         from stream_prober import extract_m3u_account_id
 
@@ -5289,13 +5351,19 @@ class ActionExecutor:
         }
         if not stream_ids or None in stream_ids or len(stream_ids) > 1000:
             return eligible, states
+        remaining = (
+            expires_at - datetime.now(timezone.utc)
+        ).total_seconds()
+        if remaining <= 0:
+            return eligible, states
         try:
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(min(10.0, remaining)):
                 streams = await self.client.get_streams_by_ids(sorted(stream_ids))
+            if datetime.now(timezone.utc) >= expires_at:
+                return eligible, states
             if not isinstance(streams, list) or any(not isinstance(row, dict) for row in streams):
                 return eligible, states
             by_id = {row.get("id"): row for row in streams if row.get("id") in stream_ids}
-            stats = await _load_stats(sorted(stream_ids))
         except Exception:
             return eligible, states
         parsed_streams = {}
@@ -5322,13 +5390,23 @@ class ActionExecutor:
             channel["streams"] = [by_id[sid] for sid in ids if sid in by_id]
             channel["_event_streams_complete"] = bool(ids) and all(sid in by_id for sid in ids)
         profile["name_source"] = "channel"
+        if datetime.now(timezone.utc) >= expires_at:
+            return eligible, states
         try:
-            _, coverage = await prepare_profiles([profile], channels, self.client, now=now, wait_for_sources=False)
+            _, coverage = await prepare_profiles(
+                [profile],
+                channels,
+                self.client,
+                expires_at=expires_at,
+                now=now,
+                wait_for_sources=False,
+            )
         except Exception:
+            return eligible, states
+        if datetime.now(timezone.utc) >= expires_at:
             return eligible, states
         sources = {row["source_id"]: row for row in coverage["sources"]}
         observations = {row["channel_id"]: row for row in coverage["channels"]}
-        floor = _min_stream_bitrate_bps()
         parsed_units = {unit_ids[unit.event_key]: unit.rows[0].result.parsed for unit in units
                         if unit.event_key in unit_ids}
         for cid, channel in channels.items():
@@ -5352,20 +5430,19 @@ class ActionExecutor:
                 continue
             if not witness and parsed_channel.start is not None and parsed_channel.start <= now:
                 for stream in channel["streams"]:
-                    stat = stats.get(stream["id"], {})
-                    try:
-                        probed = datetime.fromisoformat((stat.get("last_probed") or "").replace("Z", "+00:00"))
-                        if probed.tzinfo is None:
-                            probed = probed.replace(tzinfo=timezone.utc)
-                        measured = stat.get("measured_bitrate")
-                        parsed = parsed_streams[stream["id"]]
-                        same = _score_parsed_pair(parsed_channel, parsed, window_minutes=30, threshold=EVENT_ATTACH_FLOOR).band == BAND_ATTACH
-                        if (same and stream.get("is_stale") is not True and floor > 0
-                                and isinstance(measured, (int, float)) and measured >= floor
-                                and max(parsed_channel.start, now - timedelta(minutes=5)) <= probed <= now):
-                            states[cid] = "active"
-                    except (TypeError, ValueError):
-                        pass
+                    parsed = parsed_streams[stream["id"]]
+                    same = _score_parsed_pair(
+                        parsed_channel,
+                        parsed,
+                        window_minutes=30,
+                        threshold=EVENT_ATTACH_FLOOR,
+                    ).band == BAND_ATTACH
+                    if (
+                        same
+                        and stream.get("is_stale") is not True
+                        and flow.get(stream["id"]) is True
+                    ):
+                        states[cid] = "active"
                 continue
             if not witness:
                 continue
@@ -5382,16 +5459,7 @@ class ActionExecutor:
                 continue
             positive, transitioned = False, True
             for stream in channel["streams"]:
-                stat = stats.get(stream["id"], {})
-                try:
-                    probed = datetime.fromisoformat((stat.get("last_probed") or "").replace("Z", "+00:00"))
-                    if probed.tzinfo is None:
-                        probed = probed.replace(tzinfo=timezone.utc)
-                    measured = stat.get("measured_bitrate")
-                    working = (floor > 0 and isinstance(measured, (int, float)) and measured >= floor
-                               and max(start, now - timedelta(minutes=5)) <= probed <= now)
-                except (TypeError, ValueError):
-                    working = False
+                working = flow.get(stream["id"]) is True
                 try:
                     observed = datetime.fromisoformat((stream.get("updated_at") or stream.get("last_seen") or "").replace("Z", "+00:00"))
                     if observed.tzinfo is None:
@@ -5419,6 +5487,886 @@ class ActionExecutor:
             if states.get(cid) == "active":
                 eligible.add(key)
         return eligible, states
+
+    def _event_receipt_current(
+        self,
+        publication: dict,
+        event_key: str,
+        *,
+        channel: dict | None = None,
+        channel_missing: bool = False,
+        expired: bool = False,
+    ) -> tuple[dict, dict] | None:
+        """Return the current publication and receipt when their owner still wins."""
+        import hashlib
+        import json
+
+        from database import get_session
+        from models import ChannelPipelineRule, DummyEPGProfile
+        from services.epg_publication import _config_hash, read_publication
+
+        if not isinstance(publication, dict):
+            return None
+        scope = publication.get("scope")
+        current = read_publication(scope)
+        if current is None:
+            return None
+        expected_attempt = (
+            publication.get("state", {}).get("delivery", {}).get("guide_attempt")
+        )
+        current_attempt = current["state"]["delivery"].get("guide_attempt")
+        expected_receipt = (
+            publication.get("state", {}).get("delivery", {})
+            .get("pending_channels", {}).get(event_key)
+        )
+        receipt = current["state"]["delivery"]["pending_channels"].get(event_key)
+        if (
+            expected_attempt is None
+            or current_attempt is None
+            or expected_receipt is None
+            or receipt is None
+            or current["revision"] != publication.get("revision")
+            or current["state"]["xmltv_hash"]
+            != publication.get("state", {}).get("xmltv_hash")
+            or current["state"]["config_hash"]
+            != publication.get("state", {}).get("config_hash")
+            or current_attempt["attempt_id"] != expected_attempt.get("attempt_id")
+            or receipt["attempt_id"] != expected_receipt.get("attempt_id")
+        ):
+            return None
+
+        session = get_session()
+        try:
+            profile = session.get(DummyEPGProfile, receipt["profile_id"])
+            rule = session.get(ChannelPipelineRule, receipt["rule_id"])
+            if profile is None or profile.enabled is not True or rule is None or not rule.enabled:
+                return None
+            profile_value = profile.to_dict()
+            rule_value = rule.get_event_sync_config()
+            if not isinstance(rule_value, dict):
+                return None
+            rule_hash = hashlib.sha256(
+                json.dumps(
+                    rule_value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                _config_hash(profile_value) != current["state"]["config_hash"]
+                or rule_hash != receipt["rule_hash"]
+                or rule_value.get("dummy_epg_profile_id") != receipt["profile_id"]
+                or rule_value.get("promote_target_group_id")
+                != receipt["target_group_id"]
+            ):
+                return None
+            managed = set(rule.get_managed_channel_ids() or ())
+        finally:
+            session.close()
+
+        channel_id = receipt.get("channel_id")
+        if channel_id is not None:
+            if channel_missing:
+                if channel is not None:
+                    return None
+                if (
+                    datetime.now(timezone.utc)
+                    >= datetime.fromisoformat(receipt["expires_at"])
+                ) != expired:
+                    return None
+                return current, receipt
+            if channel is None or channel.get("id") != channel_id:
+                return None
+            group_id = channel.get("channel_group_id") or channel.get("channel_group")
+            if isinstance(group_id, dict):
+                group_id = group_id.get("id")
+            if (
+                group_id != receipt["target_group_id"]
+                or channel_id not in managed | self._pipeline_managed_channel_ids
+                or (
+                    receipt.get("channel_uuid") is not None
+                    and channel.get("uuid") != receipt["channel_uuid"]
+                )
+            ):
+                return None
+        if (
+            datetime.now(timezone.utc)
+            >= datetime.fromisoformat(receipt["expires_at"])
+        ) != expired:
+            return None
+        return current, receipt
+
+    async def _write_event_receipt(
+        self,
+        publication: dict,
+        event_key: str,
+        stages,
+        changes: dict,
+        *,
+        guide_stage: str | None = None,
+        channel: dict | None = None,
+        channel_missing: bool = False,
+    ) -> dict | None:
+        """Apply one guarded receipt transition and return its exact new snapshot."""
+        import copy
+
+        from services.epg_publication import (
+            publication_lock,
+            read_publication,
+            update_delivery,
+        )
+
+        accepted = {stages} if isinstance(stages, str) else set(stages)
+        expired_write = changes.get("stage") == "expired"
+        if expired_write and (
+            set(changes) != {"stage", "reason", "terminal_at", "retry_at"}
+            or changes.get("reason") != "guide_expired"
+            or guide_stage is not None
+            or not accepted
+            or not accepted.issubset({
+                "allocated", "importing", "linking", "ready",
+            })
+        ):
+            raise ValueError("Invalid expired event receipt transition")
+        async with publication_lock:
+            current_value = self._event_receipt_current(
+                publication,
+                event_key,
+                channel=channel,
+                channel_missing=channel_missing,
+                expired=expired_write,
+            )
+            if current_value is None:
+                return None
+            current, receipt = current_value
+            if receipt["stage"] not in accepted:
+                return None
+            delivery = current["state"]["delivery"]
+            pending = copy.deepcopy(delivery["pending_channels"])
+            pending[event_key].update(copy.deepcopy(changes))
+            attempt = copy.deepcopy(delivery["guide_attempt"])
+            if guide_stage is not None:
+                attempt["stage"] = guide_stage
+            related = [
+                value for value in pending.values()
+                if value["guide_attempt_id"] == attempt["attempt_id"]
+            ]
+            if related and all(
+                value["stage"] in {
+                    "complete", "allocation_unknown", "failed", "expired",
+                }
+                for value in related
+            ):
+                if all(value["stage"] == "complete" for value in related):
+                    attempt["stage"] = "complete"
+                elif all(value["stage"] == "expired" for value in related):
+                    attempt["stage"] = "expired"
+                else:
+                    attempt["stage"] = "failed"
+            expected_pending = {
+                key: value["attempt_id"] for key, value in pending.items()
+            }
+            next_revision = update_delivery(
+                current["scope"],
+                expected_revision=current["revision"],
+                expected_hash=current["state"]["xmltv_hash"],
+                expected_config_hash=current["state"]["config_hash"],
+                expected_attempt_id=attempt["attempt_id"],
+                expected_pending=expected_pending,
+                guide_attempt=attempt,
+                pending_channels=pending,
+            )
+            if next_revision is None:
+                return None
+            updated = read_publication(current["scope"])
+            if updated is None or updated["revision"] != next_revision:
+                return None
+            updated_receipt = updated["state"]["delivery"]["pending_channels"].get(
+                event_key
+            )
+            if (
+                updated_receipt is None
+                or updated_receipt["attempt_id"] != receipt["attempt_id"]
+                or any(updated_receipt.get(key) != value for key, value in changes.items())
+            ):
+                return None
+            self._event_publications[receipt["profile_id"]] = updated
+            return updated
+
+    @staticmethod
+    def _event_row_plan(row) -> dict:
+        """Encode only the established stream and parsed-event fields."""
+        parsed = row.result.parsed
+        return {
+            "stream": {
+                "name": row.stream.name,
+                "group_id": row.stream.group_id,
+                "stream_id": row.stream.stream_id,
+                "provider": row.stream.provider,
+                "provider_id": row.stream.provider_id,
+                "name_seen_before_today": row.stream.name_seen_before_today,
+                "is_stale": row.stream.is_stale,
+            },
+            "disposition": row.disposition,
+            "parsed": {
+                "raw_name": parsed.raw_name,
+                "title": parsed.title,
+                "start": parsed.start.astimezone(timezone.utc).isoformat(),
+                "teams": list(parsed.teams) if parsed.teams is not None else None,
+                "matched_pattern": parsed.matched_pattern,
+            },
+        }
+
+    @classmethod
+    def _event_unit_plan(cls, unit) -> dict:
+        return {
+            "event_key": unit.event_key,
+            "channel_name": unit.channel_name,
+            "dateless": unit.dateless,
+            "action": unit.action,
+            "existing_channel_id": unit.existing_channel_id,
+            "rows": [cls._event_row_plan(row) for row in unit.rows],
+        }
+
+    @staticmethod
+    def _event_row_from_plan(value: dict):
+        """Rebuild the established event types at the execution boundary."""
+        from services.event_sync_matcher import ParsedEvent, StreamMatchResult
+        from services.event_sync_resolver import ResolvedStream, SecondaryStream
+
+        stream = SecondaryStream(**value["stream"])
+        parsed_value = value["parsed"]
+        parsed = ParsedEvent(
+            raw_name=parsed_value["raw_name"],
+            title=parsed_value["title"],
+            start=datetime.fromisoformat(parsed_value["start"]),
+            teams=(
+                tuple(parsed_value["teams"])
+                if parsed_value["teams"] is not None
+                else None
+            ),
+            matched_pattern=parsed_value["matched_pattern"],
+        )
+        return ResolvedStream(
+            stream=stream,
+            result=StreamMatchResult(stream_name=stream.name, parsed=parsed),
+            disposition=value["disposition"],
+            best=None,
+        )
+
+    @classmethod
+    def _event_unit_from_plan(cls, value: dict):
+        from services.event_sync_promote import PromotionUnit
+
+        return PromotionUnit(
+            event_key=value["event_key"],
+            channel_name=value["channel_name"],
+            dateless=value["dateless"],
+            action=value["action"],
+            existing_channel_id=value["existing_channel_id"],
+            rows=tuple(cls._event_row_from_plan(row) for row in value["rows"]),
+        )
+
+    @staticmethod
+    def _event_provenance(rule_id, row, unit, channel_id, channel_name) -> dict:
+        from services.event_sync_review import PROVIDER_ID_UNKNOWN, stream_name_hash
+
+        return {
+            "kind": "event_sync_promote",
+            "rule_id": rule_id,
+            "provider_id": (
+                row.stream.provider_id
+                if row.stream.provider_id is not None
+                else PROVIDER_ID_UNKNOWN
+            ),
+            "stream_name_hash": stream_name_hash(row.stream.name),
+            "event_key": unit.event_key,
+            "secondary_stream_id": row.stream.stream_id,
+            "secondary_stream_name": row.stream.name,
+            "provider": row.stream.provider,
+            "secondary_group_id": row.stream.group_id,
+            "promoted_channel_id": channel_id,
+            "promoted_channel_name": channel_name,
+            "disposition": row.disposition,
+        }
+
+    async def validate_event_promotion(
+        self,
+        operation: dict,
+        result_id: int,
+        *,
+        original_publication: bool,
+    ) -> dict:
+        """Recheck every saved event decision against current scoped inputs."""
+        import copy
+        import hashlib
+        import json
+
+        from channel_number_prefix import channel_name_to_id
+        from channel_pipeline_schema import validate_event_sync_config
+        from database import get_session
+        from dummy_epg_engine import _extract_event_groups, _resolve_variant_duration
+        from models import ChannelPipelineRule, DummyEPGProfile
+        from services.epg_publication import _config_hash, read_publication
+        from services.pipeline_write_plan import _event_operation
+        from stream_prober import extract_m3u_account_id
+        from tasks.event_visibility import _generated_scope, _source_refresh_key
+
+        operation = _event_operation(operation, result_id)
+        if list(
+            getattr(self._settings, "default_channel_profile_ids", []) or []
+        ) != operation["default_profile_ids"]:
+            raise ValueError("event default profile settings drifted")
+        rule_id = operation["rule_id"]
+        profile_id = operation["profile_id"]
+        scope = f"profile:{profile_id}"
+        session = get_session()
+        try:
+            rule = session.get(ChannelPipelineRule, rule_id)
+            profile_row = session.get(DummyEPGProfile, profile_id)
+            if (
+                rule is None
+                or rule.enabled is not True
+                or rule.name != operation["rule_name"]
+                or profile_row is None
+                or profile_row.enabled is not True
+            ):
+                raise ValueError("event rule or profile drifted")
+            current_config = rule.get_event_sync_config()
+            checked_current = copy.deepcopy(current_config)
+            checked_saved = copy.deepcopy(operation["config"])
+            if (
+                not isinstance(checked_current, dict)
+                or validate_event_sync_config(checked_current)
+                or validate_event_sync_config(checked_saved)
+                or checked_current != checked_saved
+            ):
+                raise ValueError("event rule configuration drifted")
+            profile = profile_row.to_dict()
+        finally:
+            session.close()
+        if _config_hash(profile) != operation["profile_hash"]:
+            raise ValueError("event profile configuration drifted")
+        if (
+            operation["config"].get("dummy_epg_profile_id") != profile_id
+            or operation["config"].get("promote_target_group_id") is None
+        ):
+            raise ValueError("event promotion scope drifted")
+
+        source = next(
+            (
+                value for value in self._epg_sources
+                if value.get("id") == operation["source_id"]
+            ),
+            None,
+        )
+        if source is None or _generated_scope(source) not in {scope, "all"}:
+            raise ValueError("event guide source drifted")
+        _, endpoint_hash, source_url_hash = _source_refresh_key(
+            self.client, source, scope,
+        )
+        if operation["source_hashes"] != [{
+            "endpoint_hash": endpoint_hash,
+            "source_url_hash": source_url_hash,
+        }]:
+            raise ValueError("event guide source identity drifted")
+
+        publication = read_publication(scope)
+        expected = None
+        if not original_publication:
+            expected = self._event_publications.get(profile_id)
+        if expected is None:
+            expected_revision = operation["expected_revision"]
+            expected_hash = operation["expected_hash"]
+        else:
+            expected_revision = expected["revision"]
+            expected_hash = expected["state"]["xmltv_hash"]
+        if expected_revision == 0:
+            if publication is not None:
+                raise ValueError("event publication drifted")
+        elif (
+            publication is None
+            or publication["revision"] != expected_revision
+            or publication["state"]["xmltv_hash"] != expected_hash
+        ):
+            raise ValueError("event publication drifted")
+
+        unit = self._event_unit_from_plan(operation["unit"])
+        target_group_id = operation["config"]["promote_target_group_id"]
+        existing = channel_name_to_id(
+            (
+                channel for channel in self.existing_channels
+                if channel.get("channel_group_id") == target_group_id
+                and not self._is_manual_channel(channel)
+            ),
+            self._channel_number_separator,
+        ).get(unit.channel_name.lower())
+        if unit.action == "create":
+            if existing is not None:
+                raise ValueError("event channel decision drifted")
+            known_channel = None
+        else:
+            if existing != result_id:
+                raise ValueError("event channel decision drifted")
+            known_channel = self._channel_by_id.get(result_id)
+            if (
+                known_channel is None
+                or known_channel.get("uuid") != operation["channel_uuid"]
+            ):
+                raise ValueError("event channel identity drifted")
+
+        planned_rows = [*unit.rows, *(
+            self._event_row_from_plan(value)
+            for value in operation["stale_streams"]
+        )]
+        stream_ids = [row.stream.stream_id for row in planned_rows]
+        current_streams = await self.client.get_streams_by_ids(sorted(stream_ids))
+        if not isinstance(current_streams, list):
+            raise ValueError("event stream identity is unavailable")
+        current_by_id = {
+            value.get("id"): value
+            for value in current_streams if isinstance(value, dict)
+        }
+        if set(current_by_id) != set(stream_ids):
+            raise ValueError("event stream identity drifted")
+        for row in planned_rows:
+            current = current_by_id[row.stream.stream_id]
+            group_id = current.get("channel_group_id")
+            if group_id is None:
+                group = current.get("channel_group")
+                group_id = (
+                    group.get("id") if isinstance(group, dict)
+                    else group if isinstance(group, int) else None
+                )
+            if (
+                current.get("name") != row.stream.name
+                or group_id != row.stream.group_id
+                or extract_m3u_account_id(current.get("m3u_account"))
+                != row.stream.provider_id
+                or current.get("is_stale") is not row.stream.is_stale
+            ):
+                raise ValueError("event stream identity drifted")
+
+        first = unit.rows[0]
+        _, matched_variant = _extract_event_groups(first.stream.name, profile)
+        duration = _resolve_variant_duration(matched_variant, profile)
+        stop = first.result.parsed.start + timedelta(minutes=duration)
+        rule_hash = hashlib.sha256(
+            json.dumps(
+                current_config, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        prior_receipt = (
+            publication["state"]["delivery"]["pending_channels"].get(
+                unit.event_key
+            )
+            if publication is not None else None
+        )
+        candidate = {
+            "event_key": unit.event_key,
+            "rule_id": rule_id,
+            "rule_hash": rule_hash,
+            "profile_id": profile_id,
+            "target_group_id": target_group_id,
+            "title": first.result.parsed.title,
+            "start": first.result.parsed.start,
+            "stop": stop,
+            "streams": [
+                {
+                    "id": row.stream.stream_id,
+                    "name": row.stream.name,
+                    "account_id": row.stream.provider_id,
+                    "group_id": row.stream.group_id,
+                }
+                for row in unit.rows
+            ],
+            "channel_name": unit.channel_name,
+            "channel_id": known_channel.get("id") if known_channel else None,
+            "channel_uuid": known_channel.get("uuid") if known_channel else None,
+            "execution_id": (
+                prior_receipt["execution_id"]
+                if prior_receipt is not None else str(self._execution_id)
+            ),
+            "source_hashes": copy.deepcopy(operation["source_hashes"]),
+            "owner_proven": True,
+            "channel_exists": known_channel is not None,
+            "health_playable": all(
+                row.stream.stream_id in operation["working_stream_ids"]
+                for row in unit.rows
+            ),
+        }
+        create_action = Action(type="create_channel", params={
+            "name_template": unit.channel_name,
+            "if_exists": "skip",
+            "group_id": target_group_id,
+            "channel_number": operation["config"].get(
+                "promote_channel_number", "auto",
+            ),
+        })
+        first_ctx = StreamContext(
+            stream_id=first.stream.stream_id,
+            stream_name=first.stream.name,
+            group_name=None,
+            m3u_account_name=first.stream.provider,
+        )
+        stale_rows = {
+            row.stream.stream_id: row
+            for row in planned_rows[len(unit.rows):]
+        }
+        unit_stream_ids = {
+            row.stream.stream_id for row in planned_rows
+        }
+        promo = {
+            "promoted_created": 0,
+            "promoted_adopted": 0,
+            "streams_attached": 0,
+            "already_attached": 0,
+            "attach_errors": 0,
+            "failed_units": 0,
+            "stale_streams_removed": 0,
+            "guide_pending": 0,
+            "channel_ids": [],
+            "promote_entries": [],
+        }
+        exec_ctx = ExecutionContext()
+        return {
+            "operation": operation,
+            "publication": publication,
+            "scope": scope,
+            "profile": profile,
+            "now": datetime.now(timezone.utc),
+            "candidate": candidate,
+            "unit": unit,
+            "create_action": create_action,
+            "first_ctx": first_ctx,
+            "first": first,
+            "exec_ctx": exec_ctx,
+            "profile_id": profile_id,
+            "source_id": operation["source_id"],
+            "rule_id": rule_id,
+            "rule_name": operation["rule_name"],
+            "config": operation["config"],
+            "target_group_id": target_group_id,
+            "promo": promo,
+            "stale_rows": stale_rows,
+            "unit_stream_ids": unit_stream_ids,
+            "working_stream_ids": set(operation["working_stream_ids"]),
+            "provenance": lambda row, selected, channel_id, channel_name: (
+                self._event_provenance(
+                    rule_id, row, selected, channel_id, channel_name,
+                )
+            ),
+            "allocation_writes": operation["allocation_writes"],
+            "result_id": result_id,
+        }
+
+    async def replay_event_promotion(
+        self, operation: dict, result_id: int,
+    ) -> dict:
+        work = await self.validate_event_promotion(
+            operation, result_id, original_publication=False,
+        )
+        work["logged_promote_entries"] = 0
+        self._replayed_event_work.append(work)
+        try:
+            result = await self._stage_event_promotion(work)
+        except Exception as exc:
+            from services.epg_publication import read_publication
+
+            current = read_publication(work["scope"])
+            receipt = (
+                current.get("state", {}).get("delivery", {})
+                .get("pending_channels", {}).get(work["unit"].event_key)
+                if isinstance(current, dict) else None
+            )
+            if receipt is not None:
+                try:
+                    setattr(exc, "event_recovery_retained", True)
+                except Exception:
+                    pass
+            raise
+        if result is None:
+            raise ValueError("event promotion could not be staged")
+        if work["unit"].event_key in self._event_pending:
+            channel_id = result["id"]
+            channel = await self.client.get_channel(channel_id)
+            source_entries = self._epg_data_by_source.get(
+                operation["source_id"], []
+            )
+            source_entry_ids = {
+                value["id"] for value in source_entries if value.get("id") is not None
+            }
+            epg_id = channel.get("epg_data_id")
+            if epg_id is not None and epg_id not in source_entry_ids:
+                raise ValueError("event channel guide identity drifted")
+            if epg_id is None:
+                guide_ctx = ExecutionContext()
+                guide_ctx.current_channel_id = channel_id
+                self._deferred_epg_profiles[channel_id] = operation["profile_id"]
+                assign_result = await self._execute_assign_epg(
+                    Action(
+                        type="assign_epg",
+                        params={"epg_id": operation["source_id"]},
+                    ),
+                    StreamContext(
+                        stream_id=0,
+                        stream_name=work["unit"].channel_name,
+                        group_name=None,
+                    ),
+                    guide_ctx,
+                    defer_on_no_match=True,
+                )
+                work["exec_ctx"].add_result(assign_result)
+                if not assign_result.success:
+                    raise ValueError("event guide link could not be staged")
+        return result
+
+    async def _check_event_allocation(self, work: dict) -> None:
+        """Compare the complete computed allocation before its first write."""
+        import copy
+
+        from services.pipeline_write_plan import EventAllocationClient
+
+        writes = work.get("allocation_writes")
+        if writes is None:
+            return
+        check_client = EventAllocationClient(
+            self.client,
+            writes,
+            work["result_id"],
+            forward=False,
+        )
+        current_channels = copy.deepcopy(list(self._channel_by_id.values()))
+        epg_data = [
+            copy.deepcopy(entry)
+            for entries in self._epg_data_by_source.values()
+            for entry in entries
+        ]
+        check = type(self)(
+            check_client,
+            current_channels,
+            copy.deepcopy(self.existing_groups),
+            normalization_engine=self._normalization_engine,
+            settings=self._settings,
+            all_profile_ids=copy.deepcopy(self._all_profile_ids),
+            epg_data=epg_data,
+            epg_sources=copy.deepcopy(self._epg_sources),
+            triggered_by=self._triggered_by,
+            execution_id=self._execution_id,
+            channel_profile_membership=copy.deepcopy(
+                self._channel_profile_membership
+            ),
+            managed_channel_ids=set(self._pipeline_managed_channel_ids),
+        )
+        result = await check._execute_create_channel(
+            work["create_action"],
+            work["first_ctx"],
+            ExecutionContext(),
+            template_ctx={},
+            rule_target_group_id=work["target_group_id"],
+            match_scope_target_group=True,
+            enqueue_pending_merge=False,
+            staged=True,
+        )
+        check_client.finish()
+        if not result.success or result.entity_id != work["result_id"]:
+            raise ValueError("event allocation could not be verified")
+
+    async def _stage_event_promotion(self, work: dict) -> dict | None:
+        """Admit and stage one event through the receipt-owned lifecycle."""
+        import copy
+
+        from services.epg_publication import begin_delivery, publication_lock
+
+        publication = work["publication"]
+        unit = work["unit"]
+        promo = work["promo"]
+        provenance = work["provenance"]
+        result_id = work.get("result_id")
+
+        def keep_existing() -> None:
+            if unit.existing_channel_id is not None:
+                promo["channel_ids"].append(unit.existing_channel_id)
+
+        async with publication_lock:
+            admitted = begin_delivery(
+                work["scope"],
+                expected_revision=(publication["revision"] if publication else 0),
+                expected_hash=(
+                    publication["state"]["xmltv_hash"] if publication else None
+                ),
+                profile=work["profile"],
+                now=work["now"],
+                pending_channels={unit.event_key: work["candidate"]},
+            )
+        if admitted is None:
+            promo["guide_pending"] += 1
+            keep_existing()
+            return None
+        receipt = admitted["state"]["delivery"]["pending_channels"][
+            unit.event_key
+        ]
+        channel_id = receipt.get("channel_id")
+        if receipt["stage"] == "complete":
+            if channel_id is not None:
+                promo["promoted_adopted"] += 1
+                promo["channel_ids"].append(channel_id)
+                return {"id": channel_id, "stage": "complete"}
+            return None
+        if receipt["stage"] in {"allocation_unknown", "failed", "expired"}:
+            promo["guide_pending"] += 1
+            if channel_id is not None:
+                promo["channel_ids"].append(channel_id)
+                return {"id": channel_id, "stage": receipt["stage"]}
+            keep_existing()
+            return None
+
+        profile_id = work["profile_id"]
+        self._event_publications[profile_id] = admitted
+        if channel_id is None:
+            if receipt["stage"] != "intent":
+                promo["guide_pending"] += 1
+                keep_existing()
+                return None
+            claimed = await self._write_event_receipt(
+                admitted,
+                unit.event_key,
+                "intent",
+                {"stage": "allocating", "reason": "guide_pending"},
+                guide_stage="preparing",
+            )
+            if claimed is None:
+                promo["guide_pending"] += 1
+                keep_existing()
+                return None
+            admitted = claimed
+            original_client = self.client
+            allocation_client = None
+            if work.get("allocation_writes") is not None:
+                from services.pipeline_write_plan import EventAllocationClient
+
+                await self._check_event_allocation(work)
+                allocation_client = EventAllocationClient(
+                    original_client,
+                    work["allocation_writes"],
+                    work["result_id"],
+                )
+                self.client = allocation_client
+            try:
+                result = await self._execute_create_channel(
+                    work["create_action"],
+                    work["first_ctx"],
+                    work["exec_ctx"],
+                    template_ctx={},
+                    rule_target_group_id=work["target_group_id"],
+                    match_scope_target_group=True,
+                    enqueue_pending_merge=False,
+                    staged=True,
+                )
+            finally:
+                self.client = original_client
+            work["exec_ctx"].add_result(result)
+            if not result.success or result.entity_id is None:
+                terminal_at = datetime.now(timezone.utc).isoformat()
+                await self._write_event_receipt(
+                    admitted,
+                    unit.event_key,
+                    "allocating",
+                    {
+                        "stage": "allocation_unknown",
+                        "reason": "allocation_unknown",
+                        "terminal_at": terminal_at,
+                        "retry_at": None,
+                    },
+                )
+                promo["failed_units"] += 1
+                promo["promote_entries"].append({
+                    "type": "event_sync_promote",
+                    "description": result.description,
+                    "success": False,
+                    "skipped": False,
+                    "entity_id": None,
+                    "entity_name": unit.channel_name,
+                    "error": result.error,
+                    "match": provenance(
+                        work["first"], unit, None, unit.channel_name,
+                    ),
+                })
+                return None
+            if allocation_client is not None:
+                allocation_client.finish()
+            channel_id = result.entity_id
+            if result_id is not None and result_id > 0 \
+                    and channel_id != result_id:
+                raise ValueError("event promotion adopted the wrong channel")
+            known_channel = self._channel_by_id.get(channel_id)
+            observed = await self._write_event_receipt(
+                admitted,
+                unit.event_key,
+                "allocating",
+                {
+                    "stage": "allocated",
+                    "reason": "guide_pending",
+                    "channel_id": channel_id,
+                    "channel_uuid": (
+                        known_channel.get("uuid")
+                        if known_channel is not None else None
+                    ),
+                },
+                guide_stage="preparing",
+                channel=known_channel,
+            )
+            promo["promoted_created"] += 1
+            promo["promote_entries"].append({
+                "type": "event_sync_promote",
+                "description": result.description,
+                "success": observed is not None,
+                "skipped": result.skipped,
+                "entity_id": channel_id,
+                "entity_name": unit.channel_name,
+                "error": None,
+                "match": provenance(
+                    work["first"], unit, channel_id, unit.channel_name,
+                ),
+            })
+            promo["channel_ids"].append(channel_id)
+            if observed is None:
+                promo["failed_units"] += 1
+                return {"id": channel_id, "stage": "allocating"}
+            admitted = observed
+        else:
+            known_channel = self._channel_by_id.get(channel_id)
+            if known_channel is None:
+                promo["guide_pending"] += 1
+                keep_existing()
+                return None
+            if result_id is not None and result_id > 0 \
+                    and channel_id != result_id:
+                raise ValueError("event promotion adopted the wrong channel")
+            promo["promoted_adopted"] += 1
+            promo["channel_ids"].append(channel_id)
+
+        self._event_publications[profile_id] = admitted
+        pending = {
+            "profile_id": profile_id,
+            "source_id": work["source_id"],
+            "rule_id": work["rule_id"],
+            "rule_name": work["rule_name"],
+            "config": copy.deepcopy(work["config"]),
+            "unit": unit,
+            "exec_ctx": work["exec_ctx"],
+            "promo": promo,
+            "promote_entries": promo["promote_entries"],
+            "stale_rows": work["stale_rows"],
+            "unit_stream_ids": work["unit_stream_ids"],
+            "working_stream_ids": work["working_stream_ids"],
+        }
+        if "logged_promote_entries" in work:
+            pending["logged_promote_entries"] = work["logged_promote_entries"]
+        self._event_pending[unit.event_key] = pending
+        promo["guide_pending"] += 1
+        return {"id": channel_id, "stage": "allocated"}
 
     async def _execute_event_sync_promotion(
         self, rule_id: Optional[int], rule_name: str, config: dict,
@@ -5520,12 +6468,7 @@ class ActionExecutor:
             build_promotion_plan,
             PROMOTE_ACTION_CREATE,
         )
-        from services.event_sync_review import (
-            PROVIDER_ID_UNKNOWN,
-            stream_name_hash,
-        )
         from services.event_sync_stream_health import (
-            find_working_streams,
             stale_streams_to_detach,
         )
 
@@ -5549,6 +6492,7 @@ class ActionExecutor:
         # read it. Two wall-clock reads a few milliseconds apart disagree
         # about every event whose start falls between them. [53]
         now = datetime.now(timezone.utc)
+        health_expires_at = now + timedelta(seconds=60)
 
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id, now=now,
@@ -5586,10 +6530,16 @@ class ActionExecutor:
                 probe_after = {"previous": previous, "next": selected[-1].event_key}
 
         stale_rows: dict = {}
-        dead = set()
+        current_unplayable = set()
+        retirement_confirmed = set()
+        flow = {}
         working_stream_ids: set = set()
         unit_stream_ids_by_key: dict = {}
-        if config.get("skip_dead_streams") or config.get("retire_finished_events"):
+        if (
+            config.get("skip_dead_streams")
+            or config.get("retire_finished_events")
+            or config.get("dummy_epg_profile_id") is not None
+        ):
             # The health sample keeps the planner's new-event count plus
             # existing attachments, after the date and lead-window filters.
             # Rotation lets a missing URL or inconclusive probe yield to the
@@ -5617,18 +6567,26 @@ class ActionExecutor:
                 }
                 for unit in all_units
             }
-            dead = await self._event_health(
+            flow, retirement_confirmed = await self._event_health(
                 rule_id,
                 config,
                 health_units,
                 resolution.resolved,
                 now,
                 probe_missing=not exec_ctx.dry_run,
+                expires_at=(None if exec_ctx.dry_run else health_expires_at),
             )
-            if dead:
+            current_unplayable = {
+                row.stream.stream_id
+                for unit in health_units
+                for row in unit.rows
+                if row.stream.stream_id is not None
+                and flow.get(row.stream.stream_id) is not True
+            }
+            if current_unplayable:
                 plan = build_promotion_plan(
                     config, resolution.resolved, existing_name_to_id,
-                    now=now, dead_stream_ids=dead,
+                    now=now, dead_stream_ids=current_unplayable,
                 )
             # Read AFTER the health gate, so a candidate this run just
             # probed to success is already in it. This is the only thing
@@ -5636,10 +6594,10 @@ class ActionExecutor:
             # never-probed stream and a pre-kickoff failure through, and
             # neither is a reason to take away the stream a channel is
             # currently playing. [51]
-            working_stream_ids = await find_working_streams([
-                row.stream.stream_id
-                for unit in health_units for row in unit.rows
-            ])
+            working_stream_ids = {
+                stream_id for stream_id, state in flow.items()
+                if state is True
+            }
 
         event_states = {}
         if config.get("retire_finished_events"):
@@ -5656,11 +6614,39 @@ class ActionExecutor:
                     *(unit for key, unit in lifecycle_units.items() if key not in sampled_keys),
                 ),
                 now,
-                dead,
+                retirement_confirmed,
+                flow=flow,
+                expires_at=health_expires_at,
             )
+            from services.epg_publication import (
+                TERMINAL_PENDING_STAGES,
+                read_publication,
+            )
+
+            profile_id = config.get("dummy_epg_profile_id")
+            publication = (
+                read_publication(f"profile:{profile_id}")
+                if profile_id is not None else None
+            )
+            pending = (
+                publication["state"]["delivery"]["pending_channels"]
+                if publication is not None else {}
+            )
+            for event_key, unit in lifecycle_units.items():
+                receipt = pending.get(event_key)
+                if (
+                    receipt is not None
+                    and receipt["stage"] not in TERMINAL_PENDING_STAGES
+                    and unit.existing_channel_id is not None
+                    and receipt.get("channel_id") == unit.existing_channel_id
+                    and unit.existing_channel_id
+                    in self._pipeline_managed_channel_ids
+                ):
+                    eligible.add(event_key)
             plan = build_promotion_plan(
                 config, resolution.resolved, existing_name_to_id, now=now,
-                dead_stream_ids=dead, eligible_event_keys=eligible,
+                dead_stream_ids=current_unplayable,
+                eligible_event_keys=eligible,
             )
 
         promo = {
@@ -5688,6 +6674,7 @@ class ActionExecutor:
             "dead_streams_skipped": plan.dead_streams_skipped,
             "skipped_all_dead": plan.skipped_all_dead,
             "stale_streams_removed": 0,
+            "guide_pending": 0,
             "channel_ids": [cid for cid, state in event_states.items() if cid > 0 and state != "idle"],
             "promote_entries": [],
             "event_states": [{"channel_id": cid, "status": state} for cid, state in event_states.items() if cid > 0],
@@ -5734,24 +6721,9 @@ class ActionExecutor:
             # event key) is the durable identity; every id is display-only
             # (Dispatcharr stream/channel ids churn — epic ti939.3 keying
             # constraint, inherited verbatim).
-            return {
-                "kind": "event_sync_promote",
-                "rule_id": rule_id,
-                "provider_id": (
-                    row.stream.provider_id
-                    if row.stream.provider_id is not None
-                    else PROVIDER_ID_UNKNOWN
-                ),
-                "stream_name_hash": stream_name_hash(row.stream.name),
-                "event_key": unit.event_key,
-                "secondary_stream_id": row.stream.stream_id,
-                "secondary_stream_name": row.stream.name,
-                "provider": row.stream.provider,
-                "secondary_group_id": row.stream.group_id,
-                "promoted_channel_id": channel_id,
-                "promoted_channel_name": channel_name,
-                "disposition": row.disposition,
-            }
+            return self._event_provenance(
+                rule_id, row, unit, channel_id, channel_name,
+            )
 
         def _keep_existing_channel(unit) -> None:
             """Hold a failed unit's already-existing channel in the run's
@@ -5807,6 +6779,90 @@ class ActionExecutor:
         for unit in plan.skipped_early_units:
             _keep_existing_channel(unit)
 
+        guide_profile_id = config.get("dummy_epg_profile_id")
+        guide_profile = None
+        guide_rule_hash = None
+        guide_source_id = None
+        guide_source_hashes = []
+        if guide_profile_id is not None and not exec_ctx.dry_run:
+            import copy
+            import hashlib
+            import json
+
+            from channel_pipeline_schema import validate_event_sync_config
+            from database import get_session
+            from models import ChannelPipelineRule, DummyEPGProfile
+            from tasks.event_visibility import (
+                _generated_scope,
+                _source_refresh_key,
+            )
+
+            session = get_session()
+            try:
+                profile_row = session.get(DummyEPGProfile, guide_profile_id)
+                rule_row = session.get(ChannelPipelineRule, rule_id)
+                current_config = (
+                    rule_row.get_event_sync_config() if rule_row is not None else None
+                )
+                checked_config = copy.deepcopy(current_config)
+                checked_runtime_config = copy.deepcopy(config)
+                configs_valid = (
+                    isinstance(checked_config, dict)
+                    and isinstance(checked_runtime_config, dict)
+                )
+                if configs_valid:
+                    configs_valid = (
+                        not validate_event_sync_config(checked_config)
+                        and not validate_event_sync_config(
+                            checked_runtime_config
+                        )
+                    )
+                if (
+                    profile_row is not None
+                    and profile_row.enabled is True
+                    and rule_row is not None
+                    and rule_row.enabled is True
+                    and configs_valid
+                    and checked_config == checked_runtime_config
+                ):
+                    guide_profile = profile_row.to_dict()
+                    guide_rule_hash = hashlib.sha256(
+                        json.dumps(
+                            current_config,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+            finally:
+                session.close()
+
+            guide_source_id = self._dummy_source_by_profile.get(guide_profile_id)
+            if guide_source_id is None and self._combined_dummy_source_ids:
+                guide_source_id = self._combined_dummy_source_ids[0]
+            guide_source = next(
+                (
+                    source for source in self._epg_sources
+                    if source.get("id") == guide_source_id
+                    and _generated_scope(source) in {
+                        f"profile:{guide_profile_id}", "all",
+                    }
+                ),
+                None,
+            )
+            if guide_source is not None:
+                _, endpoint_hash, source_url_hash = _source_refresh_key(
+                    self.client,
+                    guide_source,
+                    f"profile:{guide_profile_id}",
+                )
+                guide_source_hashes = [{
+                    "endpoint_hash": endpoint_hash,
+                    "source_url_hash": source_url_hash,
+                }]
+            else:
+                guide_profile = None
+
         for unit in plan.units:
             first = unit.rows[0]
             create_action = Action(type="create_channel", params={
@@ -5827,6 +6883,284 @@ class ActionExecutor:
                 group_name=None,
                 m3u_account_name=first.stream.provider,
             )
+            if guide_profile_id is not None and not exec_ctx.dry_run:
+                import copy
+
+                from dummy_epg_engine import (
+                    _extract_event_groups,
+                    _resolve_variant_duration,
+                )
+                from services.epg_publication import (
+                    _config_hash,
+                    begin_delivery,
+                    publication_lock,
+                    read_publication,
+                )
+
+                if guide_profile is None or guide_rule_hash is None:
+                    promo["guide_pending"] += 1
+                    _keep_existing_channel(unit)
+                    continue
+                scope = f"profile:{guide_profile_id}"
+                publication = read_publication(scope)
+                prior_receipt = (
+                    publication["state"]["delivery"]["pending_channels"].get(
+                        unit.event_key
+                    )
+                    if publication is not None else None
+                )
+                known_channel_id = (
+                    prior_receipt.get("channel_id")
+                    if prior_receipt is not None
+                    else unit.existing_channel_id
+                )
+                known_channel = self._channel_by_id.get(known_channel_id)
+                parsed = first.result.parsed
+                _, matched_variant = _extract_event_groups(
+                    first.stream.name,
+                    guide_profile,
+                )
+                duration = _resolve_variant_duration(
+                    matched_variant,
+                    guide_profile,
+                )
+                stop = parsed.start + timedelta(minutes=duration)
+                execution_id = (
+                    prior_receipt.get("execution_id")
+                    if prior_receipt is not None
+                    else str(
+                        self._execution_id
+                        if self._execution_id is not None
+                        else f"rule-{rule_id}"
+                    )
+                )
+                candidate = {
+                    "event_key": unit.event_key,
+                    "rule_id": rule_id,
+                    "rule_hash": guide_rule_hash,
+                    "profile_id": guide_profile_id,
+                    "target_group_id": target_group_id,
+                    "title": parsed.title,
+                    "start": parsed.start,
+                    "stop": stop,
+                    "streams": [
+                        {
+                            "id": row.stream.stream_id,
+                            "name": row.stream.name,
+                            "account_id": row.stream.provider_id,
+                            "group_id": row.stream.group_id,
+                        }
+                        for row in unit.rows
+                        if row.stream.stream_id is not None
+                        and row.stream.provider_id is not None
+                        and row.stream.group_id is not None
+                    ],
+                    "channel_name": unit.channel_name,
+                    "channel_id": (
+                        known_channel.get("id") if known_channel is not None else None
+                    ),
+                    "channel_uuid": (
+                        known_channel.get("uuid") if known_channel is not None else None
+                    ),
+                    "execution_id": execution_id,
+                    "source_hashes": guide_source_hashes,
+                    "owner_proven": True,
+                    "channel_exists": known_channel is not None,
+                    "health_playable": all(
+                        row.stream.stream_id is not None
+                        and flow.get(row.stream.stream_id) is True
+                        for row in unit.rows
+                    ),
+                }
+                if len(candidate["streams"]) != len(unit.rows):
+                    promo["guide_pending"] += 1
+                    _keep_existing_channel(unit)
+                    continue
+                if self._plan_only:
+                    async with publication_lock:
+                        admitted = begin_delivery(
+                            scope,
+                            expected_revision=(
+                                publication["revision"] if publication else 0
+                            ),
+                            expected_hash=(
+                                publication["state"]["xmltv_hash"]
+                                if publication else None
+                            ),
+                            profile=guide_profile,
+                            now=now,
+                            pending_channels={unit.event_key: candidate},
+                            plan_only=True,
+                        )
+                    if admitted is None:
+                        promo["guide_pending"] += 1
+                        _keep_existing_channel(unit)
+                        continue
+                    receipt = admitted["state"]["delivery"]["pending_channels"][
+                        unit.event_key
+                    ]
+                    channel_id = receipt.get("channel_id")
+                    if receipt["stage"] == "complete":
+                        if channel_id is not None:
+                            promo["promoted_adopted"] += 1
+                            promo["channel_ids"].append(channel_id)
+                        continue
+                    if receipt["stage"] in {
+                        "allocation_unknown", "failed", "expired",
+                    }:
+                        promo["guide_pending"] += 1
+                        if channel_id is not None:
+                            promo["channel_ids"].append(channel_id)
+                        else:
+                            _keep_existing_channel(unit)
+                        continue
+                    unit_stream_ids = unit_stream_ids_by_key.get(
+                        unit.event_key,
+                        {
+                            row.stream.stream_id for row in unit.rows
+                            if row.stream.stream_id is not None
+                        },
+                    )
+                    approved_stale = [
+                        row for stream_id, row in sorted(stale_rows.items())
+                        if stream_id in unit_stream_ids
+                    ]
+                    allowed_stream_ids = {
+                        row.stream.stream_id for row in unit.rows
+                    } | {
+                        row.stream.stream_id for row in approved_stale
+                    }
+                    unit_value = self._event_unit_plan(unit)
+                    if channel_id is not None:
+                        unit_value["action"] = "attach_existing"
+                        unit_value["existing_channel_id"] = channel_id
+                    operation = {
+                        "rule_id": rule_id,
+                        "rule_name": rule_name,
+                        "config": copy.deepcopy(config),
+                        "profile_id": guide_profile_id,
+                        "profile_hash": _config_hash(guide_profile),
+                        "source_id": guide_source_id,
+                        "source_hashes": copy.deepcopy(guide_source_hashes),
+                        "expected_revision": (
+                            publication["revision"] if publication else 0
+                        ),
+                        "expected_hash": (
+                            publication["state"]["xmltv_hash"]
+                            if publication else None
+                        ),
+                        "channel_uuid": (
+                            known_channel.get("uuid")
+                            if known_channel is not None else None
+                        ),
+                        "unit": unit_value,
+                        "default_profile_ids": list(
+                            getattr(
+                                self._settings,
+                                "default_channel_profile_ids",
+                                [],
+                            )
+                            or []
+                        ),
+                        "stale_streams": [
+                            self._event_row_plan(row) for row in approved_stale
+                        ],
+                        "working_stream_ids": sorted(
+                            stream_id for stream_id in working_stream_ids
+                            if stream_id in allowed_stream_ids
+                        ),
+                    }
+
+                    async def _record_allocation():
+                        return await self._execute_create_channel(
+                            create_action,
+                            first_ctx,
+                            exec_ctx,
+                            template_ctx={},
+                            rule_target_group_id=target_group_id,
+                            match_scope_target_group=True,
+                            enqueue_pending_merge=False,
+                            staged=True,
+                        )
+
+                    if channel_id is None:
+                        result = await self.client.record_event_promotion(
+                            operation, _record_allocation
+                        )
+                    else:
+                        await self.client.record_event_promotion(
+                            operation, result_id=channel_id
+                        )
+                        result = ActionResult(
+                            success=True,
+                            action_type="create_channel",
+                            description=(
+                                f"Channel '{unit.channel_name}' already exists, skipped"
+                            ),
+                            entity_type="channel",
+                            entity_id=channel_id,
+                            entity_name=unit.channel_name,
+                            skipped=True,
+                        )
+                    exec_ctx.add_result(result)
+                    channel_id = result.entity_id
+                    if result.created:
+                        promo["promoted_created"] += 1
+                    else:
+                        promo["promoted_adopted"] += 1
+                    promo["channel_ids"].append(channel_id)
+                    promo["promote_entries"].append({
+                        "type": "event_sync_promote",
+                        "description": result.description,
+                        "success": True,
+                        "skipped": result.skipped,
+                        "entity_id": channel_id,
+                        "entity_name": unit.channel_name,
+                        "error": None,
+                        "match": _provenance(
+                            first, unit, channel_id, unit.channel_name,
+                        ),
+                    })
+                    promo["guide_pending"] += 1
+                    continue
+                unit_stream_ids = unit_stream_ids_by_key.get(
+                    unit.event_key,
+                    {
+                        row.stream.stream_id for row in unit.rows
+                        if row.stream.stream_id is not None
+                    },
+                )
+                await self._stage_event_promotion({
+                    "publication": publication,
+                    "scope": scope,
+                    "profile": guide_profile,
+                    "now": now,
+                    "candidate": candidate,
+                    "unit": unit,
+                    "create_action": create_action,
+                    "first_ctx": first_ctx,
+                    "first": first,
+                    "exec_ctx": exec_ctx,
+                    "profile_id": guide_profile_id,
+                    "source_id": guide_source_id,
+                    "rule_id": rule_id,
+                    "rule_name": rule_name,
+                    "config": config,
+                    "target_group_id": target_group_id,
+                    "promo": promo,
+                    "stale_rows": {
+                        stream_id: row
+                        for stream_id, row in stale_rows.items()
+                        if stream_id in unit_stream_ids
+                    },
+                    "unit_stream_ids": unit_stream_ids,
+                    "working_stream_ids": {
+                        stream_id for stream_id in working_stream_ids
+                        if stream_id in unit_stream_ids
+                    },
+                    "provenance": _provenance,
+                })
+                continue
             result = await self._execute_create_channel(
                 create_action, first_ctx, exec_ctx, template_ctx={},
                 rule_target_group_id=target_group_id,
@@ -6058,6 +7392,548 @@ class ActionExecutor:
 
         return promo
 
+    async def _finish_event_promotions(self) -> set[int]:
+        """Attach and reveal staged events only after current guide proof."""
+        from services.epg_programmes import programme_matches
+        from services.epg_publication import publication_lock
+        from services.event_sync_review import (
+            PROVIDER_ID_UNKNOWN,
+            stream_name_hash,
+        )
+        from services.event_sync_stream_health import (
+            collect_stream_flow,
+            stale_streams_to_detach,
+        )
+
+        if not self._event_pending:
+            return set()
+        observed_at = datetime.now(timezone.utc)
+        try:
+            programmes = await self.client.get_epg_grid(
+                start=(observed_at - timedelta(hours=1)).isoformat(),
+                end=(observed_at + timedelta(hours=24)).isoformat(),
+            )
+        except Exception:
+            logger.exception("[EVENT-SYNC] Could not read imported programmes")
+            programmes = []
+        touched = set()
+
+        async def expire(
+            publication,
+            event_key,
+            receipt,
+            *,
+            channel=None,
+            channel_missing=False,
+        ):
+            terminal_at = datetime.now(timezone.utc)
+            if terminal_at < datetime.fromisoformat(receipt["expires_at"]):
+                return None
+            closed = await self._write_event_receipt(
+                publication,
+                event_key,
+                {"allocated", "importing", "linking", "ready"},
+                {
+                    "stage": "expired",
+                    "reason": "guide_expired",
+                    "terminal_at": terminal_at.isoformat(),
+                    "retry_at": (
+                        (terminal_at + timedelta(minutes=5)).isoformat()
+                        if receipt.get("channel_id") is not None else None
+                    ),
+                },
+                channel=channel,
+                channel_missing=channel_missing,
+            )
+            if closed is not None:
+                self._event_publications[receipt["profile_id"]] = closed
+            return closed
+
+        async def fail(
+            publication,
+            event_key,
+            receipt,
+            reason,
+            *,
+            channel=None,
+            detail=None,
+        ):
+            terminal_at = datetime.now(timezone.utc)
+            changes = {
+                "stage": "failed",
+                "reason": reason,
+                "terminal_at": terminal_at.isoformat(),
+                "retry_at": (
+                    (terminal_at + timedelta(minutes=5)).isoformat()
+                    if receipt.get("channel_id") is not None else None
+                ),
+            }
+            if detail is not None:
+                changes["detail"] = str(detail)
+            closed = await self._write_event_receipt(
+                publication,
+                event_key,
+                {
+                    "allocated", "importing", "linking", "ready",
+                },
+                changes,
+                channel=channel,
+                channel_missing=reason == "channel_missing",
+            )
+            if closed is not None:
+                self._event_publications[receipt["profile_id"]] = closed
+                return closed
+            return await expire(
+                publication,
+                event_key,
+                receipt,
+                channel=channel,
+                channel_missing=reason == "channel_missing",
+            )
+
+        for event_key, work in list(self._event_pending.items()):
+            profile_id = work["profile_id"]
+            publication = self._event_publications.get(profile_id)
+            if publication is None:
+                continue
+            receipt = publication["state"]["delivery"]["pending_channels"].get(
+                event_key
+            )
+            if receipt is None or receipt["stage"] in {
+                "complete", "allocation_unknown", "failed", "expired",
+            }:
+                continue
+            channel_id = receipt.get("channel_id")
+            if channel_id is None:
+                continue
+            try:
+                channel = await self.client.get_channel(channel_id)
+            except Exception:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "channel_missing",
+                    detail="The staged channel could not be read.",
+                )
+                continue
+            expires_at = datetime.fromisoformat(receipt["expires_at"])
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            current_value = self._event_receipt_current(
+                publication,
+                event_key,
+                channel=channel,
+            )
+            if current_value is None:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            publication, receipt = current_value
+            self._event_publications[profile_id] = publication
+            expires_at = datetime.fromisoformat(receipt["expires_at"])
+
+            source_id = work["source_id"]
+            delivery = publication["state"]["delivery"]
+            if delivery["confirmed_dispatcharr_hashes"].get(str(source_id)) \
+                    != publication["state"]["xmltv_hash"]:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "programme_missing",
+                    channel=channel,
+                    detail="The generated guide import was not confirmed.",
+                )
+                continue
+            guide_row = next(
+                (
+                    row for row in self._epg_data_by_source.get(source_id, [])
+                    if row.get("id") == channel.get("epg_data_id")
+                ),
+                None,
+            )
+            xmltv_id = guide_row.get("tvg_id") if guide_row is not None else None
+            if (
+                not isinstance(xmltv_id, str)
+                or not programme_matches(
+                    programmes,
+                    xmltv_id=xmltv_id,
+                    channel_uuid=channel.get("uuid"),
+                    title=receipt["title"],
+                    start=receipt["start"],
+                    stop=receipt["stop"],
+                )
+            ):
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "programme_missing",
+                    channel=channel,
+                )
+                continue
+
+            stream_ids = [row["id"] for row in receipt["streams"]]
+            stream_names = {
+                row["id"]: row["name"] for row in receipt["streams"]
+            }
+            starts = {
+                stream_id: datetime.fromisoformat(receipt["start"])
+                for stream_id in stream_ids
+            }
+            flow = await collect_stream_flow(
+                stream_ids,
+                client=self.client,
+                probe_missing=True,
+                checked_after=datetime.now(timezone.utc) - timedelta(minutes=5),
+                event_start_by_stream=starts,
+                stream_names=stream_names,
+                expires_at=expires_at,
+            )
+            if any(flow.get(stream_id) is not True for stream_id in stream_ids):
+                reason = (
+                    "health_failed"
+                    if any(flow.get(stream_id) is False for stream_id in stream_ids)
+                    else "health_unknown"
+                )
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    reason,
+                    channel=channel,
+                )
+                continue
+
+            linking = await self._write_event_receipt(
+                publication,
+                event_key,
+                {"allocated", "importing", "linking", "ready"},
+                {"stage": "linking", "reason": "guide_pending"},
+                guide_stage="linking",
+                channel=channel,
+            )
+            if linking is None:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            publication = linking
+            self._event_publications[profile_id] = publication
+            unit = work["unit"]
+            exec_ctx = work["exec_ctx"]
+            promo = work["promo"]
+            failed = False
+            for row in unit.rows:
+                try:
+                    fresh = await self.client.get_channel(channel_id)
+                except Exception as exc:
+                    await fail(
+                        publication,
+                        event_key,
+                        receipt,
+                        "channel_missing",
+                        detail=exc,
+                    )
+                    failed = True
+                    break
+                merge_provenance = {
+                    "kind": "event_sync_promote",
+                    "rule_id": work["rule_id"],
+                    "provider_id": (
+                        row.stream.provider_id
+                        if row.stream.provider_id is not None
+                        else PROVIDER_ID_UNKNOWN
+                    ),
+                    "stream_name_hash": stream_name_hash(row.stream.name),
+                    "event_key": event_key,
+                    "secondary_stream_id": row.stream.stream_id,
+                    "secondary_stream_name": row.stream.name,
+                    "provider": row.stream.provider,
+                    "secondary_group_id": row.stream.group_id,
+                    "promoted_channel_id": channel_id,
+                    "promoted_channel_name": unit.channel_name,
+                    "disposition": row.disposition,
+                }
+                guard_lost = False
+                async with publication_lock:
+                    if self._event_receipt_current(
+                        publication,
+                        event_key,
+                        channel=fresh,
+                    ) is None:
+                        guard_lost = True
+                    else:
+                        result = await self._add_stream_to_channel(
+                            fresh,
+                            StreamContext(
+                                stream_id=row.stream.stream_id,
+                                stream_name=row.stream.name,
+                                group_name=None,
+                                m3u_account_name=row.stream.provider,
+                            ),
+                            exec_ctx,
+                            merge_provenance=merge_provenance,
+                            journal_category="event_sync",
+                        )
+                if guard_lost:
+                    await expire(
+                        publication,
+                        event_key,
+                        receipt,
+                        channel=fresh,
+                    )
+                    failed = True
+                    break
+                exec_ctx.add_result(result)
+                if not result.success:
+                    promo["attach_errors"] += 1
+                    await fail(
+                        publication,
+                        event_key,
+                        receipt,
+                        "guide_failed",
+                        channel=fresh,
+                        detail=result.error,
+                    )
+                    failed = True
+                    break
+                if result.skipped:
+                    promo["already_attached"] += 1
+                else:
+                    promo["streams_attached"] += 1
+                    touched.add(channel_id)
+                work["promote_entries"].append({
+                    "type": "event_sync_promote_attach",
+                    "description": result.description,
+                    "success": result.success,
+                    "skipped": result.skipped,
+                    "entity_id": channel_id,
+                    "entity_name": unit.channel_name,
+                    "error": result.error,
+                    "match": merge_provenance,
+                })
+                if datetime.now(timezone.utc) >= expires_at:
+                    await expire(
+                        publication,
+                        event_key,
+                        receipt,
+                        channel=fresh,
+                    )
+                    failed = True
+                    break
+            if failed:
+                continue
+
+            try:
+                channel = await self.client.get_channel(channel_id)
+            except Exception as exc:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "channel_missing",
+                    detail=exc,
+                )
+                continue
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            stale_rows = work["stale_rows"]
+            if stale_rows:
+                attached = [
+                    value.get("id") if isinstance(value, dict) else value
+                    for value in channel.get("streams", [])
+                ]
+                for stale_id in stale_streams_to_detach(
+                    work["unit_stream_ids"],
+                    attached,
+                    set(stale_rows),
+                    work["working_stream_ids"],
+                ):
+                    guard_lost = False
+                    async with publication_lock:
+                        if self._event_receipt_current(
+                            publication,
+                            event_key,
+                            channel=channel,
+                        ) is None:
+                            guard_lost = True
+                        else:
+                            stale_row = stale_rows[stale_id]
+                            remove_result = await self._execute_remove_from_channel(
+                                Action(type="remove_from_channel", params={}),
+                                StreamContext(
+                                    stream_id=stale_id,
+                                    stream_name=stale_row.stream.name,
+                                    channel_id=channel_id,
+                                ),
+                                exec_ctx,
+                            )
+                    if guard_lost:
+                        await expire(
+                            publication,
+                            event_key,
+                            receipt,
+                            channel=channel,
+                        )
+                        failed = True
+                        break
+                    exec_ctx.add_result(remove_result)
+                    if remove_result.success and not remove_result.skipped:
+                        promo["stale_streams_removed"] += 1
+                    if not remove_result.success:
+                        await fail(
+                            publication,
+                            event_key,
+                            receipt,
+                            "guide_failed",
+                            channel=channel,
+                            detail=remove_result.error,
+                        )
+                        failed = True
+                        break
+                    if datetime.now(timezone.utc) >= expires_at:
+                        await expire(
+                            publication,
+                            event_key,
+                            receipt,
+                            channel=channel,
+                        )
+                        failed = True
+                        break
+                    try:
+                        channel = await self.client.get_channel(channel_id)
+                    except Exception as exc:
+                        await fail(
+                            publication,
+                            event_key,
+                            receipt,
+                            "channel_missing",
+                            detail=exc,
+                        )
+                        failed = True
+                        break
+                    if datetime.now(timezone.utc) >= expires_at:
+                        await expire(
+                            publication,
+                            event_key,
+                            receipt,
+                            channel=channel,
+                        )
+                        failed = True
+                        break
+            if failed:
+                continue
+
+            guard_lost = False
+            async with publication_lock:
+                if self._event_receipt_current(
+                    publication,
+                    event_key,
+                    channel=channel,
+                ) is None:
+                    guard_lost = True
+                elif channel.get("hidden_from_output"):
+                    await self.client.update_channel(
+                        channel_id,
+                        {"hidden_from_output": False},
+                    )
+            if guard_lost:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            try:
+                fresh = await self.client.get_channel(channel_id)
+            except Exception as exc:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "channel_missing",
+                    detail=exc,
+                )
+                continue
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=fresh,
+                )
+                continue
+            attached = {
+                value.get("id") if isinstance(value, dict) else value
+                for value in fresh.get("streams", [])
+            }
+            if (
+                fresh.get("hidden_from_output") is not False
+                or fresh.get("epg_data_id") != guide_row["id"]
+                or not set(stream_ids).issubset(attached)
+            ):
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "guide_failed",
+                    channel=fresh,
+                )
+                continue
+            completed = await self._write_event_receipt(
+                publication,
+                event_key,
+                {"allocated", "importing", "linking", "ready"},
+                {
+                    "stage": "complete",
+                    "reason": None,
+                    "terminal_at": datetime.now(timezone.utc).isoformat(),
+                    "retry_at": None,
+                },
+                channel=fresh,
+            )
+            if completed is not None:
+                self._event_publications[profile_id] = completed
+                promo["guide_pending"] = max(0, promo["guide_pending"] - 1)
+            else:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=fresh,
+                )
+        return touched
+
     async def assign_event_sync_dummy_epg(self, rule_id: Optional[int],
                                           rule_name: str, config: dict,
                                           exec_ctx: ExecutionContext) -> dict:
@@ -6182,6 +8058,8 @@ class ActionExecutor:
             # deferral against whichever channel was processed last.
             channel_ctx = ExecutionContext(dry_run=exec_ctx.dry_run)
             channel_ctx.current_channel_id = channel_id
+            if channel_id is not None:
+                self._deferred_epg_profiles[channel_id] = profile_id
             action = Action(type="assign_epg", params={"epg_id": source_id})
             stream_ctx = StreamContext(
                 stream_id=0,

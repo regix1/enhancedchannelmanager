@@ -1,35 +1,23 @@
-"""Tests for ``scripts/classify_changed_paths.py``.
+"""Tests for standalone changed-path classification and image-only CI policy.
 
-Beads enhancedchannelmanager-5rwzy (``code_paths_changed``) and
-enhancedchannelmanager-t4d5w (``docs_site_affected``).
+The classifier retains its fail-open path, parsing, verdict, and command-line
+contracts even though current GitHub Actions only builds container images.
+Inputs stay inline so those standalone contracts do not depend on repository
+workflow churn.
 
-The classifier is the gate that decides whether a required CI status check
-runs its real work or passes as a no-op. A wrong ``code_paths_changed=false`` verdict
-turns ``Backend Tests`` green without pytest ever running, which is the exact
-class of defect this bead exists to close. So the accept/reject boundary and
-the fail-open behaviour are both pinned here.
-
-``docs_site_affected`` decides whether the published user-guide site rebuilds.
-Its dangerous verdict is the opposite one: a wrong ``false`` leaves the live
-site stale behind merged content, so it fails open to ``true``.
-
-Inputs are built inline rather than read from the repo so the tests stay
-stable as the tree churns. The exceptions are the workflow-contract tests at
-the bottom, which read the real workflow files on purpose.
+The workflow checks read structured YAML from the real tree or explicit
+temporary controls. They pin the current image-only envelope and reject any
+shared-action or direct classifier consumer.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
-import re
-import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "classify_changed_paths.py"
 
@@ -114,28 +102,6 @@ class TestCodePaths:
         ``.beads/`` and turn every beads path into ``beads/``. The path must
         still classify as documentation."""
         assert script.is_inert_path(".beads/issues.jsonl") is True
-
-
-def test_classifier_consumers_use_only_positive_output_name():
-    positive_consumers = [
-        REPO_ROOT / ".github/workflows/test.yml",
-        REPO_ROOT / ".github/workflows/build.yml",
-    ]
-    docs_pages = REPO_ROOT / ".github/workflows/docs-pages.yml"
-    all_consumers = positive_consumers + [
-        docs_pages,
-        REPO_ROOT / "docs/shipping.md",
-    ]
-    for consumer in all_consumers:
-        text = consumer.read_text(encoding="utf-8")
-        assert "docs_only" not in text, consumer
-    for consumer in positive_consumers:
-        text = consumer.read_text(encoding="utf-8")
-        assert "code_paths_changed" in text, consumer
-    assert "docs_site_affected" in docs_pages.read_text(encoding="utf-8")
-
-
-# --- Whole-set classification ----------------------------------------------
 
 
 class TestClassify:
@@ -423,38 +389,13 @@ class TestCommandLine:
 
 
 class TestWorkflowContract:
-    """The whole design rests on required checks being emitted exactly once.
+    """Pin the current image-only workflow and classifier absence."""
 
-    These assertions read the real workflow files, so a future edit that
-    reintroduces a path filter on the workflows carrying required contexts,
-    or resurrects a second emitter of those names, fails here rather than
-    silently on a pull request."""
-
-    # `CodeQL Analysis` is the job name; its matrix expands it into the two
-    # required contexts `CodeQL Analysis (python)` and
-    # `CodeQL Analysis (javascript-typescript)`. With those two, `Backend
-    # Tests` and `Frontend Tests` are the four contexts branch protection on
-    # `dev` requires.
-    #
-    # `MCP Server Tests` deliberately is NOT here: it still runs in test.yml
-    # and is still worth running, but it no longer gates anything, so the
-    # never-skipped / one-emitter invariants below do not cover it.
-    REQUIRED_CONTEXTS = (
-        "Backend Tests",
-        "Frontend Tests",
-        "CodeQL Analysis",
-    )
     WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
     @staticmethod
     def _workflow_files() -> list[Path]:
-        """Every workflow file, both spellings.
-
-        GitHub accepts `.yaml` as readily as `.yml`. Globbing only `*.yml`
-        would make a `.yaml` workflow invisible to every assertion in this
-        class, including the one that forbids a second emitter of a required
-        context, so the guard would pass while the defect it exists to catch
-        was present."""
+        """Return every workflow file, using both accepted extensions."""
         directory = TestWorkflowContract.WORKFLOW_DIR
         return sorted(
             list(directory.glob("*.yml")) + list(directory.glob("*.yaml"))
@@ -466,294 +407,36 @@ class TestWorkflowContract:
 
         return yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    @staticmethod
-    def _triggers(workflow: dict) -> dict:
-        # YAML 1.1 parses a bare `on:` key as the boolean True, so a workflow
-        # trigger block comes back under `True`, not `"on"`.
-        return workflow.get(True) or workflow.get("on") or {}
-
     def test_no_code_paths_changed_sentinel_workflow_remains(self):
         assert not (self.WORKFLOW_DIR / "docs-only-pass.yml").exists()
 
-    @pytest.mark.parametrize("workflow", ["test.yml", "build.yml"])
-    def test_required_check_workflows_have_no_path_filters(self, workflow):
-        triggers = self._triggers(self._load_workflow(self.WORKFLOW_DIR / workflow))
-        for event, config in triggers.items():
-            if not isinstance(config, dict):
-                continue
-            for key in ("paths", "paths-ignore"):
-                assert key not in config, (
-                    f"{workflow} reintroduced `{key}` on the `{event}` trigger. "
-                    f"A workflow that emits a required status check must run on "
-                    f"every pull request, or the context goes missing on the "
-                    f"filtered half and something else has to fill in for it. "
-                    f"Gate the expensive STEPS on the `detect` job instead. "
-                    f"See bead enhancedchannelmanager-5rwzy."
-                )
+    def test_image_only_workflow_policy(self):
+        workflows = self._workflow_files()
+        assert [path.name for path in workflows] == ["build.yml"]
 
-    def test_required_context_jobs_can_never_be_skipped(self):
-        """The half of the invariant that keeps every PR check set complete.
-
-        GitHub counts a SKIPPED job as satisfying a required status check, so
-        a required-context job must never carry a job-level `if:` that can
-        evaluate false: it would be the same permanently-satisfied context
-        the sentinel workflow used to provide. Every such job either has no
-        `if:` at all or guards only against cancellation, and gates its real
-        work at the STEP level instead."""
-        for path in self._workflow_files():
-            jobs = self._load_workflow(path).get("jobs") or {}
-            for job_id, job in jobs.items():
-                job = job or {}
-                if job.get("name", job_id) not in self.REQUIRED_CONTEXTS:
-                    continue
-                condition = str(job.get("if", "")).strip()
-                if not condition:
-                    continue
-                assert "!cancelled()" in condition, (
-                    f"{path.name}:{job_id} emits a required status check but "
-                    f"has a job-level `if:` that can evaluate false "
-                    f"({condition!r}). A skipped job satisfies a required "
-                    f"check without running anything. Gate the steps instead, "
-                    f"and keep the job-level guard at `!cancelled()`. "
-                    f"See bead enhancedchannelmanager-5rwzy."
-                )
-                assert "code_paths_changed" not in condition, (
-                    f"{path.name}:{job_id} gates the whole job on the "
-                    f"documentation-only classification. That skips the job, "
-                    f"and a skipped job satisfies the required check it is "
-                    f"named for. Gate its steps instead. "
-                    f"See bead enhancedchannelmanager-5rwzy."
-                )
-
-    def test_each_required_context_has_exactly_one_emitting_job(self):
-        emitters: dict[str, list[str]] = {name: [] for name in self.REQUIRED_CONTEXTS}
-        for path in self._workflow_files():
-            jobs = self._load_workflow(path).get("jobs") or {}
-            for job_id, job in jobs.items():
-                display_name = (job or {}).get("name", job_id)
-                if display_name in emitters:
-                    emitters[display_name].append(f"{path.name}:{job_id}")
-        for context, sources in emitters.items():
-            assert len(sources) == 1, (
-                f"required context {context!r} is emitted by {len(sources)} "
-                f"job(s) ({sources or 'none'}). Exactly one job may carry the "
-                f"name: a second emitter reports its own conclusion under the "
-                f"same context, and a permanently green one masks a real "
-                f"failure. See bead enhancedchannelmanager-5rwzy."
-            )
-
-    def test_no_new_job_name_collides_with_a_required_context(self):
-        """Exactly one job carries each required name, and it is this one.
-
-        A job whose display name is one character off a required name is
-        indistinguishable in the checks list. This mapping is the both-ways
-        assertion: a required name that no job emits fails here, and so does a
-        second job that starts emitting one."""
-        required_job_names = {
-            "Backend Tests": "test.yml:backend",
-            "Frontend Tests": "test.yml:frontend",
-            "CodeQL Analysis": "build.yml:codeql-analysis",
+        workflow = self._load_workflow(workflows[0])
+        assert set((workflow.get("jobs") or {}).keys()) == {
+            "build-amd64",
+            "build-arm64",
+            "merge-manifests",
+            "build-mcp-amd64",
+            "build-mcp-arm64",
+            "merge-mcp-manifests",
         }
-        found: dict[str, str] = {}
-        for path in self._workflow_files():
-            jobs = self._load_workflow(path).get("jobs") or {}
-            for job_id, job in jobs.items():
-                display_name = (job or {}).get("name", job_id)
-                if display_name in required_job_names:
-                    found[display_name] = f"{path.name}:{job_id}"
-        assert found == required_job_names, (
-            "the job carrying each required status check moved, disappeared, "
-            "or gained a twin. Branch protection on `dev` is classic with "
-            "enforce_admins=true, so a required name that no job emits wedges "
-            "every PR with no admin bypass. See bead "
-            "enhancedchannelmanager-t4d5w."
-        )
-
-
-# --- Rename sources reach the classifier ------------------------------------
+        assert not ACTION_FILE.exists()
+        _workflow_action_contract()
 
 
 ACTION_USE = "./.github/actions/classify-changed-paths"
 ACTION_FILE = REPO_ROOT / ".github/actions/classify-changed-paths/action.yml"
-RESERVED_OUTPUTS = {"code_paths_changed", "docs_site_affected"}
-RESERVED_IDENTIFIERS = ("classify_changed_paths", "classify-changed-paths")
-KEY_MARKER = "<key>"
 
 
-def _expected_verdict_manifest():
-    expected = set()
-    for filename in ("build.yml", "docs-pages.yml", "test.yml"):
-        for output in RESERVED_OUTPUTS:
-            expected.add((filename, ("jobs", "detect", "outputs", KEY_MARKER), output))
-            expected.add(
-                (
-                    filename,
-                    ("jobs", "detect", "outputs", output),
-                    f"${{{{ steps.classify.outputs.{output} }}}}",
-                )
-            )
-
-    code_false = "needs.detect.outputs.code_paths_changed == 'false'"
-    code_true = "needs.detect.outputs.code_paths_changed != 'false'"
-    code_always = "always() && " + code_true
-    dependency_pr = (
-        code_true
-        + " && ((github.event_name == 'push' && github.ref == 'refs/heads/main') "
-        + "|| (github.event_name == 'push' && github.ref == 'refs/heads/dev' "
-        + "&& needs.detect-dependency-change.outputs.dependency_files_changed == 'true') "
-        + "|| (github.event_name == 'pull_request' && github.base_ref == 'main') "
-        + "|| (github.event_name == 'pull_request' && github.base_ref == 'dev' "
-        + "&& needs.detect-dependency-change.outputs.dependency_files_changed == 'true'))"
-    )
-    for job in ("security-scan-frontend", "security-scan-backend"):
-        expected.add(("build.yml", ("jobs", job, "if"), dependency_pr))
-    expected.add(("build.yml", ("jobs", "security-scan-mcp", "if"), code_true))
-    for job in ("build-amd64", "build-arm64", "build-mcp-amd64", "build-mcp-arm64"):
-        expected.add(("build.yml", ("jobs", job, "if"), code_true))
-    for index, value in enumerate(
-        (code_false, code_true, code_true, code_true, code_true,
-         code_true + " && github.event_name == 'pull_request'", code_always)
-    ):
-        expected.add(("build.yml", ("jobs", "codeql-analysis", "steps", index, "if"), value))
-    expected.add(
-        (
-            "docs-pages.yml",
-            ("jobs", "build", "if"),
-            "!cancelled() && needs.detect.outputs.docs_site_affected != 'false'",
-        )
-    )
-    step_contracts = {
-        "backend": (1, 6, 9),
-        # 1..6 gated on the classifier, 7..9 additionally on always().
-        # Step 5 is the image build for the MCP isolation gate, split out from
-        # the assertion step so a transient registry failure does not report
-        # under a security-sounding name (…-04c0u.8).
-        "mcp-server": (1, 6, 9),
-        "frontend": (1, 6, 9),
-    }
-    for job, (first_true, last_true, last_always) in step_contracts.items():
-        expected.add(("test.yml", ("jobs", job, "steps", 0, "if"), code_false))
-        for index in range(first_true, last_true + 1):
-            expected.add(("test.yml", ("jobs", job, "steps", index, "if"), code_true))
-        for index in range(last_true + 1, last_always + 1):
-            expected.add(("test.yml", ("jobs", job, "steps", index, "if"), code_always))
-
-    # `Docs Link Check` is the one job here gated on the OTHER verdict. It
-    # builds the published mkdocs site, so its input set is
-    # `docs_site_affected`, not `code_paths_changed`. Same step-gated shape
-    # as the three above — step 0 is the no-op summary on the negative
-    # verdict, steps 1..4 do the work, step 5 summarizes under `always()` —
-    # and the same `!= 'false'` fail-open direction. The job is advisory, not
-    # a required context; the shape is here so a skipped job can never render
-    # as a green check that built nothing.
-    site_false = "needs.detect.outputs.docs_site_affected == 'false'"
-    site_true = "needs.detect.outputs.docs_site_affected != 'false'"
-    site_always = "always() && " + site_true
-    expected.add(("test.yml", ("jobs", "docs-link-check", "steps", 0, "if"), site_false))
-    for index in range(1, 5):
-        expected.add(
-            ("test.yml", ("jobs", "docs-link-check", "steps", index, "if"), site_true)
-        )
-    expected.add(
-        ("test.yml", ("jobs", "docs-link-check", "steps", 5, "if"), site_always)
-    )
-    return expected
-
-
-EXPECTED_VERDICT_MANIFEST = _expected_verdict_manifest()
-REGISTERED_CLASSIFIER_WORKFLOWS = {"build.yml", "docs-pages.yml", "test.yml"}
-CONTROL_FIELDS = ("if", "continue-on-error")
-CONTROL_MANIFEST_PATH = REPO_ROOT / "backend/tests/fixtures/workflow_control_manifest.json"
-EXPECTED_JOB_OUTPUTS = {
-    ("build.yml", "detect-dependency-change"): {
-        "dependency_files_changed": "${{ steps.classify.outputs.dependency_files_changed }}",
-    },
-    ("test.yml", "detect"): {
-        "code_paths_changed": "${{ steps.classify.outputs.code_paths_changed }}",
-        "docs_site_affected": "${{ steps.classify.outputs.docs_site_affected }}",
-    },
-    ("docs-pages.yml", "detect"): {
-        "code_paths_changed": "${{ steps.classify.outputs.code_paths_changed }}",
-        "docs_site_affected": "${{ steps.classify.outputs.docs_site_affected }}",
-    },
-    ("build.yml", "detect"): {
-        "code_paths_changed": "${{ steps.classify.outputs.code_paths_changed }}",
-        "docs_site_affected": "${{ steps.classify.outputs.docs_site_affected }}",
-    },
-    **{
-        ("build.yml", job): {"digest": "${{ steps.digest.outputs.digest }}"}
-        for job in ("build-amd64", "build-arm64", "build-mcp-amd64", "build-mcp-arm64")
-    },
-    ("publish-images.yml", "authorize"): {
-        "sha": "${{ steps.authorize.outputs.sha }}",
-        "branch": "${{ steps.authorize.outputs.branch }}",
-        "build_run_id": "${{ steps.authorize.outputs.build_run_id }}",
-        "ecm_amd64": "${{ steps.authorize.outputs.ecm_amd64 }}",
-        "ecm_arm64": "${{ steps.authorize.outputs.ecm_arm64 }}",
-        "mcp_amd64": "${{ steps.authorize.outputs.mcp_amd64 }}",
-        "mcp_arm64": "${{ steps.authorize.outputs.mcp_arm64 }}",
-    },
-    **{
-        ("publish-images.yml", job): {
-            "ecm_digest": "${{ steps.promote.outputs.ecm_digest }}",
-            "mcp_digest": "${{ steps.promote.outputs.mcp_digest }}",
-        }
-        for job in ("publish-amd64", "publish-arm64")
-    },
-}
-def _reserved_occurrences(value, path=()):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if isinstance(key, str) and any(name in key for name in RESERVED_OUTPUTS):
-                yield path + (KEY_MARKER,), key
-            yield from _reserved_occurrences(child, path + (str(key),))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _reserved_occurrences(child, path + (index,))
-    elif isinstance(value, str) and any(name in value for name in RESERVED_OUTPUTS):
-        yield path, value
-
-
-def _scalar_strings(value):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield from _scalar_strings(key)
-            yield from _scalar_strings(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _scalar_strings(child)
-    elif isinstance(value, str):
-        yield value
-
-
-def _workflow_controls(directory, field):
-    controls = []
-    for path in sorted((*directory.glob("*.yml"), *directory.glob("*.yaml"))):
-        workflow = TestWorkflowContract._load_workflow(path)
-        for job_id, job in (workflow.get("jobs") or {}).items():
-            if field in (job or {}):
-                controls.append(
-                    {
-                        "file": path.name,
-                        "path": ["jobs", job_id, field],
-                        "value": job[field],
-                    }
-                )
-            for index, step in enumerate((job or {}).get("steps") or []):
-                if field in (step or {}):
-                    controls.append(
-                        {
-                            "file": path.name,
-                            "path": ["jobs", job_id, "steps", index, field],
-                            "value": step[field],
-                        }
-                    )
-    return controls
-
-
-def _discover_action_consumers(directory=None) -> tuple[tuple[Path, str, int], ...]:
+def _discover_action_consumers(
+    directory: Path | None = None,
+) -> tuple[tuple[Path, str, int], ...]:
     """Locate the exact local action structurally across every workflow job."""
-    directory = directory or TestWorkflowContract.WORKFLOW_DIR
+    if directory is None:
+        directory = TestWorkflowContract.WORKFLOW_DIR
     found = []
     for path in sorted((*directory.glob("*.yml"), *directory.glob("*.yaml"))):
         jobs = TestWorkflowContract._load_workflow(path).get("jobs") or {}
@@ -761,929 +444,89 @@ def _discover_action_consumers(directory=None) -> tuple[tuple[Path, str, int], .
             for index, step in enumerate((job or {}).get("steps") or []):
                 if (step or {}).get("uses") == ACTION_USE:
                     found.append((path, job_id, index))
-    assert found, "no workflow job uses the shared changed-path action"
     return tuple(found)
 
 
-ACTION_CONSUMERS = _discover_action_consumers()
-DETECT_WORKFLOWS = tuple(dict.fromkeys(path for path, _job, _index in ACTION_CONSUMERS))
+def _workflow_action_contract(directory: Path | None = None) -> None:
+    if directory is None:
+        directory = TestWorkflowContract.WORKFLOW_DIR
 
+    consumers = _discover_action_consumers(directory)
+    assert not consumers, f"shared changed-path action found at {consumers}"
 
-def _workflow_action_contract(directory=None) -> None:
-    directory = directory or TestWorkflowContract.WORKFLOW_DIR
-    discovered = _discover_action_consumers(directory)
-    by_workflow: dict[Path, list[tuple[str, int]]] = {}
-    for path, job_id, index in discovered:
-        by_workflow.setdefault(path, []).append((job_id, index))
-    for path, locations in by_workflow.items():
-        assert len(locations) == 1, f"{path.name}: shared action must appear exactly once"
-    if directory == TestWorkflowContract.WORKFLOW_DIR:
-        _assert_registered_consumer_names(set(path.name for path in by_workflow))
-    authority_jobs = {
-        (path, locations[0][0])
-        for path, locations in by_workflow.items()
-    }
-    actual_verdicts = set()
-    actual_job_outputs = {}
     for path in sorted((*directory.glob("*.yml"), *directory.glob("*.yaml"))):
-        workflow = TestWorkflowContract._load_workflow(path)
-        actual_verdicts.update(
-            (path.name, location, value)
-            for location, value in _reserved_occurrences(workflow)
-        )
-        event_config = workflow.get("on", workflow.get(True, {})) or {}
-        workflow_call = event_config.get("workflow_call") or {}
-        call_outputs = set((workflow_call.get("outputs") or {}).keys())
-        assert not (call_outputs & RESERVED_OUTPUTS), (
-            f"{path.name}: reusable workflow may not export reserved classifier outputs"
-        )
-        reusable_jobs = {
-            job_id
-            for job_id, job in (workflow.get("jobs") or {}).items()
-            if isinstance((job or {}).get("uses"), str)
-        }
-        for job_id in reusable_jobs:
-            reference = workflow["jobs"][job_id]["uses"]
-            assert not any(
-                identifier in reference for identifier in RESERVED_IDENTIFIERS
-            ), f"{path.name}:{job_id}: reserved classifier reusable reference"
-            scalars = tuple(_scalar_strings(workflow))
-            for output in RESERVED_OUTPUTS:
-                assert not any(
-                    f"needs.{job_id}.outputs.{output}" in scalar
-                    for scalar in scalars
-                ), (
-                    f"{path.name}:{job_id}: reusable job reserved-output consumption"
-                )
-        for job_id, job in (workflow.get("jobs") or {}).items():
-            if "outputs" in (job or {}):
-                actual_job_outputs[(path.name, job_id)] = job["outputs"]
-            output_keys = set(((job or {}).get("outputs") or {}).keys())
-            if output_keys & RESERVED_OUTPUTS:
-                assert (path, job_id) in authority_jobs, (
-                    f"{path.name}:{job_id}: reserved classifier outputs require "
-                    "the canonical authority action"
-                )
-            for step in (job or {}).get("steps") or []:
+        jobs = TestWorkflowContract._load_workflow(path).get("jobs") or {}
+        for job_id, job in jobs.items():
+            for index, step in enumerate((job or {}).get("steps") or []):
                 run = (step or {}).get("run")
                 assert not (
-                    isinstance(run, str)
-                    and any(identifier in run for identifier in RESERVED_IDENTIFIERS)
-                ), f"{path.name}:{job_id}: reserved classifier identifier in run scalar"
-                uses = (step or {}).get("uses")
-                if isinstance(uses, str) and any(
-                    identifier in uses for identifier in RESERVED_IDENTIFIERS
-                ):
-                    assert uses == ACTION_USE, (
-                        f"{path.name}:{job_id}: noncanonical classifier action reference"
-                    )
-    if directory == TestWorkflowContract.WORKFLOW_DIR:
-        expected_verdicts = EXPECTED_VERDICT_MANIFEST
-        expected_job_outputs = EXPECTED_JOB_OUTPUTS
-    else:
-        expected_verdicts = set()
-        expected_job_outputs = {}
-        for path, job_id in authority_jobs:
-            expected_job_outputs[(path.name, job_id)] = {
-                "code_paths_changed": "${{ steps.classify.outputs.code_paths_changed }}",
-                "docs_site_affected": "${{ steps.classify.outputs.docs_site_affected }}",
-            }
-            for output in RESERVED_OUTPUTS:
-                expected_verdicts.add(
-                    (path.name, ("jobs", job_id, "outputs", KEY_MARKER), output)
-                )
-                expected_verdicts.add(
-                    (
-                        path.name,
-                        ("jobs", job_id, "outputs", output),
-                        f"${{{{ steps.classify.outputs.{output} }}}}",
-                    )
-                )
-    assert actual_verdicts == expected_verdicts, (
-        "reserved verdict namespace differs from the explicit workflow manifest: "
-        f"extra={actual_verdicts - expected_verdicts}, "
-        f"missing={expected_verdicts - actual_verdicts}"
-    )
-    assert actual_job_outputs == expected_job_outputs, (
-        "job output mappings differ from the closed classifier-workflow manifest"
-    )
-    controls = {
-        field: _workflow_controls(directory, field)
-        for field in CONTROL_FIELDS
-    }
-    if directory == TestWorkflowContract.WORKFLOW_DIR:
-        expected_controls = json.loads(
-            CONTROL_MANIFEST_PATH.read_text(encoding="utf-8")
-        )
-        assert controls == expected_controls, (
-            "full-repository workflow control manifest changed; review the "
-            "readable location and exact typed value before updating the golden file"
-        )
-    else:
-        allowed_if = "needs.wrapper.outputs.artifact_name != ''"
-        unexpected_ifs = [
-            value for value in controls["if"] if value["value"] != allowed_if
-        ]
-        assert not unexpected_ifs, "full-repository if control manifest changed"
-        assert not controls["continue-on-error"], (
-            "full-repository continue-on-error control manifest changed"
-        )
-    for path, locations in by_workflow.items():
-        workflow = TestWorkflowContract._load_workflow(path)
-        job_id, action_index = locations[0]
-        job = (workflow.get("jobs") or {})[job_id]
-        steps = job.get("steps") or []
-        assert len(steps) == 2, f"{path.name}:{job_id}: authority job permits exactly two steps"
-        assert action_index == 1
-        assert steps[0].get("uses", "").startswith("actions/checkout@")
-        assert "run" not in steps[0]
-        assert steps[1] == {
-            "name": "Classify the changed file set",
-            "id": "classify",
-            "uses": ACTION_USE,
-        }
-        assert job.get("outputs") == {
-            "code_paths_changed": "${{ steps.classify.outputs.code_paths_changed }}",
-            "docs_site_affected": "${{ steps.classify.outputs.docs_site_affected }}",
-        }
+                    isinstance(run, str) and SCRIPT_PATH.stem in run
+                ), f"{path.name}:{job_id}:{index}: direct classifier invocation"
 
 
-def _assert_registered_consumer_names(names):
-    assert names == REGISTERED_CLASSIFIER_WORKFLOWS, (
-        "classifier workflow consumer set changed; update the closed control "
-        "manifest only after reviewing every output and gate"
-    )
-
-
-def test_every_workflow_has_one_structured_changed_path_authority():
-    _workflow_action_contract()
-
-
-def _validate_action_contract(action):
-    expected_outputs = {
-        "code_paths_changed": {
-            "description": "Whether code gates must run.",
-            "value": "${{ steps.classify.outputs.code_paths_changed }}",
-        },
-        "docs_site_affected": {
-            "description": "Whether the published documentation site must rebuild.",
-            "value": "${{ steps.classify.outputs.docs_site_affected }}",
-        },
-    }
-    assert action.get("outputs") == expected_outputs
-    expected_occurrences = set()
-    for output in RESERVED_OUTPUTS:
-        expected_occurrences.add((("outputs", KEY_MARKER), output))
-        expected_occurrences.add(
-            (
-                ("outputs", output, "value"),
-                f"${{{{ steps.classify.outputs.{output} }}}}",
-            )
-        )
-    assert set(_reserved_occurrences(action)) == expected_occurrences
-    runs = (action.get("runs") or {})
-    assert runs.get("using") == "composite"
-    steps = runs.get("steps") or []
-    assert len(steps) == 1
-    classifier_step = steps[0]
-    assert set(classifier_step) == {"id", "shell", "env", "run"}
-    assert classifier_step.get("id") == "classify"
-    assert classifier_step.get("shell") == "bash"
-    assert classifier_step.get("env") == {
-        "GH_TOKEN": "${{ github.token }}",
-        "REPO": "${{ github.repository }}",
-        "EVENT_NAME": "${{ github.event_name }}",
-        "PR_NUMBER": "${{ github.event.pull_request.number }}",
-        "BEFORE_SHA": "${{ github.event.before }}",
-        "AFTER_SHA": "${{ github.sha }}",
-    }
-    run = classifier_step["run"]
-    assert "scripts/classify_changed_paths.py" in run
-    assert run.count('echo "$verdict" >> "$GITHUB_OUTPUT"') == 1
-    all_runs = [
-        step.get("run") or ""
-        for step in steps
-        if isinstance((step or {}).get("run"), str)
-    ]
-    assert sum(body.count("$GITHUB_OUTPUT") for body in all_runs) == 1
-
-
-def test_shared_action_has_one_stable_output_contract_and_classifier():
-    _validate_action_contract(TestWorkflowContract._load_workflow(ACTION_FILE))
-
-
-def test_action_swapped_output_or_later_fabricated_write_is_rejected():
-    import copy
-
-    action = TestWorkflowContract._load_workflow(ACTION_FILE)
-    swapped = copy.deepcopy(action)
-    swapped["outputs"]["code_paths_changed"]["value"] = (
-        "${{ steps.classify.outputs.docs_site_affected }}"
-    )
-    with pytest.raises(AssertionError):
-        _validate_action_contract(swapped)
-
-    fabricated = copy.deepcopy(action)
-    fabricated["runs"]["steps"][0]["run"] += (
-        '\necho "code_paths_changed=false" >> "$GITHUB_OUTPUT"\n'
-    )
-    with pytest.raises(AssertionError):
-        _validate_action_contract(fabricated)
-
-    split_key = copy.deepcopy(action)
-    split_key["runs"]["steps"].append(
-        {
-            "shell": "bash",
-            "run": 'printf "code_paths_"; echo "changed=true" >> "$GITHUB_OUTPUT"',
-        }
-    )
-    with pytest.raises(AssertionError):
-        _validate_action_contract(split_key)
-
-
-def test_no_second_action_can_become_changed_path_authority():
-    action_files = sorted((REPO_ROOT / ".github/actions").glob("**/action.y*ml"))
-    authorities = []
-    for path in action_files:
-        action = TestWorkflowContract._load_workflow(path)
-        if any(
-            "scripts/classify_changed_paths.py" in ((step or {}).get("run") or "")
-            for step in ((action.get("runs") or {}).get("steps") or [])
-        ):
-            authorities.append(path)
-    assert authorities == [ACTION_FILE]
-
-# Recorded from the real GitHub API for commit b47ced96 of this repository,
-# via `gh api repos/MotWakorb/enhancedchannelmanager/commits/b47ced96`. Entries
-# are verbatim, reduced to the three fields the detect step can read and to
-# three of the commit's 18 entries: the renamed one plus one either side of it,
-# enough to prove the expression handles a mixed set.
-#
-# That commit is the evidence in bead enhancedchannelmanager-9ogyd:
-# `git diff --name-only b47ced96^...b47ced96` lists 18 paths and the same
-# command with `--no-renames` lists 19. The path only the second spelling shows
-# is the `previous_filename` below.
-RECORDED_RENAME_COMMIT_FILES = [
-    {"filename": "CHANGELOG.md", "status": "modified"},
-    {"filename": "backend/routers/backup.py", "status": "modified"},
-    {
-        "filename": "frontend/src/components/settings/OutboundPolicyCard.css",
-        "previous_filename": (
-            "frontend/src/components/settings/SecuritySettingsSection.css"
-        ),
-        "status": "renamed",
-    },
-]
-RECORDED_RENAME_SOURCE = (
-    "frontend/src/components/settings/SecuritySettingsSection.css"
-)
-
-# The attack from bead enhancedchannelmanager-9ogyd, in the shape the
-# pull-request files API returns it. One entry, one `.md` destination, and a
-# deleted authentication test hiding in `previous_filename`.
-RENAME_INTO_MARKDOWN_FILES = [
-    {
-        "filename": "docs/legacy_auth_test_notes.md",
-        "previous_filename": "backend/tests/unit/test_auth_middleware.py",
-        "status": "renamed",
-    },
-]
-
-JQ = shutil.which("jq")
-assert JQ is not None, "jq is a required, non-skippable workflow-contract dependency"
-
-
-def _classify_step_run(workflow: Path) -> str:
-    """The single shared action's acquisition/classification shell body."""
-    del workflow
-    action = TestWorkflowContract._load_workflow(ACTION_FILE)
-    steps = ((action.get("runs") or {}).get("steps") or [])
-    runs = [step.get("run") or "" for step in steps if (step or {}).get("id") == "classify"]
-    assert len(runs) == 1
-    return runs[0]
-
-
-def _jq_calls(workflow: Path) -> list[tuple[str, str]]:
-    """Return (endpoint, jq) for API calls producing changed_files.json."""
-    calls = []
-    for line in _changed_file_api_lines(workflow):
-        tokens = shlex.split(line)
-        api = tokens.index("api")
-        endpoint = next((token for token in tokens[api + 1 :] if token.startswith("repos/")), None)
-        expression = tokens[tokens.index("--jq") + 1] if "--jq" in tokens else None
-        assert endpoint and expression, f"{workflow.name}: unrecognised changed-file API producer"
-        calls.append((endpoint, expression))
-    assert calls, (
-        f"{workflow.name}:detect no longer passes `--jq` to `gh api`. If the "
-        f"changed-file set is now built some other way, this guard has to be "
-        f"rewritten against it rather than deleted. See bead "
-        f"enhancedchannelmanager-9ogyd."
-    )
-    return calls
-
-
-def _changed_file_api_lines(workflow: Path) -> list[str]:
-    run = _classify_step_run(workflow).replace("\\\n", " ")
-    return [
-        line
-        for line in run.splitlines()
-        if "gh api" in line and "changed_files.json" in line
-    ]
-
-
-def _payload_for(endpoint: str, files):
-    if "/pulls/" in endpoint and endpoint.endswith("/files"):
-        return files
-    if "/compare/" in endpoint:
-        return {"files": files}
-    raise AssertionError(f"unrecognised changed-file endpoint: {endpoint}")
-
-
-def _validate_rename_sources(workflows: tuple[Path, ...]) -> None:
-    for workflow in workflows:
-        for _endpoint, expression in _jq_calls(workflow):
-            assert "previous_filename" in expression, (
-                f"{workflow.name}: changed-file producer drops rename sources"
-            )
-
-
-def _run_jq(expression: str, payload):
-    """Apply the workflow's real jq expression to a payload, as CI would.
-
-    ``gh api --slurp`` wraps all response pages in one outer array. The jq
-    expression returns an explicit completeness envelope so filename
-    delimiters remain data and capped responses cannot look complete.
-    """
-    return _run_jq_slurped(expression, [payload])
-
-
-def _run_jq_slurped(expression: str, pages):
-    result = subprocess.run(
-        [JQ, "-r", expression],
-        input=json.dumps(pages),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, (
-        f"jq rejected the workflow's own expression {expression!r}: "
-        f"{result.stderr.strip()}"
-    )
-    return json.loads(result.stdout)
-
-
-def _envelope_paths(envelope) -> list[str]:
-    assert set(envelope) == {"complete", "paths"}
-    assert isinstance(envelope["complete"], bool)
-    assert isinstance(envelope["paths"], list)
-    return envelope["paths"]
-
-
-class TestRenameSourcesReachTheClassifier:
-    """A rename shows CI only its destination unless the workflow asks for more.
-
-    `git diff --name-only` with default rename detection prints the
-    destination and drops the source, and the pull-request and compare APIs
-    have the same shape: the source lives in `previous_filename`, which
-    `.[].filename` discards. So `git mv
-    backend/tests/unit/test_auth_middleware.py docs/legacy_auth_test_notes.md`
-    reached the classifier as one `.md` path, classified documentation-only,
-    and every required status check passed having executed nothing. Branch
-    protection on `dev` requires no reviews, so those green checks were the
-    entire gate. See bead enhancedchannelmanager-9ogyd.
-    """
-
-    @pytest.mark.parametrize("workflow", DETECT_WORKFLOWS)
-    def test_every_detect_workflow_asks_for_rename_sources(self, workflow):
-        """Dependency-free half of the guard: it cannot skip, ever."""
-        _validate_rename_sources((workflow,))
-
-    def test_rename_into_markdown_classifies_as_code(self, script):
-        """The regression guard, end to end through the workflow's own jq."""
-        for workflow in DETECT_WORKFLOWS:
-            for endpoint, expression in _jq_calls(workflow):
-                paths = _envelope_paths(
-                    _run_jq(
-                        expression,
-                        _payload_for(endpoint, RENAME_INTO_MARKDOWN_FILES),
-                    )
-                )
-                code_paths_changed, code_paths = script.classify(paths)
-                assert code_paths_changed is True
-                assert "backend/tests/unit/test_auth_middleware.py" in code_paths
-
-    def test_recorded_rename_commit_yields_both_sides(self):
-        """Real recorded payload, not a hand-guessed shape."""
-        for workflow in DETECT_WORKFLOWS:
-            for endpoint, expression in _jq_calls(workflow):
-                paths = _envelope_paths(
-                    _run_jq(
-                        expression,
-                        _payload_for(endpoint, RECORDED_RENAME_COMMIT_FILES),
-                    )
-                )
-                assert RECORDED_RENAME_SOURCE in paths
-                assert "frontend/src/components/settings/OutboundPolicyCard.css" in paths
-
-    @pytest.mark.parametrize("workflow", DETECT_WORKFLOWS)
-    def test_no_blank_lines_for_ordinary_changes(self, workflow):
-        """`// empty` must emit no array element when a file is unrenamed."""
-        plain = [
-            {"filename": "backend/main.py", "status": "modified"},
-            {"filename": "CHANGELOG.md", "previous_filename": None},
-        ]
-        for endpoint, expression in _jq_calls(workflow):
-            payload = _payload_for(endpoint, plain)
-            paths = _envelope_paths(_run_jq(expression, payload))
-            assert paths == ["backend/main.py", "CHANGELOG.md"], (
-                f"{workflow.name} expression {expression!r} produced {paths!r}"
-            )
-
-    def test_compare_expression_tolerates_a_payload_with_no_files_key(self):
-        """`gh api --paginate` can hand the compare expression a page with no
-        `files` key. The `?` must keep absorbing that instead of failing the
-        step, since a failed classifier leaves the set empty."""
-        for workflow in DETECT_WORKFLOWS:
-            for endpoint, expression in _jq_calls(workflow):
-                if "/compare/" in endpoint:
-                    assert _run_jq(expression, {}) == {"complete": False, "paths": []}
-
-    def test_json_transport_preserves_filename_characters_without_rewriting(self):
-        paths = ["docs/line\nbreak.md", r"docs\shipping.md", " docs/a.md", "docs/a.md "]
-        payload_files = [{"filename": path, "status": "modified"} for path in paths]
-        for workflow in DETECT_WORKFLOWS:
-            for endpoint, expression in _jq_calls(workflow):
-                assert _envelope_paths(
-                    _run_jq(expression, _payload_for(endpoint, payload_files))
-                ) == paths
-
-    @pytest.mark.parametrize(
-        ("endpoint_kind", "count", "complete"),
-        (
-            ("compare", 299, True),
-            ("compare", 300, False),
-            ("pull", 2999, True),
-            ("pull", 3000, False),
-        ),
-    )
-    def test_endpoint_caps_produce_explicit_completeness(
-        self, endpoint_kind, count, complete
-    ):
-        endpoint, expression = next(
-            (endpoint, expression)
-            for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0])
-            if ("/compare/" in endpoint) == (endpoint_kind == "compare")
-        )
-        files = [
-            {"filename": f".beads/state-{index}.jsonl", "status": "modified"}
-            for index in range(count)
-        ]
-        envelope = _run_jq(expression, _payload_for(endpoint, files))
-        if endpoint_kind == "pull":
-            pages = [files[index : index + 100] for index in range(0, count, 100)]
-            envelope = _run_jq_slurped(expression, pages)
-        assert envelope["complete"] is complete
-        assert len(envelope["paths"]) == count
-
-    def test_malformed_or_missing_api_response_is_explicitly_incomplete(self):
-        for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0]):
-            assert _run_jq(expression, {}) == {"complete": False, "paths": []}
-
-    @pytest.mark.parametrize(
-        "pages",
-        (
-            [{"files": [{"filename": ".beads/a.jsonl"}]}, {"files": "bad"}],
-            [{"files": [{"filename": ".beads/a.jsonl"}]}, {"files": None}],
-            [{"files": [{"filename": ".beads/a.jsonl"}]}, {"message": "error"}],
-            [{"commits": []}, {"files": [{"filename": ".beads/a.jsonl"}]}],
-            [{"files": [{"filename": ".beads/a.jsonl"}]}, "bad-page"],
-            [None, {"files": [{"filename": ".beads/a.jsonl"}]}],
-            [{"files": [{"filename": ".beads/a.jsonl"}]}, {"files": []}],
-        ),
-    )
-    def test_compare_rejects_malformed_or_misordered_slurped_pages(self, pages):
-        _endpoint, expression = next(
-            (endpoint, expression)
-            for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0])
-            if "/compare/" in endpoint
-        )
-        envelope = _run_jq_slurped(expression, pages)
-        assert envelope["complete"] is False
-        result = _run_cli(["--input-format", "envelope"], json.dumps(envelope))
-        assert _outputs(result) == {
-            "code_paths_changed": "true",
-            "docs_site_affected": "true",
-        }
-        assert ".beads/a.jsonl" not in result.stderr
-
-    def test_compare_accepts_documented_later_commit_page_without_files(self):
-        _endpoint, expression = next(
-            (endpoint, expression)
-            for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0])
-            if "/compare/" in endpoint
-        )
-        pages = [
-            {"files": [{"filename": ".beads/a.jsonl"}]},
-            {"commits": []},
-        ]
-        assert _run_jq_slurped(expression, pages) == {
-            "complete": True,
-            "paths": [".beads/a.jsonl"],
-        }
-
-    @pytest.mark.parametrize("position", ("first", "later"))
-    @pytest.mark.parametrize(
-        ("marker", "value"),
-        (
-            ("message", "synthetic API error"),
-            ("documentation_url", "https://example.invalid/docs"),
-            ("errors", [{"code": "synthetic"}]),
-        ),
-    )
-    def test_compare_rejects_success_shape_mixed_with_error_markers(
-        self, position, marker, value
-    ):
-        _endpoint, expression = next(
-            (endpoint, expression)
-            for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0])
-            if "/compare/" in endpoint
-        )
-        first = {"files": [{"filename": ".beads/a.jsonl"}]}
-        later = {"commits": []}
-        (first if position == "first" else later)[marker] = value
-        envelope = _run_jq_slurped(expression, [first, later])
-        assert envelope["complete"] is False
-        result = _run_cli(["--input-format", "envelope"], json.dumps(envelope))
-        assert _outputs(result) == {
-            "code_paths_changed": "true",
-            "docs_site_affected": "true",
-        }
-        assert ".beads/a.jsonl" not in result.stderr
-
-    def test_compare_legitimate_status_field_is_not_an_error_marker(self):
-        _endpoint, expression = next(
-            (endpoint, expression)
-            for endpoint, expression in _jq_calls(DETECT_WORKFLOWS[0])
-            if "/compare/" in endpoint
-        )
-        pages = [
-            {"status": "ahead", "files": [{"filename": ".beads/a.jsonl"}]},
-            {"commits": []},
-        ]
-        assert _run_jq_slurped(expression, pages)["complete"] is True
-
-
-def test_detect_workflows_use_lossless_json_transport():
-    for workflow in DETECT_WORKFLOWS:
-        run = _classify_step_run(workflow)
-        assert "changed_files.json" in run
-        assert "changed_files.txt" not in run
-        for line in _changed_file_api_lines(workflow):
-            tokens = shlex.split(line)
-            assert "--paginate" in tokens
-            assert "--slurp" in tokens
-            assert tokens[tokens.index("--jq") + 1].startswith("(")
-
-
-def test_classifier_workflow_discovery_includes_yaml(tmp_path):
-    workflow = tmp_path / "fourth.yaml"
-    _write_action_workflow(workflow, job_id="renamed_classifier_job")
-    assert _discover_action_consumers(tmp_path) == (
-        (workflow, "renamed_classifier_job", 1),
-    )
-    _workflow_action_contract(tmp_path)
-
-
-def test_new_fourth_action_consumer_requires_manifest_registration():
-    with pytest.raises(AssertionError, match="consumer set changed"):
-        _assert_registered_consumer_names(
-            REGISTERED_CLASSIFIER_WORKFLOWS | {"fourth.yaml"}
-        )
-
-
-def _write_action_workflow(
-    path: Path,
-    *,
-    job_id: str = "detect",
-    extra_authority_steps: str = "",
-    extra_jobs: str = "",
-    step_id: str = "classify",
-    outputs: str | None = None,
-) -> None:
-    outputs = outputs or (
-        "      code_paths_changed: ${{ steps.classify.outputs.code_paths_changed }}\n"
-        "      docs_site_affected: ${{ steps.classify.outputs.docs_site_affected }}\n"
-    )
-    path.write_text(
-        f"jobs:\n  {job_id}:\n    outputs:\n{outputs}    steps:\n"
-        "      - uses: actions/checkout@v6\n"
-        f"      - name: Classify the changed file set\n        id: {step_id}\n"
-        f"        uses: {ACTION_USE}\n{extra_authority_steps}{extra_jobs}",
+@pytest.mark.parametrize("extension", [".yml", ".yaml"])
+def test_classifier_workflow_discovery_includes_yaml(tmp_path, extension):
+    workflow = tmp_path / f"build{extension}"
+    workflow.write_text(
+        f"""jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {ACTION_USE}
+""",
         encoding="utf-8",
     )
 
-
-def test_second_action_invocation_is_rejected(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_authority_steps=f"      - uses: {ACTION_USE}\n",
-    )
-    with pytest.raises(AssertionError, match="exactly once"):
+    assert _discover_action_consumers(tmp_path) == ((workflow, "build", 0),)
+    with pytest.raises(AssertionError, match="shared changed-path action"):
         _workflow_action_contract(tmp_path)
 
 
 @pytest.mark.parametrize(
-    "command",
-    (
-        "python -u scripts/classify_changed_paths.py --files-from other.json",
-        "env MODE=test python scripts/classify_changed_paths.py",
-        "command python3 scripts/classify_changed_paths.py",
-        "gh api repos/x/compare/a...b \\\n+  --jq '[.files[] | .filename]'",
-    ),
+    ("name", "command"),
+    [
+        ("build.yml", "python scripts/classify_changed_paths.py"),
+        ("build.yaml", "python3 -m scripts.classify_changed_paths"),
+    ],
 )
-def test_any_run_step_in_authority_job_is_rejected_structurally(tmp_path, command):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_authority_steps="      - run: |\n" + "\n".join(
-            f"          {line}" for line in command.splitlines()
-        ) + "\n",
+def test_direct_classifier_invocation_is_rejected(tmp_path, name, command):
+    workflow = tmp_path / name
+    workflow.write_text(
+        f"""jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: {command}
+""",
+        encoding="utf-8",
     )
-    with pytest.raises(
-        AssertionError,
-        match="reserved classifier identifier|exactly two steps",
-    ):
-        _workflow_action_contract(tmp_path)
 
-
-def test_swapped_output_or_stale_step_binding_is_rejected(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        outputs=(
-            "      code_paths_changed: ${{ steps.classify.outputs.docs_site_affected }}\n"
-            "      docs_site_affected: ${{ steps.old.outputs.docs_site_affected }}\n"
-        ),
-    )
-    with pytest.raises(AssertionError):
-        _workflow_action_contract(tmp_path)
-
-
-def test_renamed_action_step_with_stale_output_binding_is_rejected(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(workflow, step_id="renamed")
-    with pytest.raises(AssertionError):
+    assert _discover_action_consumers(tmp_path) == ()
+    with pytest.raises(AssertionError, match="direct classifier invocation"):
         _workflow_action_contract(tmp_path)
 
 
 def test_yaml_comment_prose_is_ignored(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_jobs=(
-            "  diagnostics:\n    steps:\n"
-            "      # python scripts/classify_changed_paths.py\n"
-            "      - run: echo 'ordinary diagnostics are harmless here'\n"
-        ),
+    workflow = tmp_path / "build.yml"
+    workflow.write_text(
+        f"""# {ACTION_USE}
+# {SCRIPT_PATH.stem}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo image
+""",
+        encoding="utf-8",
     )
+
+    parsed = TestWorkflowContract._load_workflow(workflow)
+    assert parsed["jobs"]["build"] == {
+        "runs-on": "ubuntu-latest",
+        "steps": [{"run": "echo image"}],
+    }
+    assert _discover_action_consumers(tmp_path) == ()
     _workflow_action_contract(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "run",
-    (
-        "echo scripts/classify_changed_paths.py is centralized",
-        "# scripts/classify_changed_paths.py is centralized",
-    ),
-)
-def test_reserved_identifier_in_any_run_scalar_is_fail_safe_red(tmp_path, run):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_jobs=f"  diagnostics:\n    steps:\n      - run: '{run}'\n",
-    )
-    with pytest.raises(AssertionError, match="reserved classifier identifier"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_direct_only_fourth_yaml_is_rejected_closed_world(tmp_path):
-    _write_action_workflow(tmp_path / "good.yml")
-    (tmp_path / "fourth.yaml").write_text(
-        "jobs:\n  renamed_job:\n    steps:\n"
-        "      - run: python -u scripts/classify_changed_paths.py\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="reserved classifier identifier"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_second_direct_job_is_rejected_closed_world(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_jobs=(
-            "  other:\n    steps:\n"
-            "      - run: env X=1 python scripts/classify_changed_paths.py\n"
-        ),
-    )
-    with pytest.raises(AssertionError, match="reserved classifier identifier"):
-        _workflow_action_contract(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "reference",
-    (
-        "../actions/classify-changed-paths",
-        "owner/repo/.github/actions/classify-changed-paths@main",
-        "./.github/actions/classify_changed_paths",
-    ),
-)
-def test_noncanonical_classifier_action_reference_is_rejected(tmp_path, reference):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_jobs=f"  other:\n    steps:\n      - uses: {reference}\n",
-    )
-    with pytest.raises(AssertionError, match="noncanonical classifier action"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_reserved_output_on_non_authority_job_is_rejected(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_jobs="  other:\n    outputs:\n      code_paths_changed: 'true'\n    steps: []\n",
-    )
-    with pytest.raises(AssertionError, match="reserved classifier outputs"):
-        _workflow_action_contract(tmp_path)
-
-
-def _write_reusable(path: Path, outputs: str) -> None:
-    path.write_text(
-        "on:\n  workflow_call:\n    outputs:\n"
-        f"{outputs}jobs:\n  harmless:\n    runs-on: ubuntu-latest\n"
-        "    steps:\n      - run: echo ok\n",
-        encoding="utf-8",
-    )
-
-
-def test_called_and_caller_cannot_bridge_reserved_output(tmp_path):
-    _write_action_workflow(tmp_path / "good.yml")
-    _write_reusable(
-        tmp_path / "called.yaml",
-        "      code_paths_changed:\n        value: ${{ jobs.harmless.outputs.value }}\n",
-    )
-    (tmp_path / "caller.yml").write_text(
-        "jobs:\n  wrapper:\n    uses: ./.github/workflows/called.yaml\n"
-        "  consume:\n    needs: wrapper\n"
-        "    if: needs.wrapper.outputs.code_paths_changed != 'false'\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="may not export reserved"):
-        _workflow_action_contract(tmp_path)
-
-
-@pytest.mark.parametrize("output", tuple(RESERVED_OUTPUTS))
-def test_innocuously_named_or_swapped_wrapper_cannot_export_reserved(tmp_path, output):
-    _write_action_workflow(tmp_path / "good.yml")
-    _write_reusable(
-        tmp_path / "ordinary-wrapper.yaml",
-        f"      {output}:\n        value: harmless\n",
-    )
-    with pytest.raises(AssertionError, match="may not export reserved"):
-        _workflow_action_contract(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "reference",
-    (
-        "./.github/workflows/ordinary.yml",
-        "owner/repo/.github/workflows/ordinary.yml@main",
-    ),
-)
-def test_local_or_remote_reusable_job_cannot_feed_reserved_output(tmp_path, reference):
-    _write_action_workflow(tmp_path / "good.yml")
-    (tmp_path / "caller.yaml").write_text(
-        "jobs:\n  wrapper:\n"
-        f"    uses: {reference}\n"
-        "  consume:\n    needs: wrapper\n"
-        "    if: needs.wrapper.outputs.docs_site_affected != 'false'\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="reserved-output consumption"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_classifier_like_reusable_reference_is_rejected(tmp_path):
-    _write_action_workflow(tmp_path / "good.yml")
-    (tmp_path / "caller.yml").write_text(
-        "jobs:\n  wrapper:\n"
-        "    uses: ./.github/workflows/classify-changed-paths.yml\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="reserved classifier reusable"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_unrelated_reusable_workflow_and_output_remain_allowed(tmp_path):
-    _write_action_workflow(tmp_path / "good.yml")
-    _write_reusable(
-        tmp_path / "called.yaml",
-        "      artifact_name:\n        value: harmless\n",
-    )
-    (tmp_path / "caller.yml").write_text(
-        "jobs:\n  wrapper:\n    uses: ./.github/workflows/called.yaml\n"
-        "  consume:\n    needs: wrapper\n"
-        "    if: needs.wrapper.outputs.artifact_name != ''\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        encoding="utf-8",
-    )
-    _workflow_action_contract(tmp_path)
-
-
-def test_dynamic_remote_reusable_output_condition_is_unmanifested(tmp_path):
-    _write_action_workflow(tmp_path / "good.yml")
-    (tmp_path / "fourth-remote.yaml").write_text(
-        "jobs:\n"
-        "  wrapper:\n    uses: owner/repo/.github/workflows/ordinary.yml@main\n"
-        "  consume:\n    needs: wrapper\n"
-        "    if: ${{ needs.wrapper.outputs[format('{0}', 'result')] }}\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="if control manifest"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_fully_dynamic_output_expression_is_still_a_manifested_control(tmp_path):
-    _write_action_workflow(
-        tmp_path / "good.yml",
-        extra_jobs=(
-            "  wrapper:\n    uses: owner/repo/.github/workflows/ordinary.yml@main\n"
-            "  consume:\n    needs: wrapper\n"
-            "    if: ${{ needs['wrapper'][format('out{0}', 'puts')]"
-            "[format('{0}', 'result')] }}\n"
-            "    runs-on: ubuntu-latest\n    steps: []\n"
-        ),
-    )
-    with pytest.raises(AssertionError, match="if control manifest"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_dynamic_continue_on_error_is_manifested_and_rejected(tmp_path):
-    _write_action_workflow(
-        tmp_path / "good.yml",
-        extra_jobs=(
-            "  other:\n    runs-on: ubuntu-latest\n"
-            "    continue-on-error: ${{ fromJSON(vars.ALLOW_FAILURE) }}\n"
-            "    steps: []\n"
-        ),
-    )
-    with pytest.raises(AssertionError, match="continue-on-error control manifest"):
-        _workflow_action_contract(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "extra_job",
-    (
-        "  other:\n    if: ${{ needs['detect'].outputs.code_paths_changed }}\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        "  other:\n    if: ${{ needs.detect-job.outputs.docs_site_affected }}\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        "  other:\n    runs-on: ubuntu-latest\n    steps:\n"
-        "      - env:\n          VALUE: ${{ steps.alternate.outputs.code_paths_changed }}\n"
-        "        run: echo ok\n",
-        "  other:\n    runs-on: ubuntu-latest\n    steps:\n"
-        "      - run: echo 'code_paths_changed=true' >> $GITHUB_OUTPUT\n",
-        "  other:\n    if: ${{ format('{0}', needs.detect.outputs.code_paths_changed) }}\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-        "  wrong-location:\n    if: needs.detect.outputs.code_paths_changed != 'false'\n"
-        "    runs-on: ubuntu-latest\n    steps: []\n",
-    ),
-)
-def test_reserved_verdict_expression_variants_and_fabrication_are_rejected(
-    tmp_path, extra_job
-):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(workflow, extra_jobs=extra_job)
-    with pytest.raises(AssertionError, match="reserved verdict namespace"):
-        _workflow_action_contract(tmp_path)
-
-
-def test_extra_unrelated_authority_step_is_deliberately_forbidden(tmp_path):
-    workflow = tmp_path / "fourth.yml"
-    _write_action_workflow(
-        workflow,
-        extra_authority_steps="      - uses: actions/setup-python@v6\n",
-    )
-    with pytest.raises(AssertionError, match="exactly two steps"):
-        _workflow_action_contract(tmp_path)
-
-
-# --- The published user-guide site has one path definition ------------------
 
 
 def _load_yaml_ignoring_unknown_tags(path: Path) -> dict:
@@ -1702,64 +545,12 @@ def _load_yaml_ignoring_unknown_tags(path: Path) -> dict:
 
 
 class TestDocsSiteWorkflowContract:
-    """`docs-pages.yml` reads the classifier instead of carrying its own list.
+    """Keep published navigation within the classifier's recognized paths."""
 
-    The list of paths the published site is built from used to live in that
-    workflow's `paths:` filter, where nothing could see it drift. It now lives
-    in the classifier. These assertions fail if a second copy comes back."""
-
-    WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
-    DOCS_PAGES = WORKFLOW_DIR / "docs-pages.yml"
     MKDOCS_CONFIG = REPO_ROOT / "mkdocs.yml"
 
-    def test_docs_pages_has_no_path_filter(self):
-        workflow = _load_yaml_ignoring_unknown_tags(self.DOCS_PAGES)
-        triggers = workflow.get(True) or workflow.get("on") or {}
-        for event, config in triggers.items():
-            if not isinstance(config, dict):
-                continue
-            for key in ("paths", "paths-ignore"):
-                assert key not in config, (
-                    f"docs-pages.yml reintroduced `{key}` on the `{event}` "
-                    f"trigger. That is a second copy of the site's path list, "
-                    f"which is what bead enhancedchannelmanager-t4d5w "
-                    f"collapsed into scripts/classify_changed_paths.py. Gate "
-                    f"the `build` job on `docs_site_affected` instead."
-                )
-
-    def test_docs_pages_build_gates_on_the_classifier_output(self):
-        workflow = _load_yaml_ignoring_unknown_tags(self.DOCS_PAGES)
-        build = (workflow.get("jobs") or {}).get("build") or {}
-        condition = str(build.get("if", ""))
-        assert "docs_site_affected" in condition, (
-            "docs-pages.yml:build no longer reads `docs_site_affected`. "
-            "Without it the site rebuilds on every push to dev, or not at all."
-        )
-        assert "!= 'false'" in condition, (
-            "docs-pages.yml:build must gate on `!= 'false'` so an absent or "
-            "empty classifier output still rebuilds the site. Gating on "
-            "`== 'true'` fails closed, and the failure mode is a published "
-            "site silently stale behind merged content."
-        )
-        assert "!cancelled()" in condition, (
-            "docs-pages.yml:build must carry `!cancelled()`. A job-level "
-            "`if:` with no status function implies `success()` over its "
-            "`needs`, so without it a FAILED `detect` skips the build, skips "
-            "the deploy, and leaves the published site silently behind "
-            "merged content until some later push heals it. `!= 'false'` "
-            "only covers an absent or empty output from a job that "
-            "SUCCEEDED. build.yml:codeql-analysis carries `!cancelled()` for "
-            "the mirror-image reason."
-        )
-
     def test_every_published_nav_target_is_a_recognised_site_path(self, script):
-        """The invariant that keeps the site from going stale after a merge.
-
-        If a page is added to the mkdocs nav outside the prefixes the
-        classifier knows about, editing that page would classify as
-        `docs_site_affected=false` and the deploy would never fire. Rather
-        than trust the two lists to stay aligned by inspection, derive one
-        from the other."""
+        """Every Markdown target in the MkDocs navigation must be recognized."""
         config = _load_yaml_ignoring_unknown_tags(self.MKDOCS_CONFIG)
         docs_dir = config.get("docs_dir", "docs").strip("/")
 
@@ -1785,18 +576,6 @@ class TestDocsSiteWorkflowContract:
             if not script.is_docs_site_path(f"{docs_dir}/{target}")
         ]
         assert not missed, (
-            f"{len(missed)} page(s) in the mkdocs nav are outside the path "
-            f"list in scripts/classify_changed_paths.py: {missed[:5]}. "
-            f"Editing one of them would classify as docs_site_affected=false, "
-            f"so docs-pages.yml would not rebuild and the published site would "
-            f"go stale behind dev. Add the prefix to DOCS_SITE_PREFIXES or "
-            f"the file to DOCS_SITE_FILES."
+            f"{len(missed)} page(s) in the MkDocs navigation are outside the "
+            f"path list in scripts/classify_changed_paths.py: {missed[:5]}."
         )
-
-    def test_declared_site_files_exist_in_the_repo(self, script):
-        """A renamed file would silently drop out of the site's path list."""
-        for relative in script.DOCS_SITE_FILES:
-            assert (REPO_ROOT / relative).is_file(), (
-                f"{relative} is in DOCS_SITE_FILES but is not in the tree. "
-                f"A stale entry means a real site input is no longer tracked."
-            )

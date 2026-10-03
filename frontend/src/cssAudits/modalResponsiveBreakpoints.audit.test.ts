@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import postcss from 'postcss'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 const SRC = path.resolve(process.cwd(), 'src/components')
 
@@ -37,7 +37,7 @@ function modalMediaBlocks(): MediaBlock[] {
     const blocks: MediaBlock[] = []
     root.walkAtRules('media', (rule) => {
       const selectors: string[] = []
-      rule.walkRules((child) => { selectors.push(child.selector) })
+      rule.walkRules((child) => { selectors.push(child.selector.replace(/\r\n/g, '\n')) })
       blocks.push({ file: relative, query: rule.params, selectors })
     })
     return blocks
@@ -123,5 +123,40 @@ describe('modal responsive breakpoint contract', () => {
     expect(filterComponent).not.toMatch(/filter-responsive-label[^>]*aria-hidden/)
     expect(filterComponent).toContain('className="filters-list" role="table"')
     expect(bulk).toContain('max-width: min(200px, 30vw);')
+  })
+
+  it.each(['lf', 'crlf'] as const)('collects identical media blocks from %s stylesheet text', (lineEnding) => {
+    const originalReadFileSync = fs.readFileSync.bind(fs)
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      const content = Reflect.apply(originalReadFileSync, fs, args) as unknown
+      if (typeof content !== 'string' || !String(args[0]).endsWith('.css')) return content
+      const lf = content.replace(/\r\n/g, '\n')
+      return lineEnding === 'crlf' ? lf.replace(/\n/g, '\r\n') : lf
+    }) as typeof fs.readFileSync)
+
+    try {
+      expect(modalMediaBlocks()).toEqual(EXPECTED)
+    } finally {
+      readFileSpy.mockRestore()
+    }
+  })
+
+  it('still rejects a changed reviewed media selector', () => {
+    const originalReadFileSync = fs.readFileSync.bind(fs)
+    const modalBaseFile = path.join(SRC, 'ModalBase.css')
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      const content = Reflect.apply(originalReadFileSync, fs, args) as unknown
+      if (typeof content !== 'string' || path.resolve(String(args[0])) !== modalBaseFile) return content
+      return content.replace(
+        /(@media \(max-width: 700px\) \{\r?\n[ ]{2})\.modal-form-row/,
+        '$1.changed-modal-form-row',
+      )
+    }) as typeof fs.readFileSync)
+
+    try {
+      expect(modalMediaBlocks()).not.toEqual(EXPECTED)
+    } finally {
+      readFileSpy.mockRestore()
+    }
   })
 })

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -102,9 +102,14 @@ describe('ProfileConflictReviewModal', () => {
 
     sessionStorage.clear();
     render(<ProfileConflictReviewModal />);
-    await screen.findByRole('dialog');
-    fireEvent.keyDown(document, { key: 'Escape' });
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await user.keyboard('{Escape}');
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(sessionStorage.getItem(PROFILE_CONFLICT_REVIEW_STORAGE_KEY)).toBe(
+      JSON.stringify(['fingerprint-a']),
+    );
+    expect(api.acceptProfileConflictReview).not.toHaveBeenCalled();
   });
 
   it('a changed fingerprint prompts again and a notification action reopens a dismissed review', async () => {

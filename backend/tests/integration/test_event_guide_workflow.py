@@ -1,6 +1,7 @@
 """Immutable-base control for retained guide reconciliation."""
 import asyncio
 import copy
+import hashlib
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -10,6 +11,9 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 import database
+
+ATTEMPT_ADMITTED_AT = datetime.now(timezone.utc)
+ATTEMPT_EXPIRES_AT = ATTEMPT_ADMITTED_AT + timedelta(hours=24)
 
 
 @pytest.fixture(autouse=True)
@@ -24,8 +28,10 @@ async def isolated_guide_state(monkeypatch, test_engine, tmp_path):
     monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
     guides._SOURCE_CACHE.clear()
     guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
     guides._CATALOGUE_CACHE.clear()
     guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
     get_cache().clear()
     yield
     tasks = [*guides._SOURCE_LOADS.values(), *guides._CATALOGUE_LOADS.values()]
@@ -34,8 +40,10 @@ async def isolated_guide_state(monkeypatch, test_engine, tmp_path):
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
     guides._SOURCE_CACHE.clear()
     guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
     guides._CATALOGUE_CACHE.clear()
     get_cache().clear()
 
@@ -77,21 +85,49 @@ def _profile(profile_id, group_id, source_ids):
 
 
 def _stored(scope, document, *, channels=None):
+    guide_attempt = None
+    if scope.startswith("profile:"):
+        guide_attempt = {
+            "attempt_id": "1" * 32,
+            "config_hash": "b" * 64,
+            "admitted_at": ATTEMPT_ADMITTED_AT.isoformat(),
+            "expires_at": ATTEMPT_EXPIRES_AT.isoformat(),
+            "stage": "preparing",
+        }
     return {
         "scope": scope,
         "xmltv": document,
         "revision": 1,
         "state": {
+            "published": True,
             "published_at": "2026-09-19T10:00:00+00:00",
-            "xmltv_hash": "b" * 64,
+            "xmltv_hash": hashlib.sha256(document.encode()).hexdigest(),
+            "config_hash": "b" * 64,
             "channels": list(channels or []),
             "delivery": {
                 "required_dispatcharr_hashes": {},
                 "confirmed_dispatcharr_hashes": {},
                 "pending_emby": True,
+                "guide_attempt": guide_attempt,
+                "source_refreshes": {},
+                "pending_channels": {},
             },
         },
     }
+
+
+def _admit(publications):
+    def begin(scope, *, expected_revision, expected_hash, profile, now, pending_channels=None):
+        row = publications.get(scope)
+        assert row is not None
+        assert row["revision"] == expected_revision
+        assert row["state"]["xmltv_hash"] == expected_hash
+        assert scope == f"profile:{profile['id']}"
+        assert now.tzinfo is not None
+        assert pending_channels in (None, {})
+        return row
+
+    return begin
 
 
 @pytest.mark.asyncio
@@ -145,7 +181,12 @@ async def test_retained_placeholder_continues_safe_profile_work():
     }
     client = MagicMock()
     client.get_epg_sources = AsyncMock(return_value=[])
-    client.update_channel = AsyncMock()
+
+    async def update_channel(channel_id, values):
+        channels[channel_id].update(values)
+
+    client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_channel = AsyncMock(side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]))
     cache = MagicMock()
     emby = AsyncMock(return_value=True)
 
@@ -183,27 +224,53 @@ async def test_retained_placeholder_continues_safe_profile_work():
             def read(scope):
                 return publications.get(scope)
 
-            def update(scope, *, expected_revision, required_dispatcharr_hashes=None,
-                       confirmed_dispatcharr_hashes=None, pending_emby=None):
+            def update(scope, *, expected_revision, expected_hash=None,
+                       expected_config_hash=None, expected_attempt_id=None,
+                       required_dispatcharr_hashes=None, confirmed_dispatcharr_hashes=None,
+                       pending_emby=None, source_refreshes=None):
                 row = publications[scope]
                 if row["revision"] != expected_revision:
                     return None
+                if expected_hash is not None:
+                    assert row["state"]["xmltv_hash"] == expected_hash
+                if expected_config_hash is not None:
+                    assert row["state"]["config_hash"] == expected_config_hash
+                if expected_attempt_id is not None:
+                    assert row["state"]["delivery"]["guide_attempt"]["attempt_id"] == expected_attempt_id
                 if required_dispatcharr_hashes is not None:
                     row["state"]["delivery"]["required_dispatcharr_hashes"] = dict(required_dispatcharr_hashes)
                 if confirmed_dispatcharr_hashes is not None:
                     row["state"]["delivery"]["confirmed_dispatcharr_hashes"] = dict(confirmed_dispatcharr_hashes)
                 if pending_emby is not None:
                     row["state"]["delivery"]["pending_emby"] = pending_emby
+                if source_refreshes is not None:
+                    row["state"]["delivery"]["source_refreshes"] = copy.deepcopy(source_refreshes)
                 row["revision"] += 1
                 return row["revision"]
 
-            stack.enter_context(patch("tasks.event_visibility._load_profiles", side_effect=[
-                (copy.deepcopy(profiles), []), (copy.deepcopy(profiles), []),
-            ]))
+            async def commit(function, *args, **kwargs):
+                assert function.__name__ == "publish_profiles"
+                assert set(kwargs["expected"]) == {"profile:1", "profile:2"}
+                assert all(
+                    set(claim) == {
+                        "revision", "xmltv_hash", "config_hash", "attempt_id",
+                    }
+                    for claim in kwargs["expected"].values()
+                )
+                return result
+
+            stack.enter_context(patch(
+                "tasks.event_visibility._load_profiles",
+                return_value=(copy.deepcopy(profiles), []),
+            ))
             stack.enter_context(patch("tasks.event_visibility.get_client", return_value=client))
             stack.enter_context(patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))))
-            stack.enter_context(patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=result)))
+            stack.enter_context(patch("concurrency.run_cpu_bound", side_effect=commit))
             stack.enter_context(patch("services.epg_publication.read_publication", side_effect=read))
+            stack.enter_context(patch(
+                "services.epg_publication.begin_delivery",
+                side_effect=_admit(publications),
+            ))
             stack.enter_context(patch("services.epg_publication.update_delivery", side_effect=update))
 
         outcome = await dummy_epg_refresh.DummyEPGRefreshTask().execute()
@@ -212,8 +279,9 @@ async def test_retained_placeholder_continues_safe_profile_work():
     assert outcome.completed_degraded is True
     assert outcome.details["retained_profile_ids"] == [1]
     assert outcome.details["published_profile_ids"] == [2]
-    assert outcome.details["hidden_channel_ids"] == [20]
+    assert outcome.details["hidden_channel_ids"] == [10, 20]
     assert client.update_channel.await_args_list == [
+        ((10, {"hidden_from_output": True}),),
         ((20, {"hidden_from_output": True}),),
     ]
     cache.set.assert_any_call("dummy_epg_xmltv_1", retained_xml)
@@ -367,6 +435,16 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     client.get_epg_data_by_id = AsyncMock(side_effect=get_link)
     client.get_epg_data = AsyncMock(side_effect=get_guide_rows)
     client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_channel = AsyncMock(
+        side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]),
+    )
+    client.get_epg_grid = AsyncMock(return_value=[{
+        "tvg_id": "event-11",
+        "title": "Main Event",
+        "start": active_start.isoformat(),
+        "stop": active_stop.isoformat(),
+    }])
+    client.refresh_epg_source = AsyncMock()
 
     seed_one = copy.deepcopy(profile_one)
     seed_one["channel_group_ids"] = []
@@ -374,7 +452,12 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     monkeypatch.setattr(guides, "stream_xmltv", stream_xmltv)
     seed_channels = {10: copy.deepcopy(channels[10]), 20: copy.deepcopy(channels[20])}
     prepared, coverage = await guides.prepare_profiles(
-        [seed_one, profile_two], seed_channels, client, now=now, wait_for_sources=True,
+        [seed_one, profile_two],
+        seed_channels,
+        client,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        now=now,
+        wait_for_sources=True,
     )
     seeded = publish_profiles(prepared, seed_channels, coverage, observations={}, now=now)
     before_profile = read_publication("profile:1")["xmltv"]
@@ -384,6 +467,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     entry["checked"] -= guides.SOURCE_RETRY + 1
 
     async def imported(*args, **kwargs):
+        assert kwargs["wait"] is False
+        assert kwargs["expires_at"].tzinfo is not None
         return True
 
     async def emby_refresh():
@@ -392,31 +477,40 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     with patch("tasks.event_visibility._load_profiles", return_value=(copy.deepcopy(profiles), [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(
+             return_value={101: True},
+         )), \
          patch("emby_client.request_guide_refresh", side_effect=emby_refresh), \
          patch("tasks.event_visibility.MAX_MATCH_STREAMS", 2):
         run = asyncio.create_task(event_visibility.EventVisibilityTask().execute())
         await asyncio.wait_for(source_started.wait(), timeout=1)
-        assert run.done() is False
-        source_release.set()
         first = await asyncio.wait_for(run, timeout=2)
+        assert source_release.is_set() is False
+        assert first.details["published_profile_ids"] == [2]
+        assert first.details["retained_profile_ids"] == [1]
+        assert first.details["hidden_channel_ids"] == [20]
+        assert read_publication("profile:1")["xmltv"] == before_profile
+        source_release.set()
+        await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+        converged = await event_visibility.EventVisibilityTask().execute()
 
         first_profile = read_publication("profile:1")["xmltv"]
         update_count = len(updates)
         oversized = True
-        second = await event_visibility.EventVisibilityTask().execute()
+        retained = await event_visibility.EventVisibilityTask().execute()
 
-    assert first.details["published_profile_ids"] == [1, 2]
-    assert first.details["retained_profile_ids"] == []
-    assert first.details["revealed_channel_ids"] == [11]
-    assert first.details["hidden_channel_ids"] == [10, 20]
+    assert converged.details["published_profile_ids"] == [1, 2]
+    assert converged.details["retained_profile_ids"] == []
+    assert converged.details["revealed_channel_ids"] == [11]
+    assert converged.details["hidden_channel_ids"] == [10]
     assert channels[11]["hidden_from_output"] is False
     assert channels[11]["epg_data_id"] == 501
     assert channels[11]["streams"] == [101, 50, 102]
     assert first_profile != before_profile
     assert read_publication("all")["xmltv"] != before_all
     assert len(source_calls) == 2
-    assert second.details["retained_profile_ids"] == [1]
-    assert second.details["published_profile_ids"] == [2]
+    assert retained.details["retained_profile_ids"] == [1]
+    assert retained.details["published_profile_ids"] == [2]
     assert read_publication("profile:1")["xmltv"] == first_profile
     assert len(updates) == update_count
     assert len(source_calls) == 2
@@ -427,11 +521,16 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     from services import epg_programmes as guides
     from services.epg_publication import read_publication
     from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+    from tasks.event_visibility import _guide_name
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
     active_start = now - timedelta(minutes=10)
     active_stop = now + timedelta(minutes=80)
     selected = _profile(1, 7, [100])
+    selected["event_sync_config"] = {
+        **_config(),
+        "secondary": [{"group_id": 9, "m3u_account_id": None}],
+    }
     selected["channel_mappings"] = [
         {"channel_id": 10, "source_id": 100, "tvg_id": "external-10"},
     ]
@@ -493,9 +592,31 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         "id": 901, "epg_source": 46, "tvg_id": "event-10",
     }])
     client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_channel = AsyncMock(
+        side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]),
+    )
+    client.get_epg_grid = AsyncMock(return_value=[{
+        "tvg_id": "event-10",
+        "title": "Main Event",
+        "start": active_start.isoformat(),
+        "stop": active_stop.isoformat(),
+    }])
+    client.refresh_epg_source = AsyncMock()
     monkeypatch.setattr(guides, "stream_xmltv", stream_xmltv)
 
+    matched_stream = SimpleNamespace(
+        stream_id=101,
+        name=_guide_name({"title": "Main Event", "start": active_start.isoformat()}, "UTC"),
+        group_id=9,
+        provider=None,
+        provider_id=None,
+        name_seen_before_today=None,
+        is_stale=False,
+    )
+
     async def imported(*args, **kwargs):
+        assert kwargs["wait"] is True
+        assert kwargs["expires_at"].tzinfo is not None
         return True
 
     async def emby_refresh():
@@ -504,6 +625,12 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     with patch("tasks.event_visibility._load_profiles", return_value=([copy.deepcopy(selected)], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
+             [matched_stream], {(9, None)}, {},
+         ))), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(
+             return_value={101: True},
+         )), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
          patch("emby_client.request_guide_refresh", side_effect=emby_refresh):
         first = await DummyEPGRefreshTask().execute()

@@ -6,6 +6,7 @@ filed in video_bitrate beside ffprobe's own declared bitrate, where no later
 reader could tell a measurement from a claim.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -117,6 +118,49 @@ class TestProbeMeasuresWhateverFfprobeDid:
 
 class TestProbeCompletionBound:
     @pytest.mark.asyncio
+    async def test_expired_event_probe_does_not_save(self):
+        prober = create_prober()
+
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        prober._run_ffprobe = AsyncMock(side_effect=never_returns)
+        with patch("stream_prober.get_session") as get_session:
+            result = await prober.probe_stream(
+                903,
+                STREAM_URL,
+                "Stream 903",
+                content=True,
+                expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=10),
+            )
+
+        assert result == {}
+        get_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_event_probe_forces_content_when_global_flag_is_off(
+        self, test_session,
+    ):
+        prober = create_prober()
+        prober._run_ffprobe = AsyncMock(return_value={})
+        prober._detect_black_screen = AsyncMock(return_value=False)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+        with patch("stream_prober.get_session", return_value=test_session):
+            saved = await prober.probe_stream(
+                903,
+                STREAM_URL,
+                "Stream 903",
+                content=True,
+                expires_at=expires_at,
+            )
+
+        assert saved["is_black_screen"] is False
+        prober._detect_black_screen.assert_awaited_once_with(
+            STREAM_URL, expires_at=expires_at,
+        )
+
+    @pytest.mark.asyncio
     async def test_a_hung_ffprobe_stage_becomes_a_timeout(
         self, test_session, monkeypatch
     ):
@@ -187,10 +231,8 @@ class TestAFailedProbeDropsAStaleNumber:
         assert saved["measured_bitrate"] is None
 
     @pytest.mark.asyncio
-    async def test_a_readable_stream_keeps_its_number_when_the_sample_fails(self, test_session):
-        """ffprobe read the stream and only the sampler came back empty. That is
-        not evidence the stream stopped, so the stored number stands. [34]
-        """
+    async def test_a_readable_stream_clears_an_obsolete_measurement(self, test_session):
+        """A new probe timestamp cannot relabel an older measured rate."""
         test_session.add(StreamStats(stream_id=932, measured_bitrate=7_000_000))
         test_session.commit()
 
@@ -204,7 +246,7 @@ class TestAFailedProbeDropsAStaleNumber:
             saved = await prober.probe_stream(932, STREAM_URL, "Stream 932")
 
         assert saved["probe_status"] == "success"
-        assert saved["measured_bitrate"] == 7_000_000
+        assert saved["measured_bitrate"] is None
 
 
 class TestStreamStatsCarriesTheColumn:

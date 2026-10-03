@@ -299,15 +299,16 @@ class TestPipelinePlanBuilderExemption:
     """
 
     def test_plan_builder_is_exempt(self):
-        """The one synchronous planning path clears the budget."""
+        """Both synchronous planning paths clear the request budget."""
         import main as main_module
 
-        assert (
-            "/api/channel-pipeline/run/prepare"
-            in main_module._TIMEOUT_EXEMPT_PREFIXES
-        )
+        for path in (
+            "/api/channel-pipeline/run/prepare",
+            "/api/channel-pipeline/run/commit",
+        ):
+            assert path in main_module._TIMEOUT_EXEMPT_PREFIXES
 
-    def test_exemption_is_the_single_path_not_the_router(self):
+    def test_exemption_is_not_the_router(self):
         """bd-enfsy again: exempting the prefix would put every pipeline CRUD
         handler back outside the budget, which is the regression that note
         warns about. Only the plan builder may clear it.
@@ -322,7 +323,6 @@ class TestPipelinePlanBuilderExemption:
         for path in (
             "/api/channel-pipeline/rules",
             "/api/channel-pipeline/run",
-            "/api/channel-pipeline/run/commit",
             "/api/channel-pipeline/event-sync-preview",
         ):
             assert not any(

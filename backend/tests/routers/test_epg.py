@@ -7,6 +7,7 @@ Mocks: get_client() to isolate from Dispatcharr.
 """
 import asyncio
 import base64
+from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1517,14 +1518,16 @@ class TestRefreshEPGSource:
     @pytest.mark.parametrize("completed", [True, False])
     async def test_completion_report_uses_shared_checked_result(self, completed):
         from routers.epg import _poll_epg_refresh_completion
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
         with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=completed)) as wait, \
              patch("routers.epg.get_client", return_value=AsyncMock()), \
              patch("routers.epg.send_alert", new=AsyncMock()) as alert, \
              patch("routers.epg.journal") as journal, \
              patch("routers.epg.get_cache") as cache:
-            await _poll_epg_refresh_completion(4, "Sports", "before")
+            await _poll_epg_refresh_completion(4, "Sports", "before", expires_at)
         assert wait.await_args.kwargs["trigger"] is False
+        assert wait.await_args.kwargs["expires_at"] == expires_at
         assert wait.await_args.kwargs["initial_source"] == {"updated_at": "before"}
         assert alert.await_args.kwargs["notification_type"] == ("success" if completed else "warning")
         assert journal.log_entry.called is completed
@@ -1534,12 +1537,13 @@ class TestRefreshEPGSource:
     async def test_cancelled_completion_does_not_report_success(self):
         import asyncio
         from routers.epg import _poll_epg_refresh_completion
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
         with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(side_effect=asyncio.CancelledError)), \
              patch("routers.epg.get_client", return_value=AsyncMock()), \
              patch("routers.epg.send_alert", new=AsyncMock()) as alert:
             with pytest.raises(asyncio.CancelledError):
-                await _poll_epg_refresh_completion(4, "Sports", "before")
+                await _poll_epg_refresh_completion(4, "Sports", "before", expires_at)
         alert.assert_not_awaited()
 
 
@@ -2611,6 +2615,7 @@ class TestMatchCacheInvalidatedOnSourceChange:
         cache = get_cache()
         cache.clear()
         cache.set("epg_match:123:456:789", {"stale": True})
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
         mock_client = AsyncMock()
         mock_client.get_epg_source.return_value = {
@@ -2621,7 +2626,9 @@ class TestMatchCacheInvalidatedOnSourceChange:
              patch("routers.epg.asyncio.sleep", new=AsyncMock()), \
              patch("routers.epg.send_alert", new=AsyncMock()), \
              patch("routers.epg.journal"):
-            await _poll_epg_refresh_completion(1, "XMLTV", "2026-06-30T11:00:00Z")
+            await _poll_epg_refresh_completion(
+                1, "XMLTV", "2026-06-30T11:00:00Z", expires_at,
+            )
 
         assert cache.get("epg_match:123:456:789") is None
 

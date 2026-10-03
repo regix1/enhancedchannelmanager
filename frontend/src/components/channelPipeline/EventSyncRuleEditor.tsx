@@ -448,6 +448,7 @@ export function EventSyncRuleEditor({
 
   // Reference data
   const [channelGroups, setChannelGroups] = useState<{ id: number; name: string }[]>([]);
+  const [groupsState, setGroupsState] = useState<'loading' | 'ready' | 'error'>('loading');
   // bead 38dzi: (provider, group) junction rows joined to channel-group names,
   // driving the provider-scoped pickers (and their inline auto-sync status).
   const [junctions, setJunctions] = useState<GroupProviderRow[]>([]);
@@ -512,13 +513,22 @@ export function EventSyncRuleEditor({
   useEffect(() => {
     // The junction rows carry no group name; join them against the channel
     // group list the editor already loads. Load both, then join.
+    const groupsRequest = getChannelGroups()
+      .then(groups => {
+        const simple = groups.map(g => ({ id: g.id, name: g.name }));
+        setChannelGroups(simple);
+        setGroupsState('ready');
+        return simple;
+      })
+      .catch(() => {
+        setGroupsState('error');
+        return [];
+      });
     Promise.all([
-      getChannelGroups().catch(() => []),
+      groupsRequest,
       getProviderGroupSettingsByProvider().catch(() => []),
     ]).then(([groups, rows]) => {
-      const simple = groups.map(g => ({ id: g.id, name: g.name }));
-      setChannelGroups(simple);
-      const byId = new Map(simple.map(g => [g.id, g.name]));
+      const byId = new Map(groups.map(g => [g.id, g.name]));
       setJunctions(joinProviderRows(rows, gid => byId.get(gid)));
     });
     getDummyEPGProfiles()
@@ -570,9 +580,11 @@ export function EventSyncRuleEditor({
   };
 
   const groupName = useMemo(() => {
+    if (groupsState === 'loading') return (_groupId: number) => 'Loading group name…';
+    if (groupsState === 'error') return (_groupId: number) => 'Group name unavailable';
     const byId = new Map(channelGroups.map(g => [g.id, g.name]));
     return (groupId: number) => byId.get(groupId) ?? `Group ${groupId}`;
-  }, [channelGroups]);
+  }, [channelGroups, groupsState]);
 
   /** The custom-shared draft as a pattern object, or null when empty. The
    * API-authored name of the first custom pattern is preserved (z4y4a);
@@ -1165,6 +1177,16 @@ export function EventSyncRuleEditor({
         </span>
       );
     }
+    if (groupsState === 'loading') {
+      return <span className="modal-intent-placeholder">Loading channel groups…</span>;
+    }
+    if (groupsState === 'error') {
+      return (
+        <span className="modal-intent-placeholder">
+          Channel groups could not be loaded. Close and reopen this editor to try again.
+        </span>
+      );
+    }
     const masterName = groupName(masterScope.group_id);
     const secCount = secondaryScopes.length;
     const source =
@@ -1234,6 +1256,7 @@ export function EventSyncRuleEditor({
     dummyEpgProfileId,
     streamSortField,
     groupName,
+    groupsState,
   ]);
 
   // S2: per-subgroup "N changed" counts — non-default flag values inside a
@@ -2717,7 +2740,11 @@ export function EventSyncRuleEditor({
               on Review, stale-marked when the config changes). Drops below the
               main column under ~820px. */}
           <aside className="modal-rail" aria-label="Rule intent, impacts, and preview">
-            <div className="modal-intent" data-testid="event-sync-intent">
+            <div
+              className="modal-intent"
+              data-testid="event-sync-intent"
+              aria-busy={groupsState === 'loading'}
+            >
               <h3 className="modal-intent-title">What this rule will do</h3>
               <p className="modal-intent-text">{intent}</p>
             </div>

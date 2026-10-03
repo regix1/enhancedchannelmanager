@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -24,6 +26,23 @@ CHECK_INTERVAL_SECONDS = 300
 MATCH_STREAM_PAGE_SIZE = 500
 MAX_MATCH_STREAMS = 10000
 EPG_LINK_MAX_RESULTS = 10000
+
+
+@asynccontextmanager
+async def _owned_lock(lock):
+    await lock.acquire()
+    held = True
+
+    def release() -> None:
+        nonlocal held
+        if held:
+            lock.release()
+            held = False
+
+    try:
+        yield release
+    finally:
+        release()
 
 
 def _stream_id(stream) -> int | None:
@@ -182,6 +201,31 @@ def _generated_scope(source: dict) -> str | None:
         return "all"
     match = re.fullmatch(r"/api/dummy-epg/xmltv/([1-9]\d*)", path)
     return f"profile:{int(match.group(1))}" if match else None
+
+
+def _url_hash(value) -> str:
+    parsed = urlparse(str(value or ""))
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    plain = f"{parsed.scheme.lower()}://{host.lower()}{parsed.path}"
+    return hashlib.sha256(plain.encode("utf-8")).hexdigest()
+
+
+def _source_refresh_key(client, source: dict, scope: str) -> tuple[str, str, str]:
+    endpoint_hash = _url_hash(getattr(client, "base_url", ""))
+    source_url_hash = _url_hash(source.get("url"))
+    value = json.dumps(
+        {
+            "endpoint_hash": endpoint_hash,
+            "source_id": source["id"],
+            "source_url_hash": source_url_hash,
+            "scope": scope,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest(), endpoint_hash, source_url_hash
 
 
 def _profile_token(profiles: list[dict]) -> str:
@@ -367,7 +411,27 @@ def _plan_profile(
     duration = timedelta(minutes=profile.get("program_duration") or 180)
     observations = []
     intervals = {}
+    stored_intervals = profile.get("event_intervals") or {}
+    if isinstance(stored_intervals, dict):
+        for channel_id, values in stored_intervals.items():
+            try:
+                parsed_channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(values, list):
+                intervals[parsed_channel_id] = copy.deepcopy(values)
+    if retained is not None:
+        for item in retained["state"].get("channels", []):
+            retained_events = [
+                copy.deepcopy(event)
+                for event in item.get("events", [])
+                if datetime.fromisoformat(event["stop"]) > now
+            ]
+            if retained_events:
+                intervals[item["channel_id"]] = retained_events
     desired = {}
+    primary_ids = {}
+    event_starts = {}
     states = {}
     ambiguous_ids = set()
     assignments = {
@@ -441,7 +505,7 @@ def _plan_profile(
             for item in config.get("slot_patterns", [])
             if slot is not None and item.get("name") == slot[0]
         ), False)
-        active_direct = []
+        parsed_direct = []
         for stream in direct if current is not None or bootstrap else []:
             parsed = parse_event_name(
                 stream.name,
@@ -455,15 +519,33 @@ def _plan_profile(
             stop = parsed.start + duration
             if not parsed.start <= now < stop:
                 continue
-            active_direct.append(stream)
-            title = parsed.title or stream.name
+            parsed_direct.append((stream, parsed, stop))
+        active_direct = []
+        if parsed_direct:
+            latest_start = max(item[1].start for item in parsed_direct)
+            latest = [item for item in parsed_direct if item[1].start == latest_start]
+            identities = {
+                " ".join((item[1].title or item[0].name).casefold().split())
+                for item in latest
+            }
+            if len(identities) == 1:
+                active_direct = [item[0] for item in latest]
+            else:
+                ambiguous_ids.add(channel_id)
+        if active_direct:
+            selected = next(item for item in parsed_direct if item[0] is active_direct[0])
+            title = selected[1].title or selected[0].name
             interval = {
                 "channel_id": channel_id,
                 "title": title,
-                "start": parsed.start.isoformat(),
-                "stop": stop.isoformat(),
+                "start": selected[1].start.isoformat(),
+                "stop": selected[2].isoformat(),
             }
-            intervals.setdefault(channel_id, []).append(interval)
+            intervals[channel_id] = [interval]
+        for stream, parsed, stop in parsed_direct:
+            if stream not in active_direct:
+                continue
+            title = parsed.title or stream.name
             observations.append({
                 "family": slot[0],
                 "slot": slot[1],
@@ -476,7 +558,30 @@ def _plan_profile(
                 "provisional": parsed.matched_pattern in SYNTHESIZED_DATE_PATTERN_NAMES,
             })
 
-        active = current is not None or bool(active_direct) or _stored_active(retained, channel_id, now)
+        interval_active = False
+        for interval in intervals.get(channel_id, []):
+            try:
+                interval_start = datetime.fromisoformat(
+                    str(interval["start"]).replace("Z", "+00:00")
+                )
+                interval_stop = datetime.fromisoformat(
+                    str(interval["stop"]).replace("Z", "+00:00")
+                )
+                if interval_start.tzinfo is None:
+                    interval_start = interval_start.replace(tzinfo=timezone.utc)
+                if interval_stop.tzinfo is None:
+                    interval_stop = interval_stop.replace(tzinfo=timezone.utc)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if interval_start <= now < interval_stop:
+                interval_active = True
+                break
+        active = (
+            current is not None
+            or bool(active_direct)
+            or interval_active
+            or _stored_active(retained, channel_id, now)
+        )
         if channel_id in ambiguous_ids or conflicting_event_slots or not scan_complete:
             state = "unknown"
         elif active:
@@ -503,7 +608,28 @@ def _plan_profile(
         fallback = fallback_by_slot.get(slot, []) if slot is not None else []
         titled_matches = [*active_direct, *titled_by_channel.get(channel_id, [])]
         if state == "active":
-            desired[channel_id] = _ordered_ids(titled_matches, scopes)
+            primary_ids[channel_id] = _ordered_ids(titled_matches, scopes)
+            desired[channel_id] = list(primary_ids[channel_id])
+            current_start = None
+            if isinstance(current, dict):
+                try:
+                    current_start = datetime.fromisoformat(
+                        str(current["start"]).replace("Z", "+00:00")
+                    )
+                    if current_start.tzinfo is None:
+                        current_start = current_start.replace(tzinfo=timezone.utc)
+                except (KeyError, TypeError, ValueError):
+                    current_start = None
+            if current_start is None and intervals.get(channel_id):
+                try:
+                    current_start = datetime.fromisoformat(
+                        intervals[channel_id][0]["start"]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    current_start = None
+            if current_start is not None:
+                for stream_id in primary_ids[channel_id]:
+                    event_starts[stream_id] = current_start
         elif state == "idle":
             desired[channel_id] = []
         else:
@@ -518,6 +644,8 @@ def _plan_profile(
         "observations": observations if scan_complete else None,
         "states": states,
         "desired": desired,
+        "primary_ids": primary_ids,
+        "event_starts": event_starts,
         "scan_complete": scan_complete,
     }
 
@@ -674,8 +802,15 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
     from cache import get_cache
     from concurrency import run_cpu_bound
     from dummy_epg_engine import get_xmltv_id
-    from services.epg_programmes import _epg_source_id, _fetch_all_channels, prepare_profiles
+    from services.epg_programmes import (
+        _epg_source_id,
+        _fetch_all_channels,
+        _profile_owners,
+        _resolve_group_assignments,
+        prepare_profiles,
+    )
     from services.epg_publication import (
+        begin_delivery,
         publication_lock,
         publish_profiles,
         read_publication,
@@ -704,8 +839,24 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             disputed_groups = {row["group_id"] for row in conflicts}
             stage = "publications"
             retained = {}
+            admitted_by_id = {}
             for profile in profiles:
-                retained[profile["id"]] = read_publication(f"profile:{profile['id']}")
+                scope = f"profile:{profile['id']}"
+                row = read_publication(scope)
+                async with publication_lock:
+                    admitted = begin_delivery(
+                        scope,
+                        expected_revision=row["revision"] if row is not None else 0,
+                        expected_hash=(
+                            row["state"]["xmltv_hash"] if row is not None else None
+                        ),
+                        profile=profile,
+                        now=now,
+                    )
+                if admitted is not None:
+                    row = admitted
+                    admitted_by_id[profile["id"]] = admitted
+                retained[profile["id"]] = row
 
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
@@ -714,20 +865,126 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
             stage = "programmes"
-            preparation = await _await_preparation(
-                prepare_profiles(
-                    profiles,
-                    channel_map,
-                    client,
-                    now=now,
-                    wait_for_sources=wait_for_sources,
-                    recover_sources=True,
-                ),
-                lambda: task._cancel_requested,
-            )
-            if preparation is None:
-                return _finish_cancelled(started_at, details)
-            prepared, coverage = preparation
+            prepared_by_id = {}
+            summary = {
+                "generated_at": now.isoformat(),
+                "window_start": None,
+                "window_stop": None,
+                "sources": [],
+                "channels": [],
+                "profiles": {},
+            }
+            for profile in profiles:
+                profile_id = profile["id"]
+                admitted = admitted_by_id.get(profile_id)
+                if admitted is None:
+                    continue
+                guide_attempt = admitted["state"]["delivery"]["guide_attempt"]
+                profile_expiry = datetime.fromisoformat(guide_attempt["expires_at"])
+                if profile_expiry <= now:
+                    continue
+                selected = copy.deepcopy(profile)
+                if not selected.get("epg_source_ids"):
+                    intervals = {}
+                    for receipt in admitted["state"]["delivery"]["pending_channels"].values():
+                        channel_id = receipt.get("channel_id")
+                        if (
+                            receipt.get("stage") in {
+                                "complete", "failed", "expired", "allocation_unknown",
+                            }
+                            or receipt.get("guide_attempt_id") != guide_attempt["attempt_id"]
+                            or channel_id not in channel_map
+                            or datetime.fromisoformat(receipt["expires_at"]) <= now
+                        ):
+                            continue
+                        channel = channel_map[channel_id]
+                        group = channel.get("channel_group_id") or channel.get("channel_group")
+                        if isinstance(group, dict):
+                            group = group.get("id")
+                        if (
+                            group != receipt["target_group_id"]
+                            or (
+                                receipt.get("channel_uuid") is not None
+                                and channel.get("uuid") != receipt["channel_uuid"]
+                            )
+                        ):
+                            continue
+                        intervals.setdefault(channel_id, []).append({
+                            "start": receipt["start"],
+                            "stop": receipt["stop"],
+                            "title": receipt["title"],
+                        })
+                    if intervals:
+                        selected["event_intervals"] = intervals
+                preparation = await _await_preparation(
+                    prepare_profiles(
+                        [selected],
+                        channel_map,
+                        client,
+                        expires_at=profile_expiry,
+                        now=now,
+                        wait_for_sources=wait_for_sources,
+                        recover_sources=True,
+                    ),
+                    lambda: task._cancel_requested,
+                )
+                if preparation is None:
+                    return _finish_cancelled(started_at, details)
+                prepared, coverage = preparation
+                if prepared:
+                    prepared_profile = next(
+                        (item for item in prepared if item.get("id") == profile_id),
+                        None,
+                    )
+                    if prepared_profile is not None:
+                        prepared_by_id[profile_id] = prepared_profile
+                summary["profiles"].update(coverage.get("profiles") or {})
+                summary["sources"].extend(coverage.get("sources") or [])
+                summary["channels"].extend(coverage.get("channels") or [])
+                for name, choose in (("window_start", min), ("window_stop", max)):
+                    value = coverage.get(name)
+                    if value is not None:
+                        summary[name] = (
+                            value if summary[name] is None
+                            else choose(summary[name], value)
+                        )
+                if coverage.get("artwork_pending"):
+                    summary["artwork_pending"] = True
+            coverage = summary
+            prepared = []
+            for profile in profiles:
+                profile_id = profile["id"]
+                current = prepared_by_id.get(profile_id)
+                if current is None:
+                    current = copy.deepcopy(profile)
+                    groups = current.get("channel_group_ids") or []
+                    if groups:
+                        current["channel_assignments"] = _resolve_group_assignments(
+                            groups, channel_map,
+                        )
+                    assignments = current.get("channel_assignments") or []
+                    coverage["profiles"].setdefault(str(profile_id), {
+                        "profile_id": profile_id,
+                        "source_ids": [],
+                        "sources": [],
+                        "owned_channel_ids": sorted({
+                            item["channel_id"] for item in assignments
+                            if item.get("channel_id") in channel_map
+                        }),
+                        "can_publish": False,
+                        "reason_codes": ["GUIDE_UNAVAILABLE"],
+                    })
+                prepared.append(current)
+            _profile_owners(prepared, channel_map, coverage)
+            publication_expectations = {
+                admitted["scope"]: {
+                    "revision": admitted["revision"],
+                    "xmltv_hash": admitted["state"]["xmltv_hash"],
+                    "config_hash": admitted["state"]["config_hash"],
+                    "attempt_id": admitted["state"]["delivery"]["guide_attempt"]["attempt_id"],
+                }
+                for admitted in admitted_by_id.values()
+            }
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
             stage = "slots"
@@ -736,6 +993,9 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             invalid_profiles = set()
             for profile in prepared:
                 profile_id = profile["id"]
+                if profile_id not in admitted_by_id:
+                    invalid_profiles.add(profile_id)
+                    continue
                 try:
                     config = event_config(profile)
                 except ValueError:
@@ -817,6 +1077,81 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                         details["source_reason_codes"][str(profile["id"])] = sorted(
                             set(details["source_reason_codes"][str(profile["id"])]) | {"GUIDE_SOURCES_PENDING"}
                         )
+            health_admitted_at = datetime.now(timezone.utc)
+            flow = {}
+            if plans:
+                from services.event_sync_stream_health import collect_stream_flow
+
+            for profile_id, plan in plans.items():
+                health_ids = {
+                    stream_id
+                    for values in plan["primary_ids"].values()
+                    for stream_id in values
+                }
+                if not health_ids:
+                    continue
+                admitted = admitted_by_id[profile_id]
+                attempt = admitted["state"]["delivery"]["guide_attempt"]
+                health_expires_at = min(
+                    datetime.fromisoformat(attempt["expires_at"]),
+                    health_admitted_at + timedelta(seconds=60),
+                )
+                if health_expires_at <= health_admitted_at:
+                    continue
+                stream_names = {
+                    stream.stream_id: stream.name
+                    for stream in streams
+                    if stream.stream_id in health_ids
+                }
+                event_start_by_stream = {
+                    stream_id: event_start
+                    for stream_id, event_start in plan["event_starts"].items()
+                    if stream_id in stream_names
+                }
+                profile_flow = await collect_stream_flow(
+                    sorted(health_ids),
+                    client=client,
+                    checked_after=health_admitted_at - timedelta(minutes=5),
+                    event_start_by_stream=event_start_by_stream,
+                    stream_names=stream_names,
+                    expires_at=health_expires_at,
+                    probe_missing=True,
+                    probe_while_busy=True,
+                    cancelled=lambda: task._cancel_requested,
+                )
+                flow.update(profile_flow)
+            health_states = {}
+            for plan in plans.values():
+                for channel_id, primary in plan["primary_ids"].items():
+                    values = [flow.get(stream_id) for stream_id in primary]
+                    if any(value is True for value in values):
+                        health_states[channel_id] = True
+                    elif values and all(value is False for value in values):
+                        health_states[channel_id] = False
+                    else:
+                        health_states[channel_id] = None
+                    desired_ids = plan["desired"].get(channel_id, [])
+                    primary_set = set(primary)
+                    attached = {
+                        stream_id
+                        for stream_id in (
+                            _stream_id(item)
+                            for item in channel_map[channel_id].get("streams") or []
+                        )
+                        if stream_id is not None
+                    }
+                    safe_primary = [
+                        stream_id for stream_id in primary
+                        if flow.get(stream_id) is True
+                        or (flow.get(stream_id) is None and stream_id in attached)
+                    ]
+                    plan["desired"][channel_id] = [
+                        *safe_primary,
+                        *(
+                            stream_id for stream_id in desired_ids
+                            if stream_id not in primary_set and stream_id not in safe_primary
+                        ),
+                    ]
         except Exception as exc:
             logger.exception("[EVENT-WORKFLOW] Could not prepare reconciliation: %s", exc)
             details["reason_codes"] = ["GUIDE_UNAVAILABLE"]
@@ -831,7 +1166,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
         if task._cancel_requested:
             return _finish_cancelled(started_at, details)
 
-        async with publication_lock:
+        async with _owned_lock(publication_lock) as release_publication:
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details)
             current_profiles, current_rules = _load_profiles()
@@ -845,6 +1180,16 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     error="GUIDE_SOURCES_PENDING",
                     degraded=any(retained.values()),
                 )
+
+            current_time = datetime.now(timezone.utc)
+            for profile_id, admitted in admitted_by_id.items():
+                attempt = admitted["state"]["delivery"]["guide_attempt"]
+                if current_time >= datetime.fromisoformat(attempt["expires_at"]):
+                    record = coverage["profiles"][str(profile_id)]
+                    record["can_publish"] = False
+                    record["reason_codes"] = sorted(
+                        set(record.get("reason_codes") or []) | {"GUIDE_UNAVAILABLE"}
+                    )
 
             states = {
                 channel_id: state
@@ -865,6 +1210,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     coverage,
                     observations=observations,
                     now=now,
+                    expected=publication_expectations,
                 )
             except Exception as exc:
                 logger.exception("[EVENT-WORKFLOW] Could not commit publication: %s", exc)
@@ -892,6 +1238,30 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             for scope in publication.xmltv_by_scope:
                 row = read_publication(scope)
                 if row is not None:
+                    if scope.startswith("profile:"):
+                        profile_id = int(scope.split(":", 1)[1])
+                        profile = next(
+                            item for item in prepared if item["id"] == profile_id
+                        )
+                        admitted = begin_delivery(
+                            scope,
+                            expected_revision=row["revision"],
+                            expected_hash=row["state"]["xmltv_hash"],
+                            profile=profile,
+                            now=now,
+                        )
+                        if admitted is None:
+                            details["reason_codes"] = ["GUIDE_IMPORT_PENDING"]
+                            details["delivery_pending"] = True
+                            return _finish(
+                                started_at,
+                                details,
+                                success=False,
+                                message="Guide delivery admission changed during reconciliation",
+                                error="GUIDE_IMPORT_PENDING",
+                                degraded=True,
+                            )
+                        row = admitted
                     publications[scope] = row
                     if scope.startswith("profile:"):
                         details["publication_times"][scope.split(":", 1)[1]] = row["state"]["published_at"]
@@ -914,21 +1284,51 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     generated_sources.setdefault(scope, []).append(source)
 
             pending = {}
-            confirmed_source_ids = set()
+            confirmed_sources = set()
             for scope, row in sorted(publications.items()):
                 required, confirmed, scope_pending = _delivery_plan(
                     row, generated_sources.get(scope, []),
                 )
                 delivery = row["state"]["delivery"]
+                source_refreshes = copy.deepcopy(delivery["source_refreshes"])
+                attempt = delivery["guide_attempt"]
+                if scope.startswith("profile:") and attempt is not None:
+                    for source in generated_sources.get(scope, []):
+                        if source["id"] not in scope_pending:
+                            continue
+                        source_key, endpoint_hash, source_url_hash = _source_refresh_key(
+                            client, source, scope,
+                        )
+                        if source_key not in source_refreshes:
+                            status = str(source.get("status") or "").strip().lower()
+                            source_refreshes[source_key] = {
+                                "source_id": source["id"],
+                                "endpoint_hash": endpoint_hash,
+                                "source_url_hash": source_url_hash,
+                                "expected_hash": row["state"]["xmltv_hash"],
+                                "initial_updated": source.get("updated_at") or source.get("last_updated"),
+                                "observed_running": status in {
+                                    "fetching", "processing", "parsing", "loading", "pending",
+                                    "running", "queued", "refreshing",
+                                },
+                                "triggered": False,
+                                "expires_at": attempt["expires_at"],
+                                "attempt_id": attempt["attempt_id"],
+                            }
                 if (
                     delivery["required_dispatcharr_hashes"] != required
                     or delivery["confirmed_dispatcharr_hashes"] != confirmed
+                    or delivery["source_refreshes"] != source_refreshes
                 ):
                     next_revision = update_delivery(
                         scope,
                         expected_revision=row["revision"],
+                        expected_hash=row["state"]["xmltv_hash"],
+                        expected_config_hash=row["state"]["config_hash"],
+                        expected_attempt_id=(attempt or {}).get("attempt_id"),
                         required_dispatcharr_hashes=required,
                         confirmed_dispatcharr_hashes=confirmed,
+                        source_refreshes=(source_refreshes if attempt is not None else None),
                     )
                     if next_revision is None:
                         details["reason_codes"] = ["GUIDE_IMPORT_PENDING"]
@@ -941,30 +1341,111 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                         )
                     row = read_publication(scope)
                     publications[scope] = row
-                confirmed_source_ids.update(
-                    int(source_id) for source_id in confirmed
+                confirmed_sources.update(
+                    (scope, int(source_id)) for source_id in confirmed
                 )
                 pending.update({
-                    source_id: (scope, document_hash)
+                    (scope, source_id): document_hash
                     for source_id, document_hash in scope_pending.items()
                 })
 
             details["pending_source_hashes"] = {
-                str(source_id): document_hash
-                for source_id, (_, document_hash) in sorted(pending.items())
-                if source_id not in confirmed_source_ids
+                f"{scope}:{source_id}": document_hash
+                for (scope, source_id), document_hash in sorted(pending.items())
+                if (scope, source_id) not in confirmed_sources
             }
             if task._cancel_requested:
                 return _finish_cancelled(started_at, details, publications)
 
+            release_publication()
+
+            owners = {
+                channel_id: profile_id
+                for profile_id, plan in plans.items()
+                for channel_id in plan["states"]
+            }
+
+            def claim_current(channel_id: int) -> bool:
+                current_profiles, current_rules = _load_profiles()
+                if (_profile_token(current_profiles), _rule_token(current_rules)) != token:
+                    return False
+                profile_id = owners.get(channel_id)
+                if profile_id is None:
+                    return False
+                scope = f"profile:{profile_id}"
+                expected = publications.get(scope)
+                current = read_publication(scope)
+                if expected is None or current is None:
+                    return False
+                if (
+                    current["revision"] != expected["revision"]
+                    or current["state"]["xmltv_hash"] != expected["state"]["xmltv_hash"]
+                    or current["state"]["config_hash"] != expected["state"]["config_hash"]
+                    or current["state"].get("published", True) is not True
+                ):
+                    return False
+                expected_attempt = expected["state"]["delivery"]["guide_attempt"]
+                current_attempt = current["state"]["delivery"]["guide_attempt"]
+                if (
+                    expected_attempt is None
+                    or current_attempt is None
+                    or current_attempt["attempt_id"] != expected_attempt["attempt_id"]
+                    or datetime.now(timezone.utc) >= datetime.fromisoformat(
+                        current_attempt["expires_at"]
+                    )
+                ):
+                    return False
+                if any(
+                    receipt.get("channel_id") == channel_id
+                    and receipt.get("stage") != "complete"
+                    for receipt in current["state"]["delivery"]["pending_channels"].values()
+                ):
+                    return False
+                return True
+
+            async def current_channel(channel_id: int) -> dict | None:
+                if not claim_current(channel_id):
+                    return None
+                profile_id = owners[channel_id]
+                fresh = await client.get_channel(channel_id)
+                group = fresh.get("channel_group_id") or fresh.get("channel_group")
+                if isinstance(group, dict):
+                    group = group.get("id")
+                target_groups = set(
+                    plans[profile_id]["profile"].get("hide_empty_group_ids") or []
+                )
+                if group not in target_groups:
+                    return None
+                return fresh
+
+            async def update_current_channel(channel_id: int, update: dict) -> bool:
+                async with publication_lock:
+                    if not claim_current(channel_id):
+                        return False
+                    await client.update_channel(channel_id, update)
+                    return True
+
             for channel_id, state in sorted(states.items()):
                 channel = channel_map[channel_id]
-                if state != "idle" or channel.get("hidden_from_output"):
+                should_hide = state == "idle" or (
+                    state == "active"
+                    and (
+                        not channel.get("streams")
+                        or health_states.get(channel_id) is False
+                    )
+                )
+                if not should_hide or channel.get("hidden_from_output"):
                     continue
                 if task._cancel_requested:
                     return _finish_cancelled(started_at, details, publications)
+                fresh = await current_channel(channel_id)
+                if fresh is None or fresh.get("hidden_from_output"):
+                    continue
                 try:
-                    await client.update_channel(channel_id, {"hidden_from_output": True})
+                    if not await update_current_channel(
+                        channel_id, {"hidden_from_output": True},
+                    ):
+                        continue
                 except Exception:
                     logger.exception("[EVENT-WORKFLOW] Could not hide idle channel %s", channel_id)
                     continue
@@ -997,37 +1478,98 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
 
             from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
 
-            for source_id, (scope, document_hash) in sorted(pending.items()):
+            for (scope, source_id), document_hash in sorted(pending.items()):
                 if task._cancel_requested:
                     return _finish_cancelled(started_at, details, publications)
+                if not scope.startswith("profile:"):
+                    continue
                 source = next(
                     item for item in generated_sources[scope] if item["id"] == source_id
                 )
+                source_key, _, _ = _source_refresh_key(client, source, scope)
+                current = read_publication(scope)
+                if current is None or current["state"]["xmltv_hash"] != document_hash:
+                    continue
+                delivery = current["state"]["delivery"]
+                attempt = delivery["guide_attempt"]
+                progress = copy.deepcopy(delivery["source_refreshes"].get(source_key))
+                if attempt is None or progress is None:
+                    continue
+                source_expires = datetime.fromisoformat(progress["expires_at"])
+                if datetime.now(timezone.utc) >= source_expires:
+                    continue
+                if progress["triggered"] is False:
+                    claimed_refreshes = copy.deepcopy(delivery["source_refreshes"])
+                    claimed_refreshes[source_key]["triggered"] = True
+                    next_revision = update_delivery(
+                        scope,
+                        expected_revision=current["revision"],
+                        expected_hash=document_hash,
+                        expected_config_hash=current["state"]["config_hash"],
+                        expected_attempt_id=attempt["attempt_id"],
+                        source_refreshes=claimed_refreshes,
+                    )
+                    if next_revision is None:
+                        continue
+                    current = read_publication(scope)
+                    publications[scope] = current
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+                    try:
+                        await client.refresh_epg_source(source_id)
+                    except Exception:
+                        logger.exception(
+                            "[EVENT-WORKFLOW] Could not trigger guide source %s", source_id,
+                        )
+                        continue
+                    progress = copy.deepcopy(
+                        current["state"]["delivery"]["source_refreshes"][source_key]
+                    )
                 completed = await wait_for_epg_source_refresh(
                     client,
                     source_id,
                     source.get("name") or f"Source {source_id}",
+                    expires_at=source_expires,
+                    initial_source=source,
+                    trigger=False,
                     cancelled=lambda: task._cancel_requested,
+                    progress=progress,
+                    wait=wait_for_sources,
                 )
-                if not completed:
-                    continue
                 current = read_publication(scope)
                 if current is None or current["state"]["xmltv_hash"] != document_hash:
                     continue
-                confirmed = dict(current["state"]["delivery"]["confirmed_dispatcharr_hashes"])
-                confirmed[str(source_id)] = document_hash
+                delivery = current["state"]["delivery"]
+                attempt = delivery["guide_attempt"]
+                current_progress = delivery["source_refreshes"].get(source_key)
+                if (
+                    attempt is None
+                    or current_progress is None
+                    or current_progress["attempt_id"] != progress["attempt_id"]
+                ):
+                    continue
+                refreshes = copy.deepcopy(delivery["source_refreshes"])
+                refreshes[source_key]["observed_running"] = progress["observed_running"]
+                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
+                if completed:
+                    confirmed[str(source_id)] = document_hash
                 next_revision = update_delivery(
                     scope,
                     expected_revision=current["revision"],
+                    expected_hash=document_hash,
+                    expected_config_hash=current["state"]["config_hash"],
+                    expected_attempt_id=attempt["attempt_id"],
                     confirmed_dispatcharr_hashes=confirmed,
+                    source_refreshes=refreshes,
                 )
                 if next_revision is not None:
-                    confirmed_source_ids.add(source_id)
+                    if completed:
+                        confirmed_sources.add((scope, source_id))
                     publications[scope] = read_publication(scope)
                     details["pending_source_hashes"] = {
-                        str(key): value[1]
+                        f"{key[0]}:{key[1]}": value
                         for key, value in sorted(pending.items())
-                        if key not in confirmed_source_ids
+                        if key not in confirmed_sources
                     }
                 if task._cancel_requested:
                     return _finish_cancelled(started_at, details, publications)
@@ -1036,16 +1578,16 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 return _finish_cancelled(started_at, details, publications)
 
             details["pending_source_hashes"] = {
-                str(source_id): document_hash
-                for source_id, (_, document_hash) in sorted(pending.items())
-                if source_id not in confirmed_source_ids
+                f"{scope}:{source_id}": document_hash
+                for (scope, source_id), document_hash in sorted(pending.items())
+                if (scope, source_id) not in confirmed_sources
             }
 
             guide_rows = {}
             source_by_id = {
                 source["id"]: source
-                for values in generated_sources.values() for source in values
-                if source["id"] in confirmed_source_ids
+                for scope, values in generated_sources.items() for source in values
+                if (scope, source["id"]) in confirmed_sources
             }
             for source_id in sorted(source_by_id):
                 if task._cancel_requested:
@@ -1070,7 +1612,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     source["id"]
                     for scope in (f"profile:{profile_id}", "all")
                     for source in generated_sources.get(scope, [])
-                    if source["id"] in confirmed_source_ids
+                    if (scope, source["id"]) in confirmed_sources
                 }
                 for assignment in profile.get("channel_assignments") or []:
                     channel_id = assignment.get("channel_id")
@@ -1099,8 +1641,19 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     if current_link != guide_row["id"]:
                         if task._cancel_requested:
                             return _finish_cancelled(started_at, details, publications)
+                        fresh = await current_channel(channel_id)
+                        if fresh is None:
+                            continue
+                        fresh_link = fresh.get("epg_data_id") or fresh.get("epg_data")
+                        if isinstance(fresh_link, dict):
+                            fresh_link = fresh_link.get("id")
+                        if fresh_link is not None and fresh_link != current_link:
+                            continue
                         try:
-                            await client.update_channel(channel_id, {"epg_data_id": guide_row["id"]})
+                            if not await update_current_channel(
+                                channel_id, {"epg_data_id": guide_row["id"]},
+                            ):
+                                continue
                         except Exception:
                             logger.exception("[EVENT-WORKFLOW] Could not link guide row for channel %s", channel_id)
                             continue
@@ -1130,36 +1683,87 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                             )
                         if task._cancel_requested:
                             return _finish_cancelled(started_at, details, publications)
-                    linked_rows[channel_id] = (source_id, guide_row["id"])
+                    linked_rows[channel_id] = (
+                        profile_id, source_id, guide_row["id"], xmltv_id,
+                    )
+
+            programme_rows = []
+            if linked_rows:
+                try:
+                    programme_rows = await client.get_epg_grid(
+                        start=(now - timedelta(hours=1)).isoformat(),
+                        end=(now + timedelta(hours=24)).isoformat(),
+                    )
+                except Exception:
+                    logger.exception("[EVENT-WORKFLOW] Could not read the imported guide grid")
+            from services.epg_programmes import programme_matches
+
+            programme_ready = set()
+            for channel_id, (profile_id, _, _, xmltv_id) in linked_rows.items():
+                publication_row = publications.get(f"profile:{profile_id}")
+                channel = channel_map[channel_id]
+                if publication_row is None:
+                    continue
+                evidence = next((
+                    item for item in publication_row["state"]["channels"]
+                    if item["channel_id"] == channel_id
+                ), None)
+                if evidence is None:
+                    continue
+                current_event = next((
+                    item for item in evidence["events"]
+                    if datetime.fromisoformat(item["start"]) <= now
+                    < datetime.fromisoformat(item["stop"])
+                ), None)
+                if current_event is None:
+                    continue
+                if programme_matches(
+                    programme_rows,
+                    xmltv_id=xmltv_id,
+                    channel_uuid=channel.get("uuid"),
+                    title=current_event["title"],
+                    start=current_event["start"],
+                    stop=current_event["stop"],
+                ):
+                    programme_ready.add(channel_id)
 
             link_pending = False
             for plan in plans.values():
                 for channel_id, state in plan["states"].items():
-                    if state != "active" or channel_id in linked_rows:
+                    if state != "active" or channel_id in programme_ready:
                         continue
-                    channel = channel_map[channel_id]
-                    if channel.get("epg_data_id") is None and channel.get("epg_data") is None:
-                        link_pending = True
+                    link_pending = True
 
             for profile_id, plan in sorted(plans.items()):
                 for channel_id, desired_ids in sorted(plan["desired"].items()):
                     state = plan["states"][channel_id]
                     channel = channel_map[channel_id]
+                    fresh = await current_channel(channel_id)
+                    if fresh is None:
+                        continue
                     attached_ids = [
-                        stream_id for stream_id in (_stream_id(row) for row in channel.get("streams") or [])
+                        stream_id for stream_id in (_stream_id(row) for row in fresh.get("streams") or [])
                         if stream_id is not None
                     ]
                     update = {}
                     if desired_ids != attached_ids:
                         update["streams"] = desired_ids
-                    if state == "active" and channel_id in linked_rows and channel.get("hidden_from_output"):
+                    if (
+                        state == "active"
+                        and channel_id in programme_ready
+                        and health_states.get(channel_id) is True
+                        and fresh.get("hidden_from_output")
+                    ):
                         update["hidden_from_output"] = False
+                    if state == "active" and desired_ids and channel_id not in programme_ready:
+                        update.pop("streams", None)
                     if not update:
                         continue
                     if task._cancel_requested:
                         return _finish_cancelled(started_at, details, publications)
                     try:
-                        await client.update_channel(channel_id, update)
+                        if not await update_current_channel(channel_id, update):
+                            continue
                     except Exception:
                         logger.exception("[EVENT-WORKFLOW] Could not apply channel %s", channel_id)
                         continue
@@ -1314,4 +1918,4 @@ class EventVisibilityTask(TaskScheduler):
         super().__init__(schedule_config)
 
     async def execute(self) -> TaskResult:
-        return await reconcile_profiles(self, wait_for_sources=True)
+        return await reconcile_profiles(self, wait_for_sources=False)

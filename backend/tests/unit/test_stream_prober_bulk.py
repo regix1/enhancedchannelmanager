@@ -6,7 +6,8 @@ probe_all_streams, so a manual bulk run shows up in get_probe_progress /
 get_probe_results just like a scheduled probe-all run (the "manual probes don't
 feed the results envelope" half of the bug).
 """
-from unittest.mock import AsyncMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +19,14 @@ def _make_prober(client, **kwargs):
     prober = StreamProber(client=client, **kwargs)
     prober._persist_probe_history = lambda: None
     return prober
+
+
+async def _wait_for_gate_waiters(prober, count: int = 1):
+    for _ in range(100):
+        if len(prober._probe_condition._waiters) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"expected {count} account-gate waiter(s)")
 
 
 @pytest.mark.asyncio
@@ -183,3 +192,262 @@ async def test_scheduled_probe_includes_hidden_channel_streams():
     client.get_channels.assert_awaited_once_with(
         page=1, page_size=500, visibility_filter="all",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_event", [False, True])
+async def test_account_limit_refresh_preserves_held_claim(first_event):
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=2)
+    prober.account_probe_limits = {2: 1}
+    first = prober.semaphore_for_account(2, event=first_event)
+    await first.__aenter__()
+    second_entered = asyncio.Event()
+
+    async def enter_second():
+        async with prober.semaphore_for_account(2, event=not first_event):
+            second_entered.set()
+
+    second = asyncio.create_task(enter_second())
+    await _wait_for_gate_waiters(prober)
+    assert not second_entered.is_set()
+
+    with patch(
+        "config.get_settings",
+        return_value=MagicMock(probe_concurrency_by_account={}),
+    ), patch(
+        "services.probe_limits.account_probe_limits",
+        AsyncMock(return_value={2: 1}),
+    ):
+        await prober.refresh_account_probe_limits()
+
+    await _wait_for_gate_waiters(prober)
+    assert not second_entered.is_set()
+    await first.__aexit__(None, None, None)
+    await asyncio.wait_for(second, timeout=1)
+    assert second_entered.is_set()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+async def test_account_limit_reduction_waits_for_all_excess_holders():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=3)
+    prober.account_probe_limits = {2: 2}
+    first = prober.semaphore_for_account(2)
+    second = prober.semaphore_for_account(2)
+    await first.__aenter__()
+    await second.__aenter__()
+    third_entered = asyncio.Event()
+
+    async def enter_third():
+        async with prober.semaphore_for_account(2):
+            third_entered.set()
+
+    with patch(
+        "config.get_settings",
+        return_value=MagicMock(probe_concurrency_by_account={}),
+    ), patch(
+        "services.probe_limits.account_probe_limits",
+        AsyncMock(return_value={2: 1}),
+    ):
+        await prober.refresh_account_probe_limits()
+
+    third = asyncio.create_task(enter_third())
+    await _wait_for_gate_waiters(prober)
+    await first.__aexit__(None, None, None)
+    await _wait_for_gate_waiters(prober)
+    assert not third_entered.is_set()
+    await second.__aexit__(None, None, None)
+    await asyncio.wait_for(third, timeout=1)
+    assert third_entered.is_set()
+    assert prober._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_account_limit_increase_wakes_waiters():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=3)
+    prober.account_probe_limits = {2: 1}
+    first = prober.semaphore_for_account(2)
+    await first.__aenter__()
+    entered = [asyncio.Event(), asyncio.Event()]
+
+    async def enter(index):
+        async with prober.semaphore_for_account(2):
+            entered[index].set()
+
+    tasks = [asyncio.create_task(enter(index)) for index in range(2)]
+    await _wait_for_gate_waiters(prober, 2)
+    with patch(
+        "config.get_settings",
+        return_value=MagicMock(probe_concurrency_by_account={}),
+    ), patch(
+        "services.probe_limits.account_probe_limits",
+        AsyncMock(return_value={2: 3}),
+    ):
+        await prober.refresh_account_probe_limits()
+
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert all(event.is_set() for event in entered)
+    await first.__aexit__(None, None, None)
+    assert prober._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_account_claims_leave_no_occupancy():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1}
+    holder_started = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def holder():
+        async with prober.semaphore_for_account(2, event=True):
+            holder_started.set()
+            await hold.wait()
+
+    active = asyncio.create_task(holder())
+    await holder_started.wait()
+
+    waiting = asyncio.create_task(holder())
+    await _wait_for_gate_waiters(prober)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert prober._account_active == {2: 1}
+    assert prober._event_probes == 1
+
+    active.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await active
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+    async with prober.semaphore_for_account(2, event=True):
+        assert prober._account_active == {2: 1}
+
+
+@pytest.mark.asyncio
+async def test_ordinary_accounts_keep_independent_capacity():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1, 18: 1}
+    release = asyncio.Event()
+    entered = {2: asyncio.Event(), 18: asyncio.Event()}
+
+    async def hold(account):
+        async with prober.semaphore_for_account(account):
+            entered[account].set()
+            await release.wait()
+
+    tasks = [asyncio.create_task(hold(account)) for account in entered]
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in entered.values())),
+        timeout=1,
+    )
+    assert prober._account_active == {2: 1, 18: 1}
+    release.set()
+    await asyncio.gather(*tasks)
+    assert prober._account_active == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["scheduled_parallel", "scheduled_sequential", "on_demand"],
+)
+async def test_bulk_paths_wait_for_active_event_claim(mode):
+    client = AsyncMock()
+    client.get_m3u_accounts.return_value = [{
+        "id": 2,
+        "name": "Account 2",
+        "max_streams": 0,
+        "profiles": [],
+    }]
+    client.get_channel_stats.return_value = {"channels": []}
+    prober = _make_prober(
+        client,
+        parallel_probing_enabled=mode == "scheduled_parallel",
+        max_concurrent_probes=1,
+        refresh_m3us_before_probe=False,
+        auto_reorder_after_probe=False,
+    )
+    prober.account_probe_limits = {2: 1}
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober._create_probe_notification = AsyncMock()
+    prober._update_probe_notification = AsyncMock()
+    prober._finalize_probe_notification = AsyncMock()
+    prober._fetch_all_streams = AsyncMock(return_value=[{
+        "id": 10,
+        "url": "http://example.com/10",
+        "name": "Stream 10",
+        "m3u_account": 2,
+    }])
+    prober._fetch_channel_stream_ids = AsyncMock(return_value=(
+        {10}, {10: ["Channel 10"]}, {10: 10},
+    ))
+    media_started = asyncio.Event()
+
+    async def probe(*_args):
+        media_started.set()
+        return {"probe_status": "success"}
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    event_claim = prober.semaphore_for_account(2, event=True)
+    await event_claim.__aenter__()
+    if mode == "on_demand":
+        bulk = asyncio.create_task(prober.probe_streams_by_ids([10]))
+    else:
+        bulk = asyncio.create_task(prober.probe_all_streams(
+            skip_m3u_refresh=True,
+        ))
+
+    await _wait_for_gate_waiters(prober)
+    assert not media_started.is_set()
+    await event_claim.__aexit__(None, None, None)
+    await asyncio.wait_for(bulk, timeout=3)
+    assert media_started.is_set()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sequential_probe_does_not_start_queued_media():
+    client = AsyncMock()
+    client.get_m3u_accounts.return_value = [{
+        "id": 2,
+        "name": "Account 2",
+        "max_streams": 0,
+        "profiles": [],
+    }]
+    client.get_channel_stats.return_value = {"channels": []}
+    prober = _make_prober(
+        client,
+        parallel_probing_enabled=False,
+        max_concurrent_probes=1,
+        refresh_m3us_before_probe=False,
+        auto_reorder_after_probe=False,
+    )
+    prober.account_probe_limits = {2: 1}
+    prober._create_probe_notification = AsyncMock()
+    prober._update_probe_notification = AsyncMock()
+    prober._finalize_probe_notification = AsyncMock()
+    prober._fetch_all_streams = AsyncMock(return_value=[{
+        "id": 10,
+        "url": "http://example.com/10",
+        "name": "Stream 10",
+        "m3u_account": 2,
+    }])
+    prober._fetch_channel_stream_ids = AsyncMock(return_value=(
+        {10}, {10: ["Channel 10"]}, {10: 10},
+    ))
+    prober.probe_stream = AsyncMock(return_value={"probe_status": "success"})
+
+    event_claim = prober.semaphore_for_account(2, event=True)
+    await event_claim.__aenter__()
+    bulk = asyncio.create_task(prober.probe_all_streams(skip_m3u_refresh=True))
+    await _wait_for_gate_waiters(prober)
+    prober._probe_cancelled = True
+    await event_claim.__aexit__(None, None, None)
+    await asyncio.wait_for(bulk, timeout=2)
+
+    prober.probe_stream.assert_not_awaited()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0

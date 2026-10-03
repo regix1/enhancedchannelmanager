@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as api from '../services/api';
 import * as channelPipelineApi from '../services/channelPipelineApi';
 import type { TaskStatus, TaskSchedule, TaskScheduleCreate, TaskScheduleUpdate, TaskParameterSchema, SettingsResponse } from '../services/api';
@@ -44,6 +44,8 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
 
   // Schedules state
   const [schedules, setSchedules] = useState<TaskSchedule[]>(task.schedules || []);
+  const [schedulesState, setSchedulesState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const schedulesRequest = useRef(0);
   const [editingSchedule, setEditingSchedule] = useState<TaskSchedule | null>(null);
   const [isAddingSchedule, setIsAddingSchedule] = useState(!!openAddSchedule);
   const { titleId: addScheduleTitleId, containerRef: addScheduleContainerRef } = useOwnedDialog(isAddingSchedule);
@@ -201,17 +203,26 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
 
   // Refresh schedules from server
   const refreshSchedules = useCallback(async () => {
+    const requestId = ++schedulesRequest.current;
+    setSchedulesState('loading');
     try {
       const result = await api.getTaskSchedules(task.task_id);
+      if (requestId !== schedulesRequest.current) return;
       setSchedules(result.schedules);
+      setSchedulesState('ready');
     } catch (err) {
+      if (requestId !== schedulesRequest.current) return;
       logger.error('Failed to refresh schedules', err);
+      setSchedulesState('error');
     }
   }, [task.task_id]);
 
   // Load schedules when modal opens (component mounts)
   useEffect(() => {
-    refreshSchedules();
+    void refreshSchedules();
+    return () => {
+      schedulesRequest.current += 1;
+    };
   }, [refreshSchedules]);
 
   // vkktd.4: a task fires only when BOTH the parent task AND >=1 child
@@ -225,6 +236,7 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
 
   // Save task-level settings (enabled, config, alerts)
   const handleSaveTask = async () => {
+    if (schedulesState !== 'ready') return;
     setSaving(true);
 
     // vkktd.4: saving with the task enabled and no enabled child schedule
@@ -462,7 +474,7 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
           </div>
 
           {/* Schedules Section */}
-          <div className="schedules-section">
+          <div className="schedules-section" aria-busy={schedulesState === 'loading'}>
             <div className="schedules-header">
               <label>Schedules</label>
               <button className="add-schedule-btn" onClick={() => setIsAddingSchedule(true)}>
@@ -473,7 +485,14 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
 
             {/* vkktd.4: live "enabled but won't run" warning — the task is
                 enabled but no child schedule is, so it will never fire. */}
-            {wontRun && (
+            {schedulesState === 'error' && (
+              <div className="schedule-wont-run-warning" role="alert">
+                <span className="material-icons" aria-hidden="true">warning</span>
+                <span>Could not load schedules. Close and reopen this dialog to try again.</span>
+              </div>
+            )}
+
+            {schedulesState === 'ready' && wontRun && (
               <div className="schedule-wont-run-warning" role="alert" data-testid="schedule-wont-run-warning">
                 <span className="material-icons" aria-hidden="true">warning</span>
                 <span>
@@ -486,7 +505,11 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
               </div>
             )}
 
-            {schedules.length === 0 ? (
+            {schedules.length === 0 && schedulesState === 'loading' ? (
+              <div className="empty-schedules" role="status">
+                Loading schedules…
+              </div>
+            ) : schedules.length === 0 && schedulesState === 'ready' ? (
               <div className="empty-schedules">
                 <span className="material-icons">event_busy</span>
                 No schedules configured.
@@ -495,7 +518,7 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
                   Click "Add Schedule" to create one, or run the task manually.
                 </span>
               </div>
-            ) : (
+            ) : schedules.length > 0 ? (
               <div className="schedule-list">
                 {schedules.map((schedule) => (
                   <div
@@ -581,7 +604,7 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
                   </div>
                 ))}
               </div>
-            )}
+            ) : null}
           </div>
 
           {/* Notification Center Settings Section */}
@@ -879,7 +902,7 @@ export function TaskEditorModal({ task, onClose, onSaved, openAddSchedule }: Tas
           <button
             className="modal-btn modal-btn-primary"
             onClick={handleSaveTask}
-            disabled={saving}
+            disabled={saving || schedulesState !== 'ready'}
           >
             {saving ? 'Saving...' : 'Save Changes'}
           </button>

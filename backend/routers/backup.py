@@ -75,6 +75,7 @@ from dbas.restore_contracts import ChannelReattachMode
 from dbas.importers.settings_agents import is_safe_setting_key
 from database import close_db, get_engine, get_session, init_db, JOURNAL_DB_FILE
 from dispatcharr_client import get_client, reset_client
+from services.epg_publication import _parse_state, publication_lock
 from models import (
     ChannelPipelineRule,
     DummyEPGProfile,
@@ -520,6 +521,12 @@ _STANDARD_ARTIFACT_EXCLUDED: dict[str, str] = {
         "actor_token_id; losing them re-surfaces a suppressed stream in the "
         "review queue, which is recoverable rather than destructive."
     ),
+    "dummy_epg_publications": (
+        "Derived XMLTV, upstream detail, and durable event-recovery receipts. "
+        "The standard scrub drops this table only after every receipt is "
+        "complete and backed by its saved rule ownership; otherwise export "
+        "refuses so an encrypted backup with credentials can preserve it."
+    ),
 }
 
 
@@ -540,6 +547,197 @@ class BackupScrubError(RuntimeError):
     ``build_backup_artifact`` already unlinks its partial ZIP and sidecar on any
     exception, and :func:`_create_backup_zip`'s caller turns this into a 500.
     """
+
+
+def _check_publication_receipts(journal_path: Path, operation: str) -> bool:
+    """Verify that dropping publication rows cannot erase recovery ownership."""
+    if not journal_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(journal_path))
+    except sqlite3.Error as exc:
+        raise BackupScrubError(
+            "%s refused: event recovery state could not be opened for verification."
+            % operation
+        ) from exc
+
+    try:
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        except sqlite3.DatabaseError as exc:
+            raise BackupScrubError(
+                "%s refused: event recovery tables could not be verified."
+                % operation
+            ) from exc
+        if "dummy_epg_publications" not in tables:
+            return False
+
+        try:
+            rows = conn.execute(
+                "SELECT scope, xmltv, state FROM dummy_epg_publications"
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise BackupScrubError(
+                "%s refused: event recovery records could not be read."
+                % operation
+            ) from exc
+
+        ownership: dict[int, str | None] = {}
+        if "auto_creation_rules" in tables:
+            try:
+                ownership = {
+                    row[0]: row[1]
+                    for row in conn.execute(
+                        "SELECT id, managed_channel_ids FROM auto_creation_rules"
+                    ).fetchall()
+                }
+            except sqlite3.DatabaseError as exc:
+                raise BackupScrubError(
+                    "%s refused: saved event channel ownership could not be read."
+                    % operation
+                ) from exc
+
+        for scope, document, raw_state in rows:
+            try:
+                state = _parse_state(raw_state, document=document)
+            except (TypeError, ValueError) as exc:
+                raise BackupScrubError(
+                    "%s refused: publication %s has unverified event recovery state."
+                    % (operation, scope)
+                ) from exc
+            for receipt in state["delivery"]["pending_channels"].values():
+                if receipt["stage"] != "complete":
+                    raise BackupScrubError(
+                        "%s refused: event recovery state is not complete. Use an "
+                        "encrypted backup with credentials included to preserve it."
+                        % operation
+                    )
+                rule_id = receipt["rule_id"]
+                channel_id = receipt["channel_id"]
+                try:
+                    managed = json.loads(ownership[rule_id] or "[]")
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise BackupScrubError(
+                        "%s refused: completed event recovery state has no verified "
+                        "saved rule ownership." % operation
+                    ) from exc
+                if (
+                    not isinstance(managed, list)
+                    or channel_id not in managed
+                    or any(
+                        not isinstance(value, int) or isinstance(value, bool)
+                        for value in managed
+                    )
+                ):
+                    raise BackupScrubError(
+                        "%s refused: completed event recovery state has no verified "
+                        "saved rule ownership." % operation
+                    )
+        return True
+    finally:
+        conn.close()
+
+
+def _pause_guide_promotions(journal_path: Path) -> int:
+    """Pause staged guide-promotion rules when recovery records are absent."""
+    try:
+        conn = sqlite3.connect(str(journal_path))
+    except sqlite3.Error as exc:
+        raise BackupScrubError(
+            "Restore refused: staged event configuration could not be opened."
+        ) from exc
+
+    try:
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "dummy_epg_publications" in tables:
+                return 0
+            if "auto_creation_rules" not in tables:
+                return 0
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    'PRAGMA table_info("auto_creation_rules")'
+                ).fetchall()
+            }
+            if not {"id", "enabled", "event_sync_config"}.issubset(columns):
+                return 0
+            rows = conn.execute(
+                "SELECT id, event_sync_config FROM auto_creation_rules "
+                "WHERE enabled = 1 AND event_sync_config IS NOT NULL"
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise BackupScrubError(
+                "Restore refused: staged event configuration could not be inspected."
+            ) from exc
+
+        paused: list[int] = []
+        for rule_id, raw_config in rows:
+            try:
+                config = json.loads(raw_config)
+            except (TypeError, ValueError) as exc:
+                raise BackupScrubError(
+                    "Restore refused: staged event configuration is malformed."
+                ) from exc
+            if not isinstance(config, dict):
+                raise BackupScrubError(
+                    "Restore refused: staged event configuration is invalid."
+                )
+            promote = config.get("promote_unmatched")
+            profile_id = config.get("dummy_epg_profile_id")
+            if promote is not None and not isinstance(promote, bool):
+                raise BackupScrubError(
+                    "Restore refused: staged event configuration is invalid."
+                )
+            if profile_id is not None and (
+                not isinstance(profile_id, int)
+                or isinstance(profile_id, bool)
+                or profile_id < 1
+            ):
+                raise BackupScrubError(
+                    "Restore refused: staged event configuration is invalid."
+                )
+            if promote is True and profile_id is None:
+                raise BackupScrubError(
+                    "Restore refused: staged event configuration is invalid."
+                )
+            if promote is True:
+                if "dummy_epg_profiles" not in tables:
+                    raise BackupScrubError(
+                        "Restore refused: staged guide profile is missing."
+                    )
+                found = conn.execute(
+                    "SELECT 1 FROM dummy_epg_profiles WHERE id = ?",
+                    (profile_id,),
+                ).fetchone()
+                if found is None:
+                    raise BackupScrubError(
+                        "Restore refused: staged guide profile is missing."
+                    )
+                paused.append(rule_id)
+
+        if paused:
+            conn.executemany(
+                "UPDATE auto_creation_rules SET enabled = 0 WHERE id = ?",
+                [(rule_id,) for rule_id in paused],
+            )
+            conn.commit()
+        return len(paused)
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # SINGLE shared credential-key denylist for the DBAS artifact (0i2vt.7, ADR-012
@@ -1358,6 +1556,8 @@ def _scrub_journal_db_in_place(tmp_path: Path) -> None:
             raise BackupScrubError(
                 "could not list the tables in the journal.db copy: %s" % e
             ) from e
+
+        _check_publication_receipts(tmp_path, "Standard backup")
 
         # Everything not explicitly permitted leaves the copy entirely. Sorted so
         # the security log line below is stable and diffable between runs.
@@ -3920,6 +4120,7 @@ _REESTABLISH_ON_RESTORE: dict[str, str] = {
 # Restores hold the database closed and are human-admin gated, so they do not
 # overlap.
 _LAST_RESTORE_CONFIG_LOSSES: dict[str, int] = {}
+_LAST_RESTORE_GUIDE_PAUSES = 0
 
 
 def _count_reestablish_rows(journal_path: Optional[Path] = None) -> dict[str, int]:
@@ -3961,7 +4162,7 @@ def _post_restore_account_notices() -> list[str]:
     artifact contained, so it cannot claim a lockout that did not happen or miss
     one that did. Empty in the ordinary case (accounts present, nothing lost).
 
-    Two notices, both live-derived:
+    Three notices, all tied to the completed restore:
 
     1. The first-run-setup notice, when the instance ends up with no accounts.
     2. The re-establish notice, when a configured surface that a standard
@@ -3969,11 +4170,16 @@ def _post_restore_account_notices() -> list[str]:
        (:data:`_REESTABLISH_ON_RESTORE`). This is the operator-facing half of
        the allowlist: ``restored_files`` reports what landed and structurally
        cannot report what the artifact could not carry.
+    3. The guide-promotion notice, when a receiptless artifact caused those
+       rules to be paused in the staged database before the swap.
     """
+    global _LAST_RESTORE_GUIDE_PAUSES
     notices: list[str] = []
 
     lost = {t: n for t, n in _LAST_RESTORE_CONFIG_LOSSES.items() if n}
     _LAST_RESTORE_CONFIG_LOSSES.clear()
+    paused = _LAST_RESTORE_GUIDE_PAUSES
+    _LAST_RESTORE_GUIDE_PAUSES = 0
     if lost:
         detail = "; ".join(
             "%d %s" % (n, _REESTABLISH_ON_RESTORE[t]) for t, n in sorted(lost.items())
@@ -3984,6 +4190,15 @@ def _post_restore_account_notices() -> list[str]:
             "personal data by design. Re-establish: %s. To carry these between "
             "instances instead, take an encrypted backup with credentials "
             "included." % detail
+        )
+        logger.warning("[BACKUP] %s", notice)
+        notices.append(notice)
+
+    if paused:
+        notice = (
+            "Guide-promotion rules paused: %d. This backup has no event "
+            "recovery records. Inspect the external channels and recovery "
+            "state before you re-enable these rules." % paused
         )
         logger.warning("[BACKUP] %s", notice)
         notices.append(notice)
@@ -4254,11 +4469,16 @@ def _restore_from_zip(zf: zipfile.ZipFile, manifest: dict) -> list[str]:
     swap or database initialization fails, prior inodes are renamed back and
     verified before the old database is reinitialized.
     """
+    global _LAST_RESTORE_GUIDE_PAUSES
+    _LAST_RESTORE_CONFIG_LOSSES.clear()
+    _LAST_RESTORE_GUIDE_PAUSES = 0
+
     restored: list[str] = []
     staged_items: list[tuple[Path, Path]] = []
     records: list[dict] = []
     database_closed = False
     failure_reinitialized = False
+    paused_guide_rules = 0
 
     # Finish settings validation and normalization before any database shutdown
     # or live write. Credential authority is reloaded later, at commit time.
@@ -4271,6 +4491,9 @@ def _restore_from_zip(zf: zipfile.ZipFile, manifest: dict) -> list[str]:
             )
         )
 
+    if "journal.db" in manifest.staged_paths:
+        _check_publication_receipts(JOURNAL_DB_FILE, "Restore")
+
     # Capture existing alert_methods.config BEFORE we close/replace the DB so
     # we can merge real creds back where the restored ZIP has REDACTED.
     prior_alert_configs = _capture_existing_alert_method_configs()
@@ -4282,7 +4505,6 @@ def _restore_from_zip(zf: zipfile.ZipFile, manifest: dict) -> list[str]:
     # the restore response can name what THIS instance actually lost rather than
     # what an artifact might not have held. Cleared first: a previous failed
     # restore must not leak its losses into this one's notices.
-    _LAST_RESTORE_CONFIG_LOSSES.clear()
     prior_reestablish_counts = _count_reestablish_rows()
 
     try:
@@ -4296,6 +4518,7 @@ def _restore_from_zip(zf: zipfile.ZipFile, manifest: dict) -> list[str]:
                 prior_alert_configs, staged_journal
             )
             _reassert_auth_rows_after_restore(prior_auth_rows, staged_journal)
+            paused_guide_rules = _pause_guide_promotions(staged_journal)
             with staged_journal.open("rb") as staged_db:
                 os.fsync(staged_db.fileno())
             staged_items.append((JOURNAL_DB_FILE, staged_journal))
@@ -4383,6 +4606,7 @@ def _restore_from_zip(zf: zipfile.ZipFile, manifest: dict) -> list[str]:
     except Exception as e:
         logger.warning("[BACKUP] Failed to reset Dispatcharr client (non-fatal): %s", e)
 
+    _LAST_RESTORE_GUIDE_PAUSES = paused_guide_rules
     return restored
 
 
@@ -4431,7 +4655,8 @@ async def restore_backup(file: UploadFile = File(...), _admin=RequireHumanAdminI
         with zf:
             manifest = _validate_backup_zip(zf)
             try:
-                restored = _restore_from_zip(zf, manifest)
+                async with publication_lock:
+                    restored = _restore_from_zip(zf, manifest)
             finally:
                 manifest.close()
     finally:
@@ -4600,7 +4825,8 @@ async def restore_backup_initial(
         with zf:
             manifest = _validate_backup_zip(zf)
             try:
-                restored = _restore_from_zip(zf, manifest)
+                async with publication_lock:
+                    restored = _restore_from_zip(zf, manifest)
             finally:
                 manifest.close()
     finally:
@@ -7044,7 +7270,8 @@ async def restore_saved_backup(req: RestoreSavedRequest, _admin=RequireHumanAdmi
     with archive, zf:
         manifest = _validate_backup_zip(zf)
         try:
-            restored = _restore_from_zip(zf, manifest)
+            async with publication_lock:
+                restored = _restore_from_zip(zf, manifest)
         finally:
             manifest.close()
 

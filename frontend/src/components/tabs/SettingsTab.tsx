@@ -697,7 +697,6 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
   // Stream probe settings (scheduled probing is controlled by Task Engine)
   const [streamProbeTimeout, setStreamProbeTimeout] = useState(30);
   const [bitrateSampleDuration, setBitrateSampleDuration] = useState(10);
-  const [minStreamBitrateKbps, setMinStreamBitrateKbps] = useState(2000);
   const [parallelProbingEnabled, setParallelProbingEnabled] = useState(true);
   const [maxConcurrentProbes, setMaxConcurrentProbes] = useState(8);
   // Rows, not the stored dict: a row being typed has no account id yet, and a
@@ -832,7 +831,7 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
     channelPipelineExcludedGroups, channelPipelineExcludeAutoSyncGroups,
     maxAutoCreatedChannelsPerRun, maxChannelPipelineLogEntries, linkedM3UAccounts,
     streamProbeTimeout, bitrateSampleDuration, parallelProbingEnabled,
-    maxConcurrentProbes, profileDistributionStrategy, skipRecentlyProbedHours,
+    maxConcurrentProbes, probeConcurrencyRows, profileDistributionStrategy, skipRecentlyProbedHours,
     refreshM3usBeforeProbe, autoReorderAfterProbe, pushStreamStatsToDispatcharr,
     probeRetryCount, probeRetryDelay, blackScreenDetectionEnabled,
     blackScreenSampleDuration, lowFpsThreshold, streamFetchPageLimit,
@@ -1146,7 +1145,6 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
       // Stream probe settings (scheduled probing is controlled by Task Engine)
       setStreamProbeTimeout(settings.stream_probe_timeout ?? 30);
       setBitrateSampleDuration(settings.bitrate_sample_duration ?? 10);
-      setMinStreamBitrateKbps(settings.min_stream_bitrate_kbps ?? 2000);
       setParallelProbingEnabled(settings.parallel_probing_enabled ?? true);
       setMaxConcurrentProbes(settings.max_concurrent_probes ?? 8);
       setProbeConcurrencyRows(
@@ -1621,7 +1619,6 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
         // Stream probe settings (scheduled probing is controlled by Task Engine)
         stream_probe_timeout: streamProbeTimeout,
         bitrate_sample_duration: bitrateSampleDuration,
-        min_stream_bitrate_kbps: minStreamBitrateKbps,
         parallel_probing_enabled: parallelProbingEnabled,
         max_concurrent_probes: maxConcurrentProbes,
         // A row with no account id, or a count that is not a whole number of
@@ -5004,25 +5001,6 @@ export function SettingsTab({ onSaved, onThemeChange, channelProfiles = [], onPr
                   { value: '20', label: '20 seconds' },
                   { value: '30', label: '30 seconds' },
                 ]}
-              />
-            </div>
-
-            <div className="form-group-vertical">
-              <label htmlFor="minStreamBitrateKbps">Minimum stream bitrate (kbps)</label>
-              <span className="form-description">
-                A stream measured below this while its event is already under way is
-                treated as dead, so Event Sync drops it. A provider&apos;s offline card
-                still pushes bytes, just far fewer than a game does, which is what this
-                number separates. Set it to 0 to judge streams on ffprobe alone.
-              </span>
-              <input
-                id="minStreamBitrateKbps"
-                type="number"
-                min="0"
-                max="50000"
-                value={minStreamBitrateKbps}
-                onChange={(e) => setMinStreamBitrateKbps(e.target.value === '' ? 2000 : parseInt(e.target.value))}
-                onBlur={() => setMinStreamBitrateKbps(Math.max(0, Math.min(50000, minStreamBitrateKbps || 0)))}
               />
             </div>
 

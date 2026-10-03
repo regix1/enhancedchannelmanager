@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
 import pytz
 
 from services.event_sync_matcher import (
@@ -336,7 +337,7 @@ class TestReviewCandidates:
 # Dateless fingerprint churn fix (bead enhancedchannelmanager-t6bin).
 #
 # Under assume_current_date the parser SYNTHESIZES the date from "now"
-# (the three _ASSUME_DATE_PATTERNS variants). A key that embeds that
+# (the _ASSUME_DATE_PATTERNS variants). A key that embeds that
 # fabricated date churns at midnight, so accepts/rejects for a recurring
 # dateless slot never carried forward and the jqwfq rail re-demoted the
 # same slot daily. Fix: such parses key on
@@ -353,6 +354,7 @@ NOW_WINTER = pytz.timezone(DEFAULT_EVENT_TIMEZONE).localize(
 DATELESS_AMPM = "Boxing 05: FURY vs HALL 6PM"
 DATELESS_24H = "MOTOR: GP Qualifying 19:00"
 DATELESS_TIME_FIRST = "LIVE EVENT 05 - 4:15pm Zenith Racing Series"
+DATELESS_LIVE_EVENT_TIME_FIRST = "LIVE EVENT 02   9pm Night Racing Series"
 
 
 def _parse_dateless(name: str, now=NOW, event_timezone=DEFAULT_EVENT_TIMEZONE):
@@ -380,20 +382,32 @@ class TestDatelessEventKeys:
         assert master_event_key(parsed) \
             == "zenith racing series|dateless|16:15-05:00"
 
-    def test_synthesized_pattern_names_constant_covers_exactly_the_three(self):
+    def test_synthesized_pattern_names(self):
         # The review module keys off this constant; it must track the
         # matcher's _ASSUME_DATE_PATTERNS by construction.
         assert SYNTHESIZED_DATE_PATTERN_NAMES == frozenset({
             "dateless-title-time-ampm",
             "dateless-title-time-24h",
             "dateless-time-first",
+            "dateless-live-event-time-first",
         })
 
-    def test_key_stable_across_days(self):
+    @pytest.mark.parametrize(
+        ("name", "pattern"),
+        (
+            (DATELESS_AMPM, "dateless-title-time-ampm"),
+            (DATELESS_24H, "dateless-title-time-24h"),
+            (DATELESS_TIME_FIRST, "dateless-time-first"),
+            (DATELESS_LIVE_EVENT_TIME_FIRST, "dateless-live-event-time-first"),
+        ),
+    )
+    def test_key_stable_across_days(self, name, pattern):
         # THE bug: the same recurring slot name must mint the SAME key
         # tomorrow — the synthesized date never enters the key.
-        day1 = _parse_dateless(DATELESS_AMPM, now=NOW)
-        day2 = _parse_dateless(DATELESS_AMPM, now=NOW + timedelta(days=1))
+        day1 = _parse_dateless(name, now=NOW)
+        day2 = _parse_dateless(name, now=NOW + timedelta(days=1))
+        assert day1.matched_pattern == pattern
+        assert day2.matched_pattern == pattern
         assert day1.start.date() != day2.start.date()
         assert master_event_key(day1) == master_event_key(day2)
 

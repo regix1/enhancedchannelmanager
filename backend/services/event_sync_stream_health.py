@@ -1,77 +1,32 @@
-"""Which of an Event Sync promotion's candidate streams do not work.
+"""Current stream playability and confirmed retirement evidence for events.
 
-Promotion turns an unmatched provider stream into a channel, and a provider
-that lists an event it cannot actually serve used to get a channel out of it
-just the same. This module answers the one question that stops that: of the
-streams a plan is about to turn into channels, which ones are dead?
+Admission uses one three-state verdict. ``True`` requires sustained measured
+transport and complete non-dark content from the exact current stream name.
+``False`` requires a current hard failure, zero sustained transport, or
+persistent dark content. Missing, stale, future, incomplete, or mismatched
+evidence remains ``None``.
 
-Two call sites — ``channel_pipeline_executor`` for a live run and
-``routers.channel_pipeline`` for the preview — so the verdict an operator
-reads in the preview is computed by the same code the run obeys.
+Retirement is stronger. Only a scoped delisting or repeated current hard
+probe failures can retire a stream. A lone dark frame result or zero-flow
+sample can hide a channel reversibly, but cannot destroy event state.
 
-:func:`find_working_streams` answers the opposite question, and the two are
-not each other's complement. "Not dead" is the bar for ATTACHING a stream,
-because refusing an unprobed candidate would create no channels at all. A
-passing probe is the bar for DETACHING one, because a channel that is
-playing must not lose the stream serving it on anything weaker than proof
-that something else works. [51]
-
-**It reads health, it does not define it.** The rule is one sentence: a
-stream is dead when the provider has stopped listing it, and probe-derived
-signals only count once the event has started.
-
-* **Provider-stale** — Dispatcharr's M3U refresh no longer finds the stream
-  in the source playlist. Dead ALWAYS, whatever its probe history says and
-  however new the event is. This is the provider's own statement rather
-  than a verdict of ours, and a delisted stream is delisted whether or not
-  it has aired. It is also the signal that matters: this provider re-issues
-  every event under a new stream id on each refresh, so the superseded id
-  keeps the ``success`` verdict it earned while it still worked.
-* **A stored failed or timed-out probe**, and **a struck-out stream**
-  (``consecutive_failures`` at or past the configured ``strike_threshold``,
-  the same signal auto-creation's ``skip_struck_streams`` uses) — dead only
-  once the event's start time has gone by.
-* **Sampled throughput under ``min_stream_bitrate_kbps``** — dead once the
-  event's start time has gone by, and where a sample exists it overrules
-  both probe signals above, in both directions. ffprobe reads a container
-  header and stops, so it never asks whether bytes keep arriving: a stream
-  it could not parse may be carrying its event at 7 Mbps, and one it
-  parsed happily may be an offline card looping at 0.5.
-* **Never probed, or not probed recently** — never dead. About sixty of
-  some thirty-seven thousand streams have ever been probed, so treating an
-  absent verdict as a failure would reject essentially every candidate and
-  no channel would ever be created.
-
-**Why a probe verdict is ignored before the event starts:** a stream for an
-event that has not begun may fail simply because there is nothing to stream
-yet. Rejecting it would stop the channel being created at all, which is the
-opposite of what an operator wants from a health check. Staleness carries
-the whole load for a future event, and it is enough. [4][7][8]
-
-**"The event has started" is the caller's answer**, taken from the same
-parsed start ``skip_past_events`` and ``promote_lead_hours`` already read,
-so there is exactly one clock on this path and the tests can pin it.
-
-**Probing is for live runs only.** A probe writes a ``StreamStats`` row, and
-the preview endpoint promises zero writes, so the preview reads whatever
-health data already exists and probes nothing. A dry run is the same. The
-consequence is worth stating plainly: on a rule whose streams have never been
-probed, the preview shows no dead streams and the run that follows may drop
-some. The alternative was a preview that writes to the database, which is
-worse.
-
-**Fail open, always.** Every failure path here returns "nothing is dead".
-A prober that will not start, a database that will not answer, a provider
-timing out on the URL lookup — none of those are evidence that an operator's
-event has no working stream, and treating them as evidence would block real
-promotions during an outage.
+Preview calls are read-only. Live callers supply one absolute expiry for URL
+lookup, account permits, subprocesses, sampling, cleanup, and result reload.
+Expired or cancelled work cannot save or consume a late verdict.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
-from datetime import datetime, timezone
+import math
+import threading
+import time
+from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+
+from cache import get_cache
+from services.mutation_plan_store import canonical_hash
 
 logger = logging.getLogger(__name__)
 
@@ -97,69 +52,73 @@ _FAILED_PROBE_STATUSES = frozenset({"failed", "timeout"})
 # Probes needed before a failure is a verdict rather than one bad moment.
 _CONFIRMED_FAILURES = 2
 
+# Reservations must advance before URL lookup without holding a lock across
+# network or probe work. The cached positions remain advisory and bounded.
+_selection_lock = threading.Lock()
+
 
 async def find_dead_streams(
     stream_ids,
     *,
+    stream_names: Mapping[int, str],
     client=None,
     probe_missing: bool = False,
     stale_stream_ids: set[int] | None = None,
-    event_start_by_stream: dict[int, datetime] | None = None,
+    event_start_by_stream: Mapping[int, datetime] | None = None,
     probe_before: datetime | None = None,
     probe_first: set[int] | None = None,
+    expires_at: datetime | None = None,
 ) -> set[int]:
-    """Return the subset of ``stream_ids`` that has no working stream.
+    """Return streams with current, confirmed retirement evidence.
 
     Args:
         stream_ids: The candidate stream ids a promotion plan is about to
             turn into channels, plus bounded attachments already owned by
             that rule when retirement is enabled. Duplicates and ``None``
             entries are tolerated.
+        stream_names: Exact names from the caller's validated event scope.
         client: The Dispatcharr client, needed only to look up probe URLs.
             Without it nothing is probed.
-        probe_missing: Probe the candidates that have no health record yet.
-            True for a live run, False for the preview and for a dry run,
-            because a probe writes a row.
+        probe_missing: Probe missing, old, or singly failed candidates. True
+            for a live run and false for read-only preview.
         stale_stream_ids: Ids the provider has stopped listing, read off the
             ``is_stale`` flag the caller's own stream fetch already carried.
-            Every candidate in here is dead, and none of them is probed —
-            dialling a stream the playlist no longer has is exactly the
-            wasted work this saves.
-        event_start_by_stream: When the event began, for the candidates
-            whose event HAS begun. ONLY these can be marked dead by what a
-            probe left behind — a verdict or a sampled throughput, stored
-            or fresh. A candidate left out is one whose
-            event is still ahead, and a stream that has nothing to serve yet
-            is not a broken stream. The instant matters as well as the
-            membership: a stored verdict recorded before that start was
-            taken while the event still had nothing to serve, and nothing
-            re-probes a stream that already has a record, so counting it
-            would make a pre-kickoff failure permanent. [59]
+            Only started events with exact scoped names can use this proof.
+        event_start_by_stream: Authoritative start time for each event.
         probe_before: Optional earliest usable measurement for an event
-            lifecycle check. Older readings are discarded from this verdict
-            and use the same bounded missing-probe path on live runs.
-        probe_first: The candidates whose reading this run cannot do
-            without — the streams still waiting for a channel. While any of
-            them has no usable record, this run probes those alone and the
-            other candidates keep their "no verdict" reading for a later
-            run, the same way the per-run cap already holds streams back.
-            The streams already on a channel are re-probed every run once
-            ``probe_before`` is set, and there can be hundreds of them: id
-            order let them fill the cap ahead of the one new event every
-            run, and a batch that dials them all outlasts the freshness
-            window the new event's own reading has to land inside. Absent
-            or empty, every candidate competes for the budget as before.
+            lifecycle check.
+        probe_first: Candidates still waiting for a channel, which receive
+            the bounded probe budget before existing attachments.
+        expires_at: The caller-owned absolute probe expiry. Required when
+            ``probe_missing`` is true.
 
-    Never raises. Every failure path returns the streams the provider
-    already disowned and nothing else, because a database that will not
-    answer is not evidence that an operator's event has no working stream.
+    Operational failures add no retirement evidence. An invalid write call
+    without its required expiry raises ``ValueError``.
     """
     ids = sorted({sid for sid in stream_ids if sid is not None})
     if not ids:
         return set()
+    if probe_missing and expires_at is None:
+        raise ValueError("expires_at is required when probe_missing is true")
 
+    now = datetime.now(timezone.utc)
+    started = event_start_by_stream or {}
+    cutoff = _utc_time(probe_before)
+
+    def lower_bound(stream_id: int) -> datetime | None:
+        event_start = _utc_time(started.get(stream_id))
+        if event_start is None or event_start > now:
+            return None
+        return max(event_start, cutoff) if cutoff is not None else event_start
+
+    eligible = {
+        sid for sid in ids
+        if isinstance(stream_names.get(sid), str)
+        and bool(stream_names[sid])
+        and lower_bound(sid) is not None
+    }
     delisted = stale_stream_ids or set()
-    stale = {sid for sid in ids if sid in delisted}
+    stale = eligible & delisted
 
     try:
         stats = await _load_stats(ids)
@@ -172,27 +131,21 @@ async def find_dead_streams(
         return stale
 
     threshold = _strike_threshold()
-    floor_bps = _min_stream_bitrate_bps()
-    started = event_start_by_stream or {}
-    if probe_before is not None:
-        stats = dict(stats)
-        for sid in ids:
-            if sid not in stats or sid not in started:
-                continue
-            try:
-                usable = _probed_after_kickoff(stats[sid], max(started[sid], probe_before))
-            except (TypeError, ValueError):
-                usable = False
-            if not usable:
-                stats.pop(sid)
-    dead = set(stale)
-    dead |= {
-        sid for sid in ids
-        if sid in started
-        and _dead_once_started(
-            stats.get(sid), started[sid], threshold, floor_bps
+
+    def confirmed(stream_id: int, rows: Mapping[int, dict]) -> bool:
+        checked_after = lower_bound(stream_id)
+        if checked_after is None:
+            return False
+        return _dead_once_started(
+            rows.get(stream_id),
+            checked_after,
+            threshold,
+            stream_name=stream_names[stream_id],
+            now=now,
         )
-    }
+
+    dead = set(stale)
+    dead.update(sid for sid in eligible if confirmed(sid, stats))
 
     if probe_missing and client is not None:
         # A stale stream is left out: the provider has already answered
@@ -201,9 +154,22 @@ async def find_dead_streams(
         # leave behind is one nothing re-probes, so the reading taken while
         # the event had nothing to serve would decide that event forever.
         unprobed = [
-            sid for sid in ids
-            if sid not in stats and sid not in stale and sid in started
+            sid for sid in eligible
+            if sid not in stale and not confirmed(sid, stats)
+            and (
+                stats.get(sid) is None
+                or (stats[sid].get("probe_status") in _FAILED_PROBE_STATUSES)
+                or not _probed_after_kickoff(
+                    stats[sid], lower_bound(sid), now=now,
+                )
+            )
         ]
+        unprobed.sort(key=lambda sid: (
+            _utc_time((stats.get(sid) or {}).get("last_probed")) is not None,
+            _utc_time((stats.get(sid) or {}).get("last_probed"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            sid,
+        ))
         if probe_first:
             waiting = [sid for sid in unprobed if sid in probe_first]
             if waiting and len(waiting) < len(unprobed):
@@ -215,10 +181,28 @@ async def find_dead_streams(
                 )
                 unprobed = waiting
         if unprobed:
-            fresh_failures = await _probe_and_collect_failures(
-                client, unprobed, floor_bps
+            await _probe_and_collect_failures(
+                client,
+                unprobed,
+                expires_at=expires_at,
+                event_start_by_stream={
+                    sid: _utc_time(started.get(sid)) for sid in unprobed
+                },
+                stream_names={sid: stream_names[sid] for sid in unprobed},
             )
-            dead |= fresh_failures & set(started)
+            if _expired(expires_at):
+                return dead
+            try:
+                refreshed = await _load_stats(unprobed)
+            except Exception as e:
+                logger.warning(
+                    "[EVENT-SYNC] refreshed retirement health lookup failed "
+                    "(%s) — no new retirement evidence is used", e,
+                )
+            else:
+                stats = {**stats, **refreshed}
+                now = datetime.now(timezone.utc)
+                dead.update(sid for sid in unprobed if confirmed(sid, stats))
 
     return dead
 
@@ -249,15 +233,20 @@ def stale_streams_to_detach(
     return sorted(on_channel & stale_stream_ids)
 
 
-async def find_working_streams(stream_ids) -> set[int]:
-    """Return the subset of ``stream_ids`` whose last probe passed.
+async def find_working_streams(
+    stream_ids,
+    *,
+    event_start_by_stream: Mapping[int, datetime],
+    stream_names: Mapping[int, str],
+    checked_after: datetime,
+) -> set[int]:
+    """Return streams whose current transport and content are playable.
 
     Deliberately NOT the complement of :func:`find_dead_streams`. "Not
     dead" covers a stream nobody has ever probed and, before its event
     starts, one that is failing right now — neither of which is evidence
-    that anything plays. A stored ``success`` verdict is, and that is the
-    only thing a caller may act on when it is about to take a stream away
-    from a channel that is currently serving an event.
+    that anything plays. Only the collector's current ``True`` state can
+    authorize removing a stream that may still be serving an event.
 
     A live run's own probes write their rows before this reads, so a
     candidate probed to success moments earlier in the same run answers
@@ -267,24 +256,15 @@ async def find_working_streams(stream_ids) -> set[int]:
     Never raises. Every failure path returns the empty set, which reads as
     "nothing is proven to work" and leaves every channel exactly as it is.
     """
-    ids = sorted({sid for sid in stream_ids if sid is not None})
-    if not ids:
-        return set()
-
-    try:
-        stats = await _load_stats(ids)
-    except Exception as e:
-        logger.warning(
-            "[EVENT-SYNC] stream health lookup failed (%s) — no stream is "
-            "treated as proven working this run, so nothing that is "
-            "currently playing is taken off a channel", e,
-        )
-        return set()
-
-    return {
-        sid for sid in ids
-        if (stats.get(sid) or {}).get("probe_status") == "success"
-    }
+    states = await collect_stream_flow(
+        stream_ids,
+        client=None,
+        checked_after=checked_after,
+        event_start_by_stream=event_start_by_stream,
+        stream_names=stream_names,
+        expires_at=None,
+    )
+    return {sid for sid, state in states.items() if state is True}
 
 
 async def collect_stream_flow(
@@ -292,22 +272,30 @@ async def collect_stream_flow(
     *,
     client,
     checked_after: datetime,
+    event_start_by_stream: Mapping[int, datetime],
+    stream_names: Mapping[int, str],
+    expires_at: datetime | None,
     probe_missing: bool = False,
     probe_while_busy: bool = False,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[int, bool | None]:
     """Return fresh measured-flow verdicts for a bounded stream set.
 
-    ``True`` means sampled throughput reached the configured floor. ``False``
-    means a fresh sample was low, the picture was black, or the probe failed.
-    ``None`` means there is no recent measurement. Hiding is reversible, so a
-    single fresh failed probe may suppress an idle slot; destructive event
-    retirement keeps its stricter repeated-failure rule.
+    ``True`` means the same current observation proved sustained transport and
+    complete non-dark content. ``False`` means a complete observation proved
+    zero sustained transport, persistent dark content, or a hard probe
+    failure. ``None`` means the available evidence is incomplete or stale.
     """
     ids = sorted({sid for sid in stream_ids if sid is not None})
     if not ids:
         return {}
-    floor = _min_stream_bitrate_bps()
+    if probe_missing and expires_at is None:
+        raise ValueError("expires_at is required when probe_missing is true")
+
+    now = datetime.now(timezone.utc)
+    caller_cutoff = _utc_time(checked_after)
+    if caller_cutoff is None:
+        return {sid: None for sid in ids}
     try:
         stats = await _load_stats(ids)
     except Exception as e:
@@ -318,11 +306,39 @@ async def collect_stream_flow(
         )
         stats = {}
 
-    states = {
-        sid: _fresh_flow_state(stats.get(sid), checked_after, floor)
-        for sid in ids
-    }
+    def classify(stream_id: int, rows: Mapping[int, dict], at: datetime) -> bool | None:
+        event_start = _utc_time(event_start_by_stream.get(stream_id))
+        stream_name = stream_names.get(stream_id)
+        if (
+            event_start is None
+            or event_start > at
+            or not isinstance(stream_name, str)
+            or not stream_name
+        ):
+            return None
+        lower = max(event_start, caller_cutoff, at - timedelta(minutes=5))
+        return _fresh_flow_state(
+            rows.get(stream_id),
+            lower,
+            stream_name=stream_name,
+            now=at,
+        )
+
+    states = {sid: classify(sid, stats, now) for sid in ids}
     missing = [sid for sid, state in states.items() if state is None]
+    missing = [
+        sid for sid in missing
+        if _utc_time(event_start_by_stream.get(sid)) is not None
+        and _utc_time(event_start_by_stream.get(sid)) <= now
+        and isinstance(stream_names.get(sid), str)
+        and bool(stream_names[sid])
+    ]
+    missing.sort(key=lambda sid: (
+        _utc_time((stats.get(sid) or {}).get("last_probed")) is not None,
+        _utc_time((stats.get(sid) or {}).get("last_probed"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+        sid,
+    ))
     if probe_missing and missing and client is not None:
         try:
             from stream_prober import get_prober
@@ -340,8 +356,17 @@ async def collect_stream_flow(
             )
             return states
         await _probe_and_collect_failures(
-            client, missing, floor, cancelled=cancelled,
+            client,
+            missing,
+            expires_at=expires_at,
+            event_start_by_stream={
+                sid: _utc_time(event_start_by_stream[sid]) for sid in missing
+            },
+            stream_names={sid: stream_names[sid] for sid in missing},
+            cancelled=cancelled,
         )
+        if _expired(expires_at) or (cancelled is not None and cancelled()):
+            return states
         try:
             refreshed = await _load_stats(missing)
         except Exception as e:
@@ -351,10 +376,9 @@ async def collect_stream_flow(
                 e,
             )
         else:
+            now = datetime.now(timezone.utc)
             for sid in missing:
-                states[sid] = _fresh_flow_state(
-                    refreshed.get(sid), checked_after, floor,
-                )
+                states[sid] = classify(sid, refreshed, now)
     return states
 
 
@@ -366,6 +390,26 @@ async def _load_stats(stream_ids: list[int]) -> dict[int, dict]:
     return await run_in_threadpool(
         StreamProber.get_stats_by_stream_ids, stream_ids
     )
+
+
+def _utc_time(value) -> datetime | None:
+    """Return a UTC observation time, or None for an invalid value."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.rstrip("Z"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _expired(expires_at: datetime | None) -> bool:
+    """Whether the caller's one supplied attempt lifetime is over."""
+    expiry = _utc_time(expires_at)
+    return expiry is not None and datetime.now(timezone.utc) >= expiry
 
 
 def _strike_threshold() -> int:
@@ -389,48 +433,45 @@ def _strike_threshold() -> int:
         return 3
 
 
-def _min_stream_bitrate_bps() -> int:
-    """What a started event's stream must be pushing, in bits per second.
-
-    A stored ``0`` is the operator switching the throughput check off,
-    since nothing measures below zero. An unreadable setting is not that
-    statement, so it falls back to the shipped default rather than turning
-    the check off on the operator's behalf without saying so — the same
-    rule :func:`_strike_threshold` follows. [9]
-    """
-    try:
-        from config import get_settings
-
-        return int(get_settings().min_stream_bitrate_kbps or 0) * 1000
-    except Exception as e:
-        logger.warning(
-            "[EVENT-SYNC] minimum stream bitrate unreadable (%s) — using "
-            "the shipped default of 2000 kbps, because returning 0 here "
-            "would switch the throughput check off silently", e,
-        )
-        return 2000 * 1000
-
-
 def _fresh_flow_state(
     stat: dict | None,
     checked_after: datetime,
-    floor_bps: int,
+    *,
+    stream_name: str,
+    now: datetime,
 ) -> bool | None:
-    """Interpret only a recent observation of bytes or their absence."""
-    if stat is None:
+    """Interpret current, name-bound transport and content evidence."""
+    if stat is None or stat.get("stream_name") != stream_name:
         return None
-    try:
-        if _black_since_kickoff(stat, checked_after):
-            return False
-        if not _probed_after_kickoff(stat, checked_after):
-            return None
-        sampled = _sample_says_dead(stat, floor_bps)
-        if sampled is not None:
-            return not sampled
-        if stat.get("probe_status") in _FAILED_PROBE_STATUSES:
-            return False
-    except (TypeError, ValueError):
+    lower = _utc_time(checked_after)
+    upper = _utc_time(now)
+    if lower is None or upper is None or lower > upper:
         return None
+
+    probed_at = _utc_time(stat.get("last_probed"))
+    probed_current = (
+        probed_at is not None and lower <= probed_at <= upper
+    )
+
+    content_at = _utc_time(stat.get("black_screen_checked_at"))
+    content_current = (
+        content_at is not None
+        and lower <= content_at <= upper
+        and (probed_at is None or content_at >= probed_at)
+        and isinstance(stat.get("is_black_screen"), bool)
+    )
+    content = stat.get("is_black_screen") if content_current else None
+
+    if probed_current and stat.get("probe_status") in _FAILED_PROBE_STATUSES:
+        return False
+    if content is True:
+        return False
+
+    sampled = _sample_says_dead(stat) if probed_current else None
+    if sampled is True:
+        return False
+    if sampled is False and content is False:
+        return True
     return None
 
 
@@ -438,91 +479,54 @@ def _dead_once_started(
     stat: dict | None,
     started_at: datetime,
     threshold: int,
-    floor_bps: int,
+    *,
+    stream_name: str,
+    now: datetime,
 ) -> bool:
-    """Is there nothing behind this stream, now that its event is on air?
-
-    A sampled throughput answers whenever the row carries one taken at or
-    after kickoff, because it is the only thing here that watched bytes
-    arrive. At or above the floor the stream is carrying its event, and
-    under it the provider is looping an offline card or sending nothing at
-    all — two shapes of the same statement, both of which sample low.
-    ffprobe disagreed with the sampled number on 5 of 11 event streams
-    measured, in both directions, so its stored verdict decides only a row
-    with no sample of its own: one probed before kickoff, one whose sample
-    could not be taken because nothing ever answered, or one written
-    before the column existed. [10]
-    """
-    if stat is not None and _black_since_kickoff(stat, started_at):
-        return True
-    if stat is not None and _probed_after_kickoff(stat, started_at):
-        sampled = _sample_says_dead(stat, floor_bps)
-        if sampled is not None:
-            return sampled
-    return _is_struck(stat, threshold) or _probe_failed(stat, started_at)
-
-
-def _black_since_kickoff(stat: dict, started_at: datetime) -> bool:
-    """Did a look at the picture, taken during this event, find nothing on it?
-
-    Throughput cannot answer this one. A provider looping an offline card
-    sends real bytes at a real rate, so it reads at or above the floor and
-    :func:`_sample_says_dead` calls it alive — which is why this has to run
-    ahead of the sample rather than after it. The scan stamps every verdict
-    it takes, black or clear, so a slot that was dark before kickoff and is
-    carrying its event now overwrites its own flag; a reading with no stamp
-    predates the column and says nothing.
-    """
-    if not stat.get("is_black_screen"):
+    """Whether this exact stream has repeated current hard failures."""
+    if stat is None or stat.get("stream_name") != stream_name:
         return False
-    # The health table keeps naive UTC and serializes it with a Z.
-    raw = stat.get("black_screen_checked_at")
-    if not raw:
+    if stat.get("probe_status") not in _FAILED_PROBE_STATUSES:
         return False
-    checked_at = datetime.fromisoformat(raw.rstrip("Z")).replace(tzinfo=timezone.utc)
-    return checked_at >= started_at
+    if not _probed_after_kickoff(stat, started_at, now=now):
+        return False
+    return _is_struck(stat, threshold) or _probe_failed(
+        stat, started_at, now=now,
+    )
 
 
-def _sample_says_dead(stat: dict | None, floor_bps: int) -> bool | None:
-    """What the sampled throughput says, or ``None`` when it says nothing.
-
-    ``None`` for every row written before the column existed, and for a
-    probe whose sample could not be taken because nothing ever arrived.
-    Neither is a low reading, so neither may be read as one.
-
-    ``None`` too when the floor is 0, which is the operator switching the
-    throughput check off. Off means the stored probe verdict decides again
-    exactly as it did before, NOT that every sampled stream is now beyond
-    reach of it.
-
-    With no sample, ffprobe's declared bitrate still answers in ONE
-    direction. A slate that ffprobe parsed cleanly reports a real figure far
-    under the floor, and a stream declaring 0.56 Mbps against a 2 Mbps floor
-    is carrying an offline card whether or not the sampler managed to read
-    it. The reverse does not hold: a high declared figure is what the
-    provider claims rather than what it sends, and ffprobe disagreed with
-    the sampled number on 5 of 11 event streams measured, so a declaration
-    at or above the floor stays no answer at all. [40]
-    """
-    if floor_bps <= 0:
-        return None
+def _sample_says_dead(stat: dict | None) -> bool | None:
+    """Classify sustained measured flow without using declared bitrate."""
     measured = (stat or {}).get("measured_bitrate")
-    if measured is None:
-        declared = (stat or {}).get("video_bitrate")
-        if declared is not None and declared < floor_bps:
-            return True
+    if (
+        isinstance(measured, bool)
+        or not isinstance(measured, (int, float))
+        or not math.isfinite(measured)
+        or measured < 0
+    ):
         return None
-    return measured < floor_bps
+    return measured == 0
 
 
 def _is_struck(stat: dict | None, threshold: int) -> bool:
     """Has this stream failed often enough in a row to count as struck out?"""
-    if stat is None or threshold <= 0:
+    if (
+        stat is None
+        or threshold <= 0
+        or stat.get("probe_status") not in _FAILED_PROBE_STATUSES
+    ):
         return False
-    return int(stat.get("consecutive_failures") or 0) >= threshold
+    return int(stat.get("consecutive_failures") or 0) >= max(
+        _CONFIRMED_FAILURES, threshold,
+    )
 
 
-def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
+def _probe_failed(
+    stat: dict | None,
+    started_at: datetime,
+    *,
+    now: datetime | None = None,
+) -> bool:
     """Did this stream's stored probe verdict say it did not answer, twice?
 
     The sibling of :func:`_is_struck`, asking the other half of the stored
@@ -545,10 +549,15 @@ def _probe_failed(stat: dict | None, started_at: datetime) -> bool:
         return False
     if int(stat.get("consecutive_failures") or 0) < _CONFIRMED_FAILURES:
         return False
-    return _probed_after_kickoff(stat, started_at)
+    return _probed_after_kickoff(stat, started_at, now=now)
 
 
-def _probed_after_kickoff(stat: dict, started_at: datetime) -> bool:
+def _probed_after_kickoff(
+    stat: dict,
+    started_at: datetime,
+    *,
+    now: datetime | None = None,
+) -> bool:
     """Was this stream's stored row written at or after the event started?
 
     A row written while the event was still ahead was taken when there was
@@ -558,29 +567,28 @@ def _probed_after_kickoff(stat: dict, started_at: datetime) -> bool:
     not count either. [59]
     """
     # The health table keeps naive UTC and serializes it with a Z.
-    raw = stat.get("last_probed")
-    if not raw:
+    probed_at = _utc_time(stat.get("last_probed"))
+    start = _utc_time(started_at)
+    upper = _utc_time(now) if now is not None else datetime.now(timezone.utc)
+    if probed_at is None or start is None or upper is None:
         return False
-    probed_at = datetime.fromisoformat(
-        raw.rstrip("Z")).replace(tzinfo=timezone.utc)
-    return probed_at >= started_at
+    return start <= probed_at <= upper
 
 
 async def _probe_and_collect_failures(
     client,
     stream_ids: list[int],
-    floor_bps: int,
     *,
+    expires_at: datetime,
+    event_start_by_stream: Mapping[int, datetime],
+    stream_names: Mapping[int, str],
     cancelled: Callable[[], bool] | None = None,
 ) -> set[int]:
-    """Probe candidates with no health record and report the failures.
+    """Probe bounded candidates and return current conclusive failures.
 
-    A fresh probe answers the same way a stored row does: its sampled
-    throughput decides where it took one, and ffprobe's verdict decides
-    only where it could not. This is the path a live run takes for nearly
-    every candidate, because the provider re-issues each event under a new
-    stream id on every refresh, so almost nothing here has a stored row to
-    read. [9][10]
+    A fresh probe answers through the shared three-state classifier. This is
+    the path a live run takes for candidates without complete current
+    evidence.
 
     Bounded twice over: at most ``MAX_HEALTH_PROBES_PER_RUN`` streams, and
     no more at a time than the prober's own ``max_concurrent_probes``. The
@@ -589,7 +597,12 @@ async def _probe_and_collect_failures(
     """
     from stream_prober import ensure_prober
 
-    if cancelled is not None and cancelled():
+    expiry = _utc_time(expires_at)
+    if expiry is None:
+        raise ValueError("expires_at must be a valid datetime")
+    if _expired(expiry) or (cancelled is not None and cancelled()):
+        return set()
+    if not stream_ids or MAX_HEALTH_PROBES_PER_RUN <= 0:
         return set()
 
     try:
@@ -603,7 +616,7 @@ async def _probe_and_collect_failures(
     if prober is None:
         logger.info(
             "[EVENT-SYNC] no stream prober configured — %d promotion "
-            "candidate(s) with no health record are treated as working",
+            "candidate(s) keep an unknown health verdict",
             len(stream_ids),
         )
         return set()
@@ -611,7 +624,59 @@ async def _probe_and_collect_failures(
     held_back = 0
     if len(stream_ids) > MAX_HEALTH_PROBES_PER_RUN:
         held_back = len(stream_ids) - MAX_HEALTH_PROBES_PER_RUN
-        stream_ids = stream_ids[:MAX_HEALTH_PROBES_PER_RUN]
+        parsed = urlparse(str(getattr(client, "base_url", "")))
+        identity = canonical_hash({
+            "endpoint": [
+                parsed.scheme.lower(),
+                (parsed.hostname or "").lower(),
+                parsed.port,
+                parsed.path,
+            ],
+            "streams": [
+                [
+                    stream_id,
+                    stream_names[stream_id],
+                    _utc_time(event_start_by_stream[stream_id]).isoformat(),
+                ]
+                for stream_id in sorted(stream_ids)
+            ],
+        })
+        with _selection_lock:
+            if _expired(expiry) or (cancelled is not None and cancelled()):
+                return set()
+            cache = get_cache()
+            cached = cache.get("event_sync_health_positions", ttl=86400)
+            positions = dict(cached) if isinstance(cached, dict) else {}
+            monotonic_now = time.monotonic()
+            for key, position in list(positions.items()):
+                if (
+                    not isinstance(position, dict)
+                    or not isinstance(position.get("expires_at"), (int, float))
+                    or position["expires_at"] <= monotonic_now
+                    or not isinstance(position.get("stream_id"), int)
+                ):
+                    positions.pop(key, None)
+
+            position = positions.get(identity)
+            ordered = list(stream_ids)
+            if position is None:
+                retention_expiry = monotonic_now + 86400
+            else:
+                retention_expiry = position["expires_at"]
+                last_stream_id = position["stream_id"]
+                if last_stream_id in ordered:
+                    start = ordered.index(last_stream_id) + 1
+                    ordered = ordered[start:] + ordered[:start]
+
+            stream_ids = ordered[:MAX_HEALTH_PROBES_PER_RUN]
+            positions.pop(identity, None)
+            positions[identity] = {
+                "expires_at": retention_expiry,
+                "stream_id": stream_ids[-1],
+            }
+            while len(positions) > 256:
+                positions.pop(next(iter(positions)))
+            cache.set("event_sync_health_positions", positions)
         logger.warning(
             "[EVENT-SYNC] promotion health check capped at %d probe(s) this "
             "run — %d candidate stream(s) keep no health verdict and will "
@@ -619,46 +684,147 @@ async def _probe_and_collect_failures(
             MAX_HEALTH_PROBES_PER_RUN, held_back,
         )
 
-    urls = await _probe_urls(client, stream_ids)
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return set()
+    try:
+        urls = await asyncio.wait_for(
+            _probe_urls(client, stream_ids, stream_names=stream_names),
+            timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return set()
     if not urls:
         return set()
 
-    await prober.refresh_account_probe_limits()
-
-    dead: set[int] = set()
-    failures_lock = asyncio.Lock()
-    semaphore = asyncio.Semaphore(max(1, prober.max_concurrent_probes))
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return set()
+    try:
+        await asyncio.wait_for(
+            prober.refresh_account_probe_limits(), timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return set()
 
     async def _probe_one(stream_id: int, url: str, name: str, m3u_account) -> None:
-        if cancelled is not None and cancelled():
+        if _expired(expiry) or (cancelled is not None and cancelled()):
             return
-        # Respect the total probe budget as well as each account's smaller limit.
-        async with prober.semaphore_for_account(m3u_account), semaphore:
-            # A task can be cancelled while this stream waits behind another
-            # provider connection. Drop queued work after the in-flight sample
-            # releases its permit instead of making cancellation drain the batch.
-            if cancelled is not None and cancelled():
-                return
-            try:
-                result = await prober.probe_stream(stream_id, url, name)
-            except Exception as e:
-                logger.warning(
-                    "[EVENT-SYNC] health probe of stream %s raised (%s) — "
-                    "treating it as working", stream_id, e,
-                )
-                return
-            is_dead = _sample_says_dead(result, floor_bps)
-            if is_dead is None:
-                is_dead = ((result or {}).get("probe_status")
-                           in _FAILED_PROBE_STATUSES)
-            if is_dead:
-                async with failures_lock:
-                    dead.add(stream_id)
+        remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            return
+        try:
+            async with asyncio.timeout(remaining):
+                # Account and event capacity share the caller's supplied
+                # lifetime with the media work that follows.
+                async with prober.semaphore_for_account(m3u_account, event=True):
+                    if cancelled is not None and cancelled():
+                        return
+                    probe_task = asyncio.create_task(prober.probe_stream(
+                        stream_id,
+                        url,
+                        name,
+                        content=True,
+                        expires_at=expiry,
+                    ))
+                    try:
+                        while not probe_task.done():
+                            if cancelled is not None and cancelled():
+                                probe_task.cancel()
+                                break
+                            await asyncio.wait(
+                                {probe_task}, timeout=min(0.05, remaining),
+                            )
+                            remaining = (
+                                expiry - datetime.now(timezone.utc)
+                            ).total_seconds()
+                            if remaining <= 0:
+                                probe_task.cancel()
+                                break
+                        await probe_task
+                    except asyncio.CancelledError:
+                        if (
+                            (cancelled is None or not cancelled())
+                            and not _expired(expiry)
+                        ):
+                            raise
+                    except Exception as e:
+                        logger.warning(
+                            "[EVENT-SYNC] health probe of stream %s raised "
+                            "(%s) — no new verdict is used", stream_id, e,
+                        )
+                    finally:
+                        if not probe_task.done():
+                            probe_task.cancel()
+                            try:
+                                await probe_task
+                            except asyncio.CancelledError:
+                                pass
+        except asyncio.TimeoutError:
+            return
 
-    await asyncio.gather(*[
-        _probe_one(sid, url, name, account)
-        for sid, (url, name, account) in urls.items()
-    ])
+    try:
+        async with asyncio.timeout(
+            max(0, (expiry - datetime.now(timezone.utc)).total_seconds())
+        ):
+            await asyncio.gather(*[
+                _probe_one(sid, url, name, account)
+                for sid, (url, name, account, _group) in urls.items()
+            ])
+    except asyncio.TimeoutError:
+        return set()
+
+    if _expired(expiry) or (cancelled is not None and cancelled()):
+        return set()
+
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return set()
+    try:
+        current = await asyncio.wait_for(
+            _probe_urls(client, list(urls), stream_names=stream_names),
+            timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return set()
+
+    unchanged = [
+        sid for sid, original in urls.items()
+        if sid in current and current[sid][1:] == original[1:]
+    ]
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return set()
+    try:
+        stats = await asyncio.wait_for(
+            _load_stats(unchanged), timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return set()
+    except Exception as e:
+        logger.warning(
+            "[EVENT-SYNC] probed stream health reload failed (%s) — no new "
+            "failure verdict is used", e,
+        )
+        return set()
+
+    classified_at = datetime.now(timezone.utc)
+    if classified_at >= expiry:
+        return set()
+    dead = {
+        sid for sid in unchanged
+        if (
+            (event_start := _utc_time(event_start_by_stream.get(sid)))
+            is not None
+            and event_start <= classified_at
+            and _fresh_flow_state(
+                stats.get(sid),
+                max(event_start, classified_at - timedelta(minutes=5)),
+                stream_name=stream_names[sid],
+                now=classified_at,
+            ) is False
+        )
+    }
     logger.info(
         "[EVENT-SYNC] promotion health check probed %d candidate stream(s), "
         "%d had nothing behind them", len(urls), len(dead),
@@ -666,7 +832,12 @@ async def _probe_and_collect_failures(
     return dead
 
 
-async def _probe_urls(client, stream_ids: list[int]) -> dict[int, tuple]:
+async def _probe_urls(
+    client,
+    stream_ids: list[int],
+    *,
+    stream_names: Mapping[int, str],
+) -> dict[int, tuple]:
     """Playback url and name per stream id, for the ones that have a url.
 
     A stream the provider no longer lists, or one with no url at all, is
@@ -688,11 +859,20 @@ async def _probe_urls(client, stream_ids: list[int]) -> dict[int, tuple]:
         for stream in streams or []:
             stream_id = stream.get("id")
             url = stream.get("url")
-            if stream_id is None or not url:
+            name = stream.get("name")
+            if (
+                stream_id is None
+                or not url
+                or not isinstance(name, str)
+                or name != stream_names.get(stream_id)
+            ):
                 continue
             urls[stream_id] = (
                 url,
-                stream.get("name") or f"Stream {stream_id}",
+                name,
                 stream.get("m3u_account"),
+                stream.get("stream_group")
+                or stream.get("stream_group_id")
+                or stream.get("group_id"),
             )
     return urls

@@ -17,7 +17,7 @@
  * Follows the isolated-render pattern of ./SettingsTab.digest.test.tsx.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 
 vi.mock('../../services/api', () => ({
   getSettings: vi.fn(),
@@ -267,10 +267,8 @@ describe('SettingsTab notification credentials — redacted read (bead 9ej7f)', 
 
     renderOnNotifications();
 
-    await waitFor(() => expect(api.getSettings).toHaveBeenCalled());
-    await waitFor(() => {
-      expect(screen.getByLabelText('Webhook URL')).toHaveValue('');
-    });
+    await waitFor(() => expect(badgeFor('Discord Webhook')).toHaveTextContent('Configured'));
+    expect(screen.getByLabelText('Webhook URL')).toHaveValue('');
     expect(screen.getByLabelText('Bot Token')).toHaveValue('');
     expect(screen.getByLabelText('Chat ID')).toHaveValue('');
   });
@@ -312,16 +310,31 @@ describe('SettingsTab notification credentials — redacted read (bead 9ej7f)', 
   });
 
   it('sends the untouched (empty) values back so the backend can preserve them', async () => {
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
-      discord_configured: true,
-      discord_webhook_url: '',
-      telegram_configured: true,
-      telegram_bot_token: '',
-      telegram_chat_id: '',
-    }));
+    let complete!: () => void;
+    const request = new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+      complete = () => resolve(makeSettings({
+        discord_configured: true,
+        discord_webhook_url: '',
+        telegram_configured: true,
+        telegram_bot_token: '',
+        telegram_chat_id: '',
+      }));
+    });
+    vi.mocked(api.getSettings).mockReturnValueOnce(request);
 
     renderOnNotifications();
     await waitFor(() => expect(api.getSettings).toHaveBeenCalled());
+    expect(badgeFor('Discord Webhook')).toHaveTextContent('Unconfigured');
+    expect(api.saveSettings).not.toHaveBeenCalled();
+
+    const completion = waitFor(() => {
+      expect(badgeFor('Discord Webhook')).toHaveTextContent('Configured');
+    });
+    await act(async () => {
+      complete();
+      await request;
+    });
+    await completion;
 
     await saveSettingsPage();
 

@@ -12,6 +12,7 @@ import secrets
 import time
 import zlib
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -394,7 +395,12 @@ async def get_program_poster(program_id: int):
 # EPG Refresh helpers
 # ---------------------------------------------------------------------------
 
-async def _poll_epg_refresh_completion(source_id: int, source_name: str, initial_updated):
+async def _poll_epg_refresh_completion(
+    source_id: int,
+    source_name: str,
+    initial_updated,
+    expires_at: datetime,
+):
     """Report only source refreshes whose completion was observed."""
     from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
 
@@ -403,7 +409,7 @@ async def _poll_epg_refresh_completion(source_id: int, source_name: str, initial
         completed = await wait_for_epg_source_refresh(
             get_client(), source_id, source_name,
             poll_interval=REFRESH_POLL_INTERVAL_SECONDS,
-            max_wait=EPG_REFRESH_MAX_WAIT_SECONDS,
+            expires_at=expires_at,
             initial_source={"updated_at": initial_updated},
             trigger=False,
         )
@@ -454,12 +460,17 @@ async def refresh_epg_source(source_id: int):
 
         # Trigger the refresh (returns immediately, refresh happens in background)
         result = await client.refresh_epg_source(source_id)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=EPG_REFRESH_MAX_WAIT_SECONDS
+        )
         elapsed_ms = (time.time() - start) * 1000
         logger.debug("[EPG-REFRESH] Triggered refresh for source %s in %.1fms", source_id, elapsed_ms)
 
         # Spawn background task to poll for completion and send notification
         asyncio.create_task(
-            _poll_epg_refresh_completion(source_id, source_name, initial_updated)
+            _poll_epg_refresh_completion(
+                source_id, source_name, initial_updated, expires_at,
+            )
         )
 
         logger.info("[EPG-REFRESH] Triggered refresh for '%s', polling for completion in background", source_name)

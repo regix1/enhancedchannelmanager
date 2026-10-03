@@ -677,7 +677,7 @@ class TestCircuitBreakerCoversEventSync:
     """
 
     def test_crashed_manual_event_sync_run_trips_the_breaker(
-        self, test_session
+        self, test_session, tmp_path
     ):
         from task_engine import _abandon_orphaned_auto_creation_executions
 
@@ -689,9 +689,12 @@ class TestCircuitBreakerCoversEventSync:
         test_session.commit()
         crashed_id = crashed.id
 
-        with patch("config.save_settings") as mock_save, \
-             patch("config.get_settings", return_value=MagicMock(
-                 auto_creation_run_on_refresh_disabled=False)):
+        settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
+                             auto_creation_hard_restart_streak=1)
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings") as mock_save, \
+             patch("config.settings_file_allows_startup_writes", return_value=True), \
+             patch("config.get_settings", return_value=settings):
             abandoned = _abandon_orphaned_auto_creation_executions(
                 session=test_session
             )
@@ -700,9 +703,11 @@ class TestCircuitBreakerCoversEventSync:
         test_session.expire_all()
         row = test_session.get(ChannelPipelineExecution, crashed_id)
         assert row.status == "abandoned"
-        # The persisted breaker flag was written (tripped).
-        mock_save.assert_called_once()
-        assert (mock_save.call_args.args[0]
+        # One write advances the hard-restart streak and the next trips the
+        # breaker. Both values must survive the restart that detected them.
+        assert mock_save.call_count == 2
+        assert settings.auto_creation_hard_restart_streak == 2
+        assert (mock_save.call_args_list[-1].args[0]
                 .auto_creation_run_on_refresh_disabled is True)
 
     @pytest.mark.asyncio

@@ -54,10 +54,11 @@ finds when they go looking during an incident.
 BINDING
 -------
 Because there is no published subject image digest to bind to, this document
-binds to what it can actually be checked against: the exact bytes of every
-manifest it was derived from. ``sbom/vX.Y.Z/index.json`` records the SHA-256 of
-each source manifest, and ``verify`` regenerates the documents from the working
-tree and byte-compares them. Editing a requirement without regenerating,
+binds to what it can actually be checked against: the UTF-8 text of every
+manifest it was derived from, with line endings normalized while reading.
+``sbom/vX.Y.Z/index.json`` records each source manifest's SHA-256, and ``verify``
+regenerates the documents from the working tree and byte-compares them. Editing
+a requirement without regenerating,
 hand-editing a document, or committing a document for the wrong version all fail
 the check. The only field carried over from the committed document rather than
 recomputed is ``creationInfo.created``, which is a timestamp and cannot be
@@ -167,7 +168,9 @@ def _read_json(path: Path) -> Any:
         raise SbomError(f"{path} is not valid JSON: {exc.msg}") from exc
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, *, text: bool = False) -> str:
+    if text:
+        return hashlib.sha256(_read_text(path).encode("utf-8")).hexdigest()
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
@@ -618,14 +621,18 @@ def render(root: Path, version: str, created: str) -> dict[str, Any]:
             _read_text(root / requirements_path), requirements_path
         )
         images = parse_dockerfile_images(_read_text(root / dockerfile_path), dockerfile_path)
-        sources[requirements_path] = sha256_file(root / requirements_path)
-        sources[dockerfile_path] = sha256_file(root / dockerfile_path)
+        sources[requirements_path] = sha256_file(
+            root / requirements_path, text=True
+        )
+        sources[dockerfile_path] = sha256_file(root / dockerfile_path, text=True)
         npm: list[dict[str, Any]] = []
         if spec["lockfile"]:
             npm = parse_lockfile_packages(
                 _read_json(root / spec["lockfile"]), spec["lockfile"]
             )
-            sources[spec["lockfile"]] = sha256_file(root / spec["lockfile"])
+            sources[spec["lockfile"]] = sha256_file(
+                root / spec["lockfile"], text=True
+            )
         documents[subject] = build_document(
             subject=subject,
             subject_name=spec["subject_name"],

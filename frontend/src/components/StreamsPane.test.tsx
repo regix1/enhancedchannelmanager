@@ -552,7 +552,10 @@ describe('StreamsPane create-in menu replaces the right-click context menu (bead
 
   it('supports the full keyboard-only single-stream flow: Tab to selector, Space selects, Create in… reachable and activatable', async () => {
     const user = userEvent.setup();
-    renderEditPane();
+    renderEditPane({
+      streams: STREAMS.filter(s => s.id === 4),
+      streamGroups: STREAM_GROUPS.filter(g => g.name === 'US | News'),
+    });
     await user.click(screen.getByRole('button', { name: /Expand all groups/i }));
 
     // Tab from the toolbar to the stream's selector — no pointer involved.

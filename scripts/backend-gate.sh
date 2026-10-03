@@ -9,7 +9,7 @@
 # collected tests:
 #
 #   documented in backend/CLAUDE.md   pytest tests/                  11304 collected
-#   actually run by CI                pytest --ignore=... -m ...     11232 collected
+#   canonical local gate              pytest --ignore=... -m ...     11232 collected
 #
 # Nothing was failing, so this was an instrument gap rather than a live
 # defect — but it is the false-green class. An agent could report "backend
@@ -19,10 +19,10 @@
 #
 # WHICH ONE WON, AND WHY
 # ----------------------
-# This script mirrors CI, because CI is what decides the PR. A local gate that
-# runs a *different* set than the required check is not a gate, whichever
-# direction the difference runs. The 72 extra tests the prose command
-# collected are not extra coverage:
+# This script defines the canonical local backend gate. A hand-typed command
+# that runs a different set is not the gate, whichever direction the
+# difference runs. The 72 extra tests the prose command collected are not
+# extra gate coverage:
 #
 #   tests/e2e/          (10 files) needs a live ECM container on localhost:6100.
 #                       Without one it self-skips; with one it exercises
@@ -30,12 +30,12 @@
 #                       whose result depends on unrelated local state cannot
 #                       gate anything. Deferred to bead
 #                       enhancedchannelmanager-2lw25.
-#   tests/performance/  (2 files)  seeds 250k rows; runs in the dedicated
-#                       perf-benchmarks workflow (bd-skqln.10).
+#   tests/performance/  (2 files)  seeds 250k rows; run it explicitly as a
+#                       local performance suite (bd-skqln.10).
 #
 # `backend/tests/unit/test_backend_gate_contract.py` asserts this script's
-# invocation still matches .github/workflows/test.yml flag for flag, so the
-# two cannot drift apart again.
+# invocation still matches the exact local flag contract, so copied commands
+# cannot redefine the gate.
 #
 # USAGE
 #   scripts/backend-gate.sh                 # the gate
@@ -138,14 +138,14 @@ cat >&2 <<EOF
 === BACKEND GATE ===
 interpreter : $PY ($PY_SOURCE)
 tree        : $REPO_ROOT
-excluded    : tests/e2e         needs a live container on :6100 (bead 2lw25)
-              tests/performance runs in perf-benchmarks (bd-skqln.10)
+excluded    : tests/e2e         needs an explicitly selected live container on :6100 (bead 2lw25)
+              tests/performance runs only when selected locally (bd-skqln.10)
 deselected  : the 2 tests marked 'slow' — named in docs/testing.md
               § "What the backend gate excludes, and why"
 EOF
 
-# ---- THE INVOCATION. Mirrors .github/workflows/test.yml "Run pytest". ----
-# Kept in sync by backend/tests/unit/test_backend_gate_contract.py.
+# ---- THE CANONICAL LOCAL INVOCATION. ----
+# Its exact flags are pinned by backend/tests/unit/test_backend_gate_contract.py.
 exec "$PY" -m pytest \
     --ignore=tests/e2e \
     --ignore=tests/performance \

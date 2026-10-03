@@ -43,9 +43,10 @@ tests/routers/test_event_sync_preview.py).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -114,6 +115,25 @@ SECONDARY_B_NAME = GROUP_NAMES[SECONDARY_B]
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _clock(value):
+    class ClockType(type):
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, datetime)
+
+    class Clock(metaclass=ClockType):
+        min = datetime.min
+        fromisoformat = datetime.fromisoformat
+
+        @classmethod
+        def now(cls, tz=None):
+            current = value() if callable(value) else value
+            if tz is None:
+                return current.replace(tzinfo=None) if current.tzinfo else current
+            return current.astimezone(tz)
+
+    return Clock
 
 
 # =========================================================================
@@ -1530,6 +1550,1501 @@ class TestLivePromotion:
         assert "1 promoted, 0 promoted-adopted" in line
 
 
+def _staged_event(db_session_factory, monkeypatch):
+    """Configure one current healthy event with an enabled generated guide."""
+    from models import DummyEPGProfile
+    from services import event_sync_stream_health
+    from tests.unit import test_event_sync_dummy_epg as dummy_epg
+
+    profile_id = dummy_epg.PROFILE_ID
+    source_id = dummy_epg.DUMMY_SOURCE_ID
+    session = db_session_factory()
+    try:
+        profile = DummyEPGProfile(
+            id=profile_id,
+            name="Promoted events",
+            enabled=True,
+            name_source="channel",
+            event_timezone="US/Eastern",
+            output_timezone="UTC",
+            program_duration=180,
+        )
+        profile.set_channel_group_ids([MASTER_GROUP_ID])
+        profile.set_epg_source_ids([source_id])
+        session.add(profile)
+        session.commit()
+    finally:
+        session.close()
+
+    config = _promote_config(dummy_epg_profile_id=profile_id)
+    rule_id = _add_rule(db_session_factory, config)
+    state = _promote_state()
+    event_start = datetime.now(EASTERN).replace(second=0, microsecond=0) \
+        - timedelta(minutes=1)
+    event_name = (
+        "DAZN 05: Fury vs. Usyk @ "
+        + event_start.strftime("%d %b %I:%M %p ET")
+    )
+    state.secondary_streams[SECONDARY_B_NAME][0]["name"] = event_name
+    event_channel_name = promoted_channel_name(
+        _parsed("Fury vs. Usyk", event_start)
+    )
+    client = make_promote_client(state)
+    create_channel = client.create_channel.side_effect
+
+    async def create_with_uuid(request):
+        channel = await create_channel(request)
+        channel["uuid"] = f"event-{channel['id']}"
+        state.channels[channel["id"]]["uuid"] = channel["uuid"]
+        return copy.deepcopy(channel)
+
+    client.create_channel.side_effect = create_with_uuid
+    flow_expires = []
+    collect_stream_flow = event_sync_stream_health.collect_stream_flow
+
+    async def collect_and_capture(*args, **kwargs):
+        flow_expires.append(kwargs["expires_at"])
+        return await collect_stream_flow(*args, **kwargs)
+
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "collect_stream_flow",
+        collect_and_capture,
+    )
+    observed_at = datetime.now(timezone.utc)
+    health = {
+        7301: {
+            "stream_name": event_name,
+            "probe_status": "success",
+            "measured_bitrate": 5_000_000,
+            "last_probed": observed_at.isoformat(),
+            "is_black_screen": False,
+            "black_screen_checked_at": observed_at.isoformat(),
+        },
+    }
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_load_stats",
+        AsyncMock(side_effect=lambda ids: {
+            stream_id: copy.deepcopy(health[stream_id])
+            for stream_id in ids
+            if stream_id in health
+        }),
+    )
+    return {
+        "profile_id": profile_id,
+        "source_id": source_id,
+        "rule_id": rule_id,
+        "state": state,
+        "event_start": event_start,
+        "event_name": event_name,
+        "event_channel_name": event_channel_name,
+        "client": client,
+        "dummy_epg": dummy_epg,
+        "flow_expires": flow_expires,
+    }
+
+
+def test_pending_guide_preserves_channel_id(db_session_factory, monkeypatch):
+    """A first guide-owned promotion stays staged until exact import proof."""
+    from models import DummyEPGProfile
+    from services import epg_publication
+
+    setup = _staged_event(db_session_factory, monkeypatch)
+    profile_id = setup["profile_id"]
+    rule_id = setup["rule_id"]
+    state = setup["state"]
+    event_start = setup["event_start"]
+    event_channel_name = setup["event_channel_name"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    flow_expires = setup["flow_expires"]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, event_channel_name),
+        ],
+    )
+
+    publication_snapshots = []
+    refresh_snapshots = []
+    refresh_expires = []
+    first_publish = regenerate.side_effect
+
+    async def publish_before_cancel(**kwargs):
+        publication_snapshots.append(copy.deepcopy(
+            kwargs["publications"][profile_id]
+        ))
+        return await first_publish(**kwargs)
+
+    async def cancel_import(*args, **kwargs):
+        refresh_expires.append(kwargs["expires_at"])
+        raise asyncio.CancelledError
+
+    regenerate.side_effect = publish_before_cancel
+    wait_refresh.side_effect = cancel_import
+
+    with patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = event_start + timedelta(minutes=1)
+        with pytest.raises(asyncio.CancelledError):
+            dummy_epg._manual_run(
+                client,
+                db_session_factory,
+                regenerate,
+                wait_refresh,
+            )
+
+    client.create_channel.assert_awaited_once()
+    create_request = client.create_channel.await_args.args[0]
+    assert create_request["hidden_from_output"] is True
+    assert create_request["streams"] == []
+    assert state.channels[900]["uuid"] == "event-900"
+    assert state.channels[900]["streams"] == []
+    assert state.channels[900]["hidden_from_output"] is True
+    assert "epg_data_id" not in state.channels[900]
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=db_session_factory,
+    ):
+        cancelled_publication = epg_publication.read_publication(
+            f"profile:{profile_id}"
+        )
+    cancelled_receipt = next(iter(
+        cancelled_publication["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert cancelled_receipt["stage"] == "allocated"
+    assert cancelled_receipt["channel_id"] == 900
+    assert cancelled_receipt["channel_uuid"] == "event-900"
+
+    resume_client = make_promote_client(state, next_channel_id=901)
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        resume_client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, event_channel_name),
+        ],
+    )
+    publish = regenerate.side_effect
+    complete_refresh = wait_refresh.complete_refresh
+
+    async def publish_and_capture(**kwargs):
+        publication_snapshots.append(copy.deepcopy(
+            kwargs["publications"][profile_id]
+        ))
+        return await publish(**kwargs)
+
+    async def refresh_and_capture(*args, **kwargs):
+        refresh_expires.append(kwargs["expires_at"])
+        completed = await complete_refresh(*args, **kwargs)
+        current = epg_publication.read_publication(
+            f"profile:{profile_id}"
+        )
+        refresh_snapshots.append(copy.deepcopy(current))
+        if len(refresh_snapshots) == 2:
+            receipt = next(iter(
+                current["state"]["delivery"]["pending_channels"].values()
+            ))
+            state.guide_programmes[:] = [{
+                "tvg_id": "ecm-900",
+                "title": receipt["title"],
+                "start": receipt["start"],
+                "stop": receipt["stop"],
+            }]
+        return completed
+
+    regenerate.side_effect = publish_and_capture
+    wait_refresh.side_effect = refresh_and_capture
+    with patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = event_start + timedelta(minutes=1)
+        result = dummy_epg._manual_run(
+            resume_client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    assert result["success"] is True
+    summary = result["event_sync"][0]["promotion"]
+    assert summary["promoted_created"] == 0
+    assert summary["promoted_adopted"] == 1
+    assert summary["streams_attached"] == 1
+    assert summary["guide_pending"] == 0
+    resume_client.create_channel.assert_not_awaited()
+    channel = state.channels[900]
+    assert channel["uuid"] == "event-900"
+    assert channel["epg_data_id"] == 502
+    assert channel["streams"] == [7301]
+    assert channel["hidden_from_output"] is False
+    assert _managed_ids(db_session_factory, rule_id) == [900]
+
+    session = db_session_factory()
+    try:
+        saved_profile = session.get(DummyEPGProfile, profile_id)
+        assert saved_profile.get_channel_group_ids() == [
+            MASTER_GROUP_ID,
+            PROMOTE_GROUP_ID,
+        ]
+    finally:
+        session.close()
+
+    assert len(publication_snapshots) == 2
+    assert len(refresh_snapshots) == 2
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=db_session_factory,
+    ):
+        final_publication = epg_publication.read_publication(
+            f"profile:{profile_id}"
+        )
+    snapshots = [
+        publication_snapshots[0],
+        cancelled_publication,
+        publication_snapshots[1],
+        *refresh_snapshots,
+        final_publication,
+    ]
+    receipts = [
+        next(iter(row["state"]["delivery"]["pending_channels"].values()))
+        for row in snapshots
+    ]
+    stable_fields = {
+        "attempt_id",
+        "attempt_no",
+        "input_hash",
+        "admitted_at",
+        "expires_at",
+        "guide_attempt_id",
+        "history",
+        "channel_id",
+        "channel_uuid",
+        "event_key",
+        "rule_id",
+        "rule_hash",
+        "config_hash",
+        "profile_id",
+        "target_group_id",
+        "title",
+        "start",
+        "stop",
+        "streams",
+        "channel_name",
+        "execution_id",
+    }
+    expected_fields = {
+        name: receipts[0][name]
+        for name in stable_fields
+    }
+    assert all(
+        {name: receipt[name] for name in stable_fields} == expected_fields
+        for receipt in receipts[1:]
+    )
+    assert [receipt["stage"] for receipt in receipts] == [
+        "allocated",
+        "allocated",
+        "allocated",
+        "allocated",
+        "importing",
+        "complete",
+    ]
+    final_receipt = receipts[-1]
+    assert final_receipt["channel_id"] == 900
+    assert final_receipt["channel_uuid"] == "event-900"
+    assert final_receipt["reason"] is None
+    assert final_receipt["terminal_at"] is not None
+    assert final_receipt["retry_at"] is None
+    guide_expires = datetime.fromisoformat(
+        final_publication["state"]["delivery"]["guide_attempt"]["expires_at"]
+    )
+    assert refresh_expires == [guide_expires, guide_expires, guide_expires]
+    assert (
+        final_publication["state"]["delivery"]["guide_attempt"]["config_hash"]
+        == final_publication["state"]["config_hash"]
+    )
+    assert final_receipt["config_hash"] != final_publication["state"]["config_hash"]
+    receipt_expires = datetime.fromisoformat(final_receipt["expires_at"])
+    assert receipt_expires in flow_expires
+
+
+def test_failed_import_keeps_event_hidden(db_session_factory, monkeypatch):
+    """A failed programme import retains the owned staged allocation."""
+    from services import epg_publication
+
+    setup = _staged_event(db_session_factory, monkeypatch)
+    profile_id = setup["profile_id"]
+    state = setup["state"]
+    event_start = setup["event_start"]
+    event_channel_name = setup["event_channel_name"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    state.channels[50] = {
+        "id": 50,
+        "uuid": "manual-50",
+        "name": "Operator channel",
+        "channel_group_id": PROMOTE_GROUP_ID,
+        "streams": [888],
+        "epg_data_id": 999,
+        "logo_id": 88,
+    }
+    manual_channel = copy.deepcopy(state.channels[50])
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, event_channel_name),
+        ],
+    )
+    complete_refresh = wait_refresh.complete_refresh
+    imports = {"count": 0}
+
+    async def fail_after_link(*args, **kwargs):
+        imports["count"] += 1
+        if imports["count"] == 1:
+            completed = await complete_refresh(*args, **kwargs)
+            state.channels[900]["logo_id"] = 77
+            return completed
+        raise RuntimeError("programme import unavailable")
+
+    wait_refresh.side_effect = fail_after_link
+    with patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = event_start + timedelta(minutes=1)
+        result = dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    assert result["success"] is False
+    assert imports["count"] == 2
+    client.create_channel.assert_awaited_once()
+    channel = state.channels[900]
+    assert channel["uuid"] == "event-900"
+    assert channel["epg_data_id"] == 502
+    assert channel["logo_id"] == 77
+    assert channel["streams"] == []
+    assert channel["hidden_from_output"] is True
+    assert state.channels[50] == manual_channel
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=db_session_factory,
+    ):
+        publication = epg_publication.read_publication(
+            f"profile:{profile_id}"
+        )
+    receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert receipt["stage"] == "failed"
+    assert receipt["reason"] == "programme_missing"
+    assert receipt["channel_id"] == 900
+    assert receipt["channel_uuid"] == "event-900"
+    assert receipt["terminal_at"] is not None
+    assert receipt["retry_at"] is not None
+
+
+def test_profile_change_loses_group_claim_without_external_mutation(
+    db_session_factory,
+    monkeypatch,
+):
+    """A profile edit wins cleanly over the staged group-add claim."""
+    from models import DummyEPGProfile
+    from services import epg_publication
+
+    setup = _staged_event(db_session_factory, monkeypatch)
+    profile_id = setup["profile_id"]
+    state = setup["state"]
+    event_start = setup["event_start"]
+    event_channel_name = setup["event_channel_name"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, event_channel_name),
+        ],
+    )
+    add_groups = epg_publication.add_groups
+    publications = []
+
+    def change_profile_then_lose(*args, **kwargs):
+        publications.append(copy.deepcopy(
+            epg_publication.read_publication(f"profile:{profile_id}")
+        ))
+        session = db_session_factory()
+        try:
+            profile = session.get(DummyEPGProfile, profile_id)
+            profile.name = "Externally changed"
+            session.commit()
+        finally:
+            session.close()
+        result = add_groups(*args, **kwargs)
+        publications.append(copy.deepcopy(
+            epg_publication.read_publication(f"profile:{profile_id}")
+        ))
+        return result
+
+    monkeypatch.setattr(
+        epg_publication,
+        "add_groups",
+        change_profile_then_lose,
+    )
+    with patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = event_start + timedelta(minutes=1)
+        result = dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    assert result["success"] is False
+    assert publications[1] == publications[0]
+    assert publications[0]["state"]["delivery"]["pending_channels"]
+    client.create_channel.assert_awaited_once()
+    regenerate.assert_not_awaited()
+    client.refresh_epg_source.assert_not_awaited()
+    channel = state.channels[900]
+    assert channel["uuid"] == "event-900"
+    assert channel["streams"] == []
+    assert channel["hidden_from_output"] is True
+    assert "epg_data_id" not in channel
+    receipt = next(iter(
+        publications[1]["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert receipt["stage"] == "allocated"
+    assert receipt["channel_id"] == 900
+    assert receipt["channel_uuid"] == "event-900"
+    session = db_session_factory()
+    try:
+        profile = session.get(DummyEPGProfile, profile_id)
+        assert profile.name == "Externally changed"
+        assert profile.get_channel_group_ids() == [MASTER_GROUP_ID]
+    finally:
+        session.close()
+
+
+def _read_event_publication(session_factory, profile_id):
+    from services import epg_publication
+
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=session_factory,
+    ):
+        return epg_publication.read_publication(f"profile:{profile_id}")
+
+
+class _DeadlineLock:
+    def __init__(self, current, expires_at, target):
+        self.current = current
+        self.expires_at = expires_at
+        self.target = target
+        self.entries = 0
+
+    async def __aenter__(self):
+        self.entries += 1
+        if self.entries == self.target:
+            self.current[0] = self.expires_at
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _CancelledLock:
+    async def __aenter__(self):
+        raise asyncio.CancelledError
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+def _pending_completion(db_session_factory, monkeypatch):
+    setup = _staged_event(db_session_factory, monkeypatch)
+    profile_id = setup["profile_id"]
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+    )
+    finish = ActionExecutor._finish_event_promotions
+    captured = []
+
+    async def pause(executor):
+        captured.append(executor)
+        raise asyncio.CancelledError
+
+    with patch.object(ActionExecutor, "_finish_event_promotions", new=pause), \
+         patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = setup["event_start"] + timedelta(minutes=1)
+        with pytest.raises(asyncio.CancelledError):
+            dummy_epg._manual_run(
+                client,
+                db_session_factory,
+                regenerate,
+                wait_refresh,
+            )
+
+    assert len(captured) == 1
+    executor = captured[0]
+    assert len(executor._event_pending) == 1
+    publication = _read_event_publication(db_session_factory, profile_id)
+    receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert receipt["stage"] == "importing"
+    assert state.channels[900]["hidden_from_output"] is True
+    assert state.channels[900]["streams"] == []
+    return setup, executor, finish
+
+
+def _add_pending_sibling(setup, executor, session_factory):
+    from models import DummyEPGProfile
+    from services.epg_publication import begin_delivery
+    from tasks.event_visibility import _source_refresh_key
+
+    profile_id = setup["profile_id"]
+    current = _read_event_publication(session_factory, profile_id)
+    first_key = next(iter(executor._event_pending))
+    first_receipt = current["state"]["delivery"]["pending_channels"][first_key]
+    work = executor._event_pending[first_key]
+    source = next(
+        row for row in executor._epg_sources
+        if row.get("id") == work["source_id"]
+    )
+    _, endpoint_hash, source_url_hash = _source_refresh_key(
+        executor.client,
+        source,
+        current["scope"],
+    )
+    sibling_key = f"{first_key}|sibling"
+    candidate = {
+        "event_key": sibling_key,
+        "rule_id": first_receipt["rule_id"],
+        "rule_hash": first_receipt["rule_hash"],
+        "profile_id": profile_id,
+        "target_group_id": first_receipt["target_group_id"],
+        "title": "Sibling event",
+        "start": first_receipt["start"],
+        "stop": first_receipt["stop"],
+        "streams": copy.deepcopy(first_receipt["streams"]),
+        "channel_name": "Sibling Event",
+        "channel_id": 901,
+        "channel_uuid": "event-901",
+        "execution_id": first_receipt["execution_id"],
+        "source_hashes": [{
+            "endpoint_hash": endpoint_hash,
+            "source_url_hash": source_url_hash,
+        }],
+        "owner_proven": True,
+        "channel_exists": True,
+        "health_playable": True,
+    }
+    setup["state"].channels[901] = {
+        "id": 901,
+        "uuid": "event-901",
+        "name": "Sibling Event",
+        "channel_group_id": PROMOTE_GROUP_ID,
+        "streams": [],
+        "hidden_from_output": True,
+    }
+    executor._pipeline_managed_channel_ids.add(901)
+    session = session_factory()
+    try:
+        profile = session.get(DummyEPGProfile, profile_id).to_dict()
+        rule = session.get(ChannelPipelineRule, setup["rule_id"])
+        rule.set_managed_channel_ids([900, 901])
+        session.commit()
+    finally:
+        session.close()
+    now = datetime.fromisoformat(first_receipt["admitted_at"]) + timedelta(seconds=1)
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=session_factory,
+    ):
+        admitted = begin_delivery(
+            current["scope"],
+            expected_revision=current["revision"],
+            expected_hash=current["state"]["xmltv_hash"],
+            profile=profile,
+            now=now,
+            pending_channels={sibling_key: candidate},
+        )
+    assert admitted is not None
+    return admitted, first_key, sibling_key, now
+
+
+def test_expiry_during_the_completion_grid_closes_only_its_receipt(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    profile_id = setup["profile_id"]
+    client = setup["client"]
+    state = setup["state"]
+    before = _read_event_publication(db_session_factory, profile_id)
+    event_key, before_receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(before_receipt["expires_at"])
+    current = [datetime.fromisoformat(before_receipt["admitted_at"])]
+    grid = client.get_epg_grid.side_effect
+    observed = []
+
+    async def expire_during_grid(*args, **kwargs):
+        observed.append(_read_event_publication(
+            db_session_factory,
+            profile_id,
+        ))
+        current[0] = expires_at
+        return await grid(*args, **kwargs)
+
+    client.get_epg_grid.side_effect = expire_during_grid
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    after = _read_event_publication(db_session_factory, profile_id)
+    after_receipt = after["state"]["delivery"]["pending_channels"][event_key]
+    assert observed == [before]
+    immutable = {
+        "event_key", "rule_id", "rule_hash", "config_hash", "profile_id",
+        "target_group_id", "title", "start", "stop", "streams",
+        "channel_name", "channel_id", "channel_uuid", "execution_id",
+        "attempt_id", "attempt_no", "input_hash", "admitted_at",
+        "expires_at", "guide_attempt_id", "history",
+    }
+    assert {
+        name: after_receipt[name] for name in immutable
+    } == {
+        name: before_receipt[name] for name in immutable
+    }
+    assert after_receipt["stage"] == "expired"
+    assert after_receipt["reason"] == "guide_expired"
+    assert after_receipt["terminal_at"] == expires_at.isoformat()
+    assert datetime.fromisoformat(after_receipt["retry_at"]) == (
+        expires_at + timedelta(minutes=5)
+    )
+    assert after["revision"] == before["revision"] + 1
+    assert after["state"]["delivery"]["guide_attempt"]["stage"] == "expired"
+    assert state.channels[900]["hidden_from_output"] is True
+    assert state.channels[900]["streams"] == []
+    assert all(
+        payload.get("hidden_from_output") is not False
+        and "streams" not in payload
+        for channel_id, payload in state.update_channel_calls
+        if channel_id == 900
+    )
+
+
+def test_fresh_completion_keeps_the_existing_success_path(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    before = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].items()
+    ))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    completed = after["state"]["delivery"]["pending_channels"][event_key]
+    assert completed["stage"] == "complete"
+    assert completed["reason"] is None
+    assert completed["terminal_at"] == current.isoformat()
+    assert completed["retry_at"] is None
+    assert setup["state"].channels[900]["hidden_from_output"] is False
+    assert setup["state"].channels[900]["streams"] == [7301]
+
+
+def test_expiry_after_flow_stops_before_link_or_channel_mutation(
+    db_session_factory,
+    monkeypatch,
+):
+    from services import event_sync_stream_health
+
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    collect = event_sync_stream_health.collect_stream_flow
+
+    async def expire_after_flow(*args, **kwargs):
+        result = await collect(*args, **kwargs)
+        current[0] = expires_at
+        return result
+
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "collect_stream_flow",
+        expire_after_flow,
+    )
+    setup["client"].get_channel.reset_mock()
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    assert after["state"]["delivery"]["pending_channels"][event_key][
+        "stage"
+    ] == "expired"
+    assert setup["client"].get_channel.await_count == 1
+    assert setup["state"].channels[900]["streams"] == []
+    assert setup["state"].channels[900]["hidden_from_output"] is True
+
+
+@pytest.mark.parametrize("boundary,target,stale", [
+    ("linking", 1, False),
+    ("attach", 2, False),
+    ("stale_removal", 3, True),
+    ("reveal", 3, False),
+    ("completion", 4, False),
+])
+def test_expiry_at_a_publication_guard_closes_outside_the_lock(
+    boundary,
+    target,
+    stale,
+    db_session_factory,
+    monkeypatch,
+):
+    from services import epg_publication
+
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    work = executor._event_pending[event_key]
+    if stale:
+        parsed = work["unit"].rows[0].result.parsed
+        stale_row = ResolvedStream(
+            stream=SecondaryStream(
+                name="Delisted Fury stream",
+                group_id=SECONDARY_B,
+                stream_id=7399,
+                provider="Prov",
+                provider_id=2,
+                is_stale=True,
+            ),
+            result=StreamMatchResult(
+                stream_name="Delisted Fury stream",
+                parsed=parsed,
+            ),
+            disposition=DISPOSITION_UNMATCHED,
+            best=None,
+        )
+        work["stale_rows"] = {7399: stale_row}
+        work["unit_stream_ids"].add(7399)
+        setup["state"].channels[900]["streams"] = [7399]
+
+    deadline_lock = _DeadlineLock(current, expires_at, target)
+    monkeypatch.setattr(epg_publication, "publication_lock", deadline_lock)
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    closed = after["state"]["delivery"]["pending_channels"][event_key]
+    assert deadline_lock.entries > target
+    assert closed["stage"] == "expired", boundary
+    assert closed["reason"] == "guide_expired"
+    assert closed["terminal_at"] == expires_at.isoformat()
+    if boundary in {"linking", "attach"}:
+        assert setup["state"].channels[900]["streams"] == []
+    elif stale:
+        assert 7399 in setup["state"].channels[900]["streams"]
+    else:
+        assert setup["state"].channels[900]["streams"] == [7301]
+    if boundary != "completion":
+        assert setup["state"].channels[900]["hidden_from_output"] is True
+
+
+@pytest.mark.parametrize("mutation", ["attach", "reveal"])
+def test_an_admitted_mutation_that_outlives_expiry_starts_no_followup(
+    mutation,
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    client = setup["client"]
+    client.get_channel.reset_mock()
+    if mutation == "attach":
+        attach = executor._add_stream_to_channel
+
+        async def attach_then_expire(*args, **kwargs):
+            result = await attach(*args, **kwargs)
+            current[0] = expires_at
+            return result
+
+        monkeypatch.setattr(
+            executor,
+            "_add_stream_to_channel",
+            attach_then_expire,
+        )
+    else:
+        update = client.update_channel.side_effect
+
+        async def reveal_then_expire(channel_id, changes):
+            result = await update(channel_id, changes)
+            if changes.get("hidden_from_output") is False:
+                current[0] = expires_at
+            return result
+
+        client.update_channel.side_effect = reveal_then_expire
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    assert after["state"]["delivery"]["pending_channels"][event_key][
+        "stage"
+    ] == "expired"
+    assert setup["state"].channels[900]["streams"] == [7301]
+    assert client.get_channel.await_count == (2 if mutation == "attach" else 3)
+    assert setup["state"].channels[900]["hidden_from_output"] is (
+        mutation == "attach"
+    )
+
+
+@pytest.mark.parametrize("read_number,expire,expected_stage", [
+    (1, False, "failed"),
+    (1, True, "expired"),
+    (3, False, "failed"),
+    (3, True, "expired"),
+    (4, False, "failed"),
+    (4, True, "expired"),
+])
+def test_channel_read_failure_uses_live_failure_or_expiry(
+    read_number,
+    expire,
+    expected_stage,
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    client = setup["client"]
+    get_channel = client.get_channel.side_effect
+    reads = {"count": 0}
+
+    async def fail_selected_read(channel_id):
+        reads["count"] += 1
+        if reads["count"] == read_number:
+            if expire:
+                current[0] = expires_at
+            raise RuntimeError("channel unavailable")
+        return await get_channel(channel_id)
+
+    client.get_channel.side_effect = fail_selected_read
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    closed = after["state"]["delivery"]["pending_channels"][event_key]
+    assert reads["count"] == read_number
+    assert closed["stage"] == expected_stage
+    assert closed["reason"] == (
+        "guide_expired" if expire else "channel_missing"
+    )
+    assert closed["retry_at"] is not None
+
+
+@pytest.mark.parametrize("stages,changes,guide_stage", [
+    (
+        {"allocated"},
+        {
+            "stage": "expired",
+            "reason": "guide_expired",
+            "terminal_at": "2026-01-01T00:00:00+00:00",
+            "retry_at": None,
+            "detail": "extra",
+        },
+        None,
+    ),
+    (
+        {"allocated"},
+        {
+            "stage": "expired",
+            "reason": "guide_failed",
+            "terminal_at": "2026-01-01T00:00:00+00:00",
+            "retry_at": None,
+        },
+        None,
+    ),
+    (
+        {"allocated"},
+        {
+            "stage": "expired",
+            "reason": "guide_expired",
+            "terminal_at": "2026-01-01T00:00:00+00:00",
+            "retry_at": None,
+        },
+        "linking",
+    ),
+    (
+        {"allocated", "complete"},
+        {
+            "stage": "expired",
+            "reason": "guide_expired",
+            "terminal_at": "2026-01-01T00:00:00+00:00",
+            "retry_at": None,
+        },
+        None,
+    ),
+    (
+        set(),
+        {
+            "stage": "expired",
+            "reason": "guide_expired",
+            "terminal_at": "2026-01-01T00:00:00+00:00",
+            "retry_at": None,
+        },
+        None,
+    ),
+])
+def test_expired_writer_accepts_only_its_terminal_shape(
+    stages,
+    changes,
+    guide_stage,
+):
+    executor = ActionExecutor(MagicMock(), [])
+
+    with pytest.raises(ValueError, match="Invalid expired event receipt transition"):
+        _run(executor._write_event_receipt(
+            {},
+            "event",
+            stages,
+            changes,
+            guide_stage=guide_stage,
+        ))
+
+
+def test_fresh_receipt_cannot_use_the_expired_writer(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, _ = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    before = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].items()
+    ))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    channel = copy.deepcopy(setup["state"].channels[900])
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        closed = _run(executor._write_event_receipt(
+            before,
+            event_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": current.isoformat(),
+                "retry_at": (current + timedelta(minutes=5)).isoformat(),
+            },
+            channel=channel,
+        ))
+
+    assert closed is None
+    assert _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    ) == before
+
+
+def test_receipt_guard_keeps_live_and_expired_authority_separate(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, _ = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    channel = copy.deepcopy(setup["state"].channels[900])
+    live_at = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(live_at)):
+        assert executor._event_receipt_current(
+            publication,
+            event_key,
+            channel=channel,
+        ) is not None
+        assert executor._event_receipt_current(
+            publication,
+            event_key,
+            channel=channel,
+            expired=True,
+        ) is None
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(expires_at)):
+        assert executor._event_receipt_current(
+            publication,
+            event_key,
+            channel=channel,
+        ) is None
+        assert executor._event_receipt_current(
+            publication,
+            event_key,
+            channel=channel,
+            expired=True,
+        ) is not None
+        assert executor._event_receipt_current(
+            publication,
+            event_key,
+            channel_missing=True,
+            expired=True,
+        ) is not None
+
+
+@pytest.mark.parametrize("mismatch", [
+    "revision",
+    "xmltv_hash",
+    "config_hash",
+    "guide_attempt",
+    "receipt_attempt",
+    "profile_disabled",
+    "profile_changed",
+    "rule_disabled",
+    "rule_changed",
+    "managed_channel",
+    "channel_group",
+    "channel_uuid",
+    "missing_channel",
+    "missing_channel_with_evidence",
+    "replacement",
+])
+def test_expired_writer_cannot_close_a_mismatched_owner(
+    mismatch,
+    db_session_factory,
+    monkeypatch,
+):
+    from models import DummyEPGProfile
+
+    setup, executor, _ = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    profile_id = setup["profile_id"]
+    expected = _read_event_publication(db_session_factory, profile_id)
+    event_key, receipt = next(iter(
+        expected["state"]["delivery"]["pending_channels"].items()
+    ))
+    expected = copy.deepcopy(expected)
+    channel = copy.deepcopy(setup["state"].channels[900])
+    channel_missing = False
+    durable_before = copy.deepcopy(expected)
+
+    if mismatch == "revision":
+        expected["revision"] += 1
+    elif mismatch == "xmltv_hash":
+        expected["state"]["xmltv_hash"] = "0" * 64
+    elif mismatch == "config_hash":
+        expected["state"]["config_hash"] = "0" * 64
+    elif mismatch == "guide_attempt":
+        expected["state"]["delivery"]["guide_attempt"]["attempt_id"] = "0" * 32
+    elif mismatch == "receipt_attempt":
+        expected["state"]["delivery"]["pending_channels"][event_key][
+            "attempt_id"
+        ] = "0" * 32
+    elif mismatch in {
+        "profile_disabled", "profile_changed", "rule_disabled",
+        "rule_changed", "managed_channel",
+    }:
+        session = db_session_factory()
+        try:
+            profile = session.get(DummyEPGProfile, profile_id)
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            if mismatch == "profile_disabled":
+                profile.enabled = False
+            elif mismatch == "profile_changed":
+                profile.name = "Changed profile"
+            elif mismatch == "rule_disabled":
+                rule.enabled = False
+            elif mismatch == "rule_changed":
+                config = rule.get_event_sync_config()
+                config["max_promote_per_run"] = 24
+                rule.set_event_sync_config(config)
+            else:
+                rule.set_managed_channel_ids([])
+            session.commit()
+        finally:
+            session.close()
+    elif mismatch == "channel_group":
+        channel["channel_group_id"] += 1
+    elif mismatch == "channel_uuid":
+        channel["uuid"] = "replacement-900"
+    elif mismatch == "missing_channel":
+        channel = None
+    elif mismatch == "missing_channel_with_evidence":
+        channel_missing = True
+    else:
+        live_at = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+        with patch("database.get_session", side_effect=db_session_factory), \
+             patch(
+                 "services.epg_publication.get_session",
+                 side_effect=db_session_factory,
+             ), \
+             patch("channel_pipeline_executor.datetime", _clock(live_at)):
+            replacement = _run(executor._write_event_receipt(
+                expected,
+                event_key,
+                {"allocated", "importing", "linking", "ready"},
+                {"stage": "linking", "reason": "guide_pending"},
+                guide_stage="linking",
+                channel=channel,
+            ))
+        assert replacement is not None
+        durable_before = replacement
+
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(expires_at)):
+        closed = _run(executor._write_event_receipt(
+            expected,
+            event_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": expires_at.isoformat(),
+                "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+            },
+            channel=channel,
+            channel_missing=channel_missing,
+        ))
+
+    assert closed is None
+    assert _read_event_publication(db_session_factory, profile_id) == durable_before
+
+
+@pytest.mark.parametrize("phase", ["guide", "flow", "lock"])
+def test_completion_cancellation_never_writes_expiry(
+    phase,
+    db_session_factory,
+    monkeypatch,
+):
+    from services import epg_publication, event_sync_stream_health
+
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    profile_id = setup["profile_id"]
+    before = _read_event_publication(db_session_factory, profile_id)
+    receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].values()
+    ))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    if phase == "guide":
+        setup["client"].get_epg_grid.side_effect = asyncio.CancelledError()
+    elif phase == "flow":
+        monkeypatch.setattr(
+            event_sync_stream_health,
+            "collect_stream_flow",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+    else:
+        monkeypatch.setattr(
+            epg_publication,
+            "publication_lock",
+            _CancelledLock(),
+        )
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        with pytest.raises(asyncio.CancelledError):
+            _run(finish(executor))
+
+    assert _read_event_publication(db_session_factory, profile_id) == before
+    assert setup["state"].channels[900]["hidden_from_output"] is True
+    assert setup["state"].channels[900]["streams"] == []
+
+
+def test_expiring_one_receipt_keeps_an_active_sibling_and_is_idempotent(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, _ = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication, first_key, sibling_key, _ = _add_pending_sibling(
+        setup,
+        executor,
+        db_session_factory,
+    )
+    first = publication["state"]["delivery"]["pending_channels"][first_key]
+    expires_at = datetime.fromisoformat(first["expires_at"])
+    first_channel = copy.deepcopy(setup["state"].channels[900])
+    sibling_channel = copy.deepcopy(setup["state"].channels[901])
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(expires_at)):
+        first_closed = _run(executor._write_event_receipt(
+            publication,
+            first_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": expires_at.isoformat(),
+                "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+            },
+            channel=first_channel,
+        ))
+        assert first_closed is not None
+        assert first_closed["state"]["delivery"]["pending_channels"][
+            sibling_key
+        ]["stage"] == "allocated"
+        assert first_closed["state"]["delivery"]["guide_attempt"]["stage"] \
+            not in {"complete", "expired", "failed"}
+        repeated = _run(executor._write_event_receipt(
+            first_closed,
+            first_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": expires_at.isoformat(),
+                "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+            },
+            channel=first_channel,
+        ))
+        assert repeated is None
+        both_closed = _run(executor._write_event_receipt(
+            first_closed,
+            sibling_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": expires_at.isoformat(),
+                "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+            },
+            channel=sibling_channel,
+        ))
+
+    assert both_closed is not None
+    assert both_closed["state"]["delivery"]["guide_attempt"]["stage"] == "expired"
+    assert _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    ) == both_closed
+
+
+def test_mixed_terminal_receipts_fail_the_shared_guide_attempt(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, _ = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication, first_key, sibling_key, live_at = _add_pending_sibling(
+        setup,
+        executor,
+        db_session_factory,
+    )
+    sibling_channel = copy.deepcopy(setup["state"].channels[901])
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(live_at)):
+        completed = _run(executor._write_event_receipt(
+            publication,
+            sibling_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "complete",
+                "reason": None,
+                "terminal_at": live_at.isoformat(),
+                "retry_at": None,
+            },
+            channel=sibling_channel,
+        ))
+    assert completed is not None
+    first = completed["state"]["delivery"]["pending_channels"][first_key]
+    expires_at = datetime.fromisoformat(first["expires_at"])
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(expires_at)):
+        mixed = _run(executor._write_event_receipt(
+            completed,
+            first_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": "expired",
+                "reason": "guide_expired",
+                "terminal_at": expires_at.isoformat(),
+                "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+            },
+            channel=copy.deepcopy(setup["state"].channels[900]),
+        ))
+
+    assert mixed is not None
+    pending = mixed["state"]["delivery"]["pending_channels"]
+    assert pending[first_key]["stage"] == "expired"
+    assert pending[sibling_key]["stage"] == "complete"
+    assert mixed["state"]["delivery"]["guide_attempt"]["stage"] == "failed"
+
+
 class TestIdempotence:
     """AC-3: re-run creates nothing; cross-provider same-key streams share
     one channel."""
@@ -1942,18 +3457,27 @@ class TestDelistedStreamSwap:
         ``probed_at`` is when that record was written, defaulting to the run
         instant. The health table stores it as naive UTC.
         """
+        observed_at = (probed_at or now).astimezone(
+            pytz.utc
+        ).replace(tzinfo=None).isoformat() + "Z"
         stats = {self.REPLACEMENT_ID: {
             "stream_id": self.REPLACEMENT_ID,
+            "stream_name": STREAM_FURY_ALT,
             "probe_status": replacement_status,
             "consecutive_failures": 2 if replacement_status == "failed" else 0,
-            "last_probed": (probed_at or now).astimezone(
-                pytz.utc).replace(tzinfo=None).isoformat() + "Z",
+            "measured_bitrate": 5_000_000 if replacement_status == "success" else 0,
+            "last_probed": observed_at,
+            "is_black_screen": False if replacement_status == "success" else None,
+            "black_screen_checked_at": (
+                observed_at if replacement_status == "success" else None
+            ),
         }}
 
         def _stats_for(stream_ids):
             return {sid: stats[sid] for sid in stream_ids if sid in stats}
 
         with patch("channel_pipeline_executor.datetime") as promote_clock, \
+             patch("services.event_sync_stream_health.datetime", _clock(now)), \
              patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_for):
             promote_clock.now.return_value = now
@@ -1973,7 +3497,7 @@ class TestDelistedStreamSwap:
         # positive evidence that this channel keeps playing without the
         # stream the provider dropped.
         result, _ = self._run_at(
-            client, db_session_factory, FROZEN_NOW,
+            client, db_session_factory, FROZEN_NOW + timedelta(hours=12),
             replacement_status="success",
         )
 
@@ -2013,7 +3537,7 @@ class TestDelistedStreamSwap:
         client.get_channel = _get_channel_after_a_late_addition
 
         result, _ = self._run_at(
-            client, db_session_factory, FROZEN_NOW,
+            client, db_session_factory, FROZEN_NOW + timedelta(hours=12),
             replacement_status="success",
         )
 
@@ -2045,9 +3569,7 @@ class TestDelistedStreamSwap:
 
         promo = result["event_sync"][0]["promotion"]
         assert promo["stale_streams_removed"] == 0
-        assert state.stream_ids_of(850) == [
-            self.STALE_ID, self.REPLACEMENT_ID,
-        ]
+        assert state.stream_ids_of(850) == [self.STALE_ID]
         assert 850 in promo["channel_ids"]
 
     def test_the_delisted_stream_stays_when_nobody_has_probed_the_replacement(
@@ -2120,10 +3642,8 @@ class TestDelistedStreamSwap:
         )
 
         promo = result["event_sync"][0]["promotion"]
-        assert promo["skipped_all_dead"] == 0
-        assert state.stream_ids_of(850) == [
-            self.STALE_ID, self.REPLACEMENT_ID,
-        ]
+        assert promo["skipped_all_dead"] == 1
+        assert state.stream_ids_of(850) == [self.STALE_ID]
 
     def test_an_event_whose_only_stream_is_delisted_creates_nothing(
         self, db_session_factory
@@ -2180,8 +3700,8 @@ class TestDelistedStreamSwap:
         result, _ = self._run_at(client, db_session_factory, FROZEN_NOW)
 
         promo = result["event_sync"][0]["promotion"]
-        assert promo["dead_streams_skipped"] == 0
-        assert promo["skipped_all_dead"] == 0
+        assert promo["dead_streams_skipped"] == 1
+        assert promo["skipped_all_dead"] == 1
         assert 850 in promo["channel_ids"]
 
     def test_a_dry_run_removes_nothing_and_reports_what_it_would_do(
@@ -2195,7 +3715,8 @@ class TestDelistedStreamSwap:
         client = make_promote_client(state)
 
         result, _ = self._run_at(
-            client, db_session_factory, FROZEN_NOW, dry_run=True,
+            client, db_session_factory, FROZEN_NOW + timedelta(hours=12),
+            dry_run=True,
             replacement_status="success",
         )
 
@@ -2231,7 +3752,7 @@ class TestDelistedStreamSwap:
         client = make_promote_client(state)
 
         result, _ = self._run_at(
-            client, db_session_factory, FROZEN_NOW,
+            client, db_session_factory, FROZEN_NOW + timedelta(hours=12),
             replacement_status="success",
         )
 
@@ -2255,7 +3776,7 @@ class TestDelistedStreamSwap:
         client = make_promote_client(state)
 
         self._run_at(
-            client, db_session_factory, FROZEN_NOW,
+            client, db_session_factory, FROZEN_NOW + timedelta(hours=12),
             replacement_status="success",
         )
 
@@ -2300,12 +3821,19 @@ class TestDelistedStreamSwap:
         """
         state = self._swap_state()
         client = make_promote_client(state)
+        preview_now = FROZEN_NOW + timedelta(hours=12)
         stats = {self.REPLACEMENT_ID: {
             "stream_id": self.REPLACEMENT_ID,
+            "stream_name": STREAM_FURY_ALT,
             "probe_status": "success",
             "consecutive_failures": 0,
-            "last_probed": FROZEN_NOW.astimezone(pytz.utc).replace(
+            "measured_bitrate": 5_000_000,
+            "last_probed": preview_now.astimezone(pytz.utc).replace(
                 tzinfo=None).isoformat() + "Z",
+            "is_black_screen": False,
+            "black_screen_checked_at": preview_now.astimezone(
+                pytz.utc
+            ).replace(tzinfo=None).isoformat() + "Z",
         }}
 
         def _stats_for(stream_ids):
@@ -2314,9 +3842,10 @@ class TestDelistedStreamSwap:
         with patch("routers.channel_pipeline.get_client",
                    return_value=client), \
              patch("routers.channel_pipeline.datetime") as preview_clock, \
+             patch("services.event_sync_stream_health.datetime", _clock(preview_now)), \
              patch("stream_prober.StreamProber.get_stats_by_stream_ids",
                    _stats_for):
-            preview_clock.now.return_value = FROZEN_NOW
+            preview_clock.now.return_value = preview_now
             resp = await async_client.post(
                 "/api/channel-pipeline/event-sync-preview",
                 json={"event_sync_config": _promote_config(
@@ -2905,7 +4434,7 @@ class TestEventSyncAssignChannelProfile:
 def retirement(db_session_factory, monkeypatch):
     from datetime import timezone
     from models import DummyEPGProfile
-    from services import epg_programmes, event_sync_stream_health
+    from services import epg_programmes, epg_publication, event_sync_stream_health
 
     now = datetime(2026, 7, 12, 4, tzinfo=timezone.utc)
     db = db_session_factory()
@@ -2933,6 +4462,10 @@ def retirement(db_session_factory, monkeypatch):
                "start": (now - timedelta(hours=1)).isoformat(),
                "stop": (now - timedelta(minutes=30)).isoformat()}
     source = {"source_id": 50, "status": "ready", "last_success": now.isoformat()}
+    epg_sources = [{
+        "id": 50,
+        "url": f"https://dispatcharr.invalid/api/dummy-epg/xmltv/{profile.id}",
+    }]
 
     async def prepare(profiles, channels, client, **kwargs):
         return [], {"sources": [source], "channels": [
@@ -2940,24 +4473,86 @@ def retirement(db_session_factory, monkeypatch):
         ]}
 
     monkeypatch.setattr(database, "get_session", db_session_factory)
+    monkeypatch.setattr(epg_publication, "get_session", db_session_factory)
     monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
     monkeypatch.setattr(event_sync_stream_health, "_load_stats", AsyncMock(side_effect=lambda ids: stats.copy()))
-    monkeypatch.setattr(event_sync_stream_health, "_min_stream_bitrate_bps", lambda: 2000000)
-    executor = ActionExecutor(client, list(state.channels.values()), managed_channel_ids=[900])
+    executor = ActionExecutor(
+        client,
+        list(state.channels.values()),
+        managed_channel_ids=[900],
+        epg_sources=epg_sources,
+    )
     yield dict(now=now, rule=rule, config=config, state=state, client=client, streams=streams,
                stats=stats, witness=witness, source=source, executor=executor, db=db,
-               session_factory=db_session_factory)
+               session_factory=db_session_factory, epg_sources=epg_sources)
     db.close()
 
 
 async def _retire(setup, dry_run=False):
     executor, rule = setup["executor"], setup["rule"]
-    _, states = await executor._event_lifecycle(rule.id, setup["config"], (), setup["now"])
+    _, states = await executor._event_lifecycle(
+        rule.id,
+        setup["config"],
+        (),
+        setup["now"],
+        flow=setup.get("flow", {}),
+        expires_at=setup["now"] + timedelta(minutes=5),
+    )
     engine = ChannelPipelineEngine(setup["client"])
     result = {"channels_removed": 0, "channels_moved": 0, "dry_run_results": [], "execution_log": []}
     with patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]):
         await engine._reconcile_orphans([rule], {rule.id: []}, executor, None, result, dry_run)
     return states, result
+
+
+@pytest.mark.asyncio
+async def test_health_that_consumes_the_lifetime_starts_no_lifecycle_read(
+    retirement,
+    monkeypatch,
+):
+    from channel_pipeline_executor import ExecutionContext
+    from services import epg_programmes
+    from types import SimpleNamespace
+
+    setup = retirement
+    executor = setup["executor"]
+    current = [setup["now"]]
+    expires_at = setup["now"] + timedelta(seconds=60)
+    row = _resolved(
+        STREAM_FURY,
+        DISPOSITION_UNMATCHED,
+        _parsed("Fury vs. Usyk", START),
+        provider_id=2,
+        stream_id=7301,
+        group_id=SECONDARY_B,
+    )
+
+    async def consume(*args, **kwargs):
+        assert kwargs["expires_at"] == expires_at
+        current[0] = expires_at
+        return {7301: True}, set()
+
+    monkeypatch.setattr(executor, "_event_health", AsyncMock(side_effect=consume))
+    setup["client"].get_streams_by_ids.reset_mock()
+    epg_programmes.prepare_profiles.reset_mock()
+    with patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ):
+        result = await executor._execute_event_sync_promotion(
+            setup["rule"].id,
+            setup["rule"].name,
+            setup["config"],
+            SimpleNamespace(resolved=[row]),
+            ExecutionContext(),
+        )
+
+    assert result["event_states"] == [{"channel_id": 900, "status": "unknown"}]
+    assert result["channel_ids"] == [900]
+    setup["client"].get_streams_by_ids.assert_not_awaited()
+    epg_programmes.prepare_profiles.assert_not_awaited()
+    setup["client"].create_channel.assert_not_awaited()
+    setup["client"].update_channel.assert_not_awaited()
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -3042,13 +4637,26 @@ async def test_event_preview_keeps_the_failed_stream_filter(async_client, retire
         {"id": 7302, "name": STREAM_FURY_ALT, "m3u_account": 2},
     ]
     setup["stats"].update({
-        7301: {"probe_status": "success", "measured_bitrate": 5000000, "last_probed": setup["now"].isoformat()},
-        7302: {"probe_status": "failed", "measured_bitrate": 1000, "last_probed": setup["now"].isoformat()},
+        7301: {
+            "stream_name": STREAM_FURY,
+            "probe_status": "success",
+            "measured_bitrate": 5000000,
+            "last_probed": setup["now"].isoformat(),
+            "is_black_screen": False,
+            "black_screen_checked_at": setup["now"].isoformat(),
+        },
+        7302: {
+            "stream_name": STREAM_FURY_ALT,
+            "probe_status": "failed",
+            "measured_bitrate": 0,
+            "last_probed": setup["now"].isoformat(),
+        },
     })
     setup["witness"]["stop"] = (setup["now"] + timedelta(hours=1)).isoformat()
     with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
          patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
-         patch("routers.channel_pipeline.datetime") as clock:
+         patch("routers.channel_pipeline.datetime") as clock, \
+         patch("services.event_sync_stream_health.datetime", _clock(setup["now"])):
         clock.now.return_value = setup["now"]
         response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
     assert response.status_code == 200, response.text
@@ -3135,6 +4743,8 @@ async def test_event_with_no_guide_listing_retires_when_every_stream_is_dead(ret
     setup["witness"].clear()
     _, states = await setup["executor"]._event_lifecycle(
         setup["rule"].id, setup["config"], (), setup["now"], {7301},
+        flow={},
+        expires_at=setup["now"] + timedelta(minutes=5),
     )
     assert states[900] == "idle"
 
@@ -3206,10 +4816,10 @@ async def test_bare_managed_slot_retires_through_the_live_promotion_path(retirem
         )
 
     assert promotion["event_states"] == [
-        {"channel_id": 900, "status": "idle"},
+        {"channel_id": 900, "status": "unknown"},
     ]
-    assert result["channels_removed"] == 1
-    assert 900 not in setup["state"].channels
+    assert result["channels_removed"] == 0
+    assert 900 in setup["state"].channels
     assert setup["streams"][0]["id"] == 7301
 
 
@@ -3250,9 +4860,9 @@ async def test_bare_managed_slot_preview_matches_the_live_retirement(retirement,
     assert response.status_code == 200, response.text
     promotion = response.json()["promotion"]
     assert promotion["event_states"] == [
-        {"channel_id": 900, "status": "idle"},
+        {"channel_id": 900, "status": "unknown"},
     ]
-    assert len(promotion["retirements"]) == 1
+    assert promotion["retirements"] == []
     setup["client"].delete_channel.assert_not_awaited()
 
 
@@ -3266,6 +4876,8 @@ async def test_a_live_stream_keeps_its_channel_whether_or_not_a_sibling_died(ret
                              "updated_at": (setup["now"] - timedelta(minutes=1)).isoformat()})
     _, states = await setup["executor"]._event_lifecycle(
         setup["rule"].id, setup["config"], (), setup["now"], dead,
+        flow={7302: True},
+        expires_at=setup["now"] + timedelta(minutes=5),
     )
     assert states[900] != "idle"
 
@@ -3302,7 +4914,7 @@ async def test_event_retirement_holds_unknown_or_conflicting_evidence(retirement
         setup["streams"][0]["name"] = "Ended"
     elif case == "old_stream_active":
         setup["streams"][0].update(name=STREAM_FURY, is_stale=True)
-        setup["stats"][7301] = {"measured_bitrate": 5000000, "last_probed": setup["now"].isoformat()}
+        setup["flow"] = {7301: True}
     elif case == "mixed_providers":
         setup["executor"]._channel_by_id[900]["streams"].append(7302)
         setup["streams"].append({"id": 7302, "name": STREAM_FURY, "updated_at": setup["now"].isoformat()})
@@ -3384,7 +4996,13 @@ async def test_later_valid_event_can_use_the_retained_stream(retirement, stale_m
     now = setup["now"] + timedelta(hours=1)
     name = "DAZN 05: Fury vs. Usyk @ 12 Jul 01:00 AM ET"
     setup["streams"][0].update(name=name, updated_at=now.isoformat())
-    setup["stats"][7301] = {"measured_bitrate": 5000000, "last_probed": now.isoformat()}
+    setup["stats"][7301] = {
+        "stream_name": name,
+        "measured_bitrate": 5000000,
+        "last_probed": now.isoformat(),
+        "is_black_screen": False,
+        "black_screen_checked_at": now.isoformat(),
+    }
     if stale_measurement:
         setup["config"]["skip_dead_streams"] = True
         setup["stats"][7301].update(measured_bitrate=1000, last_probed=(now - timedelta(minutes=10)).isoformat())
@@ -3394,17 +5012,31 @@ async def test_later_valid_event_can_use_the_retained_stream(retirement, stale_m
     parsed = _parsed("Fury vs. Usyk", start)
     row = _resolved(name, DISPOSITION_UNMATCHED, parsed, provider_id=2, stream_id=7301)
     setup["config"]["max_promote_per_run"] = 1
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
     old = [_resolved("old", DISPOSITION_UNMATCHED, _parsed(title, now - timedelta(days=2)), stream_id=sid)
            for sid, title in [(10, "Alpha"), (11, "Beta")]]
-    executor = ActionExecutor(setup["client"], list(setup["state"].channels.values()), managed_channel_ids=[])
+    executor = ActionExecutor(
+        setup["client"],
+        list(setup["state"].channels.values()),
+        managed_channel_ids=[],
+        epg_sources=setup["epg_sources"],
+    )
     after_probe = now + timedelta(seconds=5)
-    async def refreshed(client, ids, floor):
+    async def refreshed(client, ids, **kwargs):
         assert ids == [7301]
-        setup["stats"][7301].update(measured_bitrate=5000000, last_probed=after_probe.isoformat())
+        setup["stats"][7301].update(
+            measured_bitrate=5000000,
+            last_probed=after_probe.isoformat(),
+            is_black_screen=False,
+            black_screen_checked_at=after_probe.isoformat(),
+        )
         return set()
     with patch("channel_pipeline_executor.datetime") as clock, \
+         patch("services.event_sync_stream_health.datetime", _clock(after_probe)), \
          patch("services.event_sync_stream_health._probe_and_collect_failures", new=AsyncMock(side_effect=refreshed)) as probe:
-        clock.now.side_effect = [now, after_probe]
+        times = iter([now])
+        clock.now.side_effect = lambda *args: next(times, after_probe)
         clock.fromisoformat.side_effect = datetime.fromisoformat
         result = await executor._execute_event_sync_promotion(
             setup["rule"].id, setup["rule"].name, setup["config"], SimpleNamespace(resolved=[*old, row]), ExecutionContext(),
@@ -3414,7 +5046,17 @@ async def test_later_valid_event_can_use_the_retained_stream(retirement, stale_m
     assert result["promoted_created"] == 1
     assert result["channel_ids"]
     assert setup["streams"][0]["id"] == 7301
-    assert 7301 in setup["state"].channels[result["channel_ids"][0]]["streams"]
+    channel_id = result["channel_ids"][0]
+    channel = setup["state"].channels[channel_id]
+    assert channel["streams"] == []
+    assert channel["hidden_from_output"] is True
+    assert result["guide_pending"] == 1
+    from services.epg_publication import read_publication
+    publication = read_publication(f'profile:{setup["config"]["dummy_epg_profile_id"]}')
+    receipt = next(iter(publication["state"]["delivery"]["pending_channels"].values()))
+    assert receipt["stage"] == "allocated"
+    assert receipt["channel_id"] == channel_id
+    assert [stream["id"] for stream in receipt["streams"]] == [7301]
 
 
 @pytest.mark.asyncio
@@ -3439,29 +5081,54 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
           "m3u_account": 2, "is_stale": False, "updated_at": now.isoformat()}]
     setup["witness"].update(start=now.isoformat(), stop=(now + timedelta(hours=2)).isoformat())
     setup["config"]["max_promote_per_run"] = 1
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
     client = make_promote_client(setup["state"], next_channel_id=901)
     client.get_streams_by_ids = setup["client"].get_streams_by_ids
     client.get_channel_stats = setup["client"].get_channel_stats
-    rows = [_resolved("old", DISPOSITION_UNMATCHED, old, stream_id=sid) for sid in old_ids]
-    rows.append(_resolved("current", DISPOSITION_UNMATCHED, current, stream_id=7301))
+    rows = [
+        _resolved(
+            setup["streams"][index]["name"],
+            DISPOSITION_UNMATCHED,
+            old,
+            stream_id=sid,
+        )
+        for index, sid in enumerate(old_ids)
+    ]
+    rows.append(_resolved(
+        setup["streams"][-1]["name"],
+        DISPOSITION_UNMATCHED,
+        current,
+        stream_id=7301,
+    ))
     prober = StreamProber.__new__(StreamProber)
     prober.max_concurrent_probes = 1
     prober.account_probe_limits = {2: 1}
-    prober._account_semaphores = {}
+    prober._probe_condition = asyncio.Condition()
+    prober._account_active = {}
+    prober._event_probes = 0
     prober.refresh_account_probe_limits = AsyncMock()
     # Simulated clock: every dial costs two seconds, so a batch that also
     # dials the 200 attached streams ends 400 seconds later, past the
     # five-minute window the current event's own reading has to land in.
     clock_now = [now]
-    async def probe(sid, url, name):
+    async def probe(sid, url, name, **kwargs):
         clock_now[0] += timedelta(seconds=2)
-        stat = {"probe_status": "success", "measured_bitrate": 5000000, "last_probed": clock_now[0].isoformat()}
+        stat = {
+            "stream_name": name,
+            "probe_status": "success",
+            "measured_bitrate": 5000000,
+            "last_probed": clock_now[0].isoformat(),
+            "is_black_screen": False,
+            "black_screen_checked_at": clock_now[0].isoformat(),
+        }
         setup["stats"][sid] = stat
         return stat
     prober.probe_stream = AsyncMock(side_effect=probe)
     batches, results = [], []
     with patch("stream_prober.ensure_prober", return_value=prober), \
-         patch("channel_pipeline_executor.datetime") as clock:
+         patch("channel_pipeline_executor.datetime") as clock, \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: clock_now[0])):
         clock.fromisoformat.side_effect = datetime.fromisoformat
         clock.now.side_effect = lambda *args: clock_now[0]
         managed = [900]
@@ -3469,7 +5136,12 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
             # A run builds its executor over the channels it just fetched, so
             # the second run adopts the first run's channel instead of
             # planning another create for it.
-            executor = ActionExecutor(client, list(setup["state"].channels.values()), managed_channel_ids=managed)
+            executor = ActionExecutor(
+                client,
+                list(setup["state"].channels.values()),
+                managed_channel_ids=managed,
+                epg_sources=setup["epg_sources"],
+            )
             clock_now[0] = now + timedelta(seconds=offset)
             setup["source"]["last_success"] = clock_now[0].isoformat()
             result = await executor._execute_event_sync_promotion(
@@ -3500,6 +5172,7 @@ async def test_probe_batch_drops_queued_streams_after_cancel():
     from stream_prober import StreamProber
 
     client = AsyncMock()
+    client.base_url = "http://dispatcharr.test"
     client.get_streams_by_ids.return_value = [
         {
             "id": stream_id,
@@ -3512,13 +5185,15 @@ async def test_probe_batch_drops_queued_streams_after_cancel():
     prober = StreamProber.__new__(StreamProber)
     prober.max_concurrent_probes = 1
     prober.account_probe_limits = {7: 1}
-    prober._account_semaphores = {}
+    prober._probe_condition = asyncio.Condition()
+    prober._account_active = {}
+    prober._event_probes = 0
     prober.refresh_account_probe_limits = AsyncMock()
     started = asyncio.Event()
     release = asyncio.Event()
     stopped = {"value": False}
 
-    async def probe(stream_id, url, name):
+    async def probe(stream_id, url, name, **kwargs):
         started.set()
         await release.wait()
         return {"probe_status": "failed"}
@@ -3528,7 +5203,15 @@ async def test_probe_batch_drops_queued_streams_after_cancel():
         run = asyncio.create_task(_probe_and_collect_failures(
             client,
             [1, 2, 3],
-            2_000_000,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={
+                stream_id: datetime.now(timezone.utc) - timedelta(minutes=1)
+                for stream_id in (1, 2, 3)
+            },
+            stream_names={
+                stream_id: f"Event {stream_id}"
+                for stream_id in (1, 2, 3)
+            },
             cancelled=lambda: stopped["value"],
         ))
         await started.wait()
@@ -3536,7 +5219,7 @@ async def test_probe_batch_drops_queued_streams_after_cancel():
         release.set()
         dead = await run
 
-    assert dead == {1}
+    assert dead == set()
     prober.probe_stream.assert_awaited_once()
 
 
@@ -3558,7 +5241,12 @@ async def test_old_event_retirement_keeps_its_evidence(retirement, guard):
     elif guard == "viewer":
         setup["client"].get_channel_stats.return_value = {"channels": [{"channel_id": "event-900"}]}
     row = _resolved(STREAM_FURY, DISPOSITION_UNMATCHED, parsed, stream_id=7301)
-    executor = ActionExecutor(setup["client"], list(setup["state"].channels.values()), managed_channel_ids=[900])
+    executor = ActionExecutor(
+        setup["client"],
+        list(setup["state"].channels.values()),
+        managed_channel_ids=[900],
+        epg_sources=setup["epg_sources"],
+    )
     setup["executor"] = executor
     with patch("channel_pipeline_executor.datetime") as clock, \
          patch("services.event_sync_stream_health._probe_and_collect_failures", new=AsyncMock()) as probe:
@@ -3589,7 +5277,12 @@ async def test_idle_or_future_event_is_not_recreated(retirement, case):
         start = setup["now"].replace(year=2098)
     parsed = _parsed("Fury vs. Usyk", start)
     row = _resolved(STREAM_FURY, DISPOSITION_UNMATCHED, parsed, provider_id=2, stream_id=7301)
-    executor = ActionExecutor(setup["client"], list(setup["state"].channels.values()), managed_channel_ids=[])
+    executor = ActionExecutor(
+        setup["client"],
+        list(setup["state"].channels.values()),
+        managed_channel_ids=[],
+        epg_sources=setup["epg_sources"],
+    )
     with patch("channel_pipeline_executor.datetime") as clock:
         clock.now.return_value = setup["now"]
         clock.fromisoformat.side_effect = datetime.fromisoformat
@@ -3678,6 +5371,8 @@ async def test_lifecycle_uses_scoped_iso_patterns(retirement, shape, with_witnes
         setup["witness"].clear()
     eligible, states = await setup["executor"]._event_lifecycle(
         setup["rule"].id, config, plan.units, now,
+        flow={7301: case != "stale_sample"},
+        expires_at=now + timedelta(minutes=5),
     )
     active = case in {"seconds_zero", "seconds_nonzero", "shared_patterns"}
     assert eligible == ({plan.units[0].event_key} if active else set())
@@ -3717,17 +5412,26 @@ def promotion_candidates(retirement, monkeypatch):
     prober = StreamProber.__new__(StreamProber)
     prober.max_concurrent_probes = 1
     prober.account_probe_limits = {2: 1}
-    prober._account_semaphores = {}
+    prober._probe_condition = asyncio.Condition()
+    prober._account_active = {}
+    prober._event_probes = 0
     prober.refresh_account_probe_limits = AsyncMock()
 
-    async def probe(sid, url, name):
+    async def probe(sid, url, name, **kwargs):
         setup["batches"][-1].append(sid)
         if sid != 7302 and setup["first_health"] == "unknown":
             return {}
         working = sid == 7302 or setup["first_health"] == "success"
-        stat = {"probe_status": "success" if working else "failed",
-                "measured_bitrate": 5000000 if working else 0,
-                "last_probed": setup["clock"].isoformat()}
+        stat = {
+            "stream_name": name,
+            "probe_status": "success" if working else "failed",
+            "measured_bitrate": 5000000 if working else 0,
+            "last_probed": setup["clock"].isoformat(),
+            "is_black_screen": False if working else None,
+            "black_screen_checked_at": (
+                setup["clock"].isoformat() if working else None
+            ),
+        }
         setup["stats"][sid] = stat
         return stat
 
@@ -3767,8 +5471,14 @@ async def test_event_health_advances_past_unavailable_candidates(promotion_candi
     for index in range(1 if first_health == "success" else 2):
         setup["clock"] = setup["now"] + timedelta(minutes=6 * index)
         setup["batches"].append([])
-        executor = ActionExecutor(setup["client"], list(setup["state"].channels.values()), managed_channel_ids=[])
-        with patch("channel_pipeline_executor.datetime") as clock:
+        executor = ActionExecutor(
+            setup["client"],
+            list(setup["state"].channels.values()),
+            managed_channel_ids=[],
+            epg_sources=setup["epg_sources"],
+        )
+        with patch("channel_pipeline_executor.datetime") as clock, \
+             patch("services.event_sync_stream_health.datetime", _clock(setup["clock"])):
             clock.now.return_value = setup["clock"]
             clock.fromisoformat.side_effect = datetime.fromisoformat
             result = await executor._execute_event_sync_promotion(
@@ -3791,12 +5501,18 @@ async def test_event_preview_does_not_consume_health_progress(promotion_candidat
     from types import SimpleNamespace
 
     setup = promotion_candidates
-    with patch("channel_pipeline_executor.datetime") as clock:
+    with patch("channel_pipeline_executor.datetime") as clock, \
+         patch("services.event_sync_stream_health.datetime", _clock(setup["clock"])):
         clock.now.return_value = setup["clock"]
         clock.fromisoformat.side_effect = datetime.fromisoformat
         for dry_run in [True, True, False]:
             setup["batches"].append([])
-            executor = ActionExecutor(setup["client"], [], managed_channel_ids=[])
+            executor = ActionExecutor(
+                setup["client"],
+                [],
+                managed_channel_ids=[],
+                epg_sources=setup["epg_sources"],
+            )
             result = await executor._execute_event_sync_promotion(
                 setup["rule"].id, setup["rule"].name, setup["config"],
                 SimpleNamespace(resolved=setup["rows"]), ExecutionContext(dry_run=dry_run),

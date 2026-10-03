@@ -220,7 +220,9 @@ class TestEmbyTestConnectionSsrfMitigation:
             captured["base_url"] = base_url
             return mock_client
 
-        with patch("routers.settings.EmbyClient", side_effect=constructor_spy):
+        with _patch_ssrf_dns("8.8.8.8"), patch(
+            "routers.settings.EmbyClient", side_effect=constructor_spy
+        ):
             response = await async_client.post(
                 "/api/settings/emby/test-connection",
                 json={

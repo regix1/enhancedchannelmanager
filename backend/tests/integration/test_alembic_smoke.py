@@ -1832,10 +1832,25 @@ class TestSmartBootstrapFastPath:
                     "ADD COLUMN measured_bitrate BIGINT"
                 ))
                 conn.execute(text(
+                    "ALTER TABLE stream_stats "
+                    "ADD COLUMN black_screen_checked_at DATETIME"
+                ))
+                conn.execute(text(
                     "ALTER TABLE dummy_epg_profiles ADD COLUMN epg_source_ids TEXT"
                 ))
                 conn.execute(text(
                     "ALTER TABLE dummy_epg_profiles ADD COLUMN channel_mappings TEXT"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dummy_epg_profiles "
+                    "ADD COLUMN hide_empty_group_ids TEXT"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dummy_epg_profiles "
+                    "ADD COLUMN stream_match_group_ids TEXT"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE dummy_epg_profiles ADD COLUMN event_sync_config TEXT"
                 ))
                 conn.execute(text(
                     "ALTER TABLE password_reset_tokens "
@@ -1857,6 +1872,7 @@ class TestSmartBootstrapFastPath:
 
             head = database.get_alembic_head_revision()
             assert head != "0005", "test premise: head must be > 0005"
+            assert database._schema_matches_head(engine) is True
 
             # 3. Call _bootstrap_alembic. Spy on (but still execute)
             # alembic.command.upgrade so we can see exactly which revisions

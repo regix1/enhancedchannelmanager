@@ -1284,6 +1284,9 @@ describe('EventSyncRuleEditor', () => {
       );
 
       const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+      });
       expect(intent).toHaveTextContent(
         /orders each master channel's streams by provider order/i
       );
@@ -1477,6 +1480,9 @@ describe('EventSyncRuleEditor', () => {
       render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
 
       const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+      });
       // Default (enforced time window, manual runs, default threshold).
       expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
       expect(intent).toHaveTextContent(/title \+ start time within ±30 min/i);
@@ -1491,6 +1497,172 @@ describe('EventSyncRuleEditor', () => {
       await user.click(screen.getByText('Automation'));
       await user.click(screen.getByTestId('event-sync-auto-run'));
       expect(intent).toHaveTextContent(/Runs automatically after each M3U refresh\./i);
+    });
+
+    it('keeps the rule intent neutral while channel groups are pending', async () => {
+      let resolveGroupsResponse: ((response: Response) => void) | undefined;
+      const groupsResponse = new Promise<Response>((resolve) => {
+        resolveGroupsResponse = resolve;
+      });
+      server.use(
+        http.get('/api/channel-groups', async () => groupsResponse),
+      );
+      stubGroupSettings({ 1: true, 2: false });
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      expect(intent).toHaveTextContent('Loading channel groups…');
+      expect(intent).not.toHaveTextContent(/master Group 1/i);
+      expect(intent).toHaveAttribute('aria-busy', 'true');
+
+      await act(async () => {
+        resolveGroupsResponse!(HttpResponse.json([
+          createMockChannelGroup({ id: 1, name: 'Master Events' }),
+          createMockChannelGroup({ id: 2, name: 'Secondary Events' }),
+        ]));
+      });
+
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+      });
+      expect(intent).toHaveAttribute('aria-busy', 'false');
+    });
+
+    it('resolves group names before a slower junction request completes', async () => {
+      let resolveJunctionResponse: ((response: Response) => void) | undefined;
+      const junctionResponse = new Promise<Response>((resolve) => {
+        resolveJunctionResponse = resolve;
+      });
+      seedGroups();
+      server.use(
+        http.get('/api/providers/group-settings/by-provider', async () => junctionResponse),
+      );
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      try {
+        const intent = await screen.findByTestId('event-sync-intent');
+        await waitFor(() => {
+          expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+        });
+        expect(intent).toHaveAttribute('aria-busy', 'false');
+      } finally {
+        await act(async () => {
+          resolveJunctionResponse!(HttpResponse.json([]));
+        });
+      }
+    });
+
+    it('uses a numeric group identity only after a successful group list omits it', async () => {
+      server.use(
+        http.get('/api/channel-groups', () => HttpResponse.json([])),
+      );
+      stubJunctions([]);
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Group 1/i);
+      });
+      expect(intent).not.toHaveTextContent(/could not be loaded/i);
+    });
+
+    it('shows an unavailable state when the channel-group request fails', async () => {
+      server.use(
+        http.get('/api/channel-groups', () => HttpResponse.error()),
+      );
+      stubJunctions([]);
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(
+          'Channel groups could not be loaded. Close and reopen this editor to try again.',
+        );
+      });
+      expect(intent).toHaveAttribute('aria-busy', 'false');
+      expect(screen.getAllByText('Group name unavailable').length).toBeGreaterThan(0);
+      expect(intent).not.toHaveTextContent(/master Group 1/i);
+    });
+
+    it('keeps the resolved group name when the junction request fails', async () => {
+      seedGroups();
+      server.use(
+        http.get('/api/providers/group-settings/by-provider', () => HttpResponse.error()),
+      );
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+      });
+      expect(intent).not.toHaveTextContent(/could not be loaded/i);
+    });
+
+    it('starts a fresh channel-group state when the editor reopens after failure', async () => {
+      server.use(
+        http.get('/api/channel-groups', () => HttpResponse.error()),
+      );
+      stubJunctions([]);
+      const firstEditor = render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('event-sync-intent')).toHaveTextContent(/could not be loaded/i);
+      });
+      firstEditor.unmount();
+
+      server.use(
+        http.get('/api/channel-groups', () => HttpResponse.json([
+          createMockChannelGroup({ id: 1, name: 'Master Events' }),
+          createMockChannelGroup({ id: 2, name: 'Secondary Events' }),
+        ])),
+      );
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Master Events/i);
+      });
+      expect(intent).not.toHaveTextContent(/could not be loaded/i);
+    });
+
+    it('ignores a pending request released after unmount when a fresh editor is ready', async () => {
+      let resolveGroupsResponse: ((response: Response) => void) | undefined;
+      const groupsResponse = new Promise<Response>((resolve) => {
+        resolveGroupsResponse = resolve;
+      });
+      server.use(
+        http.get('/api/channel-groups', async () => groupsResponse),
+      );
+      stubJunctions([]);
+      const firstEditor = render(
+        <EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />,
+      );
+
+      expect(await screen.findByTestId('event-sync-intent')).toHaveTextContent('Loading channel groups…');
+      firstEditor.unmount();
+
+      server.use(
+        http.get('/api/channel-groups', () => HttpResponse.json([
+          createMockChannelGroup({ id: 1, name: 'Fresh Master Events' }),
+          createMockChannelGroup({ id: 2, name: 'Fresh Secondary Events' }),
+        ])),
+      );
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      const intent = await screen.findByTestId('event-sync-intent');
+      await waitFor(() => {
+        expect(intent).toHaveTextContent(/Attach streams from 1 secondary group to master Fresh Master Events/i);
+      });
+      await act(async () => {
+        resolveGroupsResponse!(HttpResponse.json([
+          createMockChannelGroup({ id: 1, name: 'Old Master Events' }),
+          createMockChannelGroup({ id: 2, name: 'Old Secondary Events' }),
+        ]));
+      });
+      expect(intent).toHaveTextContent('Fresh Master Events');
+      expect(intent).not.toHaveTextContent('Old Master Events');
     });
 
     it('badges a subgroup with the count of non-default flags it holds', async () => {

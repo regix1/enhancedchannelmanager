@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 import re
 from typing import Dict, Iterator, List, Tuple
@@ -125,16 +126,25 @@ VERSION_IDENTIFIER = re.compile(r"^(?:[A-Za-z_]*_)?version$", re.IGNORECASE)
 # Discovery helpers  (kept free of assertions so TestGuardMechanics can drive
 # them directly with synthetic input)
 # --------------------------------------------------------------------------
-def _iter_product_py_files() -> Iterator[pathlib.Path]:
+def _iter_product_py_files(root: pathlib.Path = REPO_ROOT) -> Iterator[pathlib.Path]:
     for base in PRODUCT_PY_ROOTS:
-        base_path = REPO_ROOT / base
+        base_path = root / base
         if not base_path.is_dir():
             continue
-        for path in sorted(base_path.rglob("*.py")):
-            parts = set(path.parts)
-            if "tests" in parts or "__pycache__" in parts:
-                continue
-            yield path
+        if (base_path / "pyvenv.cfg").is_file():
+            continue
+        for current, directories, filenames in os.walk(base_path):
+            current_path = pathlib.Path(current)
+            directories[:] = sorted(
+                name
+                for name in directories
+                if name
+                not in {"tests", "__pycache__", "site-packages", "dist-packages"}
+                and not (current_path / name / "pyvenv.cfg").is_file()
+            )
+            for filename in sorted(filenames):
+                if filename.endswith(".py"):
+                    yield current_path / filename
 
 
 def _docstring_constant_ids(tree: ast.AST) -> set:
@@ -627,6 +637,40 @@ class TestGuardMechanics:
             f"REPO_ROOT resolved to {REPO_ROOT}, which has no {CANONICAL_FILE}"
         )
         assert (REPO_ROOT / "docs/versioning.md").is_file()
+
+    def test_product_walk_includes_product_and_prunes_dependency_trees(
+        self, tmp_path
+    ):
+        backend = tmp_path / "backend"
+        included = {
+            backend / "current.py": 'APP_VERSION = "0.1.0-0001"\n',
+            backend / ".untracked" / "module.py": 'APP_VERSION = "0.1.0-0002"\n',
+        }
+        excluded = {
+            backend / "environment" / "module.py": 'APP_VERSION = "0.1.0-0003"\n',
+            backend / "site-packages" / "package.py": 'APP_VERSION = "0.1.0-0004"\n',
+            backend / "nested" / "dist-packages" / "package.py": (
+                'APP_VERSION = "0.1.0-0005"\n'
+            ),
+        }
+        for path, source in (included | excluded).items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+        (backend / "environment" / "pyvenv.cfg").write_text(
+            "home = /usr/bin\n", encoding="utf-8"
+        )
+
+        discovered = set(_iter_product_py_files(tmp_path))
+
+        assert discovered == set(included)
+        stale = [
+            hit
+            for path in discovered
+            for hit in build_shaped_literals_in_python(
+                path.read_text(encoding="utf-8"), path.relative_to(tmp_path).as_posix()
+            )
+        ]
+        assert {hit[2] for hit in stale} == {"0.1.0-0001", "0.1.0-0002"}
 
 
 @pytest.mark.parametrize(

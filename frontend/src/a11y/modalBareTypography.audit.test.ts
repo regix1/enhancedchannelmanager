@@ -1,5 +1,5 @@
 /// <reference types="node" />
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -92,7 +92,7 @@ const SRC = path.resolve(process.cwd(), 'src');
 
 function cssFor(decision: Decision): string {
   return decision.files
-    .map((file) => fs.readFileSync(path.join(SRC, file), 'utf8'))
+    .map((file) => fs.readFileSync(path.join(SRC, file), 'utf8').replace(/\r\n/g, '\n'))
     .join('\n');
 }
 
@@ -157,5 +157,37 @@ describe('modal bare typography decision ledger (8rszp)', () => {
     expect(css.slice(start, css.indexOf('}', start) + 1)).toContain(
       'font-size: var(--type-body-size)',
     );
+  });
+
+  it.each(['lf', 'crlf'] as const)('keeps the complete ledger stable with %s stylesheet text', (lineEnding) => {
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      const content = Reflect.apply(originalReadFileSync, fs, args) as unknown;
+      if (typeof content !== 'string' || !String(args[0]).endsWith('.css')) return content;
+      const lf = content.replace(/\r\n/g, '\n');
+      return lineEnding === 'crlf' ? lf.replace(/\n/g, '\r\n') : lf;
+    }) as typeof fs.readFileSync);
+
+    try {
+      expect(() => assertComplete(DECISIONS)).not.toThrow();
+    } finally {
+      readFileSpy.mockRestore();
+    }
+  });
+
+  it('still rejects a deleted reviewed selector after line-ending normalization', () => {
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const reviewedFile = path.join(SRC, DECISIONS[0].files[0]);
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      const content = Reflect.apply(originalReadFileSync, fs, args) as unknown;
+      if (typeof content !== 'string' || path.resolve(String(args[0])) !== reviewedFile) return content;
+      return content.replace(DECISIONS[0].selector, '.deleted-reviewed-selector');
+    }) as typeof fs.readFileSync);
+
+    try {
+      expect(() => assertComplete(DECISIONS)).toThrow();
+    } finally {
+      readFileSpy.mockRestore();
+    }
   });
 });

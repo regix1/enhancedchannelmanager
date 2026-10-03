@@ -6,13 +6,17 @@ Supports both scheduled and on-demand probing.
 import asyncio
 import json
 import logging
+import math
 import shutil
 import time
-from datetime import datetime, timedelta
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pathlib import Path
 import os
 import re
+from urllib.parse import urljoin, urlsplit
 
 import journal
 import safe_regex
@@ -20,6 +24,7 @@ import safe_regex
 import httpx
 from security.ssrf import SchemeDowngrade, SSRFError
 from security.stream_outbound import (
+    _read_hls_manifest,
     stream_request,
     validated_subprocess_input,
 )
@@ -97,6 +102,31 @@ DEFAULT_PROBE_TIMEOUT = 30  # seconds
 BITRATE_SAMPLE_DURATION = 8  # seconds to sample stream for bitrate measurement
 PROBE_STAGE_MAX_SECONDS = 120.0
 PROBE_STATS_PUSH_TIMEOUT_SECONDS = 30.0
+_MAX_HLS_MANIFESTS = 5
+
+
+def _probe_seconds(expires_at: datetime | None, cap: float) -> float:
+    """Return the remaining caller lifetime, capped for one probe stage."""
+    if expires_at is None:
+        return cap
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at = expires_at.astimezone(timezone.utc)
+    remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(cap, remaining))
+
+
+@asynccontextmanager
+async def _probe_stream_request(url: str, *, timeout, headers):
+    """Open one guarded HTTP media response for probe sampling."""
+    async with stream_request(
+        url,
+        timeout=timeout,
+        headers=headers,
+        scheme_downgrade=PROBE_SCHEME_DOWNGRADE,
+    ) as response:
+        yield response
 
 # Restrict ffprobe/ffmpeg to safe network protocols only — blocks file://, data://,
 # concat:, subfile:, etc. URLs fed to these invocations come from Dispatcharr stream
@@ -570,7 +600,9 @@ class StreamProber:
         # those land in StreamStats as if the stream were broken. Populated by
         # services.probe_limits; empty means every account uses the global. [76]
         self.account_probe_limits: dict[int, int] = {}
-        self._account_semaphores: dict[int | None, asyncio.Semaphore] = {}
+        self._probe_condition = asyncio.Condition()
+        self._account_active: dict[int | None, int] = {}
+        self._event_probes = 0
         self.profile_distribution_strategy = profile_distribution_strategy
         self.skip_recently_probed_hours = skip_recently_probed_hours
         self.refresh_m3us_before_probe = refresh_m3us_before_probe
@@ -660,30 +692,66 @@ class StreamProber:
         from services.probe_limits import account_probe_limits
 
         overrides = getattr(get_settings(), "probe_concurrency_by_account", {}) or {}
-        self.account_probe_limits = await account_probe_limits(self.client, overrides)
-        # The old semaphores were built from the previous ceilings.
-        self._account_semaphores.clear()
+        limits = await account_probe_limits(self.client, overrides)
+        async with self._probe_condition:
+            self.account_probe_limits = limits
+            self._probe_condition.notify_all()
 
-    def semaphore_for_account(self, m3u_account) -> asyncio.Semaphore:
+    @asynccontextmanager
+    async def semaphore_for_account(
+        self,
+        m3u_account,
+        *,
+        event: bool = False,
+    ) -> AsyncIterator[None]:
         """Concurrency gate for one provider, at most the global limit.
 
         Takes whatever shape the stream carries in ``m3u_account`` — an id, a
         nested object, or nothing — so callers do not each repeat the
         unwrapping.
 
-        One semaphore per account, reused for the life of the prober, so
-        streams from different providers do not queue behind each other while
-        each provider still sees no more connections than it allows. An
-        account with no recorded limit gets the global one, which is the
-        behaviour every account had before per-provider limits existed. [76]
+        Streams from different accounts do not queue behind each other while
+        each account still sees no more connections than it allows. Event
+        probes also share one aggregate limit across overlapping calls. An
+        account with no recorded limit gets the global one. [76]
         """
         account_id = self._extract_m3u_account_id(m3u_account)
-        if account_id not in self._account_semaphores:
-            limit = self.account_probe_limits.get(account_id, self.max_concurrent_probes)
-            self._account_semaphores[account_id] = asyncio.Semaphore(
-                max(1, min(self.max_concurrent_probes, limit))
-            )
-        return self._account_semaphores[account_id]
+        async with self._probe_condition:
+            while True:
+                limit = max(1, min(
+                    self.max_concurrent_probes,
+                    self.account_probe_limits.get(
+                        account_id, self.max_concurrent_probes,
+                    ),
+                ))
+                account_available = (
+                    self._account_active.get(account_id, 0) < limit
+                )
+                event_available = (
+                    not event
+                    or self._event_probes < max(1, self.max_concurrent_probes)
+                )
+                if account_available and event_available:
+                    self._account_active[account_id] = (
+                        self._account_active.get(account_id, 0) + 1
+                    )
+                    if event:
+                        self._event_probes += 1
+                    break
+                await self._probe_condition.wait()
+
+        try:
+            yield
+        finally:
+            async with self._probe_condition:
+                active = self._account_active[account_id] - 1
+                if active:
+                    self._account_active[account_id] = active
+                else:
+                    self._account_active.pop(account_id, None)
+                if event:
+                    self._event_probes -= 1
+                self._probe_condition.notify_all()
 
     def update_probing_settings(self, parallel_probing_enabled: bool, max_concurrent_probes: int,
                                 profile_distribution_strategy: str = "fill_first") -> None:
@@ -1164,7 +1232,13 @@ class StreamProber:
         }
 
     async def probe_stream(
-        self, stream_id: int, url: Optional[str], name: Optional[str] = None
+        self,
+        stream_id: int,
+        url: Optional[str],
+        name: Optional[str] = None,
+        *,
+        content: bool = False,
+        expires_at: datetime | None = None,
     ) -> dict:
         """
         Probe a single stream using ffprobe.
@@ -1172,7 +1246,14 @@ class StreamProber:
         """
         logger.debug("[STREAM-PROBE] probe_stream() called for stream_id=%s, name=%s, url=%s", stream_id, name, 'present' if url else 'missing')
 
+        if content and expires_at is None:
+            raise ValueError("expires_at is required when content is true")
+        if _probe_seconds(expires_at, 1.0) <= 0:
+            return {}
+
         if not url:
+            if content:
+                return {}
             logger.warning("[STREAM-PROBE] Stream %s has no URL, marking as failed", stream_id)
             return self._save_probe_result(
                 stream_id, name, None, "failed", "No URL available"
@@ -1188,12 +1269,22 @@ class StreamProber:
                 + self.probe_retry_delay * self.probe_retry_count
                 + 5
             )
-            result = await asyncio.wait_for(
-                self._run_ffprobe(url),
-                timeout=min(PROBE_STAGE_MAX_SECONDS, max(1.0, ffprobe_budget)),
+            ffprobe_timeout = _probe_seconds(
+                expires_at,
+                min(PROBE_STAGE_MAX_SECONDS, max(1.0, ffprobe_budget)),
             )
+            if ffprobe_timeout <= 0:
+                return {}
+            ffprobe_call = (
+                self._run_ffprobe(url, expires_at=expires_at)
+                if expires_at is not None
+                else self._run_ffprobe(url)
+            )
+            result = await asyncio.wait_for(ffprobe_call, timeout=ffprobe_timeout)
             logger.info("[STREAM-PROBE] Stream %s ffprobe succeeded", stream_id)
         except asyncio.TimeoutError:
+            if _probe_seconds(expires_at, 1.0) <= 0:
+                return {}
             logger.warning("[STREAM-PROBE] Stream %s probe timed out after %ss", stream_id, self.probe_timeout)
             status = "timeout"
             error_message = PROBE_NETWORK_ROUTE_GUIDANCE
@@ -1225,14 +1316,27 @@ class StreamProber:
         # Container headers do not establish whether bytes keep arriving.
         logger.debug("[STREAM-PROBE] Measuring bitrate for stream %s", stream_id)
         try:
-            measured_bitrate = await asyncio.wait_for(
-                self._measure_stream_bitrate(url),
-                timeout=min(
+            bitrate_timeout = _probe_seconds(
+                expires_at,
+                min(
                     PROBE_STAGE_MAX_SECONDS,
                     max(1.0, self.bitrate_sample_duration + 20),
                 ),
             )
+            if bitrate_timeout <= 0:
+                return {}
+            bitrate_call = (
+                self._measure_stream_bitrate(url, expires_at=expires_at)
+                if expires_at is not None
+                else self._measure_stream_bitrate(url)
+            )
+            measured_bitrate = await asyncio.wait_for(
+                bitrate_call,
+                timeout=bitrate_timeout,
+            )
         except asyncio.TimeoutError:
+            if _probe_seconds(expires_at, 1.0) <= 0:
+                return {}
             logger.warning(
                 "[STREAM-PROBE] Bitrate measurement exceeded its outer "
                 "budget for stream %s",
@@ -1241,17 +1345,32 @@ class StreamProber:
             measured_bitrate = None
 
         is_black: Optional[bool] = None
-        if status == "success" and self.black_screen_detection_enabled:
+        if status == "success" and (
+            self.black_screen_detection_enabled or content
+        ):
             logger.debug("[STREAM-PROBE] Running black screen detection for stream %s", stream_id)
             try:
-                is_black = await asyncio.wait_for(
-                    self._detect_black_screen(url),
-                    timeout=min(
+                content_timeout = _probe_seconds(
+                    expires_at,
+                    min(
                         PROBE_STAGE_MAX_SECONDS,
                         max(1.0, self.black_screen_sample_duration + 35),
                     ),
                 )
+                if content_timeout <= 0:
+                    return {}
+                content_call = (
+                    self._detect_black_screen(url, expires_at=expires_at)
+                    if expires_at is not None
+                    else self._detect_black_screen(url)
+                )
+                is_black = await asyncio.wait_for(
+                    content_call,
+                    timeout=content_timeout,
+                )
             except asyncio.TimeoutError:
+                if _probe_seconds(expires_at, 1.0) <= 0:
+                    return {}
                 logger.warning(
                     "[STREAM-PROBE] Black-screen detection exceeded its "
                     "outer budget for stream %s",
@@ -1259,13 +1378,20 @@ class StreamProber:
                 )
                 is_black = None
 
+        if _probe_seconds(expires_at, 1.0) <= 0:
+            return {}
         saved = self._save_probe_result(
             stream_id, name, result, status, error_message, measured_bitrate, is_black
         )
+        push_timeout = _probe_seconds(
+            expires_at, PROBE_STATS_PUSH_TIMEOUT_SECONDS,
+        )
+        if push_timeout <= 0:
+            return saved
         try:
             await asyncio.wait_for(
                 self._push_stats_to_dispatcharr(stream_id, saved),
-                timeout=PROBE_STATS_PUSH_TIMEOUT_SECONDS,
+                timeout=push_timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -1275,8 +1401,16 @@ class StreamProber:
             )
         return saved
 
-    async def _run_ffprobe(self, url: str, _retry_attempt: int = 0) -> dict:
+    async def _run_ffprobe(
+        self,
+        url: str,
+        _retry_attempt: int = 0,
+        *,
+        expires_at: datetime | None = None,
+    ) -> dict:
         """Run ffprobe and parse JSON output."""
+        if _probe_seconds(expires_at, 1.0) <= 0:
+            raise asyncio.TimeoutError
         headers = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}
         async with validated_subprocess_input(
             url, headers=headers, scheme_downgrade=PROBE_SCHEME_DOWNGRADE
@@ -1295,7 +1429,9 @@ class StreamProber:
                 "-show_format",
                 "-show_streams",
                 "-timeout",
-                str(self.probe_timeout * 1000000),  # microseconds
+                str(int(_probe_seconds(
+                    expires_at, float(self.probe_timeout),
+                ) * 1000000)),
                 subprocess_input.argument,
             ]
 
@@ -1306,11 +1442,23 @@ class StreamProber:
             )
 
             try:
+                communicate_timeout = _probe_seconds(
+                    expires_at, self.probe_timeout + 5,
+                )
+                if communicate_timeout <= 0:
+                    process.kill()
+                    await process.wait()
+                    raise asyncio.TimeoutError
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=self.probe_timeout + 5
+                    process.communicate(), timeout=communicate_timeout,
                 )
             except asyncio.TimeoutError:
                 process.kill()
+                await process.wait()
+                raise
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
                 await process.wait()
                 raise
 
@@ -1332,8 +1480,14 @@ class StreamProber:
             transient_patterns = ("5XX", "500", "502", "503", "520", "Input/output error", "Stream ends prematurely", "Connection reset", "Broken pipe")
             if any(p in error_text for p in transient_patterns) and "404" not in error_text and _retry_attempt < self.probe_retry_count:
                 logger.info("[STREAM-PROBE] Transient provider error — retry %s/%s in %ss", _retry_attempt + 1, self.probe_retry_count, self.probe_retry_delay)
+                if _probe_seconds(expires_at, self.probe_retry_delay + 0.001) <= self.probe_retry_delay:
+                    raise asyncio.TimeoutError
                 await asyncio.sleep(self.probe_retry_delay)
-                return await self._run_ffprobe(url, _retry_attempt=_retry_attempt + 1)
+                return await self._run_ffprobe(
+                    url,
+                    _retry_attempt=_retry_attempt + 1,
+                    expires_at=expires_at,
+                )
 
             if any(marker in error_text.lower() for marker in NETWORK_FAILURE_MARKERS):
                 raise ProbeNetworkRouteError("Provider connection failed")
@@ -1345,47 +1499,110 @@ class StreamProber:
 
         return json.loads(output)
 
-    async def _measure_stream_bitrate(self, url: str) -> Optional[int]:
+    async def _measure_stream_bitrate(
+        self,
+        url: str,
+        *,
+        expires_at: datetime | None = None,
+    ) -> Optional[int]:
         """
         Measure actual stream bitrate by downloading data for a few seconds.
         This is how Dispatcharr gets real bitrate - by measuring throughput.
 
         Returns bitrate in bits per second, or None if measurement fails.
         """
+        if expires_at is None:
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=min(
+                    PROBE_STAGE_MAX_SECONDS,
+                    max(1.0, self.bitrate_sample_duration + 20.0),
+                )
+            )
+
         bytes_downloaded = 0
-        start_time = time.time()
+        request_started_at = time.time()
+        # Connection setup consumes the caller's expiry, but it is not a gap
+        # in delivery before the first media bytes exist to compare.
+        first_chunk_at = None
+        last_chunk_at = None
+        largest_gap = 0.0
         answered = False
+        hls_response = False
         try:
             logger.debug("[STREAM-PROBE] Starting bitrate measurement for %ss...", self.bitrate_sample_duration)
 
-            # Stream download with timeout (all four parameters required by httpx.Timeout)
+            outer_seconds = _probe_seconds(expires_at, float("inf"))
+            if outer_seconds <= 0:
+                return None
+
+            stage_seconds = _probe_seconds(
+                expires_at, self.bitrate_sample_duration + 5.0,
+            )
+            if stage_seconds <= 0:
+                return None
             timeout = httpx.Timeout(
-                connect=10.0,
-                read=self.bitrate_sample_duration + 5.0,
-                write=10.0,
-                pool=10.0
+                connect=min(10.0, stage_seconds),
+                read=stage_seconds,
+                write=min(10.0, stage_seconds),
+                pool=min(10.0, stage_seconds),
             )
 
             headers = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}
-            async with stream_request(
-                url,
-                timeout=timeout,
-                headers=headers,
-                scheme_downgrade=PROBE_SCHEME_DOWNGRADE,
-            ) as response:
-                response.raise_for_status()
-                answered = True
+            playlist: bytes | None = None
+            playlist_url: str | None = None
+            async with asyncio.timeout(outer_seconds):
+                async with _probe_stream_request(
+                    url, timeout=timeout, headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    answered = True
 
-                # Download stream data for the sample duration
-                async for chunk in response.aiter_bytes(chunk_size=65536):  # 64KB chunks
-                    bytes_downloaded += len(chunk)
-                    elapsed = time.time() - start_time
+                    content_type = response.headers.get("content-type", "").lower()
+                    logical_url = response.extensions.get("ssrf_logical_url")
+                    requested_hls = urlsplit(url).path.lower().endswith(".m3u8")
+                    if logical_url is None and (
+                        "mpegurl" in content_type or requested_hls
+                    ):
+                        return None
+                    hls_response = "mpegurl" in content_type or (
+                        logical_url is not None
+                        and urlsplit(str(logical_url)).path.lower().endswith(".m3u8")
+                    )
+                    if hls_response:
+                        if logical_url is None:
+                            return None
+                        playlist_url = str(logical_url)
+                        playlist = await _read_hls_manifest(response)
+                    else:
+                        # Observe network deliveries directly. A fixed assembled-byte
+                        # buffer would turn a valid low-rate feed into one late burst.
+                        async for chunk in response.aiter_raw():
+                            bytes_downloaded += len(chunk)
+                            chunk_at = time.time()
+                            if first_chunk_at is None:
+                                first_chunk_at = chunk_at
+                            elif last_chunk_at is not None:
+                                largest_gap = max(largest_gap, chunk_at - last_chunk_at)
+                            last_chunk_at = chunk_at
+                            elapsed = chunk_at - first_chunk_at
 
-                    # Stop after sample duration
-                    if elapsed >= self.bitrate_sample_duration:
-                        break
+                            if _probe_seconds(expires_at, 1.0) <= 0:
+                                return None
 
-            elapsed = time.time() - start_time
+                            if elapsed >= self.bitrate_sample_duration:
+                                break
+
+                if playlist is not None and playlist_url is not None:
+                    return await self._measure_hls_bitrate(
+                        playlist_url, playlist, expires_at=expires_at,
+                    )
+
+            finished_at = time.time()
+            elapsed = (
+                finished_at - first_chunk_at
+                if first_chunk_at is not None
+                else finished_at - request_started_at
+            )
 
             # The loop above ends two ways: the window ran out, or the source
             # ended the stream. Only the first is a measurement. A live feed
@@ -1399,8 +1616,20 @@ class StreamProber:
             if elapsed < self.bitrate_sample_duration:
                 logger.info(
                     "[STREAM-PROBE] Source ended the stream after %.2fs of a "
-                    "%ss window (%d bytes) — not a sustained feed",
+                    "%ss window (%d bytes); not a sustained feed",
                     elapsed, self.bitrate_sample_duration, bytes_downloaded,
+                )
+                return 0
+
+            allowed_gap = max(
+                0.5, min(2.0, self.bitrate_sample_duration / 2),
+            )
+            if largest_gap > allowed_gap:
+                logger.info(
+                    "[STREAM-PROBE] Delivery paused for %.2fs during a %ss "
+                    "sample; not a sustained feed",
+                    largest_gap,
+                    self.bitrate_sample_duration,
                 )
                 return 0
 
@@ -1413,26 +1642,36 @@ class StreamProber:
                 logger.warning("[STREAM-PROBE] Bitrate measurement: elapsed time is zero")
                 return None
 
+        except asyncio.TimeoutError:
+            return None
         except httpx.HTTPStatusError as e:
             logger.warning("[STREAM-PROBE] HTTP error during bitrate measurement: %s", e.response.status_code)
             return None
         except httpx.TimeoutException:
-            # Headers arrived and then nothing did: a source with nothing to
-            # send, not one that cannot be measured. The rate that describes is
-            # what lets a caller's throughput floor reject it, where returning
-            # None leaves it with no verdict at all and no verdict reads as
-            # working. A timeout before the headers is a stream that could not
-            # be reached, which is a different thing and still None.
-            elapsed = time.time() - start_time
+            if hls_response:
+                return None
+            # Headers followed by a full stalled sample prove zero sustained
+            # transport. A timeout before headers remains unclassifiable.
+            elapsed = time.time() - request_started_at
             if answered and elapsed >= self.bitrate_sample_duration:
-                bitrate_bps = int((bytes_downloaded * 8) / elapsed)
                 logger.info(
-                    "[STREAM-PROBE] Sample window closed on a stalled stream: "
-                    "%d bytes in %.2fs = %d bps (%.2f Mbps)",
-                    bytes_downloaded, elapsed, bitrate_bps, bitrate_bps / 1000000,
+                    "[STREAM-PROBE] Sample window closed after delivery "
+                    "stalled: %d bytes in %.2fs — not a sustained feed",
+                    bytes_downloaded, elapsed,
                 )
-                return bitrate_bps
+                return 0
+
             logger.warning("[STREAM-PROBE] Timeout during bitrate measurement")
+            return None
+        except httpx.RemoteProtocolError:
+            if hls_response:
+                return None
+            if answered:
+                logger.info(
+                    "[STREAM-PROBE] Accepted response closed before the "
+                    "sample completed; not a sustained feed"
+                )
+                return 0
             return None
         except Exception as e:
             # Client exceptions can include the requested URL or a redirect
@@ -1453,12 +1692,162 @@ class StreamProber:
                 )
             return None
 
+    async def _measure_hls_bitrate(
+        self,
+        playlist_url: str,
+        playlist: bytes,
+        *,
+        expires_at: datetime,
+    ) -> Optional[int]:
+        """Measure the first normal HLS variant across its encoded media span."""
+        visited: set[str] = set()
+        manifest_count = 0
+        current_url = playlist_url
+        current_playlist = playlist
+        headers = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}
+
+        while True:
+            current_key = urlsplit(current_url)._replace(fragment="").geturl()
+            if current_key in visited:
+                return None
+            visited.add(current_key)
+            manifest_count += 1
+
+            try:
+                text = current_playlist.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return None
+
+            lines = [raw_line.strip() for raw_line in text.splitlines()]
+            first_line = next((line for line in lines if line), None)
+            if first_line != "#EXTM3U":
+                return None
+
+            variants: list[str] = []
+            segments: list[tuple[float, str]] = []
+            pending_variant = False
+            duration: float | None = None
+            first_index = lines.index(first_line)
+            for line in lines[first_index + 1:]:
+                if not line:
+                    continue
+                if line.startswith("#EXT-X-BYTERANGE:"):
+                    return None
+                if line.startswith("#EXT-X-STREAM-INF:"):
+                    if pending_variant or duration is not None or segments:
+                        return None
+                    pending_variant = True
+                    continue
+                if line.startswith("#EXTINF:"):
+                    if duration is not None or pending_variant or variants:
+                        return None
+                    try:
+                        duration = float(
+                            line.removeprefix("#EXTINF:").split(",", 1)[0]
+                        )
+                    except ValueError:
+                        return None
+                    if duration <= 0 or not math.isfinite(duration):
+                        return None
+                    continue
+                if line.startswith("#"):
+                    continue
+                if pending_variant:
+                    variants.append(line)
+                    pending_variant = False
+                    continue
+                if duration is not None:
+                    segments.append((duration, urljoin(current_url, line)))
+                    duration = None
+                    continue
+                return None
+
+            if pending_variant or duration is not None:
+                return None
+            if variants and segments:
+                return None
+            if segments:
+                break
+            if not variants or manifest_count >= _MAX_HLS_MANIFESTS:
+                return None
+
+            requested_url = urljoin(current_url, variants[0])
+            requested_key = urlsplit(requested_url)._replace(fragment="").geturl()
+            if requested_key in visited:
+                return None
+            remaining = _probe_seconds(
+                expires_at, self.bitrate_sample_duration + 5.0,
+            )
+            if remaining <= 0:
+                return None
+            timeout = httpx.Timeout(
+                connect=min(10.0, remaining),
+                read=remaining,
+                write=min(10.0, remaining),
+                pool=min(10.0, remaining),
+            )
+            try:
+                async with _probe_stream_request(
+                    requested_url, timeout=timeout, headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    logical_url = str(response.extensions["ssrf_logical_url"])
+                    logical_key = urlsplit(logical_url)._replace(fragment="").geturl()
+                    if logical_key in visited:
+                        return None
+                    current_playlist = await _read_hls_manifest(response)
+            except (httpx.HTTPError, SSRFError):
+                return None
+            current_url = logical_url
+
+        bytes_downloaded = 0
+        media_seconds = 0.0
+        for duration, segment_url in segments:
+            remaining = _probe_seconds(
+                expires_at, self.bitrate_sample_duration + 5.0,
+            )
+            if remaining <= 0:
+                return None
+            timeout = httpx.Timeout(
+                connect=min(10.0, remaining),
+                read=remaining,
+                write=min(10.0, remaining),
+                pool=min(10.0, remaining),
+            )
+            try:
+                segment_bytes = 0
+                async with _probe_stream_request(
+                    segment_url, timeout=timeout, headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        segment_bytes += len(chunk)
+                        if _probe_seconds(expires_at, 1.0) <= 0:
+                            return None
+            except (httpx.HTTPError, SSRFError):
+                return None
+            if segment_bytes <= 0:
+                return None
+            bytes_downloaded += segment_bytes
+            media_seconds += duration
+            if media_seconds >= self.bitrate_sample_duration:
+                break
+
+        if media_seconds < self.bitrate_sample_duration or bytes_downloaded <= 0:
+            return None
+        return int((bytes_downloaded * 8) / media_seconds)
+
     # YAVG brightness threshold for dark/black screen detection.
     # In YUV TV range, 16 = pure black. Real content typically YAVG > 40.
     # Threshold of 20 catches: pure black, dark slates, off-air screens with small logos.
     BLACK_SCREEN_YAVG_THRESHOLD = 20
 
-    async def _detect_black_screen(self, url: str) -> Optional[bool]:
+    async def _detect_black_screen(
+        self,
+        url: str,
+        *,
+        expires_at: datetime | None = None,
+    ) -> Optional[bool]:
         """Detect dark/black screens by measuring average brightness (YAVG) via signalstats.
 
         Uses ffmpeg signalstats to compute per-frame average luma (YAVG).
@@ -1486,7 +1875,11 @@ class StreamProber:
         # buffering, connection setup, and ffmpeg startup. The previous 15-s
         # grace was too tight for cold scans and caused every timeout to be
         # silently treated as a clean stream.
-        total_timeout = self.black_screen_sample_duration + 30
+        total_timeout = _probe_seconds(
+            expires_at, self.black_screen_sample_duration + 30,
+        )
+        if total_timeout <= 0:
+            return None
 
         async with validated_subprocess_input(
             url, headers=headers, scheme_downgrade=PROBE_SCHEME_DOWNGRADE
@@ -1523,13 +1916,61 @@ class StreamProber:
                     total_timeout,
                 )
                 return None
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
         output = stderr.decode()
-        yavg_values = re.findall(r'lavfi\.signalstats\.YAVG=([\d.]+)', output)
-        if not yavg_values:
-            logger.debug("[STREAM-PROBE] No YAVG data from signalstats")
+        if process.returncode != 0:
+            logger.debug(
+                "[STREAM-PROBE] Black-screen decoder exited with %s",
+                process.returncode,
+            )
             return None
-        avg_brightness = sum(float(v) for v in yavg_values) / len(yavg_values)
-        is_dark = avg_brightness < self.BLACK_SCREEN_YAVG_THRESHOLD
+
+        frames: list[tuple[float, float]] = []
+        frame_time: float | None = None
+        for line in output.splitlines():
+            time_match = re.search(r"\bpts_time:([-+\d.eE]+)", line)
+            if time_match is not None:
+                try:
+                    frame_time = float(time_match.group(1))
+                except ValueError:
+                    frame_time = None
+            value_match = re.search(
+                r"lavfi\.signalstats\.YAVG=([-+\d.eE]+)", line,
+            )
+            if value_match is None or frame_time is None:
+                continue
+            try:
+                brightness = float(value_match.group(1))
+            except ValueError:
+                continue
+            if math.isfinite(frame_time) and math.isfinite(brightness):
+                frames.append((frame_time, brightness))
+
+        if len(frames) < 2:
+            logger.debug("[STREAM-PROBE] No complete frame sample from signalstats")
+            return None
+        frame_span = max(frame[0] for frame in frames) - min(
+            frame[0] for frame in frames
+        )
+        required_span = max(0.0, self.black_screen_sample_duration - 1.0)
+        if frame_span < required_span:
+            logger.debug(
+                "[STREAM-PROBE] Black-screen sample covered %.2fs of %ss",
+                frame_span,
+                self.black_screen_sample_duration,
+            )
+            return None
+
+        brightness_values = [frame[1] for frame in frames]
+        avg_brightness = sum(brightness_values) / len(brightness_values)
+        is_dark = all(
+            value < self.BLACK_SCREEN_YAVG_THRESHOLD
+            for value in brightness_values
+        )
         if is_dark:
             logger.warning("[STREAM-PROBE] Dark screen detected (YAVG=%.1f, threshold=%d)",
                            avg_brightness, self.BLACK_SCREEN_YAVG_THRESHOLD)
@@ -1558,10 +1999,20 @@ class StreamProber:
                 stats = StreamStats(stream_id=stream_id)
                 session.add(stats)
 
+            completed_at = datetime.utcnow()
+            name_changed = (
+                stats.stream_name is not None
+                and stats.stream_name != stream_name
+            )
+            if name_changed:
+                stats.consecutive_failures = 0
+                stats.is_black_screen = False
+                stats.black_screen_checked_at = None
+
             stats.stream_name = stream_name
             stats.probe_status = status
             stats.error_message = error_message
-            stats.last_probed = datetime.utcnow()
+            stats.last_probed = completed_at
             stats.dismissed_at = None  # Clear dismissal when re-probed
 
             # Track consecutive failures for strike rule
@@ -1576,8 +2027,9 @@ class StreamProber:
                 # timed out or returned no YAVG samples — preserve whatever
                 # the prior state was so a scan-task cold-start timeout can't
                 # silently wipe out a manual probe's finding.
-                if self.black_screen_detection_enabled and is_black_screen is not None:
+                if is_black_screen is not None:
                     stats.is_black_screen = is_black_screen
+                    stats.black_screen_checked_at = completed_at
 
             if ffprobe_data and status == "success":
                 self._parse_ffprobe_data(stats, ffprobe_data)
@@ -1599,12 +2051,9 @@ class StreamProber:
             if measured_bitrate is not None:
                 stats.measured_bitrate = measured_bitrate
                 logger.debug("[STREAM-PROBE] Recorded measured bitrate: %s bps", measured_bitrate)
-            elif status != "success":
-                # ffprobe got nothing and the sampler got nothing either, so any
-                # stored number describes a stream that has since stopped
-                # answering. Drop it, or a reader that trusts the sample over the
-                # probe verdict keeps calling this stream alive forever. A
-                # success that merely failed to sample keeps its number. [34]
+            else:
+                # The timestamp belongs to this completed observation. Keeping
+                # an older rate would combine evidence from different probes.
                 stats.measured_bitrate = None
 
             session.commit()
@@ -3201,7 +3650,13 @@ class StreamProber:
                             logger.debug("[STREAM-PROBE] Account %s: waiting %.1fs", m3u_account_id, hold_remaining)
                             await asyncio.sleep(hold_remaining)
 
-                    result = await self.probe_stream(stream_id, stream_url, stream_name)
+                    async with self.semaphore_for_account(stream.get("m3u_account")):
+                        if self._probe_cancelled:
+                            self._probe_progress_status = "cancelled"
+                            break
+                        result = await self.probe_stream(
+                            stream_id, stream_url, stream_name,
+                        )
 
                     # Track success/failure
                     probe_status = result.get("probe_status", "failed")

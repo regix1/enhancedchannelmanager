@@ -64,7 +64,7 @@ export function BackupRestoreSection({ isAdmin }: Props) {
    */
   const announceRestoreNotices = useCallback((result: api.RestoreResult) => {
     for (const notice of result.notices ?? []) {
-      notifications.warning(notice, 'Account Setup Required');
+      notifications.warning(notice, 'Restore Follow-up Required');
     }
   }, [notifications]);
 
@@ -197,7 +197,7 @@ export function BackupRestoreSection({ isAdmin }: Props) {
       notifications.success(`Restored ${result.restored_files.length} files from backup`);
       announceRestoreNotices(result);
 
-      setTimeout(() => {
+      window.setTimeout(() => {
         window.location.reload();
       }, 3000);
     } catch (err) {
@@ -216,7 +216,7 @@ export function BackupRestoreSection({ isAdmin }: Props) {
       notifications.success(`Restored ${result.restored_files.length} files from ${restoringLegacySaved}`);
       announceRestoreNotices(result);
       setRestoringLegacySaved(null);
-      setTimeout(() => {
+      window.setTimeout(() => {
         window.location.reload();
       }, 3000);
     } catch (err) {

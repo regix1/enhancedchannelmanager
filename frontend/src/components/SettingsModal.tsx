@@ -209,7 +209,7 @@ export const SettingsModal = memo(function SettingsModal({ isOpen, onClose, onSa
       // first-run setup, and the file count alone never says so. `?? []`
       // because a backend predating the field omits it.
       for (const notice of result.notices ?? []) {
-        notifications.warning(notice, 'Account Setup Required');
+        notifications.warning(notice, 'Restore Follow-up Required');
       }
       onSaved();
       onClose();

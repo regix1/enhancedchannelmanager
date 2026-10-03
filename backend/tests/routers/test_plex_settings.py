@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.conftest import patch_ssrf_dns as _patch_ssrf_dns
+
 
 class TestPlexTestConnection:
     """Tests for POST /api/settings/plex/test-connection (bd-r5f0c.4)."""
@@ -184,7 +186,9 @@ class TestPlexTestConnectionSsrfMitigation:
             captured["base_url"] = base_url
             return mock_client
 
-        with patch("routers.settings.PlexClient", side_effect=constructor_spy):
+        with _patch_ssrf_dns("8.8.8.8"), patch(
+            "routers.settings.PlexClient", side_effect=constructor_spy
+        ):
             response = await async_client.post(
                 "/api/settings/plex/test-connection",
                 json={

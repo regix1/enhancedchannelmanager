@@ -97,7 +97,9 @@ class TestBoundedExecutionLog:
 # Part B — crash-loop guard
 # ---------------------------------------------------------------------------
 class TestCrashSentinel:
-    def test_sentinel_abandons_the_run_without_tripping_on_a_first_hard_restart(self, test_session):
+    def test_sentinel_abandons_the_run_without_tripping_on_a_first_hard_restart(
+        self, test_session, tmp_path
+    ):
         from models import ChannelPipelineExecution
         from task_engine import _abandon_orphaned_auto_creation_executions
 
@@ -116,7 +118,8 @@ class TestCrashSentinel:
 
         settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
                              auto_creation_hard_restart_streak=0)
-        with patch("config.save_settings"), \
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings"), \
              patch("config.settings_file_allows_startup_writes", return_value=True), \
              patch("config.get_settings", return_value=settings):
             abandoned = _abandon_orphaned_auto_creation_executions(session=test_session)
@@ -131,7 +134,9 @@ class TestCrashSentinel:
         assert settings.auto_creation_hard_restart_streak == 1
         assert settings.auto_creation_run_on_refresh_disabled is False
 
-    def test_a_second_consecutive_hard_restart_trips_the_breaker(self, test_session):
+    def test_a_second_consecutive_hard_restart_trips_the_breaker(
+        self, test_session, tmp_path
+    ):
         """Two interrupted boots with no clean shutdown between them is the crash
         loop the breaker exists for."""
         from models import ChannelPipelineExecution
@@ -145,7 +150,8 @@ class TestCrashSentinel:
 
         settings = MagicMock(auto_creation_run_on_refresh_disabled=False,
                              auto_creation_hard_restart_streak=1)
-        with patch("config.save_settings"), \
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings"), \
              patch("config.settings_file_allows_startup_writes", return_value=True), \
              patch("config.get_settings", return_value=settings):
             assert _abandon_orphaned_auto_creation_executions(session=test_session) == 1
@@ -217,11 +223,12 @@ class TestCrashSentinel:
         assert settings.auto_creation_hard_restart_streak == 1
         assert settings.auto_creation_run_on_refresh_disabled is False
 
-    def test_sentinel_idempotent(self, test_session):
+    def test_sentinel_idempotent(self, test_session, tmp_path):
         from models import ChannelPipelineExecution
         from task_engine import _abandon_orphaned_auto_creation_executions
 
-        with patch("config.save_settings"), \
+        with patch("config.CONFIG_DIR", tmp_path), \
+             patch("config.save_settings"), \
              patch("config.get_settings", return_value=MagicMock(auto_creation_run_on_refresh_disabled=True)):
             n = _abandon_orphaned_auto_creation_executions(session=test_session)
         assert n == 0

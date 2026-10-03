@@ -105,6 +105,7 @@ def _publication_record(
         "revision": revision,
         "state": {
             "version": 1,
+            "published": True,
             "published_at": published_at,
             "xmltv_hash": document_hash,
             "config_hash": config_hash or _config_hash(prepared),
@@ -1078,6 +1079,96 @@ class TestGetXmltvProfile:
         assert 'channel id="one"' in response.text
 
     @pytest.mark.asyncio
+    async def test_cold_aggregate_does_not_publish_an_admitted_profile(
+        self, async_client, test_session,
+    ):
+        from datetime import datetime, timezone
+
+        from services.epg_publication import begin_delivery, read_publication
+
+        profile = _create_profile(test_session, name="Admitted Profile")
+        saved = profile.to_dict()
+        admitted = begin_delivery(
+            f"profile:{profile.id}",
+            expected_revision=0,
+            expected_hash=None,
+            profile=saved,
+            now=datetime.now(timezone.utc),
+        )
+        coverage = {
+            "profiles": {str(profile.id): {
+                "profile_id": profile.id,
+                "owned_channel_ids": [],
+                "can_publish": True,
+                "reason_codes": [],
+            }},
+            "sources": [],
+            "channels": [],
+        }
+
+        with patch(
+            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={}),
+        ), patch(
+            "services.epg_programmes.prepare_profiles",
+            AsyncMock(return_value=([saved], coverage)),
+        ):
+            response = await async_client.get("/api/dummy-epg/xmltv")
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "GUIDE_UNAVAILABLE"
+        assert read_publication(f"profile:{profile.id}") == admitted
+        assert read_publication("all") is None
+
+    @pytest.mark.asyncio
+    async def test_cold_profile_publication_preserves_unrequested_profile(
+        self, async_client, test_session,
+    ):
+        from datetime import datetime, timezone
+
+        from services.epg_publication import publish_profiles, read_publication
+
+        selected = _create_profile(test_session, name="Selected Profile")
+        unrequested = _create_profile(test_session, name="Unrequested Profile")
+        unrequested_saved = unrequested.to_dict()
+        publish_profiles(
+            [unrequested_saved],
+            {},
+            {"profiles": {str(unrequested.id): {
+                "profile_id": unrequested.id,
+                "owned_channel_ids": [],
+                "can_publish": True,
+                "reason_codes": [],
+            }}},
+            observations={},
+            now=datetime.now(timezone.utc),
+        )
+        before = read_publication(f"profile:{unrequested.id}")
+        selected_saved = selected.to_dict()
+        coverage = {"profiles": {str(selected.id): {
+            "profile_id": selected.id,
+            "owned_channel_ids": [],
+            "can_publish": True,
+            "reason_codes": [],
+        }}, "sources": [], "channels": []}
+
+        with patch(
+            "routers.dummy_epg._fetch_all_channels", AsyncMock(return_value={}),
+        ), patch(
+            "services.epg_programmes.prepare_profiles",
+            AsyncMock(return_value=([selected_saved], coverage)),
+        ):
+            response = await async_client.get(
+                f"/api/dummy-epg/xmltv/{selected.id}",
+            )
+
+        assert response.status_code == 200, response.text
+        assert read_publication(f"profile:{unrequested.id}") == before
+        assert read_publication("all")["state"]["members"] == {
+            str(selected.id): read_publication(f"profile:{selected.id}")["state"]["xmltv_hash"],
+            str(unrequested.id): before["state"]["xmltv_hash"],
+        }
+
+    @pytest.mark.asyncio
     async def test_returns_404_for_nonexistent_profile(self, async_client):
         """Returns 404 when profile doesn't exist."""
         mock_cache = MagicMock()
@@ -1469,7 +1560,10 @@ class TestXmltvUnauthenticatedAccess:
         profile = _create_profile(test_session, name="Open Profile Read")
         cached_xml = '<?xml version="1.0"?><tv><channel id="ecm-7"/></tv>'
         with patch("main.get_auth_settings", return_value=_AuthOn()), \
-             patch("services.epg_publication.read_publication", return_value={"xmltv": cached_xml}):
+             patch("services.epg_publication.read_publication", return_value={
+                 "xmltv": cached_xml,
+                 "state": {"published": True},
+             }):
             response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
 
         assert response.status_code == 200, response.text
@@ -1676,7 +1770,8 @@ class TestProgrammeSources:
             "delivery": None,
             "channels": [],
         }
-        assert prepare.await_args.kwargs == {}
+        assert set(prepare.await_args.kwargs) == {"expires_at"}
+        assert prepare.await_args.kwargs["expires_at"].tzinfo is not None
         client.return_value.refresh_epg_source.assert_not_awaited()
         client.return_value.update_channel.assert_not_awaited()
         publish.assert_not_called()
@@ -2193,6 +2288,78 @@ class TestProgrammeSources:
         )
 
     @pytest.mark.asyncio
+    async def test_unpublished_admission_projects_delivery_without_guide_evidence(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        prepared = {**profile.to_dict(), "channel_assignments": [{"channel_id": 10}]}
+        publication = _publication_record(
+            profile.id,
+            prepared,
+            required={"source": "a" * 64},
+            confirmed={},
+            pending_emby=False,
+        )
+        publication["state"].update({
+            "published": False,
+            "window_stop": publication["state"]["window_start"],
+            "members": {},
+            "channels": [],
+            "observations": {},
+        })
+        coverage = _coverage_result(profile.id)
+
+        response = await self._request_coverage(
+            async_client,
+            profile,
+            prepared,
+            coverage,
+            publication,
+            channel_map={10: {"id": 10, "name": "Slot", "channel_number": 10}},
+        )
+
+        assert response.status_code == 200, response.text
+        projected = response.json()["publication"]
+        assert projected["status"] == "unavailable"
+        assert projected["published_at"] is None
+        assert projected["window_start"] is None
+        assert projected["window_stop"] is None
+        assert projected["reason_codes"] == ["GUIDE_UNAVAILABLE"]
+        assert projected["channels"] == [{
+            "channel_id": 10,
+            "xmltv_id": None,
+            "visibility_evidence": "unknown",
+            "events": [],
+        }]
+        assert projected["delivery"] == {
+            "dispatcharr_status": "pending",
+            "pending_emby": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_profile_xmltv_does_not_compete_with_unpublished_admission(
+        self, async_client, test_session,
+    ):
+        profile = _create_profile(test_session)
+        publication = {
+            "xmltv": '<?xml version="1.0"?><tv></tv>',
+            "state": {"published": False},
+        }
+        with patch(
+            "services.epg_publication.read_publication", return_value=publication,
+        ), patch(
+            "routers.dummy_epg._fetch_all_channels", new_callable=AsyncMock,
+        ) as fetch_channels:
+            response = await async_client.get(f"/api/dummy-epg/xmltv/{profile.id}")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == {
+            "code": "GUIDE_UNAVAILABLE",
+            "reason_codes": ["GUIDE_UNAVAILABLE"],
+        }
+        fetch_channels.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_targeted_generation_is_admitted_without_local_composition(
         self, async_client,
     ):
@@ -2426,7 +2593,8 @@ class TestProgrammeSources:
             assert response.status_code == 503
             assert response.json()["detail"]["code"] == "GUIDE_UNAVAILABLE"
         prepare.assert_awaited_once()
-        assert prepare.await_args.kwargs == {}
+        assert set(prepare.await_args.kwargs) == {"expires_at"}
+        assert prepare.await_args.kwargs["expires_at"].tzinfo is not None
 
     @pytest.mark.asyncio
     async def test_name_preview_never_fetches_programme_sources(self, async_client):

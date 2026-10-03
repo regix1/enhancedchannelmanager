@@ -18,10 +18,12 @@ from security.stream_outbound import (
     _LocalStreamRelay,
     _MAX_HLS_MANIFEST_BYTES,
     _MAX_RELAY_RESOURCES,
+    _read_hls_manifest,
     SSRFPinnedTransport,
     stream_request,
     validated_subprocess_input,
 )
+from stream_prober import StreamProber
 
 
 def _target(url: str, ip: str = "93.184.216.34"):
@@ -90,38 +92,86 @@ class _ChunkedManifestResponse:
 
 @pytest.mark.asyncio
 async def test_manifest_reader_accepts_exact_two_mib_limit():
-    relay = _LocalStreamRelay("https://media.example/root.m3u8", None, None)
     response = _ChunkedManifestResponse([b"a" * _MAX_HLS_MANIFEST_BYTES])
 
-    body = await relay._read_hls_manifest(response)
+    body = await _read_hls_manifest(response)
 
     assert len(body) == _MAX_HLS_MANIFEST_BYTES
 
 
 @pytest.mark.asyncio
 async def test_manifest_reader_stops_at_limit_plus_one_without_reading_tail():
-    relay = _LocalStreamRelay("https://media.example/root.m3u8", None, None)
     response = _ChunkedManifestResponse(
         [b"a" * (_MAX_HLS_MANIFEST_BYTES + 1), b"unread-tail"]
     )
 
     with pytest.raises(web.HTTPRequestEntityTooLarge):
-        await relay._read_hls_manifest(response)
+        await _read_hls_manifest(response)
 
     assert response.chunks_read == 1
 
 
 @pytest.mark.asyncio
 async def test_manifest_content_length_rejects_before_reading_body():
-    relay = _LocalStreamRelay("https://media.example/root.m3u8", None, None)
     response = _ChunkedManifestResponse(
         [b"must-not-be-read"], content_length=_MAX_HLS_MANIFEST_BYTES + 1
     )
 
     with pytest.raises(web.HTTPRequestEntityTooLarge):
-        await relay._read_hls_manifest(response)
+        await _read_hls_manifest(response)
 
     assert response.chunks_read == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_at", ["root", "child", "segment"])
+async def test_hls_sampler_denies_forbidden_destination_before_inner_connect(
+    blocked_at,
+):
+    public_root = "http://93.184.216.34/root.m3u8"
+    forbidden = "http://169.254.169.254/latest/meta-data"
+    connected: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        connected.append(str(request.url))
+        if blocked_at == "child":
+            body = (
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+                f"{forbidden}\n"
+            ).encode()
+        else:
+            segment = forbidden if blocked_at == "segment" else "segment.ts"
+            body = f"#EXTM3U\n#EXTINF:1.0,\n{segment}\n".encode()
+        return httpx.Response(
+            200,
+            request=request,
+            content=body,
+            headers={"Content-Type": "application/vnd.apple.mpegurl"},
+        )
+
+    @asynccontextmanager
+    async def guarded(url, *, timeout, headers, scheme_downgrade):
+        transport = SSRFPinnedTransport(
+            inner_factory=lambda: httpx.MockTransport(handler),
+            mode=SSRFMode.PUBLIC_ONLY,
+            scheme_downgrade=scheme_downgrade,
+        )
+        async with stream_request(
+            url, timeout=timeout, headers=headers, transport=transport,
+        ) as response:
+            yield response
+
+    prober = StreamProber(
+        client=MagicMock(),
+        bitrate_sample_duration=1,
+        black_screen_detection_enabled=False,
+    )
+    root = forbidden if blocked_at == "root" else public_root
+    with patch("stream_prober.stream_request", guarded):
+        measured = await prober._measure_stream_bitrate(root)
+
+    assert measured is None
+    assert len(connected) == (0 if blocked_at == "root" else 1)
 
 
 @pytest.mark.asyncio

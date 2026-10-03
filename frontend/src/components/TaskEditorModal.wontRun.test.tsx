@@ -13,7 +13,7 @@
  *      reconcile is a trust problem.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { TaskStatus, TaskSchedule } from '../services/api';
 
@@ -93,9 +93,20 @@ function renderEditor(task: TaskStatus) {
   return render(<TaskEditorModal task={task} onClose={() => {}} onSaved={() => {}} />);
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.getTaskSchedules).mockReset().mockResolvedValue({ schedules: [] });
   });
 
   it('shows the rewritten enable hint copy', async () => {
@@ -110,6 +121,276 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('keeps an unresolved empty schedule list neutral until the request completes', async () => {
+    let resolveSchedules: ((value: Awaited<ReturnType<typeof api.getTaskSchedules>>) => void) | undefined;
+    vi.mocked(api.getTaskSchedules).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getTaskSchedules>>>((resolve) => {
+        resolveSchedules = resolve;
+      }),
+    );
+    renderEditor(makeTask());
+
+    const schedulesSection = screen.getByText('Schedules').closest('.schedules-section');
+    expect(screen.queryByText(/no schedules configured/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Loading schedules…');
+    expect(schedulesSection).toHaveAttribute('aria-busy', 'true');
+
+    await act(async () => {
+      resolveSchedules!({ schedules: [] });
+    });
+
+    expect(await screen.findByText(/no schedules configured/i)).toBeInTheDocument();
+    expect(await screen.findByTestId('schedule-wont-run-warning')).toHaveTextContent(
+      /has no schedules/i,
+    );
+    expect(schedulesSection).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('blocks pointer and keyboard Save until the authoritative schedule read completes', async () => {
+    const user = userEvent.setup();
+    const schedules = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const onClose = vi.fn();
+    const onSaved = vi.fn();
+    vi.mocked(api.getTaskSchedules).mockReturnValueOnce(schedules.promise);
+    render(<TaskEditorModal task={makeTask({ schedules: [] })} onClose={onClose} onSaved={onSaved} />);
+
+    const save = screen.getByRole('button', { name: /save changes/i });
+    expect(save).toBeDisabled();
+    await user.click(save);
+
+    save.removeAttribute('disabled');
+    save.focus();
+    await user.keyboard('{Enter}');
+
+    expect(api.updateTask).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(notify.success).not.toHaveBeenCalled();
+    expect(notify.info).not.toHaveBeenCalled();
+    expect(api.getTaskSchedules).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      schedules.resolve({ schedules: [makeSchedule({ enabled: false })] });
+    });
+
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(await screen.findByTestId('schedule-wont-run-warning')).toBeInTheDocument();
+    expect(api.updateTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps initial schedule rows mounted while their refresh is pending', async () => {
+    let resolveSchedules: ((value: Awaited<ReturnType<typeof api.getTaskSchedules>>) => void) | undefined;
+    const schedule = makeSchedule({ enabled: false });
+    vi.mocked(api.getTaskSchedules).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getTaskSchedules>>>((resolve) => {
+        resolveSchedules = resolve;
+      }),
+    );
+    renderEditor(makeTask({ schedules: [schedule] }));
+
+    expect(screen.getByText('Hourly')).toBeInTheDocument();
+    expect(screen.getByText('Schedules').closest('.schedules-section')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveSchedules!({ schedules: [schedule] });
+    });
+
+    expect(await screen.findByTestId('schedule-wont-run-warning')).toBeInTheDocument();
+    expect(screen.getByText('Hourly')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /save changes/i })).toBeEnabled();
+  });
+
+  it('shows a load error without concluding that an empty task has no schedules', async () => {
+    let rejectSchedules: ((reason?: unknown) => void) | undefined;
+    vi.mocked(api.getTaskSchedules).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getTaskSchedules>>>((_resolve, reject) => {
+        rejectSchedules = reject;
+      }),
+    );
+    renderEditor(makeTask());
+
+    await act(async () => {
+      rejectSchedules!(new Error('Schedule request failed'));
+    });
+
+    const loadError = await screen.findByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    );
+    expect(loadError.closest('[role="alert"]')).toBeInTheDocument();
+    expect(screen.queryByText(/no schedules configured/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+    const save = screen.getByRole('button', { name: /save changes/i });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(api.updateTask).not.toHaveBeenCalled();
+    expect(notify.success).not.toHaveBeenCalled();
+  });
+
+  it('retains populated rows beside a schedule load error', async () => {
+    let rejectSchedules: ((reason?: unknown) => void) | undefined;
+    vi.mocked(api.getTaskSchedules).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getTaskSchedules>>>((_resolve, reject) => {
+        rejectSchedules = reject;
+      }),
+    );
+    renderEditor(makeTask({ schedules: [makeSchedule({ enabled: false })] }));
+
+    await act(async () => {
+      rejectSchedules!(new Error('Schedule request failed'));
+    });
+
+    const loadError = await screen.findByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    );
+    expect(loadError.closest('[role="alert"]')).toBeInTheDocument();
+    expect(screen.getByText('Hourly')).toBeInTheDocument();
+    expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+    const save = screen.getByRole('button', { name: /save changes/i });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(api.updateTask).not.toHaveBeenCalled();
+    expect(notify.success).not.toHaveBeenCalled();
+  });
+
+  it('clears a prior load error after a later schedule refresh succeeds', async () => {
+    let resolveSchedules: ((value: Awaited<ReturnType<typeof api.getTaskSchedules>>) => void) | undefined;
+    const disabledSchedule = makeSchedule({ enabled: false });
+    const enabledSchedule = makeSchedule({ enabled: true });
+    vi.mocked(api.getTaskSchedules)
+      .mockRejectedValueOnce(new Error('Schedule request failed'))
+      .mockReturnValueOnce(
+        new Promise<Awaited<ReturnType<typeof api.getTaskSchedules>>>((resolve) => {
+          resolveSchedules = resolve;
+        }),
+      );
+    renderEditor(makeTask({ schedules: [disabledSchedule] }));
+
+    expect(await screen.findByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    )).toBeInTheDocument();
+    const toggle = screen.getByRole('checkbox', { name: /Hourly/i });
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(api.getTaskSchedules).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Hourly')).toBeInTheDocument();
+    expect(screen.getByText('Schedules').closest('.schedules-section')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.queryByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    )).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveSchedules!({ schedules: [enabledSchedule] });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Schedules').closest('.schedules-section')).toHaveAttribute('aria-busy', 'false');
+    });
+    expect(screen.getByText('Hourly')).toBeInTheDocument();
+    expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+  });
+
+  it('lets only the latest schedule refresh set rows and Save readiness', async () => {
+    const initial = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const failedRefresh = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const latestRefresh = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const snapshot = makeSchedule({ name: 'Snapshot schedule', enabled: false });
+    vi.mocked(api.getTaskSchedules)
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(failedRefresh.promise)
+      .mockReturnValueOnce(latestRefresh.promise);
+    renderEditor(makeTask({ schedules: [snapshot] }));
+
+    const save = screen.getByRole('button', { name: /save changes/i });
+    expect(save).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /Snapshot schedule/i }));
+    await waitFor(() => expect(api.getTaskSchedules).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initial.resolve({ schedules: [makeSchedule({ name: 'Older response', enabled: true })] });
+    });
+
+    expect(screen.queryByText('Older response')).not.toBeInTheDocument();
+    expect(screen.getByText('Snapshot schedule')).toBeInTheDocument();
+    expect(screen.getByText('Schedules').closest('.schedules-section')).toHaveAttribute('aria-busy', 'true');
+    expect(save).toBeDisabled();
+
+    await act(async () => {
+      failedRefresh.reject(new Error('Latest schedule request failed'));
+    });
+
+    expect(await screen.findByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    )).toBeInTheDocument();
+    expect(screen.getByText('Snapshot schedule')).toBeInTheDocument();
+    expect(save).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Snapshot schedule/i }));
+    await waitFor(() => expect(api.getTaskSchedules).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      latestRefresh.resolve({ schedules: [makeSchedule({ name: 'Latest response', enabled: true })] });
+    });
+
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(screen.getByText('Latest response')).toBeInTheDocument();
+    expect(screen.queryByText('Snapshot schedule')).not.toBeInTheDocument();
+    expect(screen.queryByText(
+      'Could not load schedules. Close and reopen this dialog to try again.',
+    )).not.toBeInTheDocument();
+  });
+
+  it('keeps a reopened Task Editor owned by its new schedule request', async () => {
+    const changedRequest = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const closedRequest = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    const reopenedRequest = deferred<Awaited<ReturnType<typeof api.getTaskSchedules>>>();
+    vi.mocked(api.getTaskSchedules)
+      .mockReturnValueOnce(changedRequest.promise)
+      .mockReturnValueOnce(closedRequest.promise)
+      .mockReturnValueOnce(reopenedRequest.promise);
+
+    const first = renderEditor(makeTask({ schedules: [makeSchedule({ name: 'Original snapshot' })] }));
+    first.rerender(
+      <TaskEditorModal
+        task={makeTask({ task_id: 'cleanup', schedules: [makeSchedule({ name: 'Changed snapshot' })] })}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const changedSave = screen.getByRole('button', { name: /save changes/i });
+    expect(changedSave).toBeDisabled();
+    await waitFor(() => expect(api.getTaskSchedules).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      changedRequest.resolve({ schedules: [makeSchedule({ name: 'Old task response', enabled: true })] });
+    });
+
+    expect(screen.getByText('Original snapshot')).toBeInTheDocument();
+    expect(screen.queryByText('Old task response')).not.toBeInTheDocument();
+    expect(changedSave).toBeDisabled();
+
+    first.unmount();
+    renderEditor(makeTask({ task_id: 'stream_probe', schedules: [makeSchedule({ name: 'Reopened snapshot' })] }));
+
+    const save = screen.getByRole('button', { name: /save changes/i });
+    expect(save).toBeDisabled();
+    await act(async () => {
+      closedRequest.resolve({ schedules: [makeSchedule({ name: 'Closed response', enabled: true })] });
+    });
+
+    expect(screen.getByText('Reopened snapshot')).toBeInTheDocument();
+    expect(screen.queryByText('Closed response')).not.toBeInTheDocument();
+    expect(save).toBeDisabled();
+
+    await act(async () => {
+      reopenedRequest.resolve({ schedules: [makeSchedule({ name: 'Reopened response', enabled: true })] });
+    });
+
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(screen.getByText('Reopened response')).toBeInTheDocument();
+    expect(screen.queryByText('Reopened snapshot')).not.toBeInTheDocument();
+  });
+
   it('shows the inline warning when the task is enabled and all schedules are disabled', async () => {
     vi.mocked(api.getTaskSchedules).mockResolvedValue({ schedules: [makeSchedule({ enabled: false })] });
     renderEditor(makeTask());
@@ -118,6 +399,7 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
     expect(warning).toHaveTextContent(/will not run automatically/i);
     // Non-manual task with an existing schedule → promises the save reconcile.
     expect(warning).toHaveTextContent(/save and the most recent schedule will be enabled/i);
+    expect(screen.getByRole('button', { name: /save changes/i })).toBeEnabled();
   });
 
   it('hides the warning when at least one schedule is enabled', async () => {
@@ -138,6 +420,7 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
 
     await screen.findByText(/no schedules configured/i);
     expect(screen.queryByTestId('schedule-wont-run-warning')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /save changes/i })).toBeEnabled();
   });
 
   it('shows the warning when unchecking is reverted (live with the checkbox)', async () => {
@@ -163,7 +446,9 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
     renderEditor(makeTask());
 
     await screen.findByTestId('schedule-wont-run-warning');
-    fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+    const save = screen.getByRole('button', { name: /save changes/i });
+    await waitFor(() => expect(save).toBeEnabled());
+    fireEvent.click(save);
 
     await waitFor(() => {
       expect(notify.info).toHaveBeenCalledWith(
@@ -179,10 +464,42 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
     renderEditor(makeTask());
 
     await screen.findByText('Hourly');
-    fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+    const save = screen.getByRole('button', { name: /save changes/i });
+    await waitFor(() => expect(save).toBeEnabled());
+    fireEvent.click(save);
 
     await waitFor(() => expect(api.updateTask).toHaveBeenCalled());
     expect(notify.info).not.toHaveBeenCalled();
+  });
+
+  it('prevents a second Save while the first authoritative update is pending', async () => {
+    const user = userEvent.setup();
+    const update = deferred<void>();
+    const onClose = vi.fn();
+    const onSaved = vi.fn();
+    vi.mocked(api.getTaskSchedules).mockResolvedValue({ schedules: [makeSchedule({ enabled: true })] });
+    vi.mocked(api.updateTask).mockReturnValueOnce(update.promise);
+    render(<TaskEditorModal task={makeTask()} onClose={onClose} onSaved={onSaved} />);
+
+    await screen.findByText('Hourly');
+    const save = screen.getByRole('button', { name: /save changes/i });
+    await waitFor(() => expect(save).toBeEnabled());
+    await user.click(save);
+
+    const saving = screen.getByRole('button', { name: /saving/i });
+    expect(saving).toBeDisabled();
+    await user.click(saving);
+    expect(api.updateTask).toHaveBeenCalledTimes(1);
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      update.resolve();
+    });
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(api.updateTask).toHaveBeenCalledTimes(1);
   });
 
   it('opens straight at Add Schedule when openAddSchedule is set (Fix-it path)', async () => {

@@ -1,155 +1,383 @@
-"""Health check for the streams Event Sync promotion is about to promote.
+"""Current, name-bound Event Sync stream health decisions."""
 
-The rails that matter here are all about what the check REFUSES to do. It
-reports a stream dead only on evidence, it probes only on a live run, and
-every failure of its own machinery reads as "nothing is dead" so an outage
-in ECM can never look like an outage at the provider.
-
-The evidence itself is one rule: a stream is dead when the provider has
-stopped listing it, and a probe verdict counts only once the event has
-started. Everything in here is a case of that.
-"""
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cache import Cache
+from models import StreamStats
 from services.event_sync_stream_health import (
-    MAX_HEALTH_PROBES_PER_RUN,
+    _fresh_flow_state,
+    _probe_and_collect_failures,
     collect_stream_flow,
     find_dead_streams,
     find_working_streams,
 )
+from services.pipeline_write_plan import PlanningDispatcharrClient
+from stream_prober import StreamProber
+from tests.unit.test_event_sync_promotion import _clock
 
 
-# When the events in these tests began, and when a stored verdict was
-# recorded unless a test says otherwise. A probe taken after kickoff is the
-# ordinary case; one taken before it is the case in
-# test_a_failure_recorded_before_kickoff_stays_out_of_the_verdict.
-_KICKOFF = datetime(2026, 7, 11, 23, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 7, 11, 20, 0, tzinfo=timezone.utc)
+_START = _NOW - timedelta(minutes=2)
+_CHECKED = _NOW - timedelta(minutes=4)
 
 
-def _stat(stream_id, *, failures=0, status="success", probed_at=None,
-          measured=None, declared=None):
-    return {
+@pytest.fixture
+def fixed_consumer_clock():
+    with patch("services.event_sync_stream_health.datetime", _clock(_NOW)):
+        yield
+
+
+def _make_prober(client=None, **kwargs) -> StreamProber:
+    with patch.object(StreamProber, "_load_probe_history"):
+        return StreamProber(
+            client=client if client is not None else AsyncMock(),
+            **kwargs,
+        )
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _stat(
+    stream_id: int,
+    *,
+    name: str | None = None,
+    measured=4_000_000,
+    dark: bool | None = False,
+    status: str = "success",
+    failures: int = 0,
+    probed_at: datetime = _NOW,
+    checked_at: datetime | None = _NOW,
+    declared: int | None = None,
+) -> dict:
+    stat = {
         "stream_id": stream_id,
+        "stream_name": name or f"s{stream_id}",
         "probe_status": status,
         "consecutive_failures": failures,
         "measured_bitrate": measured,
         "video_bitrate": declared,
-        "last_probed": (probed_at or _KICKOFF).replace(
-            tzinfo=None).isoformat() + "Z",
+        "last_probed": _iso(probed_at),
     }
-
-
-def _black(stream_id, *, checked_at=None, is_black=True, measured=5_000_000):
-    """A stat whose throughput reads healthy, as an offline card's does."""
-    stat = _stat(stream_id, measured=measured)
-    stat["is_black_screen"] = is_black
+    if dark is not None:
+        stat["is_black_screen"] = dark
     if checked_at is not None:
-        stat["black_screen_checked_at"] = checked_at.replace(tzinfo=None).isoformat() + "Z"
+        stat["black_screen_checked_at"] = _iso(checked_at)
     return stat
 
 
-@pytest.mark.parametrize("checked_at,expected", [
-    (_KICKOFF + timedelta(minutes=20), True),
-    (_KICKOFF, True),
-    (_KICKOFF - timedelta(minutes=20), False),
-    (None, False),
-])
-def test_a_black_picture_taken_during_the_event_outranks_healthy_throughput(checked_at, expected):
-    from services.event_sync_stream_health import _dead_once_started
+@pytest.mark.parametrize(
+    "measured,dark,expected",
+    [
+        (4_000_000, True, False),
+        (4_000_000, False, True),
+        (4_000_000, None, None),
+        (0, True, False),
+        (0, False, False),
+        (0, None, False),
+        (None, True, False),
+        (None, False, None),
+        (None, None, None),
+    ],
+)
+def test_current_playability_table(measured, dark, expected):
+    stat = _stat(1, measured=measured, dark=dark)
+    if dark is None:
+        stat.pop("black_screen_checked_at", None)
 
-    stat = _black(1, checked_at=checked_at)
-    assert _dead_once_started(stat, _KICKOFF, 3, 2_000_000) is expected
+    assert _fresh_flow_state(
+        stat,
+        _CHECKED,
+        stream_name="s1",
+        now=_NOW,
+    ) is expected
 
 
-def test_a_cleared_picture_leaves_the_throughput_to_decide():
-    from services.event_sync_stream_health import _dead_once_started
+@pytest.mark.parametrize("measured", [True, -1, float("nan"), float("inf")])
+def test_invalid_measurements_are_unknown(measured):
+    assert _fresh_flow_state(
+        _stat(1, measured=measured, dark=False),
+        _CHECKED,
+        stream_name="s1",
+        now=_NOW,
+    ) is None
 
-    checked = _KICKOFF + timedelta(minutes=20)
-    assert _dead_once_started(_black(1, checked_at=checked, is_black=False), _KICKOFF, 3, 2_000_000) is False
-    assert _dead_once_started(
-        _black(1, checked_at=checked, is_black=False, measured=10_000), _KICKOFF, 3, 2_000_000,
-    ) is True
+
+def test_current_hard_failure_is_false_without_a_measurement():
+    assert _fresh_flow_state(
+        _stat(1, measured=None, dark=None, status="timeout"),
+        _CHECKED,
+        stream_name="s1",
+        now=_NOW,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "stat,name,now",
+    [
+        (None, "s1", _NOW),
+        (_stat(1, name="other"), "s1", _NOW),
+        (_stat(1, probed_at=_NOW - timedelta(minutes=6)), "s1", _NOW),
+        (_stat(1, probed_at=_NOW + timedelta(minutes=1)), "s1", _NOW),
+    ],
+)
+def test_missing_stale_future_and_other_name_rows_are_unknown(stat, name, now):
+    assert _fresh_flow_state(
+        stat,
+        _NOW - timedelta(minutes=5),
+        stream_name=name,
+        now=now,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "measured,dark",
+    [
+        (4_000_000, True),
+        (4_000_000, False),
+        (4_000_000, None),
+        (0, True),
+        (0, False),
+        (0, None),
+        (None, True),
+        (None, False),
+        (None, None),
+    ],
+)
+@pytest.mark.parametrize("invalid", ["missing", "stale", "future", "name"])
+def test_every_table_pair_rejects_invalid_evidence(measured, dark, invalid):
+    stat = _stat(1, measured=measured, dark=dark)
+    expected_name = "s1"
+    if invalid == "missing":
+        stat = None
+    elif invalid == "stale":
+        stat["last_probed"] = _iso(_NOW - timedelta(minutes=6))
+        stat["black_screen_checked_at"] = _iso(_NOW - timedelta(minutes=6))
+    elif invalid == "future":
+        stat["last_probed"] = _iso(_NOW + timedelta(minutes=1))
+        stat["black_screen_checked_at"] = _iso(_NOW + timedelta(minutes=1))
+    else:
+        expected_name = "renamed"
+
+    assert _fresh_flow_state(
+        stat,
+        _NOW - timedelta(minutes=5),
+        stream_name=expected_name,
+        now=_NOW,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "measured,dark,expected",
+    [
+        (4_000_000, True, None),
+        (4_000_000, False, None),
+        (4_000_000, None, None),
+        (0, True, False),
+        (0, False, False),
+        (0, None, False),
+        (None, True, None),
+        (None, False, None),
+        (None, None, None),
+    ],
+)
+def test_every_table_pair_rejects_content_from_before_the_probe(
+    measured, dark, expected,
+):
+    stat = _stat(
+        1,
+        measured=measured,
+        dark=dark,
+        probed_at=_NOW,
+        checked_at=_NOW - timedelta(seconds=1),
+    )
+
+    assert _fresh_flow_state(
+        stat,
+        _CHECKED,
+        stream_name="s1",
+        now=_NOW,
+    ) is expected
+
+
+def test_content_before_a_newer_probe_cannot_complete_that_probe():
+    stat = _stat(
+        1,
+        measured=4_000_000,
+        dark=False,
+        probed_at=_NOW,
+        checked_at=_NOW - timedelta(seconds=1),
+    )
+    assert _fresh_flow_state(
+        stat, _CHECKED, stream_name="s1", now=_NOW,
+    ) is None
+
+
+def test_a_new_dark_scan_can_classify_old_transport():
+    stat = _stat(
+        1,
+        measured=4_000_000,
+        dark=True,
+        probed_at=_NOW - timedelta(minutes=10),
+        checked_at=_NOW,
+    )
+    assert _fresh_flow_state(
+        stat, _CHECKED, stream_name="s1", now=_NOW,
+    ) is False
 
 
 @pytest.mark.asyncio
-async def test_current_flow_uses_recent_sample_black_picture_and_probe_failure():
-    checked_after = _KICKOFF - timedelta(minutes=30)
+async def test_collector_uses_event_time_name_and_complete_evidence(
+    fixed_consumer_clock,
+):
     stats = {
-        1: _stat(1, measured=5_000_000),
-        2: _stat(2, measured=100_000),
-        3: _black(3, checked_at=_KICKOFF, measured=5_000_000),
-        4: _stat(4, status="timeout"),
-        5: _stat(5, measured=5_000_000, probed_at=checked_after - timedelta(seconds=1)),
+        1: _stat(1, measured=12_000, dark=False, declared=1),
+        2: _stat(2, measured=4_000_000, dark=None),
+        3: _stat(3, measured=0, dark=None),
+        4: _stat(4, measured=4_000_000, dark=False, name="old"),
     }
     with patch(
         "services.event_sync_stream_health._load_stats",
         AsyncMock(return_value=stats),
-    ), patch(
-        "services.event_sync_stream_health._min_stream_bitrate_bps",
-        return_value=2_000_000,
     ):
-        assert await collect_stream_flow(
-            stats,
-            client=MagicMock(),
-            checked_after=checked_after,
-        ) == {1: True, 2: False, 3: False, 4: False, 5: None}
+        result = await collect_stream_flow(
+            [1, 2, 3, 4, 5],
+            client=None,
+            checked_after=_CHECKED,
+            event_start_by_stream={
+                1: _START,
+                2: _START,
+                3: _START,
+                4: _START,
+                5: _NOW + timedelta(hours=1),
+            },
+            stream_names={sid: f"s{sid}" for sid in range(1, 6)},
+            expires_at=None,
+        )
+
+    assert result == {1: True, 2: None, 3: False, 4: None, 5: None}
 
 
 @pytest.mark.asyncio
-async def test_current_flow_accepts_a_new_black_scan_when_the_probe_is_old():
-    checked_after = _KICKOFF - timedelta(minutes=30)
-    stat = _black(
-        1,
-        checked_at=_KICKOFF,
-        measured=5_000_000,
-    )
-    stat["last_probed"] = (checked_after - timedelta(hours=1)).replace(
-        tzinfo=None,
-    ).isoformat() + "Z"
+async def test_collector_read_only_path_never_probes(fixed_consumer_clock):
+    probe = AsyncMock()
     with patch(
         "services.event_sync_stream_health._load_stats",
-        AsyncMock(return_value={1: stat}),
+        AsyncMock(return_value={}),
     ), patch(
-        "services.event_sync_stream_health._min_stream_bitrate_bps",
-        return_value=2_000_000,
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
     ):
-        assert await collect_stream_flow(
-            [1], client=MagicMock(), checked_after=checked_after,
-        ) == {1: False}
+        result = await collect_stream_flow(
+            [1],
+            client=MagicMock(),
+            checked_after=_CHECKED,
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+            expires_at=None,
+        )
+
+    assert result == {1: None}
+    probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_current_flow_probes_only_streams_without_a_recent_measurement():
-    checked_after = _KICKOFF - timedelta(minutes=30)
-    initial = {1: _stat(1, measured=5_000_000)}
-    refreshed = {2: _stat(2, measured=100_000)}
-    load = AsyncMock(side_effect=[initial, refreshed])
-    probe = AsyncMock(return_value={2})
+async def test_collector_reloads_after_targeted_probe(fixed_consumer_clock):
+    expires_at = _NOW + timedelta(minutes=1)
+    fresh = _stat(
+        1,
+        probed_at=_NOW,
+        checked_at=_NOW,
+    )
+    load = AsyncMock(side_effect=[{}, {1: fresh}])
+    probe = AsyncMock(return_value=set())
     client = MagicMock()
     with patch("services.event_sync_stream_health._load_stats", load), patch(
         "services.event_sync_stream_health._probe_and_collect_failures", probe,
-    ), patch(
-        "services.event_sync_stream_health._min_stream_bitrate_bps",
-        return_value=2_000_000,
     ):
-        assert await collect_stream_flow(
-            [1, 2],
+        result = await collect_stream_flow(
+            [1],
             client=client,
-            checked_after=checked_after,
+            checked_after=_CHECKED,
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+            expires_at=expires_at,
             probe_missing=True,
-        ) == {1: True, 2: False}
+            probe_while_busy=True,
+        )
+
+    assert result == {1: True}
     probe.assert_awaited_once_with(
-        client, [2], 2_000_000, cancelled=None,
+        client,
+        [1],
+        expires_at=expires_at,
+        event_start_by_stream={1: _START},
+        stream_names={1: "s1"},
+        cancelled=None,
     )
 
 
 @pytest.mark.asyncio
-async def test_current_flow_does_not_duplicate_an_active_scheduled_probe():
-    checked_after = _KICKOFF - timedelta(minutes=30)
+async def test_collector_skips_future_and_unscoped_candidates(
+    fixed_consumer_clock,
+):
+    probe = AsyncMock()
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={}),
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ):
+        result = await collect_stream_flow(
+            [1, 2],
+            client=MagicMock(),
+            checked_after=_CHECKED,
+            event_start_by_stream={1: _NOW + timedelta(hours=1)},
+            stream_names={1: "s1"},
+            expires_at=_NOW + timedelta(minutes=1),
+            probe_missing=True,
+            probe_while_busy=True,
+        )
+
+    assert result == {1: None, 2: None}
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_collector_uses_unprobed_then_oldest_order(fixed_consumer_clock):
+    stats = {
+        1: _stat(1, measured=None, dark=None, probed_at=_NOW - timedelta(minutes=4)),
+        3: _stat(3, measured=None, dark=None, probed_at=_NOW - timedelta(minutes=1)),
+    }
+    probe = AsyncMock(return_value=set())
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(side_effect=[stats, {}]),
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ):
+        await collect_stream_flow(
+            [1, 2, 3],
+            client=MagicMock(),
+            checked_after=_NOW - timedelta(minutes=5),
+            event_start_by_stream={1: _START, 2: _START, 3: _START},
+            stream_names={1: "s1", 2: "s2", 3: "s3"},
+            expires_at=_NOW + timedelta(minutes=1),
+            probe_missing=True,
+            probe_while_busy=True,
+        )
+
+    assert probe.await_args.args[1] == [2, 1, 3]
+
+
+@pytest.mark.asyncio
+async def test_collector_respects_active_bulk_probe_by_default(
+    fixed_consumer_clock,
+):
     probe = AsyncMock()
     prober = MagicMock(_probing_in_progress=True)
     with patch(
@@ -157,898 +385,874 @@ async def test_current_flow_does_not_duplicate_an_active_scheduled_probe():
         AsyncMock(return_value={}),
     ), patch(
         "services.event_sync_stream_health._probe_and_collect_failures", probe,
-    ), patch(
-        "services.event_sync_stream_health._min_stream_bitrate_bps",
-        return_value=2_000_000,
     ), patch("stream_prober.get_prober", return_value=prober):
-        assert await collect_stream_flow(
+        result = await collect_stream_flow(
             [1],
             client=MagicMock(),
-            checked_after=checked_after,
+            checked_after=_CHECKED,
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+            expires_at=_NOW + timedelta(minutes=1),
             probe_missing=True,
-        ) == {1: None}
+        )
+
+    assert result == {1: None}
     probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_current_flow_can_probe_an_event_during_a_scheduled_probe():
-    checked_after = _KICKOFF - timedelta(minutes=30)
-    fresh = _stat(1, measured=5_000_000)
-    load = AsyncMock(side_effect=[{}, {1: fresh}])
-    probe = AsyncMock(return_value=set())
-    prober = MagicMock(_probing_in_progress=True)
-    with patch(
-        "services.event_sync_stream_health._load_stats", load,
-    ), patch(
-        "services.event_sync_stream_health._probe_and_collect_failures", probe,
-    ), patch(
-        "services.event_sync_stream_health._min_stream_bitrate_bps",
-        return_value=2_000_000,
-    ), patch("stream_prober.get_prober", return_value=prober):
-        assert await collect_stream_flow(
+async def test_collector_requires_expiry_for_writes():
+    with pytest.raises(ValueError, match="expires_at"):
+        await collect_stream_flow(
             [1],
             client=MagicMock(),
-            checked_after=checked_after,
+            checked_after=_CHECKED,
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+            expires_at=None,
             probe_missing=True,
-            probe_while_busy=True,
-        ) == {1: True}
-    probe.assert_awaited_once()
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2])
-async def test_probe_batch_respects_total_and_account_limits(limit):
-    from services.event_sync_stream_health import _probe_and_collect_failures
-    from stream_prober import StreamProber
-
-    prober = StreamProber.__new__(StreamProber)
-    prober.max_concurrent_probes = limit
+async def test_targeted_probe_respects_total_and_account_limits(limit):
+    prober = _make_prober(max_concurrent_probes=limit)
     prober.account_probe_limits = {2: 1, 18: 1}
-    prober._account_semaphores = {}
     prober.refresh_account_probe_limits = AsyncMock()
-    accounts = {1: 2, 2: 2, 3: 18, 4: 18, 5: None, 6: None}
-    active, peak, by_account = 0, 0, {}
-    async def probe(sid, url, name):
+    accounts = {1: 2, 2: 2, 3: 18, 4: 18}
+    active = 0
+    peak = 0
+    by_account: dict[int, int] = {}
+    stats = {}
+
+    async def probe(stream_id, url, name, *, content, expires_at):
         nonlocal active, peak
-        account = accounts[sid]
+        account = accounts[stream_id]
         active += 1
         peak = max(peak, active)
         by_account[account] = by_account.get(account, 0) + 1
         try:
-            assert by_account[account] <= (1 if account in {2, 18} else limit)
+            assert content is True
+            assert by_account[account] == 1
             await asyncio.sleep(0.01)
-            return {"probe_status": "success", "measured_bitrate": 5000000}
+            checked = datetime.now(timezone.utc)
+            stats[stream_id] = _stat(
+                stream_id,
+                probed_at=checked,
+                checked_at=checked,
+            )
+            return stats[stream_id]
         finally:
             active -= 1
             by_account[account] -= 1
+
     prober.probe_stream = AsyncMock(side_effect=probe)
-    urls = {sid: ("https://example.invalid/stream", str(sid), account) for sid, account in accounts.items()}
-    with patch("stream_prober.ensure_prober", return_value=prober), \
-         patch("services.event_sync_stream_health._probe_urls", new=AsyncMock(return_value=urls)):
-        assert await _probe_and_collect_failures(None, list(accounts), 2000000) == set()
-    assert peak == limit
-    assert active == 0
-    assert all(value == 0 for value in by_account.values())
+    urls = {
+        sid: (f"http://example.com/{sid}", f"s{sid}", account, 70 + account)
+        for sid, account in accounts.items()
+    }
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health._probe_urls",
+        AsyncMock(side_effect=[urls, urls]),
+    ), patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(side_effect=lambda ids: {sid: stats[sid] for sid in ids}),
+    ):
+        result = await _probe_and_collect_failures(
+            MagicMock(),
+            list(accounts),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={sid: _START for sid in accounts},
+            stream_names={sid: f"s{sid}" for sid in accounts},
+        )
+
+    assert result == set()
+    assert peak <= limit
 
 
 @pytest.mark.asyncio
-async def test_probe_batch_cancellation_releases_its_slots():
-    from services.event_sync_stream_health import _probe_and_collect_failures
-    from stream_prober import StreamProber
-
-    prober = StreamProber.__new__(StreamProber)
-    prober.max_concurrent_probes = 1
-    prober.account_probe_limits = {2: 1, 18: 1}
-    prober._account_semaphores = {}
+async def test_targeted_probe_expiry_cancels_work_and_releases_permit():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1}
     prober.refresh_account_probe_limits = AsyncMock()
-    started = asyncio.Event()
-    released = asyncio.Event()
-    async def probe(*args):
-        started.set()
+    cancelled = asyncio.Event()
+
+    async def probe(*_args, **_kwargs):
         try:
             await asyncio.Event().wait()
         finally:
-            released.set()
+            cancelled.set()
+
     prober.probe_stream = AsyncMock(side_effect=probe)
-    urls = {sid: ("https://example.invalid/stream", str(sid), account)
-            for sid, account in [(1, 2), (2, 18), (3, None)]}
-    with patch("stream_prober.ensure_prober", return_value=prober), \
-         patch("services.event_sync_stream_health._probe_urls", new=AsyncMock(return_value=urls)):
-        task = asyncio.create_task(_probe_and_collect_failures(None, list(urls), 2000000))
-        await asyncio.wait_for(started.wait(), 1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        await asyncio.wait_for(released.wait(), 1)
-        prober.probe_stream = AsyncMock(return_value={"probe_status": "success", "measured_bitrate": 5000000})
-        assert await asyncio.wait_for(_probe_and_collect_failures(None, list(urls), 2000000), 1) == set()
-    assert prober.probe_stream.await_count == 3
-
-
-def _settings(threshold=3, floor_kbps=2000):
-    settings = MagicMock()
-    settings.strike_threshold = threshold
-    settings.min_stream_bitrate_kbps = floor_kbps
-    return settings
-
-
-def _stats_returning(stats):
-    def _get(stream_ids):
-        return {sid: stats[sid] for sid in stream_ids if sid in stats}
-    return _get
-
-
-class TestVerdictFromStoredHealth:
-    async def test_a_struck_stream_is_dead(self):
-        stats = {7: _stat(7, failures=3), 8: _stat(8)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7, 8], event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7}
-
-    async def test_a_single_failure_waits_for_the_next_probe_to_agree(self):
-        """One probe is one moment. The same slot answered on one probe and
-        failed on the next inside an afternoon, so a lone failure is as
-        likely to be the provider blinking as the event ending — and this
-        verdict now deletes the channel."""
-        stats = {7: _stat(7, failures=1, status="failed")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_a_confirmed_failure_after_the_event_started_is_dead(self):
-        """Two failures in a row are still below the strike threshold, and
-        once the event is on air that is a stream that did not answer."""
-        stats = {7: _stat(7, failures=2, status="failed")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_stored_failure_before_the_event_starts_is_not_dead(self):
-        """The criterion that keeps upcoming events working: a stream for an
-        event that has not begun may fail simply because there is nothing to
-        stream yet."""
-        stats = {7: _stat(7, failures=99, status="failed")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams([7], event_start_by_stream={}) \
-                == set()
-
-    async def test_a_failure_recorded_before_kickoff_stays_out_of_the_verdict(
-        self
+    urls = {1: ("http://example.com/1", "s1", 2, 72)}
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health._probe_urls",
+        AsyncMock(return_value=urls),
     ):
-        """The same failure as the test above, still stored an hour later
-        when the event is on air. It was recorded while the stream had
-        nothing to serve, and a stream that already has a record is never
-        probed again, so counting it now would decide the event on evidence
-        nothing will ever refresh. [59]
-        """
-        stats = {7: _stat(7, failures=2, status="failed",
-                          probed_at=_KICKOFF - timedelta(hours=1))}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
+        result = await _probe_and_collect_failures(
+            MagicMock(),
+            [1],
+            expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=20),
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+        )
 
-    async def test_a_stream_with_no_health_record_is_not_dead(self):
-        """Nothing has looked at this stream. Roughly sixty of thirty-seven
-        thousand streams have ever been probed, so an absent verdict has to
-        mean nothing, even for an event already on air."""
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7, 8], event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == set()
-
-    async def test_the_strike_rule_switched_off_reports_nothing(self):
-        stats = {7: _stat(7, failures=99, status="success")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(0)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_an_unreadable_strike_threshold_keeps_the_check_on(self):
-        """A settings error is not the operator switching the struck-out
-        check off, so it must not read as a threshold of 0."""
-        stats = {7: _stat(7, failures=99, status="success")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", side_effect=RuntimeError("boom")):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_stream_nobody_probed_recently_is_not_dead(self):
-        """"Not probed recently" says only that ECM has not looked, so it
-        must never reach this gate. The guard exists because there is a
-        second endpoint that merges that signal into its stale list, and
-        reading the gate off THAT one would block essentially every
-        candidate."""
-        stat = _stat(7, status="success")
-        stat["last_probed"] = "2020-01-01T00:00:00Z"
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({7: stat})), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_no_candidates_asks_nothing(self):
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids") \
-                as lookup:
-            assert await find_dead_streams([]) == set()
-            assert await find_dead_streams([None, None]) == set()
-        assert lookup.call_count == 0
+    assert result == set()
+    assert cancelled.is_set()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
 
 
-class TestVerdictFromSampledThroughput:
-    """What the stream was actually pushing, once its event was on air.
+@pytest.mark.asyncio
+async def test_targeted_probe_callback_cancels_work_and_releases_permit():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1}
+    prober.refresh_account_probe_limits = AsyncMock()
+    stopped = asyncio.Event()
+    state = {"cancelled": False}
 
-    ffprobe reads a container header and stops, so it never asks whether
-    bytes keep arriving. Measured one at a time against 11 event channels
-    it disagreed with the sampled throughput 5 times, in BOTH directions,
-    which is worse than a coin flip. So a row carrying a sample taken at or
-    after kickoff is judged on the sample, and ffprobe's stored verdict
-    decides only a row that has none.
+    async def probe(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
 
-    The provider says "no event" in three shapes and all three land here:
-    an offline card looping at 0.45 Mbps, a socket that opens and closes
-    with no bytes at all, and a socket that never sends anything and times
-    out. Content ran 4.97 Mbps and up, so the 2 Mbps floor sits in empty
-    space.
-    """
+    async def cancel():
+        await asyncio.sleep(0.01)
+        state["cancelled"] = True
 
-    async def test_a_stream_pushing_less_than_the_floor_is_dead(self):
-        """The offline card: 0.45 Mbps, with ffprobe perfectly happy about
-        the container it read."""
-        stats = {7: _stat(7, status="success", measured=450_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_stream_sending_no_bytes_at_all_is_dead(self):
-        """The same state caught at a different moment: the socket opens,
-        nothing arrives and the provider closes it cleanly. Zero is a
-        measurement, not a missing one."""
-        stats = {7: _stat(7, status="success", measured=0)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_stream_that_timed_out_with_nothing_to_sample_is_dead(
-        self
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    urls = {1: ("http://example.com/1", "s1", 2, 72)}
+    cancel_task = asyncio.create_task(cancel())
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health._probe_urls",
+        AsyncMock(return_value=urls),
     ):
-        """The third shape: nothing ever arrives and the socket does not
-        even close, so there is no sample to take and the stored verdict is
-        all there is."""
-        stats = {7: _stat(7, failures=2, status="timeout", measured=None)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+        result = await _probe_and_collect_failures(
+            MagicMock(),
+            [1],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+            cancelled=lambda: state["cancelled"],
+        )
+    await cancel_task
 
-    async def test_a_failed_probe_pushing_real_content_is_not_dead(self):
-        """The mirror, and the one this whole change exists for: three of
-        the channels carrying their event at 5.65 to 7.87 Mbps are stored
-        as ``failed``, because ffprobe could not parse what they sent."""
-        stats = {7: _stat(7, failures=2, status="failed",
-                          measured=6_140_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
+    assert result == set()
+    assert stopped.is_set()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
 
-    async def test_a_struck_stream_pushing_real_content_is_not_dead(self):
-        """The strike counter is fed by the same ffprobe verdict, so a
-        stream ffprobe cannot parse strikes out while it plays."""
-        stats = {7: _stat(7, failures=99, status="failed",
-                          measured=7_870_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
 
-    async def test_a_sample_taken_before_kickoff_stays_out_of_the_verdict(
-        self
+@pytest.mark.asyncio
+async def test_targeted_probe_cap_leaves_later_candidates_unprobed():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    urls = AsyncMock(return_value={})
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch(
+        "services.event_sync_stream_health._probe_urls", urls,
+    ), patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={}),
     ):
-        """A stream dialled while its event was still ahead was sampled
-        against the offline card, and a stream that already has a record is
-        never probed again, so counting that sample now would condemn the
-        event on evidence nothing will ever refresh. [59]"""
-        stats = {7: _stat(7, status="success", measured=0,
-                          probed_at=_KICKOFF - timedelta(hours=1))}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
+        results = []
+        for _ in range(3):
+            results.append(await collect_stream_flow(
+                [3, 4],
+                client=client,
+                checked_after=_CHECKED,
+                event_start_by_stream={3: _START, 4: _START},
+                stream_names={3: "s3", 4: "s4"},
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                probe_missing=True,
+                probe_while_busy=True,
+            ))
 
-    async def test_a_stream_before_its_event_is_not_judged_on_throughput(
-        self
+    assert results == [
+        {3: None, 4: None},
+        {3: None, 4: None},
+        {3: None, 4: None},
+    ]
+    assert [call.args[1] for call in urls.await_args_list] == [[3], [4], [3]]
+    prober.probe_stream.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_targeted_probe_covers_more_than_two_batches():
+    prober = _make_prober(max_concurrent_probes=2)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    urls = AsyncMock(return_value={})
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    starts = {sid: _START for sid in range(1, 6)}
+    names = {sid: f"s{sid}" for sid in range(1, 6)}
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 2,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", urls):
+        for _ in range(3):
+            assert await _probe_and_collect_failures(
+                client,
+                list(starts),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                event_start_by_stream=starts,
+                stream_names=names,
+            ) == set()
+
+    assert [call.args[1] for call in urls.await_args_list] == [
+        [1, 2], [3, 4], [5, 1],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cap,candidates,expected",
+    [
+        (0, [1, 2], []),
+        (2, [1], [[1]]),
+        (2, [1, 2], [[1, 2]]),
+        (2, [1, 2, 3], [[1, 2]]),
+    ],
+)
+async def test_targeted_probe_cap_boundaries(cap, candidates, expected):
+    prober = _make_prober(max_concurrent_probes=2)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    urls = AsyncMock(return_value={})
+    cache = Cache()
+    starts = {sid: _START for sid in candidates}
+    names = {sid: f"s{sid}" for sid in candidates}
+    client = MagicMock(base_url="http://dispatcharr.test")
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", cap,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ) as cache_get, patch(
+        "services.event_sync_stream_health._probe_urls", urls,
     ):
-        """Nothing is being broadcast yet, so an empty stream says nothing
-        about the stream."""
-        stats = {7: _stat(7, status="success", measured=0)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={}) == set()
+        result = await _probe_and_collect_failures(
+            client,
+            candidates,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream=starts,
+            stream_names=names,
+        )
 
-    async def test_a_stream_nobody_sampled_is_not_dead_on_that_alone(self):
-        """Every row written before this column existed reads as ``None``,
-        and so does one whose sample could not be taken. An absent number
-        is not a low one."""
-        stats = {7: _stat(7, status="success", measured=None)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
+    assert result == set()
+    assert [call.args[1] for call in urls.await_args_list] == expected
+    if len(candidates) <= cap or cap <= 0:
+        cache_get.assert_not_called()
+    else:
+        cache_get.assert_called_once_with()
 
-    async def test_a_slate_ffprobe_parsed_is_dead_without_any_sample(self):
-        """Measured live 2026-08-12 on stream 1876738, the Concacaf slate:
-        ``probe_status`` success, ``measured_bitrate`` null because the
-        sampler timed out, and ``video_bitrate`` 561969. Every other signal
-        reads healthy, so the channel survived while the provider looped an
-        offline card. A declared 0.56 Mbps against a 2 Mbps floor is the
-        stream saying what it carries. [40]"""
-        stats = {7: _stat(7, status="success", measured=None,
-                          declared=561_969)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
 
-    async def test_a_high_declared_bitrate_is_not_proof_of_life(self):
-        """The reverse must NOT hold. ffprobe reports what the provider
-        claims, and it disagreed with the sampled figure on 5 of 11 event
-        streams, so a declaration at or above the floor stays no answer and
-        the stored verdict still decides. Here that verdict is a failure
-        after kickoff, so the stream is dead despite declaring 8 Mbps. [40]"""
-        stats = {7: _stat(7, failures=2, status="failed", measured=None,
-                          declared=8_000_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+@pytest.mark.asyncio
+async def test_overlapping_targeted_probes_reserve_different_candidates():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    first_lookup_started = asyncio.Event()
+    release_first_lookup = asyncio.Event()
+    batches = []
 
-    async def test_the_floor_is_the_operators_setting_in_kbps(self):
-        """6.14 Mbps of real content, against an operator who set the floor
-        to 8000 kbps. Pins both the setting and the unit conversion."""
-        stats = {7: _stat(7, status="success", measured=6_140_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings",
-                   return_value=_settings(3, floor_kbps=8000)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+    async def lookup(_client, stream_ids, *, stream_names):
+        batches.append(list(stream_ids))
+        if len(batches) == 1:
+            first_lookup_started.set()
+            await release_first_lookup.wait()
+        return {}
 
-    async def test_an_unreadable_floor_keeps_the_check_on(self):
-        """A settings error is not the operator switching the throughput
-        check off, so it must not read as a floor of 0 — nothing is ever
-        below that."""
-        stats = {7: _stat(7, status="success", measured=0)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", side_effect=RuntimeError("boom")):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
+    async def run_probe():
+        return await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+        )
 
-    async def test_the_floor_switched_off_reports_nothing(self):
-        """A stored 0 IS the operator switching the check off, unlike an
-        unreadable setting."""
-        stats = {7: _stat(7, status="success", measured=0)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings",
-                   return_value=_settings(3, floor_kbps=0)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == set()
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", side_effect=lookup):
+        first = asyncio.create_task(run_probe())
+        await first_lookup_started.wait()
+        second = asyncio.create_task(run_probe())
+        assert await second == set()
+        release_first_lookup.set()
+        assert await first == set()
 
-    async def test_the_floor_switched_off_leaves_the_stored_verdict_alone(
-        self
+    assert batches == [[3], [4]]
+
+
+@pytest.mark.asyncio
+async def test_targeted_probe_position_uses_stable_scope_identity():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    urls = AsyncMock(return_value={})
+    first_client = MagicMock(base_url="https://user:secret@dispatcharr.test:8443/api?token=x")
+    proxy_client = PlanningDispatcharrClient(MagicMock(
+        base_url="https://other:hidden@dispatcharr.test:8443/api?token=y",
+    ))
+    equivalent_start = _START.astimezone(timezone(timedelta(hours=-5)))
+
+    async def run(client, *, starts=None, names=None, ids=None, seconds=60):
+        selected = ids or [3, 4]
+        return await _probe_and_collect_failures(
+            client,
+            selected,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
+            event_start_by_stream=starts or {3: _START, 4: _START},
+            stream_names=names or {3: "s3", 4: "s4"},
+        )
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", urls):
+        await run(first_client)
+        await run(proxy_client, starts={3: equivalent_start, 4: equivalent_start})
+        await run(first_client, seconds=30)
+        await run(first_client, seconds=45)
+        await run(MagicMock(base_url="https://dispatcharr.other:8443/api"))
+        await run(first_client, names={3: "renamed", 4: "s4"})
+        await run(first_client, starts={3: _START - timedelta(seconds=1), 4: _START})
+        await run(first_client, ids=[3, 4, 5], starts={3: _START, 4: _START, 5: _START},
+                  names={3: "s3", 4: "s4", 5: "s5"})
+
+    assert [call.args[1] for call in urls.await_args_list] == [
+        [3], [4], [3], [4], [3], [3], [3], [3],
+    ]
+    positions = cache.get("event_sync_health_positions", ttl=86400)
+    assert all(len(key) == 64 for key in positions)
+    assert all(set(value) == {"expires_at", "stream_id"} for value in positions.values())
+
+
+@pytest.mark.asyncio
+async def test_targeted_probe_lookup_timeout_keeps_reserved_progress():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    batches = []
+
+    async def lookup(_client, stream_ids, *, stream_names):
+        batches.append(list(stream_ids))
+        if len(batches) == 1:
+            await asyncio.Event().wait()
+        return {}
+
+    async def run(seconds):
+        return await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+        )
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", side_effect=lookup):
+        assert await run(0.02) == set()
+        assert await run(60) == set()
+
+    assert batches == [[3], [4]]
+    prober.probe_stream.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_targeted_probe_permit_timeout_keeps_reserved_progress():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1}
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    batches = []
+
+    async def lookup(_client, stream_ids, *, stream_names):
+        batches.append(list(stream_ids))
+        if stream_ids == [3]:
+            return {3: ("http://example.com/3", "s3", 2, 72)}
+        return {}
+
+    held = prober.semaphore_for_account(2)
+    await held.__aenter__()
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", side_effect=lookup):
+        assert await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=20),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+        ) == set()
+        await held.__aexit__(None, None, None)
+        assert await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+        ) == set()
+
+    assert batches == [[3], [4]]
+    prober.probe_stream.assert_not_awaited()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_targeted_probe_keeps_reserved_progress():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.account_probe_limits = {2: 1}
+    prober.refresh_account_probe_limits = AsyncMock()
+    cache = Cache()
+    client = MagicMock(base_url="http://dispatcharr.test")
+    batches = []
+    probe_started = asyncio.Event()
+    probe_stopped = asyncio.Event()
+    state = {"cancelled": False}
+
+    async def lookup(_client, stream_ids, *, stream_names):
+        batches.append(list(stream_ids))
+        if stream_ids == [3]:
+            return {3: ("http://example.com/3", "s3", 2, 72)}
+        return {}
+
+    async def probe(*_args, **_kwargs):
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            probe_stopped.set()
+
+    async def cancel():
+        await probe_started.wait()
+        state["cancelled"] = True
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", side_effect=lookup):
+        cancel_task = asyncio.create_task(cancel())
+        assert await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+            cancelled=lambda: state["cancelled"],
+        ) == set()
+        await cancel_task
+        state["cancelled"] = False
+        assert await _probe_and_collect_failures(
+            client,
+            [3, 4],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={3: _START, 4: _START},
+            stream_names={3: "s3", 4: "s4"},
+            cancelled=lambda: state["cancelled"],
+        ) == set()
+
+    assert batches == [[3], [4]]
+    assert probe_stopped.is_set()
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_overlapping_targeted_calls_share_event_limit(limit):
+    prober = _make_prober(max_concurrent_probes=limit)
+    prober.account_probe_limits = {2: 1, 18: 1}
+    prober.refresh_account_probe_limits = AsyncMock()
+    active = 0
+    peak = 0
+    first_started = asyncio.Event()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def probe(*_args, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        first_started.set()
+        if active == 2:
+            both_started.set()
+        try:
+            await release.wait()
+            return {}
+        finally:
+            active -= 1
+
+    async def lookup(_client, stream_ids, *, stream_names):
+        stream_id = stream_ids[0]
+        account = 2 if stream_id == 1 else 18
+        return {
+            stream_id: (
+                f"http://example.com/{stream_id}",
+                f"s{stream_id}",
+                account,
+                70 + account,
+            ),
+        }
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+
+    async def run(stream_id):
+        return await _probe_and_collect_failures(
+            MagicMock(base_url="http://dispatcharr.test"),
+            [stream_id],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={stream_id: _START},
+            stream_names={stream_id: f"s{stream_id}"},
+        )
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health._probe_urls", side_effect=lookup,
+    ), patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={}),
     ):
-        """Switching the throughput check off must not switch the stored
-        ffprobe verdict off along with it. The sample is what stops being
-        consulted, and everything the gate did before it existed carries
-        on."""
-        stats = {7: _stat(7, failures=2, status="failed",
-                          measured=6_140_000)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings",
-                   return_value=_settings(3, floor_kbps=0)):
-            assert await find_dead_streams(
-                [7], event_start_by_stream={7: _KICKOFF}) == {7}
-
-
-class TestStaleStreamsToDetach:
-    """The rule the run applies and the preview reports, in one place. [75]"""
-
-    def test_nothing_goes_without_a_working_stream_on_the_channel(self):
-        from services.event_sync_stream_health import stale_streams_to_detach
-        assert stale_streams_to_detach(
-            unit_stream_ids={1, 2},
-            attached=[1, 2],
-            stale_stream_ids={1},
-            working_stream_ids=set(),
-        ) == []
-
-    def test_the_delisted_stream_goes_once_something_works(self):
-        from services.event_sync_stream_health import stale_streams_to_detach
-        assert stale_streams_to_detach(
-            unit_stream_ids={1, 2},
-            attached=[1, 2],
-            stale_stream_ids={1},
-            working_stream_ids={2},
-        ) == [1]
-
-    def test_another_events_stream_is_never_taken(self):
-        """Two events can derive the same channel name and share a channel.
-        Stream 9 is delisted and attached, but it belongs to a different
-        event, so this event's passing probe must not remove it."""
-        from services.event_sync_stream_health import stale_streams_to_detach
-        assert stale_streams_to_detach(
-            unit_stream_ids={1, 2},
-            attached=[1, 2, 9],
-            stale_stream_ids={1, 9},
-            working_stream_ids={2},
-        ) == [1]
-
-    def test_a_working_stream_on_the_channel_but_not_this_event_is_not_evidence(self):
-        """Stream 8 works and is attached, but it is not this event's, so it
-        proves nothing about whether this event can lose its delisted one."""
-        from services.event_sync_stream_health import stale_streams_to_detach
-        assert stale_streams_to_detach(
-            unit_stream_ids={1},
-            attached=[1, 8],
-            stale_stream_ids={1},
-            working_stream_ids={8},
-        ) == []
-
-
-class TestDelistedStreams:
-    """Dispatcharr's own ``is_stale`` flag: the provider has stopped listing
-    the stream. This provider re-issues every event under a new id on each
-    refresh, so the superseded id keeps the ``success`` verdict it earned
-    while it still worked, and only the listing says otherwise."""
-
-    def _probing_client(self):
-        client = MagicMock()
-        client.get_streams_by_ids = AsyncMock(
-            return_value=[{"id": 7, "url": "http://x/7", "name": "seven"}])
-        return client
-
-    def _prober(self):
-        prober = MagicMock()
-        prober.max_concurrent_probes = 4
-        prober.probe_stream = AsyncMock(
-            return_value={"probe_status": "success"})
-        # Probing is bounded per provider, so the health check asks the prober
-        # for that account's gate and refreshes the ceilings first. [76]
-        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
-        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
-        return prober
-
-    async def test_a_delisted_stream_is_dead_despite_a_success_record(self):
-        stats = {7: _stat(7, status="success"), 8: _stat(8)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7, 8], stale_stream_ids={7}) == {7}
-
-    async def test_a_delisted_stream_is_dead_before_its_event_starts(self):
-        """Staleness carries the whole load for an event still ahead: a
-        delisted stream is delisted whether or not it has aired."""
-        stats = {7: _stat(7, status="success")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], stale_stream_ids={7}, event_start_by_stream={}) == {7}
-
-    async def test_a_delisted_stream_is_never_probed(self):
-        client = self._probing_client()
-        prober = self._prober()
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                stale_stream_ids={7}) == {7}
-        assert prober.probe_stream.call_count == 0
-        assert client.get_streams_by_ids.call_count == 0
-
-    async def test_a_listed_stream_with_a_success_record_is_not_dead(self):
-        stats = {7: _stat(7, status="success")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams(
-                [7], stale_stream_ids=set(), event_start_by_stream={7: _KICKOFF}) == set()
-
-
-class TestFailOpen:
-    """A failure of the check's own machinery reads as "nothing dead". The
-    one thing that survives it is the provider's own statement that a stream
-    is no longer listed, which needed no lookup to begin with."""
-
-    async def test_an_unreadable_health_table_reports_nothing(self):
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   side_effect=RuntimeError("no database")):
-            assert await find_dead_streams([7, 8]) == set()
-
-    async def test_an_unreadable_health_table_still_reports_delisted(self):
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   side_effect=RuntimeError("no database")):
-            assert await find_dead_streams(
-                [7, 8], stale_stream_ids={8}) == {8}
-
-    async def test_no_prober_reports_nothing(self):
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=None):
-            assert await find_dead_streams(
-                [7], client=MagicMock(), probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_a_url_lookup_failure_reports_nothing(self):
-        client = MagicMock()
-        client.get_streams_by_ids = AsyncMock(
-            side_effect=RuntimeError("provider down"))
-        prober = MagicMock()
-        prober.max_concurrent_probes = 4
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_a_probe_that_raises_leaves_the_stream_working(self):
-        client = MagicMock()
-        client.get_streams_by_ids = AsyncMock(
-            return_value=[{"id": 7, "url": "http://x/7", "name": "seven"}])
-        prober = MagicMock()
-        prober.max_concurrent_probes = 4
-        prober.probe_stream = AsyncMock(side_effect=RuntimeError("ffprobe"))
-        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
-        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == set()
-
-
-class TestProbing:
-    def _client(self, streams):
-        client = MagicMock()
-        client.get_streams_by_ids = AsyncMock(return_value=streams)
-        return client
-
-    def _prober(self, statuses, measured=None):
-        prober = MagicMock()
-        prober.max_concurrent_probes = 4
-        samples = measured or {}
-
-        async def _probe(stream_id, url, name):
-            # probe_stream hands back the saved row, so the sampled
-            # throughput is always a key even when nothing was sampled.
-            return {
-                "probe_status": statuses[stream_id],
-                "measured_bitrate": samples.get(stream_id),
-            }
-
-        prober.probe_stream = AsyncMock(side_effect=_probe)
-        # Probing is bounded per provider now, so the health check refreshes
-        # the ceilings and asks for that account's gate. [76]
-        prober.refresh_account_probe_limits = AsyncMock(return_value=None)
-        prober.semaphore_for_account = lambda _account: asyncio.Semaphore(4)
-        return prober
-
-    async def test_a_stream_that_does_not_answer_is_dead(self):
-        client = self._client([
-            {"id": 7, "url": "http://x/7", "name": "seven"},
-            {"id": 8, "url": "http://x/8", "name": "eight"},
-        ])
-        prober = self._prober({7: "failed", 8: "success"})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7, 8], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7}
-
-    async def test_a_probe_failure_before_the_event_starts_is_not_dead(self):
-        """The measured case that made this rule necessary: every listed
-        replacement for an event days away probes failed, and rejecting
-        them would stop the channel ever being created."""
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "failed"})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={}) == set()
-
-    async def test_a_timeout_counts_as_not_answering(self):
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "timeout"})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_fresh_probe_pushing_real_content_is_not_dead(self):
-        """This path decides most live runs, not the stored-row one: the
-        provider re-issues every event under a new stream id on each
-        refresh, so almost nothing a run promotes has a health record yet.
-        ffprobe cannot parse this stream and it is carrying its event at
-        6.14 Mbps."""
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "failed"}, measured={7: 6_140_000})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == set()
-
-    async def test_a_fresh_probe_sending_almost_nothing_is_dead(self):
-        """The other direction, on the same path: ffprobe reads the
-        offline card's container perfectly happily, and 0.45 Mbps against
-        a 2 Mbps floor is the provider saying there is no event."""
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "success"}, measured={7: 450_000})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == {7}
-
-    async def test_a_fresh_probe_before_the_event_is_not_judged_on_it(self):
-        """The started-only rule still governs the whole path, sample or
-        no sample: the event has not begun, so an empty stream says
-        nothing."""
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "success"}, measured={7: 0})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={}) == set()
-
-    async def test_probe_missing_off_never_probes(self):
-        """The preview and every dry run take this path: a probe writes a
-        health row, and neither of those may write anything."""
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "failed"})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams([7], client=client) == set()
-        assert prober.probe_stream.call_count == 0
-        assert client.get_streams_by_ids.call_count == 0
-
-    async def test_an_already_probed_stream_is_not_probed_again(self):
-        client = self._client([{"id": 8, "url": "http://x/8", "name": "s"}])
-        prober = self._prober({8: "success"})
-        stats = {7: _stat(7)}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            await find_dead_streams(
-                [7, 8], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF})
-        assert client.get_streams_by_ids.call_args[0][0] == [8]
-
-    @pytest.mark.parametrize("case", ["old", "before_kickoff", "invalid", "fresh", "preview"])
-    async def test_measurement_cutoff_reuses_bounded_probing(self, case):
-        cutoff = _KICKOFF + timedelta(minutes=20)
-        stat = _stat(7, failures=3, status="failed", measured=1000,
-                     probed_at=_KICKOFF + timedelta(minutes=10))
-        if case == "before_kickoff":
-            stat = _stat(7, status="failed", probed_at=_KICKOFF - timedelta(minutes=1))
-        elif case == "invalid":
-            stat["last_probed"] = "unknown"
-        elif case == "fresh":
-            stat = _stat(7, status="failed", measured=1000, probed_at=cutoff)
-        client = self._client([{"id": 7, "url": "http://x/7", "name": "s"}])
-        prober = self._prober({7: "success"}, {7: 5000000})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids", _stats_returning({7: stat})), \
-             patch("config.get_settings", return_value=_settings()), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            dead = await find_dead_streams([7], client=client, probe_missing=case != "preview",
-                                          event_start_by_stream={7: _KICKOFF}, probe_before=cutoff)
-        assert dead == ({7} if case == "fresh" else set())
-        if case in {"fresh", "preview"}:
-            prober.probe_stream.assert_not_awaited()
+        first = asyncio.create_task(run(1))
+        await first_started.wait()
+        second = asyncio.create_task(run(2))
+        if limit == 1:
+            for _ in range(100):
+                if prober._probe_condition._waiters:
+                    break
+                await asyncio.sleep(0)
+            assert prober._probe_condition._waiters
+            assert not both_started.is_set()
         else:
-            prober.probe_stream.assert_awaited_once()
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+        release.set()
+        assert await asyncio.gather(first, second) == [set(), set()]
 
-    async def test_a_stream_whose_event_is_still_ahead_is_not_probed(self):
-        """Dialling it now writes a row taken while the event still had
-        nothing to serve. Nothing re-probes a stream that has a row, and a
-        row from before kickoff is not read as a live-event verdict, so that
-        one probe would put the stream beyond the gate's reach for good. The
-        verdict is discarded this run either way, so nothing is lost by
-        waiting until the event is on air.
-        """
-        client = self._client([
-            {"id": 7, "url": "http://x/7", "name": "s"},
-            {"id": 8, "url": "http://x/8", "name": "s"},
-        ])
-        prober = self._prober({7: "failed", 8: "failed"})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7, 8], client=client, probe_missing=True,
-                event_start_by_stream={8: _KICKOFF}) == {8}
-        assert client.get_streams_by_ids.call_args[0][0] == [8]
-
-    async def test_a_stream_with_no_url_is_left_alone(self):
-        client = self._client([{"id": 7, "url": "", "name": "s"}])
-        prober = self._prober({})
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF}) == set()
-        assert prober.probe_stream.call_count == 0
-
-    @pytest.mark.parametrize("stale_measurement", [False, True])
-    async def test_probing_is_capped_per_run(self, stale_measurement):
-        """Probing dials the provider, so a first run on a big rule must
-        not hold the pipeline open for the whole playlist. Runs are
-        idempotent: the rest gets probed later."""
-        candidates = list(range(1, MAX_HEALTH_PROBES_PER_RUN + 51))
-        client = self._client([
-            {"id": sid, "url": f"http://x/{sid}", "name": str(sid)}
-            for sid in candidates
-        ])
-        prober = self._prober({sid: "success" for sid in candidates})
-        stats = {sid: _stat(sid, status="failed") for sid in candidates} if stale_measurement else {}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            await find_dead_streams(
-                candidates, client=client, probe_missing=True,
-                event_start_by_stream={sid: _KICKOFF for sid in candidates},
-                probe_before=_KICKOFF + timedelta(minutes=5) if stale_measurement else None)
-        assert len(client.get_streams_by_ids.call_args[0][0]) \
-            == MAX_HEALTH_PROBES_PER_RUN
-
-    @pytest.mark.parametrize("case", ["waiting", "recorded", "absent"])
-    async def test_a_stream_still_waiting_for_a_channel_is_probed_first(self, case):
-        """With a measurement cutoff every attached stream is re-probed each
-        run, and in id order two hundred of them fill the cap ahead of the
-        one event that has no channel yet. While that event still needs a
-        reading the run dials it alone; once it has one, or with nothing
-        marked, the attached streams get the budget as before."""
-        attached = list(range(1, MAX_HEALTH_PROBES_PER_RUN + 1))
-        candidates = [*attached, 7301]
-        client = self._client([
-            {"id": sid, "url": f"http://x/{sid}", "name": str(sid)}
-            for sid in candidates
-        ])
-        prober = self._prober({sid: "success" for sid in candidates},
-                              {sid: 5000000 for sid in candidates})
-        cutoff = _KICKOFF + timedelta(minutes=5)
-        stats = {7301: _stat(7301, measured=5000000, probed_at=cutoff)} if case == "recorded" else {}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            dead = await find_dead_streams(
-                candidates, client=client, probe_missing=True,
-                event_start_by_stream={sid: _KICKOFF for sid in candidates},
-                probe_before=cutoff,
-                probe_first=set() if case == "absent" else {7301})
-        assert dead == set()
-        assert client.get_streams_by_ids.call_args[0][0] \
-            == ([7301] if case == "waiting" else attached)
-
-    async def test_a_struck_stream_and_a_failing_probe_are_both_reported(self):
-        client = self._client([{"id": 8, "url": "http://x/8", "name": "s"}])
-        prober = self._prober({8: "failed"})
-        stats = {7: _stat(7, failures=5, status="failed")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)), \
-             patch("config.get_settings", return_value=_settings(3)), \
-             patch("stream_prober.ensure_prober", return_value=prober):
-            assert await find_dead_streams(
-                [7, 8], client=client, probe_missing=True,
-                event_start_by_stream={7: _KICKOFF, 8: _KICKOFF}) == {7, 8}
+    assert peak == limit
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
 
 
-class TestProvenWorking:
-    """The other half of the gate, and deliberately not its complement.
+@pytest.mark.asyncio
+async def test_targeted_probe_position_retention_is_fixed_and_bounded():
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    urls = AsyncMock(return_value={})
 
-    "Not dead" is what a stream needs to be ATTACHED, because refusing an
-    unprobed candidate would create no channels at all. Taking a stream
-    off a channel that is currently serving an event needs more than the
-    absence of bad news, so only a passing verdict counts here. [51]
-    """
+    async def run(endpoint):
+        return await _probe_and_collect_failures(
+            MagicMock(base_url=endpoint),
+            [1, 2],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={1: _START, 2: _START},
+            stream_names={1: "s1", 2: "s2"},
+        )
 
-    async def test_only_a_passing_verdict_counts_as_working(self):
-        stats = {7: _stat(7), 8: _stat(8, failures=1, status="failed")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)):
-            assert await find_working_streams([7, 8]) == {7}
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+    ), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", urls):
+        await run("http://dispatcharr.test")
+        first_positions = cache.get("event_sync_health_positions", ttl=86400)
+        first_expiry = next(iter(first_positions.values()))["expires_at"]
+        await run("http://dispatcharr.test")
+        second_positions = cache.get("event_sync_health_positions", ttl=86400)
+        assert next(iter(second_positions.values()))["expires_at"] == first_expiry
 
-    async def test_a_stream_nobody_probed_is_not_working(self):
-        """The gap between the two questions: this stream is not dead, and
-        it is not proven to work either."""
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})):
-            assert await find_working_streams([7]) == set()
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning({})), \
-             patch("config.get_settings", return_value=_settings(3)):
-            assert await find_dead_streams([7], event_start_by_stream={7: _KICKOFF}) \
-                == set()
+        for index in range(257):
+            await run(f"http://dispatcharr-{index}.test")
 
-    async def test_a_timed_out_probe_is_not_working(self):
-        stats = {7: _stat(7, status="timeout"), 8: _stat(8, status="pending")}
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   _stats_returning(stats)):
-            assert await find_working_streams([7, 8]) == set()
-
-    async def test_an_unreadable_health_table_proves_nothing_working(self):
-        """Fail CLOSED here, unlike the dead check. Nothing is proven to
-        work, so nothing is taken off a channel."""
-        with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-                   side_effect=RuntimeError("db is gone")):
-            assert await find_working_streams([7, 8]) == set()
+    positions = cache.get("event_sync_health_positions", ttl=86400)
+    assert len(positions) == 256
+    assert all(set(value) == {"expires_at", "stream_id"} for value in positions.values())
 
 
-@pytest.mark.parametrize("probe_missing", [True, False])
-async def test_no_client_never_probes(probe_missing):
-    with patch("stream_prober.StreamProber.get_stats_by_stream_ids",
-               _stats_returning({})), \
-         patch("config.get_settings", return_value=_settings(3)), \
-         patch("stream_prober.ensure_prober") as ensure:
-        assert await find_dead_streams(
-            [7], probe_missing=probe_missing) == set()
-    assert ensure.call_count == 0
+@pytest.mark.asyncio
+async def test_targeted_probe_prunes_positions_only_on_capped_admission():
+    prober = _make_prober(max_concurrent_probes=2)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock()
+    cache = Cache()
+    cache.set("event_sync_health_positions", {
+        "expired": {"expires_at": -1.0, "stream_id": 99},
+    })
+    urls = AsyncMock(return_value={})
+    client = MagicMock(base_url="http://dispatcharr.test")
+
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health.get_cache", return_value=cache,
+    ), patch("services.event_sync_stream_health._probe_urls", urls):
+        with patch(
+            "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 2,
+        ):
+            await _probe_and_collect_failures(
+                client,
+                [1],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                event_start_by_stream={1: _START},
+                stream_names={1: "s1"},
+            )
+        assert "expired" in cache.get("event_sync_health_positions", ttl=86400)
+
+        with patch(
+            "services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 1,
+        ):
+            await _probe_and_collect_failures(
+                client,
+                [1, 2],
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                event_start_by_stream={1: _START, 2: _START},
+                stream_names={1: "s1", 2: "s2"},
+            )
+
+    assert "expired" not in cache.get("event_sync_health_positions", ttl=86400)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [
+    {1: ("http://example.com/1", "renamed", 2, 72)},
+    {1: ("http://example.com/1", "s1", 2, 99)},
+])
+async def test_targeted_probe_rejects_changed_stream(changed):
+    prober = MagicMock()
+    prober.max_concurrent_probes = 1
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.semaphore_for_account.return_value = asyncio.Semaphore(1)
+    prober.probe_stream = AsyncMock(return_value={})
+    initial = {1: ("http://example.com/1", "s1", 2, 72)}
+    with patch("stream_prober.ensure_prober", return_value=prober), patch(
+        "services.event_sync_stream_health._probe_urls",
+        AsyncMock(side_effect=[initial, changed]),
+    ), patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={1: _stat(1, measured=0, dark=False)}),
+    ):
+        result = await _probe_and_collect_failures(
+            MagicMock(),
+            [1],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            event_start_by_stream={1: _START},
+            stream_names={1: "s1"},
+        )
+
+    assert result == set()
+
+
+@pytest.mark.asyncio
+async def test_retirement_requires_repeated_current_hard_failure(
+    fixed_consumer_clock,
+):
+    stats = {
+        1: _stat(1, measured=0, dark=True, status="success", failures=9),
+        2: _stat(2, measured=None, dark=None, status="failed", failures=1),
+        3: _stat(3, measured=None, dark=None, status="timeout", failures=2),
+        4: _stat(4, measured=None, dark=None, status="success", failures=9),
+    }
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value=stats),
+    ), patch("services.event_sync_stream_health._strike_threshold", return_value=3):
+        result = await find_dead_streams(
+            stats,
+            stream_names={sid: f"s{sid}" for sid in stats},
+            event_start_by_stream={sid: _START for sid in stats},
+        )
+
+    assert result == {3}
+
+
+@pytest.mark.asyncio
+async def test_retirement_requires_exact_name_and_current_time(
+    fixed_consumer_clock,
+):
+    stats = {
+        1: _stat(1, name="old", status="failed", failures=3),
+        2: _stat(
+            2,
+            status="failed",
+            failures=3,
+            probed_at=_NOW - timedelta(minutes=10),
+        ),
+        3: _stat(
+            3,
+            status="failed",
+            failures=3,
+            probed_at=_NOW + timedelta(minutes=1),
+        ),
+    }
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value=stats),
+    ), patch("services.event_sync_stream_health._strike_threshold", return_value=2):
+        result = await find_dead_streams(
+            stats,
+            stream_names={1: "s1", 2: "s2", 3: "s3"},
+            event_start_by_stream={1: _START, 2: _START, 3: _START},
+            probe_before=_NOW - timedelta(minutes=5),
+        )
+
+    assert result == set()
+
+
+@pytest.mark.asyncio
+async def test_optional_probe_reloads_counter_before_retirement(
+    fixed_consumer_clock,
+):
+    first_failure = _stat(
+        1,
+        measured=None,
+        dark=None,
+        status="failed",
+        failures=1,
+        probed_at=_NOW,
+    )
+    probe = AsyncMock(return_value={1})
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(side_effect=[{}, {1: first_failure}]),
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures", probe,
+    ), patch("services.event_sync_stream_health._strike_threshold", return_value=3):
+        result = await find_dead_streams(
+            [1],
+            stream_names={1: "s1"},
+            client=MagicMock(),
+            probe_missing=True,
+            event_start_by_stream={1: _START},
+            probe_before=_NOW - timedelta(minutes=1),
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+
+    assert result == set()
+    assert probe.await_args.kwargs["event_start_by_stream"] == {1: _START}
+
+
+@pytest.mark.asyncio
+async def test_optional_probe_accepts_reloaded_repeated_failure(
+    fixed_consumer_clock,
+):
+    repeated = _stat(
+        1,
+        measured=None,
+        dark=None,
+        status="failed",
+        failures=2,
+        probed_at=_NOW,
+    )
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(side_effect=[{}, {1: repeated}]),
+    ), patch(
+        "services.event_sync_stream_health._probe_and_collect_failures",
+        AsyncMock(return_value={1}),
+    ), patch("services.event_sync_stream_health._strike_threshold", return_value=3):
+        result = await find_dead_streams(
+            [1],
+            stream_names={1: "s1"},
+            client=MagicMock(),
+            probe_missing=True,
+            event_start_by_stream={1: _START},
+            expires_at=_NOW + timedelta(minutes=1),
+        )
+
+    assert result == {1}
+
+
+@pytest.mark.asyncio
+async def test_delisted_future_stream_is_preserved(fixed_consumer_clock):
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value={}),
+    ):
+        result = await find_dead_streams(
+            [1, 2],
+            stream_names={1: "s1", 2: "s2"},
+            stale_stream_ids={1, 2},
+            event_start_by_stream={
+                1: _START,
+                2: _NOW + timedelta(hours=1),
+            },
+        )
+
+    assert result == {1}
+
+
+@pytest.mark.asyncio
+async def test_unreadable_health_keeps_only_scoped_delisting(
+    fixed_consumer_clock,
+):
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(side_effect=RuntimeError("unavailable")),
+    ):
+        result = await find_dead_streams(
+            [1, 2],
+            stream_names={1: "s1"},
+            stale_stream_ids={1, 2},
+            event_start_by_stream={1: _START, 2: _START},
+        )
+
+    assert result == {1}
+
+
+@pytest.mark.asyncio
+async def test_working_set_uses_only_collector_true(fixed_consumer_clock):
+    stats = {
+        1: _stat(1),
+        2: _stat(2, measured=4_000_000, dark=None),
+        3: _stat(3, measured=0, dark=False),
+    }
+    with patch(
+        "services.event_sync_stream_health._load_stats",
+        AsyncMock(return_value=stats),
+    ):
+        result = await find_working_streams(
+            [1, 2, 3],
+            event_start_by_stream={1: _START, 2: _START, 3: _START},
+            stream_names={1: "s1", 2: "s2", 3: "s3"},
+            checked_after=_CHECKED,
+        )
+
+    assert result == {1}
+
+
+def test_reloaded_stats_preserve_exact_stream_name(test_session):
+    test_session.add(StreamStats(stream_id=91, stream_name="exact scoped name"))
+    test_session.commit()
+
+    with patch("stream_prober.get_session", return_value=test_session):
+        rows = StreamProber.get_stats_by_stream_ids([91])
+
+    assert rows[91]["stream_name"] == "exact scoped name"

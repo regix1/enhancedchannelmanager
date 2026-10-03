@@ -41,7 +41,7 @@
  * the rail's selector matches may exist while the fetch is pending.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, within, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, within, waitFor, fireEvent } from '@testing-library/react';
 import type { TaskStatus } from '../services/api';
 
 vi.mock('../services/api', async () => {
@@ -138,6 +138,30 @@ const PINNED = [
     'settings-scheduled-tasks-section-cross-instance-sync-prod-replica'],
 ] as const;
 
+async function renderTasks() {
+  let complete!: () => void;
+  const request = new Promise<Awaited<ReturnType<typeof api.getTasks>>>((resolve) => {
+    complete = () => resolve({ tasks: TASKS });
+  });
+  vi.mocked(api.getTasks).mockReturnValueOnce(request);
+
+  const result = render(<Harness />);
+
+  expect(api.getTasks).toHaveBeenCalled();
+  expect(screen.getByText('Loading scheduled tasks...')).toBeInTheDocument();
+  expect(screen.queryByRole('navigation', { name: 'On this page' })).toBeNull();
+  const pane = result.container.querySelector<HTMLElement>('.settings-content-main');
+  expect(pane).not.toBeNull();
+  expect([...pane!.querySelectorAll('.settings-section, [data-settings-section]')]).toEqual([]);
+
+  await act(async () => {
+    complete();
+    await request;
+  });
+
+  return result;
+}
+
 const originalHash = window.location.hash;
 
 describe('Scheduled Tasks section rail — anchors pinned to task_id (bead de6u1)', () => {
@@ -154,11 +178,9 @@ describe('Scheduled Tasks section rail — anchors pinned to task_id (bead de6u1
   });
 
   it('names every rail entry by task_name and every anchor by task_id', async () => {
-    vi.mocked(api.getTasks).mockResolvedValue({ tasks: TASKS });
+    const { container } = await renderTasks();
 
-    const { container } = render(<Harness />);
-
-    const nav = await screen.findByRole('navigation', { name: 'On this page' });
+    const nav = screen.getByRole('navigation', { name: 'On this page' });
     // Both halves together, because they are one contract: an entry that kept
     // its label but moved its id still breaks every shared link.
     expect(within(nav).getAllByRole('button').map((b) => b.textContent))
@@ -181,10 +203,8 @@ describe('Scheduled Tasks section rail — anchors pinned to task_id (bead de6u1
     // without the query. A raw snake_case task_id is therefore unlinkable: the
     // anchor renders, the URL loses the section, and the link dies with no
     // error anywhere. Measured in a browser before this guard existed.
-    vi.mocked(api.getTasks).mockResolvedValue({ tasks: TASKS });
-
-    const { container } = render(<Harness />);
-    await screen.findByRole('navigation', { name: 'On this page' });
+    const { container } = await renderTasks();
+    screen.getByRole('navigation', { name: 'On this page' });
 
     const ids = [...container.querySelectorAll('[data-settings-section]')].map((el) => el.id);
     expect(ids).toHaveLength(TASKS.length);
@@ -196,9 +216,8 @@ describe('Scheduled Tasks section rail — anchors pinned to task_id (bead de6u1
   it('keeps a card\'s anchor when its task_name is renamed under it', async () => {
     // The whole point of the pin: renaming a cross-instance sync target
     // rewrites task_name and must NOT move the id a shared link names.
-    vi.mocked(api.getTasks).mockResolvedValue({ tasks: TASKS });
-    const { container } = render(<Harness />);
-    await screen.findByRole('navigation', { name: 'On this page' });
+    const { container } = await renderTasks();
+    screen.getByRole('navigation', { name: 'On this page' });
 
     // The rename arrives the way it really does: a refetch into the same
     // mounted component, same task_id, different task_name.
@@ -245,11 +264,9 @@ describe('Scheduled Tasks section rail — anchors pinned to task_id (bead de6u1
     // container and nothing else.
     const scrolled: HTMLElement[] = [];
     Element.prototype.scrollTo = vi.fn(function (this: HTMLElement) { scrolled.push(this); });
-    vi.mocked(api.getTasks).mockResolvedValue({ tasks: TASKS });
+    const { container } = await renderTasks();
 
-    const { container } = render(<Harness />);
-
-    await screen.findByRole('navigation', { name: 'On this page' });
+    screen.getByRole('navigation', { name: 'On this page' });
     await waitFor(() => expect(scrolled.length).toBeGreaterThan(0));
     expect(scrolled[0]).toBe(container.querySelector('.settings-content'));
     // `scrollIntoView` would drag every scrollable ancestor, including the

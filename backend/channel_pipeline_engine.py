@@ -16,7 +16,7 @@ import re
 import resource
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import safe_regex
@@ -752,6 +752,7 @@ class ChannelPipelineEngine:
         from normalization_engine import NormalizationEngine
 
         linked_ids: set[int] = set()
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         try:
             # The engine's own paginated fetch. self._existing_channels is read
             # at run start, so the channels this run just created are missing
@@ -863,7 +864,8 @@ class ChannelPipelineEngine:
                 try:
                     completed = await wait_for_epg_source_refresh(
                         self.client, source_id, dummy_sources[source_id].get("name", "Guide"),
-                        poll_interval=3, max_wait=120,
+                        poll_interval=3,
+                        expires_at=expires_at,
                     )
                     if not completed:
                         logger.warning("[AUTO-CREATE-ENGINE] Programme import incomplete for source %s", source_id)
@@ -2304,6 +2306,71 @@ class ChannelPipelineEngine:
             f"safe to retry manually by rerunning the pipeline — every action "
             f"path is idempotent."
         )
+
+    async def make_event_replay_executor(
+        self, rule_ids: list[int] | None, execution_id: int,
+    ) -> ActionExecutor:
+        """Build the live event executor from current commit-scoped inputs."""
+        channels = []
+        page = 1
+        while True:
+            response = await self.client.get_channels(page=page, page_size=100)
+            batch = response.get("results", [])
+            channels.extend(batch)
+            if len(channels) >= response.get("count", 0) or not batch:
+                break
+            page += 1
+        groups = await self.client.get_channel_groups() or []
+        self._existing_channels = channels
+        self._existing_groups = groups
+
+        settings = get_settings()
+        profiles = []
+        if getattr(settings, "default_channel_profile_ids", None):
+            profiles = await self.client.get_channel_profiles()
+        all_profile_ids = [profile["id"] for profile in profiles]
+        membership = build_channel_profile_membership(profiles)
+        epg_data = await self.client.get_epg_data()
+        epg_sources = await self.client.get_epg_sources()
+        rules = await self._load_rules(rule_ids)
+        managed: set[int] = set()
+        for rule in rules:
+            managed.update(rule.get_managed_channel_ids() or [])
+        return ActionExecutor(
+            self.client,
+            channels,
+            groups,
+            settings=settings,
+            all_profile_ids=all_profile_ids,
+            epg_data=epg_data,
+            epg_sources=epg_sources,
+            triggered_by="api",
+            execution_id=execution_id,
+            channel_profile_membership=membership,
+            managed_channel_ids=managed,
+        )
+
+    async def complete_event_replay(
+        self, executor: ActionExecutor, results: dict,
+    ) -> None:
+        """Run the established guide refresh and completion owners."""
+        try:
+            if executor._deferred_epg_assignments:
+                await self._refresh_dummy_epg_and_retry(
+                    executor, results, executor._epg_sources, False,
+                )
+            else:
+                await self._refresh_linked_epg(
+                    executor, results, executor._epg_sources,
+                )
+            for work in executor._replayed_event_work:
+                pending = executor._event_pending.get(work["unit"].event_key)
+                if pending is not None:
+                    work["logged_promote_entries"] = pending.get(
+                        "logged_promote_entries", 0,
+                    )
+        finally:
+            executor._flush_journal_buffer()
 
     async def _process_streams(
         self,
@@ -4246,7 +4313,8 @@ class ChannelPipelineEngine:
             if promotion is not None:
                 # Execution-log + dry-run rows per promotion entry (the
                 # bounded-log chokepoint applies, mirroring attach entries).
-                for entry in promotion.pop("promote_entries"):
+                promote_entries = promotion.pop("promote_entries")
+                for entry in promote_entries:
                     match = entry.get("match") or {}
                     results["execution_log"].append({
                         "stream_id": match.get("secondary_stream_id"),
@@ -4266,6 +4334,9 @@ class ChannelPipelineEngine:
                                              and not entry.get("skipped", False),
                             "would_modify": not entry.get("skipped", False),
                         })
+                for work in executor._event_pending.values():
+                    if work.get("promo") is promotion:
+                        work["logged_promote_entries"] = len(promote_entries)
 
                 # Register the promoted channels as THIS rule's managed set
                 # (the "current" side of Pass 4 reconciliation). INVARIANT
@@ -5055,6 +5126,210 @@ class ChannelPipelineEngine:
     # Pass 5: Dummy EPG Refresh + Retry Deferred Assignments
     # =========================================================================
 
+    async def _refresh_epg_source(
+        self,
+        source: dict,
+        publications: dict[int, dict],
+        *,
+        expires_at: datetime,
+        after_link: bool = False,
+    ) -> bool:
+        """Refresh one generated source under its stored publication claims."""
+        import copy
+
+        from services.epg_publication import (
+            publication_lock,
+            read_publication,
+            update_delivery,
+        )
+        from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+        from tasks.event_visibility import _generated_scope, _source_refresh_key
+
+        source_id = source.get("id")
+        if source_id is None:
+            return False
+        source_name = source.get("name", f"Source {source_id}")
+        if not publications:
+            return await wait_for_epg_source_refresh(
+                self.client,
+                source_id,
+                source_name,
+                poll_interval=3,
+                expires_at=expires_at,
+            )
+        initial = await self.client.get_epg_source(source_id)
+        scope_kind = _generated_scope(source)
+        claimed = {}
+        trigger = False
+        for profile_id, expected in sorted(publications.items()):
+            scope = f"profile:{profile_id}"
+            if scope_kind not in {scope, "all"}:
+                continue
+            if scope_kind == "all":
+                aggregate = read_publication("all")
+                if (
+                    aggregate is None
+                    or aggregate["state"].get("published", True) is not True
+                    or aggregate["state"]["members"].get(str(profile_id))
+                    != expected["state"]["xmltv_hash"]
+                ):
+                    return False
+            async with publication_lock:
+                current = read_publication(scope)
+                if current is None:
+                    return False
+                expected_attempt = expected["state"]["delivery"].get(
+                    "guide_attempt"
+                )
+                attempt = current["state"]["delivery"].get("guide_attempt")
+                if (
+                    expected_attempt is None
+                    or attempt is None
+                    or current["revision"] != expected["revision"]
+                    or current["state"]["xmltv_hash"]
+                    != expected["state"]["xmltv_hash"]
+                    or current["state"]["config_hash"]
+                    != expected["state"]["config_hash"]
+                    or attempt["attempt_id"] != expected_attempt["attempt_id"]
+                    or datetime.now(timezone.utc)
+                    >= datetime.fromisoformat(attempt["expires_at"])
+                ):
+                    return False
+                source_key, endpoint_hash, source_url_hash = _source_refresh_key(
+                    self.client,
+                    source,
+                    scope,
+                )
+                delivery = current["state"]["delivery"]
+                refreshes = copy.deepcopy(delivery["source_refreshes"])
+                if any(
+                    key != source_key
+                    and value["source_id"] == source_id
+                    and value["expected_hash"] == current["state"]["xmltv_hash"]
+                    for key, value in refreshes.items()
+                ):
+                    return False
+                progress = refreshes.get(source_key)
+                if after_link or progress is None:
+                    status = str(initial.get("status") or "").strip().lower()
+                    progress = {
+                        "source_id": source_id,
+                        "endpoint_hash": endpoint_hash,
+                        "source_url_hash": source_url_hash,
+                        "expected_hash": current["state"]["xmltv_hash"],
+                        "initial_updated": (
+                            initial.get("updated_at")
+                            or initial.get("last_updated")
+                        ),
+                        "observed_running": status in {
+                            "fetching", "processing", "parsing", "loading",
+                            "pending", "running", "queued", "refreshing",
+                        },
+                        "triggered": False,
+                        "expires_at": attempt["expires_at"],
+                        "attempt_id": attempt["attempt_id"],
+                    }
+                if progress["triggered"] is False:
+                    progress["triggered"] = True
+                    trigger = True
+                refreshes[source_key] = progress
+                required = dict(delivery["required_dispatcharr_hashes"])
+                required[str(source_id)] = current["state"]["xmltv_hash"]
+                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
+                if after_link:
+                    confirmed.pop(str(source_id), None)
+                next_revision = update_delivery(
+                    scope,
+                    expected_revision=current["revision"],
+                    expected_hash=current["state"]["xmltv_hash"],
+                    expected_config_hash=current["state"]["config_hash"],
+                    expected_attempt_id=attempt["attempt_id"],
+                    required_dispatcharr_hashes=required,
+                    confirmed_dispatcharr_hashes=confirmed,
+                    source_refreshes=refreshes,
+                )
+                if next_revision is None:
+                    return False
+                updated = read_publication(scope)
+                if updated is None or updated["revision"] != next_revision:
+                    return False
+                publications[profile_id] = updated
+                claimed[profile_id] = (
+                    source_key,
+                    copy.deepcopy(progress),
+                    datetime.fromisoformat(attempt["expires_at"]),
+                )
+        if not claimed:
+            return False
+        if trigger:
+            await self.client.refresh_epg_source(source_id)
+        source_expires = min(item[2] for item in claimed.values())
+        progress = next(iter(claimed.values()))[1]
+        completed = await wait_for_epg_source_refresh(
+            self.client,
+            source_id,
+            source_name,
+            poll_interval=3,
+            expires_at=source_expires,
+            initial_source=initial,
+            trigger=False,
+            progress=progress,
+        )
+        if not completed:
+            return False
+        for profile_id, (source_key, stored_progress, _) in claimed.items():
+            scope = f"profile:{profile_id}"
+            if scope_kind == "all":
+                aggregate = read_publication("all")
+                current_profile = read_publication(scope)
+                if (
+                    aggregate is None
+                    or current_profile is None
+                    or aggregate["state"].get("published", True) is not True
+                    or aggregate["state"]["members"].get(str(profile_id))
+                    != current_profile["state"]["xmltv_hash"]
+                ):
+                    return False
+            async with publication_lock:
+                current = read_publication(scope)
+                if current is None:
+                    return False
+                delivery = current["state"]["delivery"]
+                attempt = delivery.get("guide_attempt")
+                current_progress = delivery["source_refreshes"].get(source_key)
+                if (
+                    attempt is None
+                    or current_progress is None
+                    or current_progress["attempt_id"]
+                    != stored_progress["attempt_id"]
+                    or datetime.now(timezone.utc)
+                    >= datetime.fromisoformat(current_progress["expires_at"])
+                ):
+                    return False
+                refreshes = copy.deepcopy(delivery["source_refreshes"])
+                refreshes[source_key]["observed_running"] = stored_progress[
+                    "observed_running"
+                ]
+                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
+                if after_link:
+                    confirmed[str(source_id)] = current["state"]["xmltv_hash"]
+                next_revision = update_delivery(
+                    scope,
+                    expected_revision=current["revision"],
+                    expected_hash=current["state"]["xmltv_hash"],
+                    expected_config_hash=current["state"]["config_hash"],
+                    expected_attempt_id=attempt["attempt_id"],
+                    confirmed_dispatcharr_hashes=confirmed,
+                    source_refreshes=refreshes,
+                )
+                if next_revision is None:
+                    return False
+                updated = read_publication(scope)
+                if updated is None or updated["revision"] != next_revision:
+                    return False
+                publications[profile_id] = updated
+        return True
+
     async def _refresh_dummy_epg_and_retry(
         self, executor, results: dict, epg_sources: list, dry_run: bool
     ):
@@ -5070,6 +5345,8 @@ class ChannelPipelineEngine:
         """
         from database import get_session
         from models import DummyEPGProfile
+
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
         # Collect unique dummy source IDs and target group IDs from deferred list
         dummy_source_ids = set()
@@ -5107,8 +5384,25 @@ class ChannelPipelineEngine:
                 profile_ids_to_update = None
                 break
 
+        assigned_profiles = set(executor._deferred_epg_profiles.values())
+        if assigned_profiles:
+            profile_ids_to_update = assigned_profiles
+
+        profile_groups: dict[int, set[int]] = defaultdict(set)
+        for channel_id, _, _, _ in executor._deferred_epg_assignments:
+            profile_id = executor._deferred_epg_profiles.get(channel_id)
+            channel = executor._channel_by_id.get(channel_id, {})
+            group_id = channel.get("channel_group_id") or channel.get(
+                "channel_group"
+            )
+            if isinstance(group_id, dict):
+                group_id = group_id.get("id")
+            if profile_id is not None and group_id is not None:
+                profile_groups[profile_id].add(group_id)
+
         # Resolve profile names for reporting
         profile_names = {}
+        admitted_by_id = {}
         db = get_session()
         try:
             if profile_ids_to_update is None:
@@ -5121,67 +5415,129 @@ class ChannelPipelineEngine:
                     DummyEPGProfile.enabled == True  # noqa: E712
                 ).all()
 
-            for profile in profiles:
-                profile_names[profile.id] = profile.name
-                existing_groups = set(profile.get_channel_group_ids())
-                missing = target_group_ids - existing_groups
-
-                # Step 1: Auto-add target groups to profiles
-                if missing and target_group_ids:
-                    group_names = [
-                        executor._group_by_id.get(gid, {}).get("name", f"ID:{gid}")
-                        for gid in missing
-                    ]
-                    step1_desc = (
-                        f"Add groups {group_names} to dummy EPG profile "
-                        f"'{profile.name}' (id={profile.id})"
-                    )
-                    if dry_run:
-                        results["dry_run_results"].append({
-                            "stream_id": None,
-                            "stream_name": "[Pass 5] Update Profile Groups",
-                            "rule_id": None,
-                            "rule_name": None,
-                            "action": f"Would {step1_desc.lower()}",
-                            "would_create": False,
-                            "would_modify": True
-                        })
-                    else:
-                        updated = list(existing_groups | target_group_ids)
-                        profile.set_channel_group_ids(updated)
-                        db.merge(profile)
-                        logger.info("[AUTO-CREATE-ENGINE] Pass 5: %s", step1_desc)
-
-                    results["execution_log"].append({
-                        "stream_id": None,
-                        "stream_name": "[Pass 5] Update Profile Groups",
-                        "m3u_account_id": None,
-                        "rules_evaluated": [],
-                        "actions_executed": [{
-                            "type": "update_epg_profile",
-                            "description": ("Would " if dry_run else "") + step1_desc,
-                            "success": True,
-                            "entity_id": profile.id,
-                            "error": None
-                        }]
-                    })
-
-            if not dry_run:
-                db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error("[AUTO-CREATE-ENGINE] Pass 5: failed to update profile groups: %s", e)
-            # y3m6o.1 review (WARN #2): a failed profile-group update leaves the
-            # dummy EPG profile without the run's target groups, so the deferred
-            # guide-data assignments will not resolve — escalate so the run
-            # finalizes completed_with_errors instead of silently green.
-            self._record_failed_phase(
-                results, phase="dummy_epg_refresh",
-                stream_name="[Pass 5] Update Profile Groups",
-                error=f"Failed to update dummy EPG profile groups: {e}",
-            )
+            profiles = [profile.to_dict() for profile in profiles]
         finally:
             db.close()
+
+        from services.epg_publication import (
+            add_groups,
+            begin_delivery,
+            publication_lock,
+            read_publication,
+        )
+
+        for profile in profiles:
+            profile_id = profile["id"]
+            profile_names[profile_id] = profile["name"]
+            existing_groups = set(profile.get("channel_group_ids") or [])
+            desired_groups = profile_groups.get(profile_id, target_group_ids)
+            missing = desired_groups - existing_groups
+            if missing:
+                group_names = [
+                    executor._group_by_id.get(group_id, {}).get(
+                        "name", f"ID:{group_id}"
+                    )
+                    for group_id in sorted(missing)
+                ]
+                step1_desc = (
+                    f"Add groups {group_names} to dummy EPG profile "
+                    f"'{profile['name']}' (id={profile_id})"
+                )
+                if dry_run:
+                    results["dry_run_results"].append({
+                        "stream_id": None,
+                        "stream_name": "[Pass 5] Update Profile Groups",
+                        "rule_id": None,
+                        "rule_name": None,
+                        "action": f"Would {step1_desc.lower()}",
+                        "would_create": False,
+                        "would_modify": True,
+                    })
+                results["execution_log"].append({
+                    "stream_id": None,
+                    "stream_name": "[Pass 5] Update Profile Groups",
+                    "m3u_account_id": None,
+                    "rules_evaluated": [],
+                    "actions_executed": [{
+                        "type": "update_epg_profile",
+                        "description": ("Would " if dry_run else "") + step1_desc,
+                        "success": True,
+                        "entity_id": profile_id,
+                        "error": None,
+                    }],
+                })
+            if dry_run:
+                continue
+            try:
+                async with publication_lock:
+                    expected = executor._event_publications.get(profile_id)
+                    current = read_publication(f"profile:{profile_id}")
+                    if expected is not None:
+                        if (
+                            current is None
+                            or current["revision"] != expected["revision"]
+                            or current["state"]["xmltv_hash"]
+                            != expected["state"]["xmltv_hash"]
+                            or current["state"]["config_hash"]
+                            != expected["state"]["config_hash"]
+                        ):
+                            admitted = None
+                        else:
+                            admitted = current
+                    else:
+                        admitted = begin_delivery(
+                            f"profile:{profile_id}",
+                            expected_revision=(current["revision"] if current else 0),
+                            expected_hash=(
+                                current["state"]["xmltv_hash"] if current else None
+                            ),
+                            profile=profile,
+                            now=datetime.now(timezone.utc),
+                        )
+                    if admitted is not None and missing:
+                        delivery = admitted["state"]["delivery"]
+                        attempt = delivery.get("guide_attempt")
+                        if attempt is None:
+                            admitted = None
+                        else:
+                            transition = add_groups(
+                                admitted["scope"],
+                                expected_revision=admitted["revision"],
+                                expected_hash=admitted["state"]["xmltv_hash"],
+                                expected_config_hash=admitted["state"]["config_hash"],
+                                expected_attempt_id=attempt["attempt_id"],
+                                expected_pending={
+                                    key: value["attempt_id"]
+                                    for key, value in delivery[
+                                        "pending_channels"
+                                    ].items()
+                                },
+                                profile=profile,
+                                group_ids=sorted(missing),
+                                now=datetime.now(timezone.utc),
+                            )
+                            if transition is None:
+                                admitted = None
+                            else:
+                                profile, admitted = transition
+                if admitted is None:
+                    raise RuntimeError("Guide admission changed before group update")
+                admitted_by_id[profile_id] = admitted
+                executor._event_publications[profile_id] = admitted
+                if missing:
+                    logger.info("[AUTO-CREATE-ENGINE] Pass 5: %s", step1_desc)
+            except Exception as e:
+                logger.error(
+                    "[AUTO-CREATE-ENGINE] Pass 5: failed to update profile %s: %s",
+                    profile_id,
+                    e,
+                )
+                self._record_failed_phase(
+                    results,
+                    phase="dummy_epg_refresh",
+                    stream_name="[Pass 5] Update Profile Groups",
+                    error=f"Failed to update dummy EPG profile groups: {e}",
+                )
 
         # Step 2: Regenerate XMLTV cache
         profile_label = ", ".join(
@@ -5203,10 +5559,15 @@ class ChannelPipelineEngine:
             try:
                 from tasks.dummy_epg_refresh import DummyEPGRefreshTask
                 task = DummyEPGRefreshTask()
-                publication = await task._regenerate_xmltv()
+                if not admitted_by_id:
+                    raise RuntimeError("No guide publication admission is available")
+                publication = await task._regenerate_xmltv(
+                    publications=admitted_by_id,
+                    wait_for_sources=False,
+                )
                 expected_scopes = {
-                    f"profile:{profile_id}" for profile_id in profile_ids_to_update
-                } if profile_ids_to_update is not None else {"all"}
+                    f"profile:{profile_id}" for profile_id in admitted_by_id
+                }
                 missing_scopes = expected_scopes - set(publication.xmltv_by_scope)
                 if publication.superseded or missing_scopes:
                     reason = ", ".join(publication.reason_codes) or "GUIDE_UNAVAILABLE"
@@ -5217,6 +5578,18 @@ class ChannelPipelineEngine:
                     set(publication.published_profile_ids)
                     | set(publication.retained_profile_ids)
                 )
+                for profile_id in list(admitted_by_id):
+                    current = read_publication(f"profile:{profile_id}")
+                    if (
+                        current is None
+                        or current["state"].get("published", True) is not True
+                    ):
+                        raise RuntimeError(
+                            f"Guide publication unavailable for profile {profile_id}"
+                        )
+                    admitted_by_id[profile_id] = current
+                    if profile_id in executor._event_publications:
+                        executor._event_publications[profile_id] = current
                 step2_desc = f"Regenerated XMLTV cache for {profile_count} profiles"
                 logger.info("[AUTO-CREATE-ENGINE] Pass 5: %s", step2_desc)
             except Exception as e:
@@ -5279,13 +5652,23 @@ class ChannelPipelineEngine:
             refresh_error: str | None = None
             if not dry_run:
                 try:
-                    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
-                    completed = await wait_for_epg_source_refresh(
-                        self.client, src_id, source_name,
-                        poll_interval=3, max_wait=120,
+                    scope_kind = _generated_scope(src) if src else None
+                    served = {
+                        profile_id: row
+                        for profile_id, row in admitted_by_id.items()
+                        if scope_kind in {f"profile:{profile_id}", "all"}
+                    }
+                    completed = await self._refresh_epg_source(
+                        src or {"id": src_id, "name": source_name},
+                        served,
+                        expires_at=expires_at,
                     )
                     if not completed:
                         raise RuntimeError("EPG source refresh did not complete successfully")
+                    admitted_by_id.update(served)
+                    for profile_id, row in served.items():
+                        if profile_id in executor._event_publications:
+                            executor._event_publications[profile_id] = row
                 except Exception as e:
                     logger.error(
                         "[AUTO-CREATE-ENGINE] Pass 5: failed to refresh source %s: %s",
@@ -5425,6 +5808,40 @@ class ChannelPipelineEngine:
                 })
                 retry_success += 1
             else:
+                staged_key = next((
+                    event_key
+                    for event_key, work in executor._event_pending.items()
+                    if work["profile_id"]
+                    == executor._deferred_epg_profiles.get(channel_id)
+                    and executor._event_publications.get(work["profile_id"])
+                    and executor._event_publications[work["profile_id"]][
+                        "state"
+                    ]["delivery"]["pending_channels"].get(
+                        event_key, {}
+                    ).get("channel_id") == channel_id
+                ), None)
+                if staged_key is not None:
+                    work = executor._event_pending[staged_key]
+                    staged_publication = executor._event_publications[
+                        work["profile_id"]
+                    ]
+                    try:
+                        staged_channel = await self.client.get_channel(channel_id)
+                    except Exception:
+                        retry_failed += 1
+                        continue
+                    importing = await executor._write_event_receipt(
+                        staged_publication,
+                        staged_key,
+                        {"allocated", "importing"},
+                        {"stage": "importing", "reason": "guide_pending"},
+                        guide_stage="importing",
+                        channel=staged_channel,
+                    )
+                    if importing is None:
+                        retry_failed += 1
+                        continue
+                    executor._event_publications[work["profile_id"]] = importing
                 action_obj = Action.from_dict(
                     action.to_dict() if hasattr(action, 'to_dict')
                     else (action if isinstance(action, dict)
@@ -5508,63 +5925,169 @@ class ChannelPipelineEngine:
 
     async def _refresh_linked_epg(self, executor, results: dict, epg_sources: list) -> None:
         """Import programmes after their channels have acquired guide links."""
-        import weakref
-        from cache import get_cache
-        from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
-        cache = get_cache()
-        now = time.monotonic()
-        pending = cache.get("dummy_epg_import_retries", ttl=86400) or {}
-        pending = {key: value for key, value in pending.items()
-                   if now - value["checked"] < 86400 and value["client"]() is not None}
+        from services.epg_publication import read_publication
+        from tasks.event_visibility import _generated_scope
+
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         sources = {source["id"]: source for source in epg_sources}
-        identities = {(id(self.client), source_id, source.get("url")): source_id
-                      for source_id, source in sources.items() if source.get("is_active", True)}
         attempted = getattr(executor, "_epg_import_attempts", set())
-        source_ids = (set(executor._epg_import_sources)
-                      | {identities[key] for key in pending if key in identities}) - attempted
+        pending_by_source: dict[int, dict[int, dict]] = defaultdict(dict)
+        for source_id, source in sources.items():
+            scope_kind = _generated_scope(source)
+            if scope_kind is None:
+                continue
+            if scope_kind == "all":
+                aggregate = read_publication("all")
+                profile_ids = (
+                    [int(profile_id) for profile_id in aggregate["state"]["members"]]
+                    if aggregate is not None else []
+                )
+            else:
+                profile_ids = [int(scope_kind.split(":", 1)[1])]
+            for profile_id in profile_ids:
+                publication = (
+                    executor._event_publications.get(profile_id)
+                    or read_publication(f"profile:{profile_id}")
+                )
+                if publication is None:
+                    continue
+                executor._event_publications[profile_id] = publication
+                delivery = publication["state"]["delivery"]
+                document_hash = publication["state"]["xmltv_hash"]
+                if (
+                    delivery["required_dispatcharr_hashes"].get(str(source_id))
+                    == document_hash
+                    and delivery["confirmed_dispatcharr_hashes"].get(str(source_id))
+                    != document_hash
+                ):
+                    pending_by_source[source_id][profile_id] = publication
+                    executor._event_publications[profile_id] = publication
+        source_ids = (
+            set(executor._epg_import_sources)
+            | set(pending_by_source)
+            | {
+                work["source_id"]
+                for work in executor._event_pending.values()
+                if work.get("source_id") is not None
+            }
+        )
         executor._epg_import_sources.clear()
-        executor._epg_import_attempts = attempted | source_ids
+        executor._epg_import_attempts = attempted
         for source_id in sorted(source_ids):
             source = sources.get(source_id, {})
-            key = (id(self.client), source_id, source.get("url"))
-            source_name = source.get("name", f"Source {source_id}")
-            failure = None
             try:
-                completed = await wait_for_epg_source_refresh(
-                    self.client, source_id, source_name, poll_interval=3, max_wait=120,
+                publications = dict(pending_by_source.get(source_id, {}))
+                scope_kind = _generated_scope(source) if source else None
+                publications.update({
+                    profile_id: row
+                    for profile_id, row in executor._event_publications.items()
+                    if scope_kind in {f"profile:{profile_id}", "all"}
+                })
+                publications.update({
+                    profile_id: row
+                    for profile_id, row in executor._event_publications.items()
+                    if any(
+                        work["profile_id"] == profile_id
+                        and work["source_id"] == source_id
+                        for work in executor._event_pending.values()
+                    )
+                })
+                attempt_key = (
+                    source_id,
+                    tuple(sorted({
+                        row["state"]["xmltv_hash"]
+                        for row in publications.values()
+                    })),
+                )
+                if attempt_key in attempted:
+                    continue
+                attempted.add(attempt_key)
+                completed = await self._refresh_epg_source(
+                    source or {"id": source_id, "name": f"Source {source_id}"},
+                    publications,
+                    expires_at=expires_at,
+                    after_link=bool(publications),
                 )
                 if not completed:
                     raise RuntimeError("EPG programme import did not complete successfully")
-            except (Exception, asyncio.CancelledError) as exc:
-                failure = exc
-            # Merge only this outcome into the current cache after the wait.
-            # No await separates the read and write, so concurrent runs keep
-            # each other's completed or failed source imports.
-            now = time.monotonic()
-            pending = cache.get("dummy_epg_import_retries", ttl=86400) or {}
-            pending = {item: value for item, value in pending.items()
-                       if now - value["checked"] < 86400 and value["client"]() is not None}
-            if failure is None:
-                pending.pop(key, None)
-            else:
-                retry_ids = source_ids if isinstance(failure, asyncio.CancelledError) else {source_id}
-                for retry_id in retry_ids:
-                    retry_key = (id(self.client), retry_id, sources.get(retry_id, {}).get("url"))
-                    pending[retry_key] = {"client": weakref.ref(self.client), "checked": now}
-            source_ids.discard(source_id)
-            while len(pending) > 128:
-                pending.pop(min(pending, key=lambda item: pending[item]["checked"]))
-            if pending:
-                cache.set("dummy_epg_import_retries", pending)
-            else:
-                cache.invalidate("dummy_epg_import_retries")
-            if isinstance(failure, asyncio.CancelledError):
-                raise failure
-            if failure is not None:
+                for profile_id, row in publications.items():
+                    executor._event_publications[profile_id] = row
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 self._record_failed_phase(
                     results, phase="refresh_epg_source", entity_id=source_id,
-                    stream_name="Import linked guide programmes", error=str(failure),
+                    stream_name="Import linked guide programmes", error=str(exc),
                 )
+
+        contexts = {
+            id(work["exec_ctx"]): work["exec_ctx"]
+            for work in executor._event_pending.values()
+        }
+        before = {
+            key: {
+                "streams_merged": context.streams_merged,
+                "streams_skipped": context.streams_skipped,
+                "channels_updated": context.channels_updated,
+                "modified": len(context.modified_entities),
+            }
+            for key, context in contexts.items()
+        }
+        promos = {
+            id(work["promo"]): work["promo"]
+            for work in executor._event_pending.values()
+        }
+        pending_before = sum(
+            promo.get("guide_pending", 0) for promo in promos.values()
+        )
+        delayed_entries = {}
+        for work in executor._event_pending.values():
+            entries = work.get("promote_entries")
+            if isinstance(entries, list):
+                delayed_entries[id(entries)] = (
+                    entries,
+                    work.get("logged_promote_entries", len(entries)),
+                )
+        touched = await executor._finish_event_promotions()
+        for entries, logged in delayed_entries.values():
+            for entry in entries[logged:]:
+                match = entry.get("match") or {}
+                results["execution_log"].append({
+                    "stream_id": match.get("secondary_stream_id"),
+                    "stream_name": match.get("secondary_stream_name"),
+                    "m3u_account_id": None,
+                    "rules_evaluated": [],
+                    "actions_executed": [entry],
+                })
+            for work in executor._event_pending.values():
+                if work.get("promote_entries") is entries:
+                    work["logged_promote_entries"] = len(entries)
+        for key, context in contexts.items():
+            prior = before[key]
+            results["streams_merged"] += (
+                context.streams_merged - prior["streams_merged"]
+            )
+            results["streams_skipped"] += (
+                context.streams_skipped - prior["streams_skipped"]
+            )
+            results["channels_updated"] += (
+                context.channels_updated - prior["channels_updated"]
+            )
+            results["modified_entities"].extend(
+                context.modified_entities[prior["modified"]:]
+            )
+        results["channels_touched"] += len(touched)
+        pending_after = sum(
+            promo.get("guide_pending", 0) for promo in promos.values()
+        )
+        if pending_after and pending_after >= pending_before:
+            self._record_failed_phase(
+                results,
+                phase="dummy_epg_refresh",
+                stream_name="Complete staged event promotions",
+                error=f"{pending_after} staged event promotion(s) remain pending",
+                count=pending_after,
+            )
 
     # =========================================================================
     # Pass 4: Reconciliation

@@ -465,7 +465,7 @@ class SettingsRequest(BaseModel):
     parallel_probing_enabled: bool = True  # Probe multiple streams from different M3Us simultaneously
     max_concurrent_probes: int = 8  # Max simultaneous probes when parallel probing is enabled (1-16)
     probe_concurrency_by_account: Optional[dict[str, int]] = None  # Per-provider probe ceiling, keyed by M3U account id
-    min_stream_bitrate_kbps: Optional[int] = None  # Sustained throughput below this means the stream is carrying nothing
+    min_stream_bitrate_kbps: Optional[int] = None  # Legacy field accepted and preserved for older clients
     profile_distribution_strategy: str = "fill_first"  # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     skip_recently_probed_hours: int = 0  # Skip streams successfully probed within last N hours (0 = always probe)
     refresh_m3us_before_probe: bool = True  # Refresh all M3U accounts before starting probe
@@ -616,7 +616,7 @@ class SettingsResponse(BaseModel):
     parallel_probing_enabled: bool  # Probe multiple streams from different M3Us simultaneously
     max_concurrent_probes: int  # Max simultaneous probes when parallel probing is enabled (1-16)
     probe_concurrency_by_account: dict[str, int]  # Per-provider probe ceiling, keyed by M3U account id
-    min_stream_bitrate_kbps: int  # Sustained throughput below this means the stream is carrying nothing
+    min_stream_bitrate_kbps: int  # Legacy field returned for older clients
     profile_distribution_strategy: str  # How to distribute probes across M3U profiles: fill_first, round_robin, least_loaded
     skip_recently_probed_hours: int  # Skip streams successfully probed within last N hours (0 = always probe)
     refresh_m3us_before_probe: bool  # Refresh all M3U accounts before starting probe
@@ -1115,10 +1115,9 @@ async def update_settings(
         else current_settings.backend_log_file_backup_count
     )
 
-    # The per-provider probe ceiling and the throughput floor follow the same
-    # preserve-on-omit rule. A body without the key keeps the stored value, so a
-    # cached older bundle cannot drop a one-connection provider's ceiling back to
-    # unlimited or a tuned floor back to 2000 kbps. [35]
+    # The per-account probe ceiling and legacy bitrate field follow the same
+    # preserve-on-omit rule. A request without either key keeps its stored value,
+    # so clients can update unrelated settings without resetting them. [35]
     probe_concurrency_by_account = (
         request.probe_concurrency_by_account
         if request.probe_concurrency_by_account is not None
@@ -1234,7 +1233,7 @@ async def update_settings(
         "jellyfin_api_key": jellyfin_api_key,
         # bd-mlcla: trusted media/proxy networks (preserve-on-omit above).
         "trusted_media_networks": trusted_media_networks,
-        # Probe ceiling per provider and the throughput floor (preserve-on-omit above).
+        # Per-account probe ceiling and legacy bitrate field (preserve-on-omit above).
         "probe_concurrency_by_account": probe_concurrency_by_account,
         "min_stream_bitrate_kbps": min_stream_bitrate_kbps,
         # Post-run Emby guide refresh toggle (preserve-on-omit above).

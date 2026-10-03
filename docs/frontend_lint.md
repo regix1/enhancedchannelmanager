@@ -1,15 +1,15 @@
 # Frontend Lint Policy
 
 > This document is **authoritative for ESLint policy**: the
-> `--max-warnings 0` floor, per-rule fix patterns, and CI behavior. The
+> `--max-warnings 0` floor, per-rule fix patterns, and local gate behavior. The
 > general `docs/style_guide.md` summarises the policy and the inline-disable
 > rationale rule, then defers here for the recurring-pattern catalog. If
 > the two disagree, this document wins; please file a PR against the style
 > guide so they are reconciled.
 
-**Policy:** `npm run lint` must exit clean: zero errors, zero warnings
-(`--max-warnings 0`). Enforced in CI via `.github/workflows/test.yml` on every
-push and pull request.
+**Policy:** Run `npm run lint` as a required local check. It must exit clean
+with zero errors and zero warnings (`--max-warnings 0`). The installed image
+workflow does not run this check.
 
 ## Why `--max-warnings 0`
 
@@ -116,8 +116,9 @@ Compiler-inferred deps didn't match the manual `useCallback` deps. Typically
 caused by optional-chain property deps (`displayInfo?.externalUrl`). Fix by
 using the whole object (`displayInfo`). The compiler re-memoizes correctly.
 
-## CI Behavior
+## Local Gate Behavior
 
-`.github/workflows/test.yml` runs `npm run lint` as a blocking step on every
-push and every pull request. There is no "informational" mode: a new
-warning fails the build, same as a new test failure.
+Run `npm run lint` before publication. There is no informational mode: a new
+warning returns a nonzero exit, the same as a new lint error. The repository's
+installed `.github/workflows/build.yml` builds and publishes images; it does
+not run frontend lint.

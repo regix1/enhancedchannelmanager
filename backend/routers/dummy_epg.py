@@ -4,6 +4,7 @@ Dummy EPG router — profile CRUD, channel assignments, preview, and XMLTV outpu
 import asyncio
 import copy
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -627,7 +628,10 @@ async def get_profile_coverage(profile_id: int, db: Session = Depends(get_sessio
             p_dict.get("channel_group_ids", []), channel_map
         )
         p_dict["channel_map"] = channel_map
-        prepared, coverage = await prepare_profiles([p_dict], channel_map, get_client())
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        prepared, coverage = await prepare_profiles(
+            [p_dict], channel_map, get_client(), expires_at=expires_at,
+        )
         if not prepared:
             return JSONResponse(
                 status_code=500,
@@ -699,19 +703,45 @@ async def get_profile_coverage(profile_id: int, db: Session = Depends(get_sessio
                     assignment, channel, prepared_profile,
                 )
 
-        if publication is None:
+        if publication is None or publication["state"].get("published", True) is not True:
             reason_codes = ["GUIDE_UNAVAILABLE"]
             if not profile.enabled:
                 reason_codes.append("PROFILE_DISABLED")
+            state = publication["state"] if publication is not None else None
+            delivery = state["delivery"] if state is not None else None
+            config_matches = (
+                state["config_hash"] == _config_hash(prepared_profile)
+                if state is not None else None
+            )
+            dispatcharr_status = "unknown"
+            if (
+                config_matches is True
+                and delivery is not None
+                and delivery["required_dispatcharr_hashes"]
+            ):
+                dispatcharr_status = (
+                    "confirmed"
+                    if all(
+                        delivery["confirmed_dispatcharr_hashes"].get(key) == value
+                        for key, value in delivery["required_dispatcharr_hashes"].items()
+                    )
+                    else "pending"
+                )
             coverage["publication"] = {
                 "status": "unavailable",
                 "published_at": None,
-                "revision": None,
+                "revision": publication["revision"] if publication is not None else None,
                 "window_start": None,
                 "window_stop": None,
-                "config_matches": None,
+                "config_matches": config_matches,
                 "reason_codes": sorted(reason_codes),
-                "delivery": None,
+                "delivery": (
+                    {
+                        "dispatcharr_status": dispatcharr_status,
+                        "pending_emby": delivery["pending_emby"],
+                    }
+                    if delivery is not None else None
+                ),
                 "channels": [{
                     "channel_id": channel_id,
                     "xmltv_id": None,
@@ -1235,7 +1265,10 @@ async def get_xmltv_all(db: Session = Depends(get_session)):
             profile_data.append(p_dict)
 
         from services.epg_programmes import prepare_profiles
-        profile_data, coverage = await prepare_profiles(profile_data, channel_map, get_client())
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        profile_data, coverage = await prepare_profiles(
+            profile_data, channel_map, get_client(), expires_at=expires_at,
+        )
         result = await _publish_for_http(profile_data, channel_map, coverage, "all")
         xml_string = result.xmltv_by_scope.get("all")
         if xml_string is None:
@@ -1283,9 +1316,17 @@ async def get_xmltv_profile(profile_id: int, db: Session = Depends(get_session))
 
         scope = f"profile:{profile_id}"
         publication = read_publication(scope)
-        if publication is not None:
+        if publication is not None and publication["state"].get("published", True) is True:
             return Response(
                 content=publication["xmltv"], media_type="application/xml",
+            )
+        if publication is not None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "GUIDE_UNAVAILABLE",
+                    "reason_codes": ["GUIDE_UNAVAILABLE"],
+                },
             )
 
         channel_map = await _fetch_all_channels()
@@ -1298,7 +1339,10 @@ async def get_xmltv_profile(profile_id: int, db: Session = Depends(get_session))
         profile_data = [p_dict]
 
         from services.epg_programmes import prepare_profiles
-        profile_data, coverage = await prepare_profiles(profile_data, channel_map, get_client())
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        profile_data, coverage = await prepare_profiles(
+            profile_data, channel_map, get_client(), expires_at=expires_at,
+        )
         result = await _publish_for_http(profile_data, channel_map, coverage, scope)
         xml_string = result.xmltv_by_scope.get(scope)
         if xml_string is None:
@@ -1330,10 +1374,13 @@ async def _publish_for_http(
     from datetime import datetime, timezone
 
     from services.epg_publication import (
+        PublicationResult,
+        _config_hash,
         publication_lock,
         publish_profiles,
         read_publication,
     )
+    from services.epg_programmes import _profile_owners, _resolve_group_assignments
     if not isinstance(coverage.get("profiles"), dict):
         from services.epg_programmes import can_cache
 
@@ -1357,15 +1404,97 @@ async def _publish_for_http(
             },
         }
 
-    async with publication_lock:
-        publication = read_publication(scope)
-        if publication is not None:
-            from services.epg_publication import PublicationResult
+    session = get_session()
+    try:
+        from models import DummyEPGProfile
 
+        saved = [
+            row.to_dict()
+            for row in session.query(DummyEPGProfile).filter(
+                DummyEPGProfile.enabled == True  # noqa: E712
+            ).all()
+        ]
+    finally:
+        session.close()
+    supplied = {profile["id"]: profile for profile in profiles}
+    complete_profiles = []
+    records = coverage.setdefault("profiles", {})
+    for profile in saved:
+        profile_id = profile["id"]
+        prepared = supplied.get(profile_id)
+        if prepared is not None:
+            if _config_hash(prepared) != _config_hash(profile):
+                return PublicationResult(
+                    superseded=True,
+                    reason_codes=("GUIDE_PUBLICATION_SUPERSEDED",),
+                )
+        else:
+            prepared = copy.deepcopy(profile)
+            groups = prepared.get("channel_group_ids") or []
+            if groups:
+                prepared["channel_assignments"] = _resolve_group_assignments(
+                    groups, channel_map,
+                )
+            assignments = prepared.get("channel_assignments") or []
+            records.setdefault(str(profile_id), {
+                "profile_id": profile_id,
+                "source_ids": [],
+                "sources": [],
+                "owned_channel_ids": sorted({
+                    item["channel_id"] for item in assignments
+                    if item.get("channel_id") in channel_map
+                }),
+                "can_publish": False,
+                "reason_codes": ["GUIDE_UNAVAILABLE"],
+            })
+        complete_profiles.append(prepared)
+    _profile_owners(complete_profiles, channel_map, coverage)
+
+    async with publication_lock:
+        for profile in complete_profiles:
+            admitted = read_publication(f"profile:{profile['id']}")
+            if admitted is not None and admitted["state"].get("published", True) is not True:
+                record = records[str(profile["id"])]
+                record["can_publish"] = False
+                record["reason_codes"] = sorted(
+                    set(record.get("reason_codes") or []) | {"GUIDE_UNAVAILABLE"}
+                )
+        publication = read_publication(scope)
+        if publication is not None and publication["state"].get("published", True) is True:
             return PublicationResult(xmltv_by_scope={scope: publication["xmltv"]})
+        if publication is not None:
+            return PublicationResult(
+                unavailable_profile_ids=(
+                    (int(scope.split(":", 1)[1]),)
+                    if scope.startswith("profile:") else ()
+                ),
+                reason_codes=("GUIDE_UNAVAILABLE",),
+            )
+        session = get_session()
+        try:
+            current = [
+                row.to_dict()
+                for row in session.query(DummyEPGProfile).filter(
+                    DummyEPGProfile.enabled == True  # noqa: E712
+                ).all()
+            ]
+        finally:
+            session.close()
+        saved_by_id = {profile["id"]: profile for profile in saved}
+        if (
+            {profile["id"] for profile in current} != set(saved_by_id)
+            or any(
+                _config_hash(profile) != _config_hash(saved_by_id[profile["id"]])
+                for profile in current
+            )
+        ):
+            return PublicationResult(
+                superseded=True,
+                reason_codes=("GUIDE_PUBLICATION_SUPERSEDED",),
+            )
         return await run_cpu_bound(
             publish_profiles,
-            profiles,
+            complete_profiles,
             channel_map,
             coverage,
             observations={},

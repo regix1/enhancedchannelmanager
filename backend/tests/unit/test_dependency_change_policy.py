@@ -15,7 +15,6 @@ SCRIPT = Path(
         ROOT / "scripts" / "dependency_change_policy.py",
     )
 )
-BUILD_WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
 
 
 @pytest.fixture(scope="module")
@@ -55,21 +54,3 @@ def test_unrelated_change_does_not_trigger(policy):
 )
 def test_ambiguous_input_fails_toward_running_gate(policy, paths):
     assert policy.has_dependency_change(paths) is True
-
-
-def test_workflow_gates_dev_dependency_prs_before_merge():
-    workflow = BUILD_WORKFLOW.read_text(encoding="utf-8")
-    assert "scripts/dependency_change_policy.py" in workflow
-    assert (
-        "needs.detect-dependency-change.outputs.dependency_files_changed == 'true'"
-        in workflow
-    )
-    assert 'git diff --name-only --no-renames -z "$BEFORE_SHA" "$HEAD_SHA"' in workflow
-    assert "github.event.before" in workflow
-    assert "refs/heads/dev" in workflow
-    for check_name in (
-        "Frontend Security Scan",
-        "Backend Security Scan",
-        "Container Security Scan (Trivy)",
-    ):
-        assert check_name in workflow

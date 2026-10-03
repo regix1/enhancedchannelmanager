@@ -5,7 +5,7 @@ Tests the ChannelPipelineEngine class which orchestrates the entire auto-creatio
 pipeline, coordinating rules, streams, and executions.
 """
 from unittest.mock import MagicMock, AsyncMock, patch
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 import pytest
@@ -26,6 +26,15 @@ from channel_pipeline_evaluator import StreamContext
 from channel_pipeline_executor import ActionExecutor, ExecutionContext
 from epg_matching import EPGMatchResult, EPGMatchWithScore
 import journal
+
+
+def _enable_guide_lifecycle(executor):
+    """Model the guide lifecycle fields implemented by ActionExecutor."""
+    executor._epg_import_sources = set()
+    executor._epg_import_attempts = set()
+    executor._event_pending = {}
+    executor._event_publications = {}
+    executor._finish_event_promotions = AsyncMock(return_value=set())
 
 
 class TestChannelPipelineEngineInit:
@@ -1136,6 +1145,7 @@ class TestPass3RenumberGating:
             mock_executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             # Stub engine internals that touch DB/external calls
@@ -1208,6 +1218,7 @@ class TestPass3RenumberGating:
             mock_executor.prune_merge_streams = AsyncMock()
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             # Stub engine internals that touch DB/external calls
@@ -1264,6 +1275,7 @@ class TestPass3RenumberGating:
             mock_executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             # Stub engine internals that touch DB/external calls
@@ -1323,6 +1335,7 @@ class TestPass3RenumberGating:
             mock_executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             # Stub engine internals that touch DB/external calls
@@ -1427,6 +1440,7 @@ class TestPass35SkippedMergeRegistration:
             mock_executor.prune_merge_streams = AsyncMock()
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             self.engine._refresh_dummy_epg_and_retry = AsyncMock()
@@ -1551,6 +1565,7 @@ class TestEventSyncStreamReorderWiring:
             mock_executor.prune_merge_streams = AsyncMock()
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             self.engine._refresh_dummy_epg_and_retry = AsyncMock()
@@ -3849,14 +3864,56 @@ class TestPass5DeferredEpgRetryFailureAggregation:
     failing ``_execute_assign_epg``."""
 
     def _run_pass5(
-        self, retry_result, *, source_refresh=None, query_raises=False,
+        self, retry_result, test_engine, *, source_refresh=None, query_raises=False,
         publication_result=None,
     ):
         from channel_pipeline_executor import ActionResult  # noqa: F401
-        from services.epg_publication import PublicationResult
+        from models import DummyEPGProfile
+        from services.epg_publication import (
+            PublicationResult,
+            begin_delivery,
+            publish_profiles,
+        )
+        from sqlalchemy.orm import sessionmaker
+
+        sessions = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=test_engine,
+            expire_on_commit=False,
+        )
+        session = sessions()
+        try:
+            profile = DummyEPGProfile(id=1, name="Dummy", enabled=True)
+            session.add(profile)
+            session.commit()
+            saved_profile = profile.to_dict()
+        finally:
+            session.close()
+        now = datetime.now(timezone.utc)
+        with patch(
+            "services.epg_publication.get_session",
+            side_effect=sessions,
+        ):
+            admitted = begin_delivery(
+                "profile:1",
+                expected_revision=0,
+                expected_hash=None,
+                profile=saved_profile,
+                now=now,
+            )
+        assert admitted is not None
 
         client = MagicMock()
+        client.base_url = "http://dispatcharr.test"
         client.get_epg_data = AsyncMock(return_value=[])
+        client.get_epg_source = AsyncMock(return_value={
+            "id": 5,
+            "name": "Dummy",
+            "status": "idle",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+        client.refresh_epg_source = AsyncMock()
         engine = ChannelPipelineEngine(client)
 
         action = MagicMock()
@@ -3867,34 +3924,77 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         stream_ctx = StreamContext(stream_id=42, stream_name="ESPN", m3u_account_id=1)
 
         executor = MagicMock()
+        _enable_guide_lifecycle(executor)
         executor._deferred_epg_assignments = [(100, action, stream_ctx, MagicMock())]
         executor._channel_by_id = {100: {"name": "ESPN", "channel_group_id": 9}}
         executor._group_by_id = {9: {"name": "Sports"}}
         executor.reload_epg_data = MagicMock()
         executor._execute_assign_epg = AsyncMock(return_value=retry_result)
+        executor._deferred_epg_profiles = {100: 1}
+        executor._event_publications = {1: admitted}
 
         epg_sources = [{"id": 5, "name": "Dummy", "url": "/api/dummy-epg/xmltv/1"}]
-        results = {"execution_log": [], "dry_run_results": []}
+        results = {
+            "execution_log": [],
+            "dry_run_results": [],
+            "streams_merged": 0,
+            "streams_skipped": 0,
+            "channels_updated": 0,
+            "channels_touched": 0,
+            "modified_entities": [],
+        }
+
+        async def regenerate(*, publications, wait_for_sources):
+            assert wait_for_sources is False
+            if publication_result is not None:
+                return publication_result
+            current_session = sessions()
+            try:
+                current_profile = current_session.get(DummyEPGProfile, 1).to_dict()
+            finally:
+                current_session.close()
+            current = publications[1]
+            attempt = current["state"]["delivery"]["guide_attempt"]
+            return publish_profiles(
+                [current_profile],
+                {},
+                {"profiles": {"1": {
+                    "profile_id": 1,
+                    "can_publish": True,
+                    "reason_codes": [],
+                }}},
+                observations={},
+                now=datetime.now(timezone.utc),
+                expected={"profile:1": {
+                    "revision": current["revision"],
+                    "xmltv_hash": current["state"]["xmltv_hash"],
+                    "config_hash": current["state"]["config_hash"],
+                    "attempt_id": attempt["attempt_id"],
+                }},
+            )
 
         fake_task = MagicMock()
-        fake_task._regenerate_xmltv = AsyncMock(return_value=(
-            publication_result if publication_result is not None else PublicationResult(
-                published_profile_ids=(1,),
-                xmltv_by_scope={"profile:1": "<tv/>"},
-            )
-        ))
-        sess = MagicMock()
-        if query_raises:
-            # WARN #2: Step 1 profile-group update raises.
-            sess.query.side_effect = RuntimeError("profile group update boom")
-        else:
-            sess.query.return_value.filter.return_value.all.return_value = []
+        fake_task._regenerate_xmltv = AsyncMock(side_effect=regenerate)
+        publication_calls = 0
+
+        def publication_session():
+            nonlocal publication_calls
+            publication_calls += 1
+            current_session = sessions()
+            if query_raises and publication_calls == 2:
+                current_session.query = MagicMock(
+                    side_effect=RuntimeError("profile group update boom")
+                )
+            return current_session
+
         refresh_mock = (
             AsyncMock(side_effect=source_refresh) if callable(source_refresh)
-            else AsyncMock()
+            else AsyncMock(return_value=True)
         )
-        with patch("channel_pipeline_engine.get_session", return_value=sess), \
-                patch("database.get_session", return_value=sess), \
+        with patch("channel_pipeline_engine.get_session", side_effect=sessions), \
+                patch("database.get_session", side_effect=sessions), \
+                patch("services.epg_publication.get_session",
+                      side_effect=publication_session), \
                 patch("tasks.dummy_epg_refresh.DummyEPGRefreshTask",
                       return_value=fake_task), \
                 patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh",
@@ -3913,7 +4013,7 @@ class TestPass5DeferredEpgRetryFailureAggregation:
             for a in e["actions_executed"] if a["type"] == type_
         ]
 
-    def test_failed_retry_aggregates(self):
+    def test_failed_retry_aggregates(self, test_engine):
         from channel_pipeline_executor import ActionResult
 
         failing = ActionResult(
@@ -3921,17 +4021,18 @@ class TestPass5DeferredEpgRetryFailureAggregation:
             description="assign_epg still failing after refresh",
             entity_id=100, error="dispatcharr rejected",
         )
-        results = self._run_pass5(failing)
+        results = self._run_pass5(failing, test_engine)
         failed = results.get("failed_actions", [])
         assert any(fa["action_type"] == "assign_epg" for fa in failed)
         assert len(failed) == 1
 
-    def test_unavailable_publication_aborts_before_refresh_and_retry(self):
+    def test_unavailable_publication_aborts_before_refresh_and_retry(self, test_engine):
         from channel_pipeline_executor import ActionResult
         from services.epg_publication import PublicationResult
 
         results = self._run_pass5(
             ActionResult(success=True, action_type="assign_epg", description="unused"),
+            test_engine,
             publication_result=PublicationResult(
                 unavailable_profile_ids=(1,),
                 reason_codes=("GUIDE_SOURCES_PENDING",),
@@ -3943,14 +4044,14 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         assert not self._log_entries(results, "refresh_epg_source")
         assert not self._log_entries(results, "assign_epg")
 
-    def test_successful_retry_aggregates_nothing(self):
+    def test_successful_retry_aggregates_nothing(self, test_engine):
         from channel_pipeline_executor import ActionResult
 
         ok = ActionResult(
             success=True, action_type="assign_epg",
             description="assigned", entity_id=100,
         )
-        results = self._run_pass5(ok)
+        results = self._run_pass5(ok, test_engine)
         assert not results.get("failed_actions")
 
     def _ok_retry(self):
@@ -3960,20 +4061,24 @@ class TestPass5DeferredEpgRetryFailureAggregation:
             entity_id=100,
         )
 
-    def test_profile_group_update_failure_aggregates(self):
+    def test_profile_group_update_failure_aggregates(self, test_engine):
         """y3m6o.1 review (WARN #2): a Pass 5 profile-group update failure now
         escalates so the run finalizes completed_with_errors, not green."""
-        results = self._run_pass5(self._ok_retry(), query_raises=True)
+        results = self._run_pass5(
+            self._ok_retry(), test_engine, query_raises=True
+        )
         failed = results.get("failed_actions", [])
         assert any(fa["action_type"] == "dummy_epg_refresh" for fa in failed)
 
-    def test_source_refresh_failure_aggregates_and_logs_honestly(self):
+    def test_source_refresh_failure_aggregates_and_logs_honestly(self, test_engine):
         """y3m6o.1 review (WARN #3): a Pass 5 source-refresh failure escalates
         AND its execution-log entry reflects the actual failure (previously it
         recorded success=True even when the refresh raised)."""
         def _boom(*a, **k):
             raise RuntimeError("refresh timed out")
-        results = self._run_pass5(self._ok_retry(), source_refresh=_boom)
+        results = self._run_pass5(
+            self._ok_retry(), test_engine, source_refresh=_boom
+        )
 
         # Escalated into aggregation.
         failed = results.get("failed_actions", [])
@@ -3984,10 +4089,10 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         assert entries[0]["error"] is not None
         assert "Failed to refresh" in entries[0]["description"]
 
-    def test_source_refresh_success_logs_success_and_no_failure(self):
+    def test_source_refresh_success_logs_success_and_no_failure(self, test_engine):
         """Control: a healthy source refresh logs success=True and aggregates
         nothing."""
-        results = self._run_pass5(self._ok_retry())
+        results = self._run_pass5(self._ok_retry(), test_engine)
         entries = self._log_entries(results, "refresh_epg_source")
         assert entries and entries[0]["success"] is True
         assert entries[0]["error"] is None
@@ -4059,6 +4164,7 @@ class TestEngineFoldMatchKeyPassThrough:
             mock_executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             self.engine._refresh_dummy_epg_and_retry = AsyncMock()
@@ -4212,6 +4318,7 @@ class TestAutoChannelNumberSkipsRenumberPass:
             mock_executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             mock_executor._channel_by_id = {}
             mock_executor._created_channels = {}
+            _enable_guide_lifecycle(mock_executor)
             mock_exec_cls.return_value = mock_executor
 
             engine._refresh_dummy_epg_and_retry = AsyncMock()

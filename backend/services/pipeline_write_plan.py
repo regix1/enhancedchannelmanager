@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import json
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from services.mutation_plan_store import canonical_hash
@@ -12,6 +15,7 @@ PIPELINE_WRITE_METHODS = frozenset({
     "assign_channel_numbers", "create_channel", "create_channel_group", "create_logo",
     "delete_channel", "delete_channel_group", "update_channel", "update_profile_channel",
 })
+EVENT_PROMOTE_METHOD = "event_sync_promote"
 
 # Every normal successful API run side effect suppressed during plan_only must
 # be recreated after replay. This inventory is asserted by tests and reviewed
@@ -30,6 +34,247 @@ class PlannedWrite:
     method: str
     args: list[Any]
     kwargs: dict[str, Any]
+    result_id: int | None = None
+
+
+_EVENT_FIELDS = frozenset({
+    "rule_id", "rule_name", "config", "profile_id", "profile_hash",
+    "source_id", "source_hashes", "expected_revision", "expected_hash",
+    "unit", "allocation_writes", "default_profile_ids", "stale_streams",
+    "working_stream_ids", "channel_uuid",
+})
+
+
+def _positive(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _sha(value: Any, name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{name} must be a lowercase SHA-256 hash")
+    return value
+
+
+def _event_row(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "stream", "disposition", "parsed",
+    }:
+        raise ValueError("event row fields are invalid")
+    stream = value["stream"]
+    parsed = value["parsed"]
+    if not isinstance(stream, dict) or set(stream) != {
+        "name", "group_id", "stream_id", "provider", "provider_id",
+        "name_seen_before_today", "is_stale",
+    }:
+        raise ValueError("event stream fields are invalid")
+    if not isinstance(stream["name"], str) or not stream["name"]:
+        raise ValueError("event stream name is invalid")
+    _positive(stream["group_id"], "event stream group ID")
+    _positive(stream["stream_id"], "event stream ID")
+    if stream["provider_id"] is not None:
+        _positive(stream["provider_id"], "event stream provider ID")
+    if stream["provider"] is not None and not isinstance(stream["provider"], str):
+        raise ValueError("event stream provider is invalid")
+    for name in ("name_seen_before_today", "is_stale"):
+        if stream[name] is not None and not isinstance(stream[name], bool):
+            raise ValueError(f"event stream {name} is invalid")
+    if value["disposition"] not in {"unmatched", "excluded"}:
+        raise ValueError("event stream disposition is invalid")
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "raw_name", "title", "start", "teams", "matched_pattern",
+    }:
+        raise ValueError("parsed event fields are invalid")
+    if (
+        not isinstance(parsed["raw_name"], str)
+        or not isinstance(parsed["title"], str)
+        or not parsed["title"].strip()
+        or not isinstance(parsed["start"], str)
+    ):
+        raise ValueError("parsed event identity is invalid")
+    try:
+        start = datetime.fromisoformat(parsed["start"])
+    except ValueError as exc:
+        raise ValueError("parsed event start is invalid") from exc
+    if start.tzinfo is None or start.utcoffset() != timezone.utc.utcoffset(start):
+        raise ValueError("parsed event start must be UTC")
+    teams = parsed["teams"]
+    if teams is not None and (
+        not isinstance(teams, list)
+        or len(teams) != 2
+        or any(not isinstance(team, str) for team in teams)
+    ):
+        raise ValueError("parsed event teams are invalid")
+    if parsed["matched_pattern"] is not None and not isinstance(
+        parsed["matched_pattern"], str
+    ):
+        raise ValueError("parsed event pattern is invalid")
+    return copy.deepcopy(value)
+
+
+def _event_operation(value: Any, result_id: Any) -> dict[str, Any]:
+    """Validate the exact bounded event operation stored by the server."""
+    if not isinstance(value, dict) or set(value) != _EVENT_FIELDS:
+        raise ValueError("event promotion fields are invalid")
+    if not isinstance(result_id, int) or isinstance(result_id, bool) or result_id == 0:
+        raise ValueError("event promotion result ID is invalid")
+    _positive(value["rule_id"], "event rule ID")
+    _positive(value["profile_id"], "event profile ID")
+    _positive(value["source_id"], "event source ID")
+    if not isinstance(value["rule_name"], str) or not value["rule_name"].strip():
+        raise ValueError("event rule name is invalid")
+    if not isinstance(value["config"], dict):
+        raise ValueError("event rule configuration is invalid")
+    try:
+        json.dumps(value["config"], sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("event rule configuration is not JSON-safe") from exc
+    _sha(value["profile_hash"], "event profile hash")
+    hashes = value["source_hashes"]
+    if (
+        not isinstance(hashes, list)
+        or len(hashes) != 1
+        or not isinstance(hashes[0], dict)
+        or set(hashes[0]) != {"endpoint_hash", "source_url_hash"}
+    ):
+        raise ValueError("event source hashes are invalid")
+    _sha(hashes[0]["endpoint_hash"], "event source endpoint hash")
+    _sha(hashes[0]["source_url_hash"], "event source URL hash")
+    revision = value["expected_revision"]
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise ValueError("event publication revision is invalid")
+    if revision == 0:
+        if value["expected_hash"] is not None:
+            raise ValueError("absent event publication cannot have a hash")
+    else:
+        _sha(value["expected_hash"], "event publication hash")
+
+    unit = value["unit"]
+    if not isinstance(unit, dict) or set(unit) != {
+        "event_key", "channel_name", "dateless", "action",
+        "existing_channel_id", "rows",
+    }:
+        raise ValueError("event promotion unit fields are invalid")
+    if (
+        not isinstance(unit["event_key"], str)
+        or not unit["event_key"]
+        or not isinstance(unit["channel_name"], str)
+        or not unit["channel_name"].strip()
+        or not isinstance(unit["dateless"], bool)
+        or unit["action"] not in {"create", "attach_existing"}
+        or not isinstance(unit["rows"], list)
+        or not unit["rows"]
+    ):
+        raise ValueError("event promotion unit is invalid")
+    rows = [_event_row(row) for row in unit["rows"]]
+    selected_ids = [row["stream"]["stream_id"] for row in rows]
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError("event promotion streams must be unique")
+    existing_id = unit["existing_channel_id"]
+    if unit["action"] == "create":
+        if existing_id is not None or result_id >= 0 or value["channel_uuid"] is not None:
+            raise ValueError("event creation result is invalid")
+    else:
+        if _positive(existing_id, "event existing channel ID") != result_id:
+            raise ValueError("event adoption result is invalid")
+        if not isinstance(value["channel_uuid"], str) or not value["channel_uuid"]:
+            raise ValueError("event adoption channel UUID is invalid")
+
+    default_ids = value["default_profile_ids"]
+    if not isinstance(default_ids, list):
+        raise ValueError("event default profile IDs are invalid")
+    normalized_defaults = [
+        _positive(item, "event default profile ID") for item in default_ids
+    ]
+    if len(normalized_defaults) != len(set(normalized_defaults)):
+        raise ValueError("event default profile IDs must be unique")
+
+    writes = value["allocation_writes"]
+    if not isinstance(writes, list):
+        raise ValueError("event allocation writes are invalid")
+    creates = 0
+    seen_profiles: set[int] = set()
+    for nested in writes:
+        if not isinstance(nested, dict) or set(nested) != {
+            "method", "args", "kwargs", "result_id",
+        }:
+            raise ValueError("event allocation write fields are invalid")
+        method = nested["method"]
+        args = nested["args"]
+        kwargs = nested["kwargs"]
+        if not isinstance(args, list) or not isinstance(kwargs, dict) or kwargs:
+            raise ValueError("event allocation write arguments are invalid")
+        if method == "create_channel":
+            creates += 1
+            if (
+                len(args) != 1
+                or not isinstance(args[0], dict)
+                or args[0].get("streams") != []
+                or args[0].get("hidden_from_output") is not True
+                or args[0].get("channel_group_id") != value["config"].get(
+                    "promote_target_group_id"
+                )
+                or nested["result_id"] != result_id
+            ):
+                raise ValueError("event allocation channel create is invalid")
+        elif method == "update_profile_channel":
+            if (
+                len(args) != 3
+                or _positive(args[0], "event allocation profile ID") in seen_profiles
+                or args[1] != result_id
+                or not isinstance(args[2], dict)
+                or set(args[2]) != {"enabled"}
+                or not isinstance(args[2]["enabled"], bool)
+                or nested["result_id"] is not None
+            ):
+                raise ValueError("event allocation profile write is invalid")
+            seen_profiles.add(args[0])
+            if args[2]["enabled"] is not (args[0] in normalized_defaults):
+                raise ValueError("event allocation profile target is invalid")
+        else:
+            raise ValueError("event allocation contains an unsupported write")
+    if creates != (1 if unit["action"] == "create" else 0):
+        raise ValueError("event allocation create count is invalid")
+    if unit["action"] == "attach_existing" and writes:
+        raise ValueError("event adoption cannot contain allocation writes")
+
+    stale = value["stale_streams"]
+    if not isinstance(stale, list):
+        raise ValueError("event stale streams are invalid")
+    stale_rows = [_event_row(row) for row in stale]
+    stale_ids = [row["stream"]["stream_id"] for row in stale_rows]
+    if len(stale_ids) != len(set(stale_ids)):
+        raise ValueError("event stale streams must be unique")
+    if set(stale_ids) & set(selected_ids):
+        raise ValueError("event selected and stale streams must not overlap")
+    working = value["working_stream_ids"]
+    if not isinstance(working, list):
+        raise ValueError("event working streams are invalid")
+    working_ids = [_positive(item, "event working stream ID") for item in working]
+    if len(working_ids) != len(set(working_ids)):
+        raise ValueError("event working streams must be unique")
+    if not set(working_ids) <= set(selected_ids) | set(stale_ids):
+        raise ValueError("event working streams are outside the approved unit")
+    return copy.deepcopy(value)
+
+
+def _event_write_bounds(value: dict[str, Any]) -> tuple[int, set[tuple[str, Any]]]:
+    writes = value["allocation_writes"]
+    stream_count = len(value["unit"]["rows"])
+    stale_count = len(value["stale_streams"])
+    result_id = next(
+        nested["result_id"]
+        for nested in writes
+        if nested["method"] == "create_channel"
+    ) if value["unit"]["action"] == "create" else value["unit"]["existing_channel_id"]
+    targets = {("channel", result_id)}
+    for nested in writes:
+        if nested["method"] == "create_channel":
+            targets.add(("channel", nested["result_id"]))
+        elif nested["method"] == "update_profile_channel":
+            targets.add(("channel", nested["args"][1]))
+    return len(writes) + 2 + stream_count + stale_count, targets
 
 
 @dataclass(frozen=True)
@@ -68,19 +313,32 @@ class PipelineWritePlan:
     def accounting(self) -> dict[str, int]:
         """Authoritative counts derived from exact operations, never previews."""
         targets: set[tuple[str, Any]] = set()
+        write_count = 0
         for index, write in enumerate(self.writes):
-            if write.method == "assign_channel_numbers":
+            if write.method == EVENT_PROMOTE_METHOD:
+                if len(write.args) != 1 or write.kwargs:
+                    raise ValueError("event promotion write shape is invalid")
+                operation = _event_operation(write.args[0], write.result_id)
+                bounded_writes, bounded_targets = _event_write_bounds(operation)
+                write_count += bounded_writes
+                targets.update(bounded_targets)
+            elif write.method == "assign_channel_numbers":
+                write_count += 1
                 targets.update(("channel", value) for value in write.args[0])
             elif write.method == "update_profile_channel":
+                write_count += 1
                 targets.add(("channel", write.args[1]))
             elif write.method in {"update_channel", "delete_channel"}:
+                write_count += 1
                 targets.add(("channel", write.args[0]))
             elif write.method == "delete_channel_group":
+                write_count += 1
                 targets.add(("group", write.args[0]))
             else:
+                write_count += 1
                 # Each create is a distinct future entity even when payloads match.
-                targets.add((write.method, index))
-        return {"write_count": len(self.writes), "unique_target_count": len(targets)}
+                targets.add((write.method, write.result_id if write.result_id is not None else index))
+        return {"write_count": write_count, "unique_target_count": len(targets)}
 
 
 class PartialReplayError(RuntimeError):
@@ -129,27 +387,32 @@ class PlanningDispatcharrClient:
         self._shadow_channels[channel_id] = relevant
         return copy.deepcopy(relevant)
 
-    def _record(self, method: str, *args, **kwargs) -> None:
-        self.plan.writes.append(PlannedWrite(method, copy.deepcopy(list(args)), copy.deepcopy(kwargs)))
+    def _record(self, method: str, *args, result_id: int | None = None, **kwargs) -> None:
+        self.plan.writes.append(PlannedWrite(
+            method,
+            copy.deepcopy(list(args)),
+            copy.deepcopy(kwargs),
+            result_id=result_id,
+        ))
 
     async def create_channel(self, data: dict) -> dict:
         temp_id = self._next_temp_id
         self._next_temp_id -= 1
         created = {"id": temp_id, **copy.deepcopy(data)}
         self._shadow_channels[temp_id] = created
-        self._record("create_channel", data)
+        self._record("create_channel", data, result_id=temp_id)
         return copy.deepcopy(created)
 
     async def create_channel_group(self, name: str) -> dict:
         temp_id = self._next_temp_id
         self._next_temp_id -= 1
-        self._record("create_channel_group", name)
+        self._record("create_channel_group", name, result_id=temp_id)
         return {"id": temp_id, "name": name}
 
     async def create_logo(self, data: dict) -> dict:
         temp_id = self._next_temp_id
         self._next_temp_id -= 1
-        self._record("create_logo", data)
+        self._record("create_logo", data, result_id=temp_id)
         return {"id": temp_id, **copy.deepcopy(data)}
 
     async def update_channel(self, channel_id: int, data: dict) -> dict:
@@ -194,6 +457,115 @@ class PlanningDispatcharrClient:
         self._record("update_profile_channel", profile_id, channel_id, data)
         return copy.deepcopy(data)
 
+    async def record_event_promotion(
+        self, operation: dict, realize=None, *, result_id: int | None = None
+    ) -> Any:
+        """Replace one staged allocation segment with its semantic event write."""
+        start = len(self.plan.writes)
+        result = None
+        if result_id is None:
+            if realize is None:
+                raise ValueError("event promotion allocation is required")
+            result = await realize()
+            result_id = getattr(result, "entity_id", None)
+            if not getattr(result, "success", False) or result_id is None:
+                del self.plan.writes[start:]
+                raise ValueError("event promotion allocation could not be planned")
+        elif result_id < 1 or realize is not None:
+            raise ValueError("event promotion adoption is invalid")
+        else:
+            await self._channel_before(result_id)
+        allocation = [vars(write) for write in self.plan.writes[start:]]
+        del self.plan.writes[start:]
+        stored = copy.deepcopy(operation)
+        stored["allocation_writes"] = allocation
+        stored = _event_operation(stored, result_id)
+        self.plan.writes.append(PlannedWrite(
+            EVENT_PROMOTE_METHOD,
+            [stored],
+            {},
+            result_id=result_id,
+        ))
+        return result
+
+
+class EventAllocationClient:
+    """Forward only the approved staged allocation calls in their exact order."""
+
+    def __init__(
+        self,
+        client,
+        writes: list[dict],
+        result_id: int,
+        *,
+        forward: bool = True,
+    ) -> None:
+        self._client = client
+        self._writes = copy.deepcopy(writes)
+        self._result_id = result_id
+        self._forward = forward
+        self._index = 0
+        self._real_id: int | None = None
+
+    def __getattr__(self, name: str):
+        if name in PIPELINE_WRITE_METHODS:
+            async def refuse(*args, **kwargs):
+                raise ValueError(f"unexpected event allocation write {name}")
+            return refuse
+        return getattr(self._client, name)
+
+    def _expected(self, method: str, args: list[Any], kwargs: dict[str, Any]) -> None:
+        if self._index >= len(self._writes):
+            raise ValueError("event allocation issued an extra write")
+        expected = copy.deepcopy(self._writes[self._index])
+        if self._real_id is not None:
+            def remap(value):
+                if value == self._result_id:
+                    return self._real_id
+                if isinstance(value, list):
+                    return [remap(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: remap(item) for key, item in value.items()}
+                return value
+            expected["args"] = remap(expected["args"])
+            expected["kwargs"] = remap(expected["kwargs"])
+        actual = {"method": method, "args": args, "kwargs": kwargs}
+        approved = {
+            "method": expected["method"],
+            "args": expected["args"],
+            "kwargs": expected["kwargs"],
+        }
+        if canonical_hash(actual) != canonical_hash(approved):
+            raise ValueError("event allocation write drifted")
+        self._index += 1
+
+    async def create_channel(self, value: dict) -> dict:
+        self._expected("create_channel", [value], {})
+        if not self._forward:
+            return {"id": self._result_id, **copy.deepcopy(value)}
+        result = await self._client.create_channel(value)
+        real_id = result.get("id") if isinstance(result, dict) else None
+        if real_id is None:
+            raise RuntimeError("event allocation create did not return an id")
+        self._real_id = int(real_id)
+        return result
+
+    async def update_profile_channel(
+        self, profile_id: int, channel_id: int, value: dict
+    ) -> dict:
+        self._expected(
+            "update_profile_channel", [profile_id, channel_id, value], {}
+        )
+        if not self._forward:
+            return copy.deepcopy(value)
+        return await self._client.update_profile_channel(
+            profile_id, channel_id, value
+        )
+
+    def finish(self) -> None:
+        if self._index != len(self._writes):
+            raise ValueError("event allocation omitted an approved write")
+
 
 async def validate_read_set(client, plan: PipelineWritePlan) -> None:
     """Validate every existing channel before replay performs its first write."""
@@ -223,9 +595,21 @@ async def validate_read_set(client, plan: PipelineWritePlan) -> None:
 
 
 async def replay_write_plan(
-    client, plan: PipelineWritePlan, *, read_set_validated: bool = False
+    client,
+    plan: PipelineWritePlan,
+    *,
+    read_set_validated: bool = False,
+    event_operation=None,
 ) -> tuple[list[Any], dict[int, int]]:
     """Validate first, then replay only recorded writes with temp-ID remapping."""
+    if any(write.method == EVENT_PROMOTE_METHOD for write in plan.writes):
+        if event_operation is None:
+            raise ValueError("event promotion replay support is required")
+        for write in plan.writes:
+            if write.method == EVENT_PROMOTE_METHOD:
+                if write.args is None or len(write.args) != 1 or write.kwargs:
+                    raise ValueError("event promotion write shape is invalid")
+                _event_operation(write.args[0], write.result_id)
     if not read_set_validated:
         await validate_read_set(client, plan)
     remap: dict[int, int] = {}
@@ -246,14 +630,35 @@ async def replay_write_plan(
     completed: list[tuple[PlannedWrite, list[Any], Any]] = []
     try:
         for write in plan.writes:
-            args = mapped(write.args)
-            kwargs = mapped(write.kwargs)
-            result = await getattr(client, write.method)(*args, **kwargs)
+            if write.method == EVENT_PROMOTE_METHOD:
+                operation = _event_operation(write.args[0], write.result_id)
+                result = await event_operation(operation, write.result_id)
+                real_id = result.get("id") if isinstance(result, dict) else None
+                if real_id is None:
+                    raise RuntimeError("event promotion did not return an id")
+                real_id = int(real_id)
+                if write.result_id < 0:
+                    remap[write.result_id] = real_id
+                elif real_id != write.result_id:
+                    raise RuntimeError("event promotion returned the wrong channel id")
+                args = [operation]
+                kwargs = {}
+            else:
+                args = mapped(write.args)
+                kwargs = mapped(write.kwargs)
+                result = await getattr(client, write.method)(*args, **kwargs)
             if write.method.startswith("create_"):
                 real_id = result.get("id") if isinstance(result, dict) else None
                 if real_id is None:
                     raise RuntimeError(f"{write.method} did not return an id")
-                remap[next_temp] = int(real_id)
+                temp_id = write.result_id if write.result_id is not None else next_temp
+                if temp_id != next_temp:
+                    raise ValueError("planned temporary id order is invalid")
+                remap[temp_id] = int(real_id)
+                next_temp -= 1
+            elif write.method == EVENT_PROMOTE_METHOD and write.result_id < 0:
+                if write.result_id != next_temp:
+                    raise ValueError("planned temporary id order is invalid")
                 next_temp -= 1
             results.append(result)
             completed.append((write, args, result))
@@ -276,9 +681,20 @@ async def replay_write_plan(
             except Exception as compensation_exc:  # noqa: BLE001
                 compensation_errors.append(f"{done.method}: {compensation_exc}")
         completed_targets = [
-            f"{item[0].method}:{item[1][0] if item[1] else '<no-arg>'}"
+            (
+                f"{item[0].method}:{item[0].result_id}:recovery-retained"
+                if item[0].method == EVENT_PROMOTE_METHOD
+                else f"{item[0].method}:{item[1][0] if item[1] else '<no-arg>'}"
+            )
             for item in completed
         ]
+        if (
+            write.method == EVENT_PROMOTE_METHOD
+            and getattr(exc, "event_recovery_retained", False) is True
+        ):
+            completed_targets.append(
+                f"{EVENT_PROMOTE_METHOD}:{write.result_id}:recovery-retained"
+            )
         raise PartialReplayError(
             len(completed), completed_targets, compensation_errors
         ) from exc
@@ -309,9 +725,13 @@ def journal_entries_for_plan(
     }
     for write in plan.writes:
         method = write.method
+        if method == EVENT_PROMOTE_METHOD:
+            continue
         if method.startswith("create_"):
-            entity_id = remap.get(next_temp, next_temp)
-            next_temp -= 1
+            temp_id = write.result_id if write.result_id is not None else next_temp
+            entity_id = remap.get(temp_id, temp_id)
+            if temp_id == next_temp:
+                next_temp -= 1
             payload = write.args[0] if write.args else {}
             append(method, entity_id, payload.get("name") if isinstance(payload, dict) else str(payload),
                    None, payload, f"Planned pipeline executed {method} for {entity_id}")

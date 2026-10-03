@@ -1,8 +1,12 @@
-from datetime import datetime
+import json
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.unit.test_event_sync_promotion import (
-    db_session_factory, promotion_candidates, retirement,
+    _clock, db_session_factory, promotion_candidates, retirement,
+)
+from tests.unit.test_event_sync_dummy_epg import (
+    _dummy_entry, _refresh_results, _wire_epg,
 )
 
 import pytest
@@ -90,23 +94,96 @@ def event_plan(promotion_candidates, monkeypatch):
     from channel_pipeline_engine import ChannelPipelineEngine
     from channel_pipeline_executor import ActionExecutor, ExecutionContext
     from routers import channel_pipeline
+    from services.epg_publication import read_publication
+    from services.event_sync_promote import promoted_channel_name
 
     setup = promotion_candidates
+    current_streams = {
+        stream["id"]: stream for stream in setup["streams"]
+    }
+    setup["rows"] = [
+        replace(
+            row,
+            stream=replace(
+                row.stream,
+                is_stale=current_streams[row.stream.stream_id].get("is_stale"),
+            ),
+        )
+        for row in setup["rows"]
+    ]
     setup["later_write"] = None
     setup["promotions"] = []
+    setup["create_receipt_stages"] = []
+    source_id = setup["epg_sources"][0]["id"]
+    profile_id = setup["config"]["dummy_epg_profile_id"]
+    first_name = promoted_channel_name(setup["rows"][0].result.parsed)
+    headers, regenerate, wait_refresh = _wire_epg(
+        setup["state"],
+        setup["client"],
+        setup["session_factory"],
+        initial_entries=[],
+        source_url=setup["epg_sources"][0]["url"],
+        regenerated_entries=[_dummy_entry(501, 900, first_name, source_id)],
+        profile_id=profile_id,
+        source_id=source_id,
+        now=setup["clock"],
+    )
+    setup["guide_headers"] = headers
+    setup["regenerate"] = regenerate
+    setup["wait_refresh"] = wait_refresh
+    setup["profile_before"] = None
+    profile_session = setup["session_factory"]()
+    try:
+        from models import DummyEPGProfile
+
+        setup["profile_before"] = profile_session.get(
+            DummyEPGProfile, profile_id,
+        ).to_dict()
+    finally:
+        profile_session.close()
+
+    create_channel = setup["client"].create_channel.side_effect
+
+    async def create_with_uuid(value):
+        publication = read_publication(f"profile:{profile_id}")
+        receipt = next(
+            receipt for receipt in publication["state"]["delivery"][
+                "pending_channels"
+            ].values()
+            if receipt.get("channel_id") is None
+        )
+        setup["create_receipt_stages"].append(receipt["stage"])
+        channel = await create_channel(value)
+        channel["uuid"] = f"event-{channel['id']}"
+        setup["state"].channels[channel["id"]]["uuid"] = channel["uuid"]
+        return deepcopy(channel)
+
+    setup["client"].create_channel.side_effect = create_with_uuid
     live_engine = ChannelPipelineEngine(setup["client"])
 
     async def run(engine, **kwargs):
+        from models import ChannelPipelineRule
+
         engine._existing_channels = deepcopy(list(setup["state"].channels.values()))
+        rule_session = setup["session_factory"]()
+        try:
+            stored_rule = rule_session.get(ChannelPipelineRule, setup["rule"].id)
+            managed_channel_ids = stored_rule.get_managed_channel_ids()
+        finally:
+            rule_session.close()
         executor = ActionExecutor(
             engine.client, deepcopy(engine._existing_channels),
-            managed_channel_ids=[], plan_only=kwargs.get("plan_only", False),
+            managed_channel_ids=managed_channel_ids,
+            plan_only=kwargs.get("plan_only", False),
+            epg_sources=deepcopy(setup["epg_sources"]),
         )
         setup["batches"].append([])
+        exec_ctx = ExecutionContext()
         promotion = await executor._execute_event_sync_promotion(
             setup["rule"].id, setup["rule"].name, setup["config"],
-            SimpleNamespace(resolved=setup["rows"]), ExecutionContext(),
+            SimpleNamespace(resolved=setup["rows"]), exec_ctx,
         )
+        promote_entries = promotion.pop("promote_entries")
         setup["promotions"].append(promotion)
         if setup["later_write"] == "attach":
             await engine.client.update_channel(800, {"streams": [7000, 7001]})
@@ -114,29 +191,72 @@ def event_plan(promotion_candidates, monkeypatch):
             await engine.client.delete_channel(800)
         elif setup["later_write"] == "profile":
             await engine.client.update_profile_channel(1, 800, {"enabled": True})
-        return {
+        result = _refresh_results()
+        result.update({
             "channels_created": promotion["promoted_created"],
             "event_sync": [{"rule_id": setup["rule"].id, "promotion": promotion}],
-        }
+            "execution_log": [
+                {
+                    "stream_id": (entry.get("match") or {}).get("secondary_stream_id"),
+                    "stream_name": (entry.get("match") or {}).get("secondary_stream_name"),
+                    "m3u_account_id": None,
+                    "rules_evaluated": [],
+                    "actions_executed": [entry],
+                }
+                for entry in promote_entries
+            ],
+            "created_entities": list(exec_ctx.created_entities),
+        })
+        return result
+
+    async def load_rules(rule_ids=None):
+        from models import ChannelPipelineRule
+
+        rule_session = setup["session_factory"]()
+        try:
+            stored_rule = rule_session.get(ChannelPipelineRule, setup["rule"].id)
+            if rule_ids and stored_rule.id not in rule_ids:
+                return []
+            return [stored_rule]
+        finally:
+            rule_session.close()
 
     monkeypatch.setattr(ChannelPipelineEngine, "run_pipeline", run)
-    monkeypatch.setattr(ChannelPipelineEngine, "_load_rules", AsyncMock(return_value=[setup["rule"]]))
+    monkeypatch.setattr(
+        ChannelPipelineEngine,
+        "_load_rules",
+        AsyncMock(side_effect=load_rules),
+    )
     monkeypatch.setattr(ChannelPipelineEngine, "_update_rule_stats", AsyncMock())
     monkeypatch.setattr(channel_pipeline, "_ensure_engine", AsyncMock(return_value=live_engine))
     monkeypatch.setattr(channel_pipeline, "get_session", setup["session_factory"])
     monkeypatch.setattr("journal.log_entries", MagicMock())
+    task = MagicMock()
+    task.return_value._regenerate_xmltv = regenerate
+    monkeypatch.setattr("tasks.dummy_epg_refresh.DummyEPGRefreshTask", task)
+    monkeypatch.setattr(
+        "tasks.dummy_epg_refresh.wait_for_epg_source_refresh", wait_refresh,
+    )
+    monkeypatch.setattr(
+        "channel_pipeline_executor.datetime", _clock(lambda: setup["clock"]),
+    )
+    monkeypatch.setattr(
+        "channel_pipeline_engine.datetime", _clock(lambda: setup["clock"]),
+    )
+    monkeypatch.setattr(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: setup["clock"]),
+    )
     setup["client"].get_channel_profiles = AsyncMock(return_value=[{"id": 1, "channels": []}])
     setup["client"].update_profile_channel = AsyncMock(return_value={})
-    with patch("channel_pipeline_executor.datetime") as clock:
-        clock.now.return_value = setup["clock"]
-        clock.fromisoformat.side_effect = datetime.fromisoformat
-        yield setup
+    yield setup
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first_health", ["failed", "unknown", "missing_url"])
 async def test_empty_event_prepare_reaches_next_candidate_and_commits(event_plan, first_health):
     from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+    from services.event_sync_promote import promoted_channel_name
 
     setup = event_plan
     setup["first_health"] = first_health
@@ -149,6 +269,12 @@ async def test_empty_event_prepare_reaches_next_candidate_and_commits(event_plan
     second = await prepare_auto_creation_pipeline(request, _admin=None)
     assert second["preview"]["channels_created"] == 1
     setup["client"].create_channel.assert_not_awaited()
+    setup["guide_headers"][:] = [_dummy_entry(
+        501,
+        900,
+        promoted_channel_name(setup["rows"][1].result.parsed),
+        setup["epg_sources"][0]["id"],
+    )]
     response = await commit_auto_creation_pipeline(
         CommitPipelinePlanRequest(plan_id=second["plan_id"], plan_hash=second["plan_hash"]),
         _admin=None,
@@ -158,6 +284,357 @@ async def test_empty_event_prepare_reaches_next_candidate_and_commits(event_plan
     assert "Zulu Event" in next(iter(setup["state"].channels.values()))["name"]
     assert setup["batches"] == [[] if first_health == "missing_url" else [7301], [7302], []]
     assert all("probe_after" not in promotion for promotion in setup["promotions"])
+
+
+@pytest.mark.asyncio
+async def test_event_prepare_is_read_only_stable_and_commit_completes(event_plan):
+    import journal
+    from models import ChannelPipelineExecution, ChannelPipelineRule, DummyEPGProfile
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+    from services.epg_publication import read_publication
+    from services.event_sync_promote import promoted_channel_name
+
+    setup = event_plan
+    setup["first_health"] = "success"
+    request = RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id])
+    scope = f"profile:{setup['config']['dummy_epg_profile_id']}"
+
+    def stored_state():
+        session = setup["session_factory"]()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule"].id)
+            profile = session.get(
+                DummyEPGProfile, setup["config"]["dummy_epg_profile_id"],
+            )
+            return rule.get_managed_channel_ids(), profile.to_dict()
+        finally:
+            session.close()
+
+    assert read_publication(scope) is None
+    assert setup["state"].channels == {}
+    assert stored_state() == ([], setup["profile_before"])
+    first = await prepare_auto_creation_pipeline(request, _admin=None)
+    second = await prepare_auto_creation_pipeline(request, _admin=None)
+    assert first["plan_hash"] == second["plan_hash"]
+    assert first["preview"] == second["preview"]
+    assert first["preview"]["channels_created"] == 1
+    assert read_publication(scope) is None
+    assert setup["state"].channels == {}
+    assert stored_state() == ([], setup["profile_before"])
+    setup["client"].create_channel.assert_not_awaited()
+    setup["client"].update_profile_channel.assert_not_awaited()
+    journal.log_entries.assert_not_called()
+
+    setup["guide_headers"][:] = [_dummy_entry(
+        501,
+        900,
+        promoted_channel_name(setup["rows"][0].result.parsed),
+        setup["epg_sources"][0]["id"],
+    )]
+    response = await commit_auto_creation_pipeline(
+        CommitPipelinePlanRequest(
+            plan_id=second["plan_id"], plan_hash=second["plan_hash"],
+        ),
+        _admin=None,
+    )
+
+    body = json.loads(response.body)
+    assert body["status"] == "completed"
+    assert setup["create_receipt_stages"] == ["allocating"]
+    channel = setup["state"].channels[900]
+    assert channel["uuid"] == "event-900"
+    assert channel["hidden_from_output"] is False
+    assert channel["streams"] == [7301]
+    assert channel["epg_data_id"] == 501
+    publication = read_publication(scope)
+    receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert receipt["stage"] == "complete"
+    assert receipt["channel_id"] == 900
+    assert receipt["channel_uuid"] == "event-900"
+    managed, profile = stored_state()
+    assert managed == [900]
+    assert profile == setup["profile_before"]
+    session = setup["session_factory"]()
+    try:
+        execution = session.get(ChannelPipelineExecution, body["execution_id"])
+        assert execution.status == "completed"
+        assert execution.channels_created == 1
+    finally:
+        session.close()
+    assert journal.log_entries.call_count >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "changed", "detail"), [
+    ("name", "Changed Event", "pipeline decision inputs drifted"),
+    ("channel_group_id", 999, "event stream identity drifted"),
+    ("m3u_account", 99, "event stream identity drifted"),
+    ("is_stale", True, "pipeline decision inputs drifted"),
+])
+async def test_event_commit_rejects_stream_identity_drift(
+    event_plan, field, changed, detail,
+):
+    from routers.channel_pipeline import (
+        CommitPipelinePlanRequest,
+        commit_auto_creation_pipeline,
+    )
+
+    setup = event_plan
+    setup["first_health"] = "success"
+    prepared = await prepare_auto_creation_pipeline(
+        RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id]),
+        _admin=None,
+    )
+    setup["streams"][0][field] = changed
+
+    with pytest.raises(Exception) as caught:
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=prepared["plan_id"],
+                plan_hash=prepared["plan_hash"],
+            ),
+            _admin=None,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 409
+    assert detail in caught.value.detail
+    setup["client"].create_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_two_events_share_one_profile_and_complete_in_order(event_plan):
+    from models import ChannelPipelineRule
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+    from services.epg_publication import read_publication
+    from services.event_sync_promote import promoted_channel_name
+
+    setup = event_plan
+    setup["first_health"] = "success"
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+    setup["guide_headers"][:] = [
+        _dummy_entry(
+            501 + index,
+            900 + index,
+            promoted_channel_name(row.result.parsed),
+            setup["epg_sources"][0]["id"],
+        )
+        for index, row in enumerate(setup["rows"])
+    ]
+    prepared = await prepare_auto_creation_pipeline(
+        RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id]),
+        _admin=None,
+    )
+    assert prepared["preview"]["channels_created"] == 2
+
+    response = await commit_auto_creation_pipeline(
+        CommitPipelinePlanRequest(
+            plan_id=prepared["plan_id"], plan_hash=prepared["plan_hash"],
+        ),
+        _admin=None,
+    )
+
+    assert json.loads(response.body)["status"] == "completed"
+    assert setup["client"].create_channel.await_count == 2
+    assert setup["create_receipt_stages"] == ["allocating", "allocating"]
+    assert setup["state"].channels[900]["streams"] == [7301]
+    assert setup["state"].channels[901]["streams"] == [7302]
+    assert setup["state"].channels[900]["hidden_from_output"] is False
+    assert setup["state"].channels[901]["hidden_from_output"] is False
+    publication = read_publication(
+        f"profile:{setup['config']['dummy_epg_profile_id']}"
+    )
+    receipts = publication["state"]["delivery"]["pending_channels"]
+    assert {receipt["stage"] for receipt in receipts.values()} == {"complete"}
+    assert {receipt["channel_id"] for receipt in receipts.values()} == {900, 901}
+    session = setup["session_factory"]()
+    try:
+        stored = session.get(ChannelPipelineRule, setup["rule"].id)
+        assert stored.get_managed_channel_ids() == [900, 901]
+    finally:
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_intervening_publication_writer_blocks_second_event(
+    event_plan, monkeypatch,
+):
+    from channel_pipeline_engine import ChannelPipelineEngine
+    from models import ChannelPipelineRule, GuidePublication
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+    from services.epg_publication import read_publication
+    from services.event_sync_promote import promoted_channel_name
+
+    setup = event_plan
+    setup["first_health"] = "success"
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+    setup["guide_headers"][:] = [
+        _dummy_entry(
+            501 + index,
+            900 + index,
+            promoted_channel_name(row.result.parsed),
+            setup["epg_sources"][0]["id"],
+        )
+        for index, row in enumerate(setup["rows"])
+    ]
+    original_complete = ChannelPipelineEngine.complete_event_replay
+    completions = 0
+
+    async def complete_with_intervening_write(engine, executor, results):
+        nonlocal completions
+        await original_complete(engine, executor, results)
+        completions += 1
+        if completions != 1:
+            return
+        session = setup["session_factory"]()
+        try:
+            row = session.get(
+                GuidePublication,
+                f"profile:{setup['config']['dummy_epg_profile_id']}",
+            )
+            row.revision += 1
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(
+        ChannelPipelineEngine,
+        "complete_event_replay",
+        complete_with_intervening_write,
+    )
+    prepared = await prepare_auto_creation_pipeline(
+        RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id]),
+        _admin=None,
+    )
+    with pytest.raises(Exception) as caught:
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=prepared["plan_id"], plan_hash=prepared["plan_hash"],
+            ),
+            _admin=None,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 502
+    assert setup["client"].create_channel.await_count == 1
+    assert 900 in setup["state"].channels
+    assert 901 not in setup["state"].channels
+    publication = read_publication(
+        f"profile:{setup['config']['dummy_epg_profile_id']}"
+    )
+    receipts = publication["state"]["delivery"]["pending_channels"]
+    assert {receipt["channel_id"] for receipt in receipts.values()} == {900}
+    session = setup["session_factory"]()
+    try:
+        rule = session.get(ChannelPipelineRule, setup["rule"].id)
+        assert rule.get_managed_channel_ids() == [900]
+    finally:
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_publication_resumes_same_channel_and_expiry(event_plan):
+    import asyncio
+
+    from models import ChannelPipelineExecution, ChannelPipelineRule
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+    from services.epg_publication import read_publication
+    from services.event_sync_promote import promoted_channel_name
+
+    setup = event_plan
+    setup["first_health"] = "success"
+    setup["rows"] = setup["rows"][:1]
+    setup["streams"][:] = setup["streams"][:1]
+    setup["guide_headers"][:] = [_dummy_entry(
+        501,
+        900,
+        promoted_channel_name(setup["rows"][0].result.parsed),
+        setup["epg_sources"][0]["id"],
+    )]
+    publish = setup["regenerate"].side_effect
+    cancelled = False
+
+    async def cancel_after_publication(*args, **kwargs):
+        nonlocal cancelled
+        result = await publish(*args, **kwargs)
+        if not cancelled:
+            cancelled = True
+            raise asyncio.CancelledError()
+        return result
+
+    setup["regenerate"].side_effect = cancel_after_publication
+    first = await prepare_auto_creation_pipeline(
+        RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id]),
+        _admin=None,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=first["plan_id"], plan_hash=first["plan_hash"],
+            ),
+            _admin=None,
+        )
+
+    assert setup["client"].create_channel.await_count == 1
+    assert setup["state"].channels[900]["hidden_from_output"] is True
+    assert setup["state"].channels[900]["streams"] == []
+    scope = f"profile:{setup['config']['dummy_epg_profile_id']}"
+    interrupted = read_publication(scope)
+    interrupted_receipt = next(iter(
+        interrupted["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert interrupted_receipt["channel_id"] == 900
+    assert interrupted_receipt["stage"] == "allocated"
+    stored_attempt = interrupted_receipt["attempt_id"]
+    stored_expiry = interrupted_receipt["expires_at"]
+    session = setup["session_factory"]()
+    try:
+        rule = session.get(ChannelPipelineRule, setup["rule"].id)
+        assert rule.get_managed_channel_ids() == [900]
+        failed = session.query(ChannelPipelineExecution).filter(
+            ChannelPipelineExecution.status == "failed"
+        ).all()
+        assert len(failed) == 1
+    finally:
+        session.close()
+
+    second = await prepare_auto_creation_pipeline(
+        RunPipelineRequest(dry_run=False, rule_ids=[setup["rule"].id]),
+        _admin=None,
+    )
+    response = await commit_auto_creation_pipeline(
+        CommitPipelinePlanRequest(
+            plan_id=second["plan_id"], plan_hash=second["plan_hash"],
+        ),
+        _admin=None,
+    )
+
+    assert json.loads(response.body)["status"] == "completed"
+    assert setup["client"].create_channel.await_count == 1
+    completed = read_publication(scope)
+    completed_receipt = next(iter(
+        completed["state"]["delivery"]["pending_channels"].values()
+    ))
+    assert completed_receipt["stage"] == "complete", (
+        f"stage={completed_receipt['stage']} "
+        f"reason={completed_receipt['reason']} "
+        f"regenerations={setup['regenerate'].await_count} "
+        f"refresh_waits={setup['wait_refresh'].await_count} "
+        f"source_refreshes={setup['client'].refresh_epg_source.await_count} "
+        f"programme_reads={setup['client'].get_epg_grid.await_count} "
+        f"guide_rows={len(setup['state'].guide_rows)} "
+        f"programmes={len(setup['state'].guide_programmes)} "
+        f"updates={setup['state'].update_channel_calls} "
+        f"response={json.loads(response.body)}"
+    )
+    assert setup["state"].channels[900]["hidden_from_output"] is False
+    assert setup["state"].channels[900]["streams"] == [7301]
+    assert completed_receipt["attempt_id"] == stored_attempt
+    assert completed_receipt["expires_at"] == stored_expiry
 
 
 @pytest.mark.asyncio

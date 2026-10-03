@@ -334,20 +334,37 @@ describe('PendingMergesPage — a replay that obtained no evidence', () => {
   });
 
   it('keeps the notice after the row has left the queue', async () => {
-    vi.mocked(api.acceptPendingMerge).mockResolvedValue(
-      outcome({ dispatcharr_updated: null, unapplied_reason: REPLAY_REASON }),
-    );
+    let resolveMerge!: (value: AcceptMergeOutcome) => void;
+    const mergeRequest = new Promise<AcceptMergeOutcome>((resolve) => {
+      resolveMerge = resolve;
+    });
+    vi.mocked(api.acceptPendingMerge).mockReturnValueOnce(mergeRequest);
 
     render(<PendingMergesPage />);
     await screen.findByText('ESPN HD');
-    fireEvent.click(screen.getByRole('button', { name: /^Merge$/i }));
+    const queue = screen.getByRole('list', { name: 'Pending merges' });
+    const row = within(queue).getByRole('listitem');
+    expect(within(row).getByText('ESPN HD')).toBeInTheDocument();
+    fireEvent.click(within(row).getByRole('button', { name: /^Merge$/i }));
 
-    await waitFor(() => {
-      expect(screen.queryByRole('button', { name: /^Merge$/i })).toBeNull();
+    await waitFor(() => expect(api.acceptPendingMerge).toHaveBeenCalledTimes(1));
+    expect(api.acceptPendingMerge).toHaveBeenCalledWith(1);
+    expect(row).toBeInTheDocument();
+    expect(within(row).getByText('ESPN HD')).toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: 'Working...' })).toBeDisabled();
+    expect(screen.queryByTestId('pending-merges-unknown')).toBeNull();
+
+    await act(async () => {
+      resolveMerge(outcome({ dispatcharr_updated: null, unapplied_reason: REPLAY_REASON }));
+      await mergeRequest;
     });
-    expect(screen.getByTestId('pending-merges-unknown')).toHaveTextContent(
-      REPLAY_REASON,
-    );
+
+    const notice = await screen.findByTestId('pending-merges-unknown');
+    await waitFor(() => expect(row).not.toBeInTheDocument());
+    expect(notice).toHaveTextContent(REPLAY_REASON);
+    expect(notice).toHaveTextContent('ESPN HD');
+    expect(screen.queryByTestId('pending-merges-unapplied')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('does not report it as a failure', async () => {

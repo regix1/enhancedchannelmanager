@@ -5,6 +5,7 @@ from pathlib import Path
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from tests.unit.test_version_touchpoint_consistency import _iter_product_py_files
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -49,10 +50,37 @@ def test_backend_runtime_uses_pyjwt_without_python_jose_or_ecdsa():
 
 
 def test_backend_code_imports_pyjwt_not_python_jose():
-    python_files = list(BACKEND.glob("**/*.py"))
+    python_files = [path for path in _iter_product_py_files() if path.is_relative_to(BACKEND)]
 
     assert not [path for path in python_files if _imports_package(path, "jose")]
     assert _imports_package(BACKEND / "auth" / "tokens.py", "jwt")
+
+
+def test_backend_python_discovery_includes_product_and_prunes_dependencies(tmp_path):
+    backend = tmp_path / "backend"
+    product = backend / "current.py"
+    hidden_product = backend / ".untracked" / "module.py"
+    environment = backend / "arbitrary-environment"
+    dependencies = (
+        environment / "module.py",
+        backend / "site-packages" / "package.py",
+        backend / "nested" / "dist-packages" / "package.py",
+    )
+    for path in (product, hidden_product, *dependencies):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("from jose import jwt\n", encoding="utf-8")
+    (environment / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    python_files = [
+        path
+        for path in _iter_product_py_files(tmp_path)
+        if path.is_relative_to(backend)
+    ]
+
+    assert set(python_files) == {product, hidden_product}
+    assert {
+        path for path in python_files if _imports_package(path, "jose")
+    } == {product, hidden_product}
 
 
 def test_josepy_remains_the_acme_dependency():

@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -187,12 +187,180 @@ def test_disputed_stable_group_skips_lifecycle_writes():
             1,
             {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
             (),
-            datetime(2026, 9, 20),
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            flow={},
+            expires_at=(
+                datetime(2026, 9, 20, tzinfo=timezone.utc)
+                + timedelta(minutes=5)
+            ),
         ))
 
     assert eligible == set()
     assert states == {100: "unknown"}
     client.get_streams_by_ids.assert_not_awaited()
+
+
+def _deadline_lifecycle():
+    client = MagicMock()
+    client.get_streams_by_ids = AsyncMock(return_value=[{
+        "id": 9001,
+        "name": STREAM_MERCURY,
+        "is_stale": False,
+    }])
+    executor = ActionExecutor(
+        client,
+        existing_channels=[{
+            "id": 100,
+            "name": MASTER_MERCURY,
+            "channel_group_id": 77,
+            "streams": [9001],
+        }],
+    )
+    rule = MagicMock(enabled=True)
+    rule.get_managed_channel_ids.return_value = [100]
+    profile = MagicMock(enabled=True)
+    profile.to_dict.return_value = {
+        "id": 1,
+        "event_timezone": "US/Eastern",
+    }
+    session = MagicMock()
+    session.get.side_effect = lambda model, _key: (
+        rule if model is ChannelPipelineRule else profile
+    )
+    session.query.return_value.filter.return_value.all.return_value = []
+    return client, executor, session
+
+
+@pytest.mark.asyncio
+async def test_elapsed_lifecycle_keeps_managed_channels_unknown():
+    now = datetime(2026, 7, 11, 22, 30, tzinfo=timezone.utc)
+    client, executor, session = _deadline_lifecycle()
+    prepare = AsyncMock()
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[]), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("channel_pipeline_executor.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        eligible, states = await executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (),
+            now,
+            flow={9001: True},
+            expires_at=now,
+        )
+
+    assert eligible == set()
+    assert states == {100: "unknown"}
+    client.get_streams_by_ids.assert_not_awaited()
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining_seconds,timeout_seconds", [
+    (0.25, 0.25),
+    (30, 10.0),
+])
+async def test_lifecycle_lookup_uses_the_smaller_remaining_budget(
+    remaining_seconds,
+    timeout_seconds,
+):
+    now = datetime(2026, 7, 11, 22, 30, tzinfo=timezone.utc)
+    expires_at = now + timedelta(seconds=remaining_seconds)
+    client, executor, session = _deadline_lifecycle()
+    prepare = AsyncMock()
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[]), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("channel_pipeline_executor.datetime", wraps=datetime) as clock, \
+         patch("asyncio.timeout", wraps=asyncio.timeout) as timeout:
+        clock.now.side_effect = [now, expires_at]
+        eligible, states = await executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (),
+            now,
+            flow={9001: True},
+            expires_at=expires_at,
+        )
+
+    assert eligible == set()
+    assert states == {100: "unknown"}
+    timeout.assert_called_once_with(pytest.approx(timeout_seconds))
+    client.get_streams_by_ids.assert_awaited_once_with([9001])
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires_during", ["parsing", "preparation"])
+async def test_lifecycle_discards_evidence_that_outlives_its_deadline(
+    expires_during,
+):
+    now = datetime(2026, 7, 11, 22, 30, tzinfo=timezone.utc)
+    expires_at = now + timedelta(minutes=5)
+    client, executor, session = _deadline_lifecycle()
+    prepare = AsyncMock(return_value=(
+        [],
+        {"sources": [], "channels": []},
+    ))
+    readings = (
+        [now, now, expires_at]
+        if expires_during == "parsing"
+        else [now, now, now, expires_at]
+    )
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[]), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("channel_pipeline_executor.datetime", wraps=datetime) as clock:
+        clock.now.side_effect = readings
+        eligible, states = await executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (),
+            now,
+            flow={9001: True},
+            expires_at=expires_at,
+        )
+
+    assert eligible == set()
+    assert states == {100: "unknown"}
+    if expires_during == "parsing":
+        prepare.assert_not_awaited()
+    else:
+        prepare.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fresh_lifecycle_evidence_can_mark_a_channel_active():
+    now = datetime(2026, 7, 11, 22, 30, tzinfo=timezone.utc)
+    expires_at = now + timedelta(minutes=5)
+    client, executor, session = _deadline_lifecycle()
+    prepare = AsyncMock(return_value=(
+        [],
+        {"sources": [], "channels": []},
+    ))
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[]), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("channel_pipeline_executor.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        eligible, states = await executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (),
+            now,
+            flow={9001: True},
+            expires_at=expires_at,
+        )
+
+    assert eligible == set()
+    assert states == {100: "active"}
+    prepare.assert_awaited_once()
+    assert prepare.await_args.kwargs["expires_at"] == expires_at
 
 
 class TestIdempotency:

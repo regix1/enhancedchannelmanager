@@ -97,115 +97,34 @@ def test_policy_rejects_a_different_digest_pinned_mcp_base(tmp_path):
     assert any("reviewed Alpine base digest" in failure for failure in failures), failures
 
 
-def test_policy_rejects_publication_without_exact_sha_authorization(
-    tmp_path,
-):
+def test_policy_fails_closed_when_an_image_input_is_missing(tmp_path):
     gate = _load_gate()
     _copy_policy_files(gate, tmp_path)
-    workflow = tmp_path / ".github/workflows/publish-images.yml"
-    contents = workflow.read_text(encoding="utf-8")
-    trigger = "python scripts/image_publish_policy.py"
-    assert trigger in contents
-    workflow.write_text(contents.replace(trigger, "python -c 'print(1)'", 1), encoding="utf-8")
+    (tmp_path / "Dockerfile").unlink()
 
-    failures = gate.check_repository(tmp_path)
-
-    assert any("exact-SHA policy" in failure for failure in failures), failures
+    with pytest.raises(FileNotFoundError):
+        gate.check_repository(tmp_path)
 
 
-def test_policy_rejects_mcp_scans_that_ignore_unfixed_high_findings(tmp_path):
+def test_policy_rejects_a_floating_root_base(tmp_path):
     gate = _load_gate()
     _copy_policy_files(gate, tmp_path)
-    workflow = tmp_path / ".github/workflows/build.yml"
-    contents = workflow.read_text(encoding="utf-8")
-    trigger = "          vuln-type: os,library\n"
-    assert contents.count(trigger) >= 2
-    scan_start = contents.index("  trivy-scan-mcp-amd64:")
-    prefix, mcp_scans = contents[:scan_start], contents[scan_start:]
-    unsafe_setting = "          ignore-unfixed: true\n" + trigger
-    workflow.write_text(
-        prefix + mcp_scans.replace(trigger, unsafe_setting, 1),
-        encoding="utf-8",
+    dockerfile = tmp_path / "Dockerfile"
+    contents = dockerfile.read_text(encoding="utf-8")
+    pinned = "node:20-alpine@sha256:"
+    assert pinned in contents
+    dockerfile.write_text(
+        contents.replace(pinned, "node:20-alpine # sha256:", 1), encoding="utf-8"
     )
 
     failures = gate.check_repository(tmp_path)
 
-    assert any("unfixed Critical/High" in failure for failure in failures), failures
-
-
-def test_policy_rejects_deleting_the_ecm_amd64_image_scan(tmp_path):
-    """The four-scan floor must fail on the mutation it exists to catch.
-
-    build.yml documents this floor in a comment that quotes the very literals
-    the floor counts. A whole-file count therefore scored those comment lines
-    as scans, and deleting the ECM amd64 scan job outright still left four
-    matches, so the floor passed on three real scans. The gate strips comment
-    lines before counting; this pins that.
-    """
-    gate = _load_gate()
-    _copy_policy_files(gate, tmp_path)
-    workflow = tmp_path / ".github/workflows/build.yml"
-    contents = workflow.read_text(encoding="utf-8")
-    scan_start = contents.index("  trivy-scan:\n")
-    scan_end = contents.index("  trivy-scan-arm64:\n")
-    without_amd64_scan = contents[:scan_start] + contents[scan_end:]
-    assert "  trivy-scan:\n" not in without_amd64_scan
-    workflow.write_text(without_amd64_scan, encoding="utf-8")
-
-    failures = gate.check_repository(tmp_path)
-
-    assert any("exit-code: '1'" in failure for failure in failures), failures
-    assert any("severity: 'CRITICAL,HIGH'" in failure for failure in failures), failures
-
-
-def test_policy_rejects_brittle_vulnerable_fixture_output_matcher(tmp_path):
-    gate = _load_gate()
-    _copy_policy_files(gate, tmp_path)
-    workflow = tmp_path / ".github/workflows/build.yml"
-    contents = workflow.read_text(encoding="utf-8")
-    robust = "^starlette[[:space:]]+0\\.27\\.0[[:space:]]+[^[:space:]]+"
-    brittle = "starlette[[:space:]]+0\\.27\\.0[[:space:]]+[1-9][0-9]*"
-    assert contents.count(robust) == 1
-    workflow.write_text(contents.replace(robust, brittle, 1), encoding="utf-8")
-
-    failures = gate.check_repository(tmp_path)
-
-    assert any("output-format brittle" in failure for failure in failures), failures
+    assert any("digest-pinned FROM" in failure for failure in failures), failures
 
 
 @pytest.mark.parametrize(
     ("relative_path", "old", "new", "expected"),
     [
-        (
-            ".github/workflows/build.yml",
-            "pip-audit -r mcp-server/requirements.txt",
-            "echo audit-disabled",
-            "MCP dependency audit",
-        ),
-        (
-            ".github/workflows/build.yml",
-            "pip-audit -r backend/tests/fixtures/mcp_vulnerable_requirements.txt",
-            "echo vulnerable-fixture-disabled",
-            "vulnerable-fixture self-test",
-        ),
-        (
-            ".github/workflows/publish-images.yml",
-            "workflows: [Tests, Build and Push Docker Image]",
-            "workflows: [Build and Push Docker Image]",
-            "both verification workflows",
-        ),
-        (
-            ".github/workflows/build.yml",
-            "- trivy-scan-mcp-arm64",
-            "- omitted-mcp-arm64-scan",
-            "both MCP architectures",
-        ),
-        (
-            ".github/workflows/build.yml",
-            "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25",
-            "aquasecurity/trivy-action@master",
-            "immutable action",
-        ),
         (
             "mcp-server/Dockerfile",
             "python:3.12-alpine@sha256:",
@@ -217,12 +136,6 @@ def test_policy_rejects_brittle_vulnerable_fixture_output_matcher(tmp_path):
             "RUN npm ci",
             "RUN npm install",
             "npm production build",
-        ),
-        (
-            ".github/workflows/release-cut-gate.yml",
-            "ref: beads",
-            "ref: dev",
-            "authoritative board branch",
         ),
     ],
 )

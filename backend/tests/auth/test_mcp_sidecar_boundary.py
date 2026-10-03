@@ -1,6 +1,9 @@
 """Regression tests for the MCP client/sidecar/backend credential boundary."""
+import errno
 import json
 import logging
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,6 +24,33 @@ from auth.mcp_service import (
 )
 from config import rotate_mcp_api_key
 from database import get_session
+
+
+@contextmanager
+def _deny_projection_opens(projection_dir: Path):
+    """Deny only opens whose resolved parent is the test projection directory."""
+    real_open = os.open
+    resolved_projection_dir = projection_dir.resolve()
+    denied: list[Path] = []
+
+    def deny(path, flags, mode=0o777, *, dir_fd=None):
+        candidate = Path(path)
+        if (
+            dir_fd is None
+            and candidate.resolve(strict=False).parent == resolved_projection_dir
+        ):
+            denied.append(candidate)
+            raise PermissionError(
+                errno.EACCES,
+                os.strerror(errno.EACCES),
+                str(candidate),
+            )
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    with patch("auth.mcp_service.os.open", side_effect=deny):
+        yield denied
 
 
 def test_internal_credentials_are_distinct_private_and_not_in_settings(tmp_path: Path):
@@ -103,8 +133,7 @@ class TestUnwritableProjectionDegradesInsteadOfKillingECM:
     def test_an_unwritable_projection_directory_returns_none(self, tmp_path: Path):
         projection_dir = tmp_path / "ecm-mcp"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
-        try:
+        with _deny_projection_opens(projection_dir) as denied:
             with pytest.raises(PermissionError):
                 ensure_mcp_service_credentials(projection_dir / "mcp-service.json")
 
@@ -112,8 +141,8 @@ class TestUnwritableProjectionDegradesInsteadOfKillingECM:
                 load_mcp_service_credentials(projection_dir / "mcp-service.json")
                 is None
             )
-        finally:
-            projection_dir.chmod(0o700)
+        assert denied
+        assert all(path.resolve(strict=False).parent == projection_dir for path in denied)
 
     def test_a_malformed_projection_returns_none(self, tmp_path: Path):
         projection = tmp_path / "mcp-service.json"
@@ -201,14 +230,12 @@ class TestBrokenProjectionAtTheRouteDependencySeam:
     ):
         projection_dir = tmp_path / "ecm-mcp"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
-        try:
+        with _deny_projection_opens(projection_dir) as denied:
             status = await self._get(
                 projection_dir / "mcp-service.json", "not-a-jwt-at-all"
             )
-        finally:
-            projection_dir.chmod(0o700)
 
+        assert denied
         assert status == 401
 
     @pytest.mark.asyncio
@@ -242,8 +269,7 @@ class TestBrokenProjectionAtTheRouteDependencySeam:
         """
         projection_dir = tmp_path / "ecm-mcp"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
-        try:
+        with _deny_projection_opens(projection_dir) as denied:
             with (
                 patch(
                     "auth.dependencies.MCP_SERVICE_FILE",
@@ -257,8 +283,7 @@ class TestBrokenProjectionAtTheRouteDependencySeam:
                 assert _is_mcp_service_token("") is False
                 assert _is_mcp_service_token(" ") is False
                 assert _is_mcp_service_token("anything") is False
-        finally:
-            projection_dir.chmod(0o700)
+        assert denied
 
     @pytest.mark.asyncio
     async def test_a_healthy_projection_still_authenticates_the_principal(
@@ -288,17 +313,17 @@ class TestDegradedModeDoesNotLogPerRequest:
     ):
         projection_dir = tmp_path / "ecm-mcp"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
         projection = projection_dir / "mcp-service.json"
         reset_mcp_projection_failure_log_latch()
         try:
             with caplog.at_level(logging.DEBUG, logger="auth.mcp_service"):
-                for _ in range(25):
-                    assert load_mcp_service_credentials(projection) is None
+                with _deny_projection_opens(projection_dir) as denied:
+                    for _ in range(25):
+                        assert load_mcp_service_credentials(projection) is None
         finally:
-            projection_dir.chmod(0o700)
             reset_mcp_projection_failure_log_latch()
 
+        assert denied
         with_traceback = [
             record
             for record in caplog.records
@@ -318,18 +343,18 @@ class TestDegradedModeDoesNotLogPerRequest:
         reset_mcp_projection_failure_log_latch()
         try:
             with caplog.at_level(logging.DEBUG, logger="auth.mcp_service"):
-                projection_dir.chmod(0o500)
-                assert load_mcp_service_credentials(projection) is None
-                assert load_mcp_service_credentials(projection) is None
-                projection_dir.chmod(0o700)
+                with _deny_projection_opens(projection_dir) as first_denied:
+                    assert load_mcp_service_credentials(projection) is None
+                    assert load_mcp_service_credentials(projection) is None
                 assert load_mcp_service_credentials(projection) is not None
                 projection.unlink()
-                projection_dir.chmod(0o500)
-                assert load_mcp_service_credentials(projection) is None
+                with _deny_projection_opens(projection_dir) as second_denied:
+                    assert load_mcp_service_credentials(projection) is None
         finally:
-            projection_dir.chmod(0o700)
             reset_mcp_projection_failure_log_latch()
 
+        assert first_denied
+        assert second_denied
         tracebacks = [
             record
             for record in caplog.records
@@ -364,16 +389,15 @@ class TestCredentialRotationRefusesLoudlyButCleanly:
 
         projection_dir = tmp_path / "ecm-mcp"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
-        try:
+        with _deny_projection_opens(projection_dir) as denied:
             with patch.object(
                 settings_router, "MCP_SERVICE_FILE", projection_dir / "mcp-service.json"
             ):
                 with pytest.raises(HTTPException) as raised:
                     settings_router._rotate_private_projection_or_503()
-        finally:
-            projection_dir.chmod(0o700)
 
+        assert denied
+        assert any(path.name.endswith(".tmp") for path in denied)
         assert raised.value.status_code == 503
         assert str(projection_dir) not in raised.value.detail
         assert "MCP_SECRETS_DIR" in raised.value.detail

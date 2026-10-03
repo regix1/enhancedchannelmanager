@@ -7,7 +7,7 @@ scripts/backend-gate.sh
 echo $?          # 0 = green
 ```
 
-**Do not hand-type a pytest invocation.** This page used to specify one here and instruct "never vary it" — while CI ran a different one. That is precisely how two gate figures ended up in circulation, 72 collected tests apart (bead `enhancedchannelmanager-c9lb9`). The script is now the single invocation, and `backend/tests/unit/test_backend_gate_contract.py` asserts it still matches `.github/workflows/test.yml` flag for flag. Full detail — what it excludes and why, the expected `3 skipped, 2 deselected` shape, the interpreter trap, and the subset-run coverage trap — is in [`docs/testing.md`](testing.md#what-the-backend-gate-runs).
+**Do not hand-type a pytest invocation.** This page used to specify one here and instruct "never vary it" while another command ran a different set. That is precisely how two gate figures ended up in circulation, 72 collected tests apart (bead `enhancedchannelmanager-c9lb9`). The script is now the single invocation, and `backend/tests/unit/test_backend_gate_contract.py` pins its exact local flags. Full detail about its exclusions, historical result shape, interpreter selection, and subset-run coverage is in [`docs/testing.md`](testing.md#what-the-backend-gate-runs).
 
 Two things the script handles that a typed command does not:
 

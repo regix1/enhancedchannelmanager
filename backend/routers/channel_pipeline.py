@@ -1688,6 +1688,153 @@ def _canonical_pipeline_decision(payload: dict) -> dict:
     }
 
 
+def _apply_event_results(
+    result: dict, executor, event_results: dict, remap: dict[int, int],
+) -> None:
+    """Replace projected event counts with the receipt-proven outcomes."""
+    created_projection = 0
+    actual_created = 0
+    for work in executor._replayed_event_work:
+        operation = work["operation"]
+        rule_id = operation["rule_id"]
+        summary = next(
+            (
+                value for value in result.get("event_sync", [])
+                if value.get("rule_id") == rule_id
+            ),
+            None,
+        )
+        if summary is None:
+            raise ValueError("event result summary is missing")
+        promotion = summary.get("promotion")
+        if not isinstance(promotion, dict):
+            raise ValueError("event promotion result is missing")
+        action = operation["unit"]["action"]
+        projected_field = (
+            "promoted_created" if action == "create" else "promoted_adopted"
+        )
+        promotion[projected_field] = max(
+            0, promotion.get(projected_field, 0) - 1,
+        )
+        promotion["guide_pending"] = max(
+            0, promotion.get("guide_pending", 0) - 1,
+        )
+        projected_id = remap.get(work["result_id"], work["result_id"])
+        channel_ids = promotion.get("channel_ids", [])
+        if projected_id in channel_ids:
+            channel_ids.remove(projected_id)
+        event_key = operation["unit"]["event_key"]
+        for log_index in range(len(result.get("execution_log", [])) - 1, -1, -1):
+            log = result["execution_log"][log_index]
+            actions = log.get("actions_executed")
+            if not isinstance(actions, list):
+                continue
+            retained = [
+                entry for entry in actions
+                if not (
+                    entry.get("type") == "event_sync_promote"
+                    and (entry.get("match") or {}).get("event_key") == event_key
+                    and (entry.get("match") or {}).get("rule_id") == rule_id
+                )
+            ]
+            if len(retained) == len(actions):
+                continue
+            if retained:
+                log["actions_executed"] = retained
+            else:
+                result["execution_log"].pop(log_index)
+        actual = work["promo"]
+        for name in (
+            "promoted_created", "promoted_adopted", "streams_attached",
+            "already_attached", "attach_errors", "failed_units",
+            "stale_streams_removed", "guide_pending",
+        ):
+            promotion[name] = promotion.get(name, 0) + actual.get(name, 0)
+        channel_ids.extend(actual.get("channel_ids", []))
+        promotion["channel_ids"] = list(dict.fromkeys(channel_ids))
+        logged = work.get("logged_promote_entries", 0)
+        for entry in actual.get("promote_entries", [])[logged:]:
+            match = entry.get("match") or {}
+            event_results["execution_log"].append({
+                "stream_id": match.get("secondary_stream_id"),
+                "stream_name": match.get("secondary_stream_name"),
+                "m3u_account_id": None,
+                "rules_evaluated": [],
+                "actions_executed": [entry],
+            })
+        if action == "create":
+            created_projection += 1
+        actual_created += work["exec_ctx"].channels_created
+
+    result["channels_created"] = max(
+        0, result.get("channels_created", 0) - created_projection,
+    ) + actual_created
+    for name in (
+        "streams_merged", "streams_skipped", "channels_updated",
+        "channels_touched",
+    ):
+        result[name] = result.get(name, 0) + event_results.get(name, 0)
+    result.setdefault("modified_entities", []).extend(
+        event_results.get("modified_entities", [])
+    )
+    result.setdefault("failed_actions", []).extend(
+        event_results.get("failed_actions", [])
+    )
+    result.setdefault("execution_log", []).extend(
+        event_results.get("execution_log", [])
+    )
+
+
+def _retain_event_ownership(executor) -> None:
+    """Keep receipt-proven channel ownership after interrupted replay."""
+    if executor is None:
+        return
+    owned: dict[int, tuple[int, list[int]]] = {}
+    for work in executor._replayed_event_work:
+        rule_id = work["rule_id"]
+        target_group_id = work["target_group_id"]
+        entry = owned.setdefault(rule_id, (target_group_id, []))
+        if entry[0] != target_group_id:
+            raise ValueError("event managed channel scope is inconsistent")
+        for channel_id in work["promo"].get("channel_ids", []):
+            channel = executor._channel_by_id.get(channel_id)
+            if (
+                not isinstance(channel_id, int)
+                or isinstance(channel_id, bool)
+                or channel_id < 1
+                or channel is None
+                or channel.get("channel_group_id") != target_group_id
+            ):
+                raise ValueError("event managed channel identity is invalid")
+            if channel_id not in entry[1]:
+                entry[1].append(channel_id)
+    if not owned:
+        return
+
+    from models import ChannelPipelineRule
+
+    session = get_session()
+    try:
+        for rule_id, (target_group_id, channel_ids) in owned.items():
+            rule = session.get(ChannelPipelineRule, rule_id)
+            config = rule.get_event_sync_config() if rule is not None else None
+            if (
+                not isinstance(config, dict)
+                or config.get("promote_unmatched") is not True
+                or config.get("promote_target_group_id") != target_group_id
+            ):
+                raise ValueError("event managed channel scope drifted")
+            current = list(rule.get_managed_channel_ids() or [])
+            rule.set_managed_channel_ids(list(dict.fromkeys([*current, *channel_ids])))
+            session.add(rule)
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 async def _materialize_pipeline_plan(request: RunPipelineRequest, principal: str = "api") -> dict:
     """Build and persist the exact post-refresh write plan without side effects."""
     from services.mutation_plan_store import canonical_hash, mutation_plan_store
@@ -1763,6 +1910,7 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
     """Validate drift, consume once, then execute the prepared pipeline scope."""
     from services.mutation_plan_store import mutation_plan_store
     from services.pipeline_write_plan import (
+        EVENT_PROMOTE_METHOD,
         PipelineWritePlan, PlannedWrite, PartialReplayError,
         replay_write_plan, validate_read_set,
         journal_entries_for_plan,
@@ -1831,6 +1979,28 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
             raise HTTPException(status_code=409, detail=f"pipeline state drifted: {exc}") from exc
         execution_id = _create_pending_execution(mode="execute", triggered_by="api")
         started = time.time()
+        event_writes = [
+            write for write in write_plan.writes
+            if write.method == EVENT_PROMOTE_METHOD
+        ]
+        event_executor = None
+        if event_writes:
+            event_executor = await engine.make_event_replay_executor(
+                plan.payload["request"].get("rule_ids"), execution_id,
+            )
+            try:
+                for write in event_writes:
+                    await event_executor.validate_event_promotion(
+                        write.args[0],
+                        write.result_id,
+                        original_publication=True,
+                    )
+            except ValueError as exc:
+                _mark_execution_failed(execution_id, exc)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"event promotion inputs drifted: {exc}",
+                ) from exc
         # Durable recovery evidence is committed immediately before the first
         # external write while the same planned-run lock is held.  Store both
         # the current rollback snapshot and the exact replay program in the
@@ -1847,6 +2017,12 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
                     targeted_channel_ids.add(write.args[1])
                 elif write.method in {"update_channel", "delete_channel"} and write.args[0] > 0:
                     targeted_channel_ids.add(write.args[0])
+                elif (
+                    write.method == EVENT_PROMOTE_METHOD
+                    and write.result_id is not None
+                    and write.result_id > 0
+                ):
+                    targeted_channel_ids.add(write.result_id)
             recovery_channels = [
                 channel for channel in next_payload["snapshot"]
                 if channel.get("id") in targeted_channel_ids
@@ -1873,8 +2049,41 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
             _mark_execution_failed(execution_id, exc)
             raise HTTPException(status_code=409, detail=f"pipeline state drifted: {exc}") from exc
         try:
-            _, remap = await replay_write_plan(engine.client, write_plan, read_set_validated=True)
+            event_results = {
+                "execution_log": [],
+                "dry_run_results": [],
+                "failed_actions": [],
+                "streams_merged": 0,
+                "streams_skipped": 0,
+                "channels_updated": 0,
+                "modified_entities": [],
+                "channels_touched": 0,
+            }
+
+            async def execute_event(operation, result_id):
+                staged = await event_executor.replay_event_promotion(
+                    operation, result_id,
+                )
+                await engine.complete_event_replay(event_executor, event_results)
+                return staged
+
+            _, remap = await replay_write_plan(
+                engine.client,
+                write_plan,
+                read_set_validated=True,
+                event_operation=(execute_event if event_executor is not None else None),
+            )
+        except asyncio.CancelledError as exc:
+            _retain_event_ownership(event_executor)
+            _mark_execution_failed(execution_id, exc)
+            raise
         except PartialReplayError as exc:
+            try:
+                _retain_event_ownership(event_executor)
+            except Exception as ownership_exc:
+                exc.compensation_errors.append(
+                    f"event ownership: {ownership_exc}"
+                )
             partial_replay = {
                 "failed_index": exc.failed_index,
                 "completed_targets": exc.completed,
@@ -1904,6 +2113,39 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
         if planned_journal:
             journal.log_entries(entries=planned_journal)
         result = remapped(plan.payload["result"])
+        if event_executor is not None:
+            _apply_event_results(result, event_executor, event_results, remap)
+        event_summaries = [
+            {key: value for key, value in summary.items() if key != "review_candidates"}
+            for summary in result.get("event_sync", [])
+        ]
+        event_managed: dict[int, tuple[int, list[int]]] = {}
+        for summary in event_summaries:
+            promotion = summary.get("promotion")
+            if not isinstance(promotion, dict):
+                continue
+            rule_id = summary.get("rule_id")
+            target_group_id = promotion.get("target_group_id")
+            channel_ids = list(dict.fromkeys(promotion.get("channel_ids", [])))
+            if (
+                not isinstance(rule_id, int)
+                or isinstance(rule_id, bool)
+                or rule_id < 1
+                or not isinstance(target_group_id, int)
+                or isinstance(target_group_id, bool)
+                or target_group_id < 1
+                or any(
+                    not isinstance(channel_id, int)
+                    or isinstance(channel_id, bool)
+                    or channel_id < 1
+                    for channel_id in channel_ids
+                )
+            ):
+                raise ValueError("event managed channel result is invalid")
+            event_managed[rule_id] = (target_group_id, channel_ids)
+        scoped_rules = await engine._load_rules(
+            plan.payload["request"].get("rule_ids")
+        )
         review_counts: dict[int, dict] = {}
         from services.event_sync_review_store import enqueue_review_candidates
         for review in result.get("planned_review_candidates", []):
@@ -1940,6 +2182,7 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
                 "capped" if result.get("capped") else
                 "completed_with_errors" if failed_actions else "completed"
             )
+            execution_status = execution.status
             if failed_actions:
                 execution.error_message = engine._summarize_failed_actions(failed_actions)
             execution.completed_at = datetime.utcnow()
@@ -1957,12 +2200,21 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
             execution.set_modified_entities(result.get("modified_entities", []))
             execution.set_execution_log(result.get("execution_log", []))
             execution.set_warnings(_planned_run_warnings(result))
-            event_summaries = [
-                {key: value for key, value in summary.items() if key != "review_candidates"}
-                for summary in result.get("event_sync", [])
-            ]
             execution.set_event_sync_summary(event_summaries)
-            scoped_rules = await engine._load_rules(plan.payload["request"].get("rule_ids"))
+            if event_managed:
+                from models import ChannelPipelineRule
+
+                for rule_id, (target_group_id, channel_ids) in event_managed.items():
+                    rule = session.get(ChannelPipelineRule, rule_id)
+                    config = rule.get_event_sync_config() if rule is not None else None
+                    if (
+                        not isinstance(config, dict)
+                        or config.get("promote_unmatched") is not True
+                        or config.get("promote_target_group_id") != target_group_id
+                    ):
+                        raise ValueError("event managed channel scope drifted")
+                    rule.set_managed_channel_ids(channel_ids)
+                    session.add(rule)
             execution.is_event_sync = bool(event_summaries) and not any(
                 not rule.is_event_sync() for rule in scoped_rules
             )
@@ -1970,7 +2222,10 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
         finally:
             session.close()
         await engine._update_rule_stats(scoped_rules, result)
-    return JSONResponse(status_code=202, content={"execution_id": execution_id, "status": "completed"})
+    return JSONResponse(
+        status_code=202,
+        content={"execution_id": execution_id, "status": execution_status},
+    )
 
 
 @router.post("/rules/{rule_id}/run", status_code=202)
@@ -3878,6 +4133,7 @@ async def preview_event_sync(
         # health gate's started-event set must agree about every event whose
         # start falls between two wall-clock reads. [53]
         now = datetime.now(timezone.utc)
+        preview_expires_at = now + timedelta(minutes=5)
 
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id, now=now,
@@ -3889,6 +4145,9 @@ async def preview_event_sync(
         # Stays empty for the same reason: with the health gate off there
         # are no all-dead units, so no channel leaves the managed set. [24]
         retired_channel_keys: set[str] = set()
+        current_unplayable: set[int] = set()
+        retirement_confirmed: set[int] = set()
+        flow: dict[int, bool | None] = {}
         executor = None
 
         if config.get("skip_dead_streams") or config.get("retire_finished_events"):
@@ -3905,14 +4164,22 @@ async def preview_event_sync(
                 existing_channels=target_channels,
                 managed_channel_ids=managed_channel_ids,
             )
-            dead = await executor._event_health(
+            flow, retirement_confirmed = await executor._event_health(
                 request.rule_id,
                 config,
                 plan.units,
                 resolution.resolved,
                 now,
                 probe_missing=False,
+                expires_at=None,
             )
+            current_unplayable = {
+                row.stream.stream_id
+                for unit in plan.units
+                for row in unit.rows
+                if row.stream.stream_id is not None
+                and flow.get(row.stream.stream_id) is not True
+            }
             # Which streams belong to which event, read BEFORE the health
             # replan, the same instant the run reads it. A delisted stream
             # is always dead, so the replan takes every one of them out of
@@ -3926,14 +4193,14 @@ async def preview_event_sync(
                 }
                 for unit in plan.units
             }
-            if dead:
+            if current_unplayable:
                 # Annotate the losing rows from the pre-health plan, which
                 # is the last place they still appear — the replan below
                 # takes them out of their unit. The unit loops that follow
                 # overwrite these entries where they have more to say.
                 for unit in plan.units:
                     for row in unit.rows:
-                        if row.stream.stream_id in dead:
+                        if row.stream.stream_id in current_unplayable:
                             promote_annotations[
                                 (row.stream.group_id, row.stream.stream_id)
                             ] = {
@@ -3944,16 +4211,14 @@ async def preview_event_sync(
                             }
                 plan = build_promotion_plan(
                     config, resolution.resolved, existing_name_to_id,
-                    now=now, dead_stream_ids=dead,
+                    now=now, dead_stream_ids=current_unplayable,
                 )
 
             # What the run would DETACH. Removing a stream from a live
             # channel is the one destructive thing this feature does, and
             # without this the operator cannot see it coming. Same rule the
             # run applies, from the same helper, so the two cannot drift. [75]
-            from services.event_sync_stream_health import (
-                find_working_streams, stale_streams_to_detach,
-            )
+            from services.event_sync_stream_health import stale_streams_to_detach
 
             stale_ids = {
                 row.stream.stream_id
@@ -3984,11 +4249,10 @@ async def preview_event_sync(
                 ]
                 for ch in target_channels
             }
-            working = await find_working_streams([
-                row.stream.stream_id
-                for unit in plan.units for row in unit.rows
-                if row.stream.stream_id is not None
-            ])
+            working = {
+                stream_id for stream_id, state in flow.items()
+                if state is True
+            }
             for unit in plan.units:
                 if unit.existing_channel_id is None:
                     continue
@@ -4028,10 +4292,13 @@ async def preview_event_sync(
 
             eligible, event_states = await executor._event_lifecycle(
                 request.rule_id, config, (*plan.units, *plan.capped_units), now,
-                dead,
+                retirement_confirmed,
+                flow=flow,
+                expires_at=preview_expires_at,
             )
             plan = build_promotion_plan(config, resolution.resolved, existing_name_to_id,
-                                        now=now, dead_stream_ids=dead, eligible_event_keys=eligible)
+                                        now=now, dead_stream_ids=current_unplayable,
+                                        eligible_event_keys=eligible)
             retired_channel_keys = set()
             if request.rule_id is not None:
                 session = get_session()

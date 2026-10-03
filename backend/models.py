@@ -3004,8 +3004,12 @@ class GuidePublication(Base):
 
     scope = Column(String(255), primary_key=True)
     xmltv = Column(Text, nullable=True)
-    state = Column(Text, nullable=False, default="{}")
-    revision = Column(Integer, nullable=False, default=0)
+    state = Column(
+        Text, nullable=False, default="{}", server_default=sa_text("'{}'"),
+    )
+    revision = Column(
+        Integer, nullable=False, default=0, server_default=sa_text("0"),
+    )
 
     def get_state(self) -> dict:
         """Parse the retained publication state."""

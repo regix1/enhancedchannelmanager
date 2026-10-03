@@ -195,6 +195,26 @@ _MAX_HLS_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_RELAY_RESOURCES = 1024
 
 
+async def _read_hls_manifest(response: httpx.Response) -> bytes:
+    content_length = response.headers.get("content-length") or response.headers.get(
+        "Content-Length"
+    )
+    if content_length is not None and int(content_length) > _MAX_HLS_MANIFEST_BYTES:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=_MAX_HLS_MANIFEST_BYTES, actual_size=int(content_length)
+        )
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes(chunk_size=65536):
+        remaining = _MAX_HLS_MANIFEST_BYTES + 1 - len(body)
+        body.extend(chunk[:remaining])
+        if len(body) > _MAX_HLS_MANIFEST_BYTES:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=_MAX_HLS_MANIFEST_BYTES, actual_size=len(body)
+            )
+    return bytes(body)
+
+
 class _LocalStreamRelay:
     """Loopback-only token relay whose every upstream fetch uses ``stream_request``."""
 
@@ -231,25 +251,6 @@ class _LocalStreamRelay:
         self._targets[token] = url
         self._tokens_by_target[url] = token
         return token
-
-    async def _read_hls_manifest(self, response: httpx.Response) -> bytes:
-        content_length = response.headers.get("content-length") or response.headers.get(
-            "Content-Length"
-        )
-        if content_length is not None and int(content_length) > _MAX_HLS_MANIFEST_BYTES:
-            raise web.HTTPRequestEntityTooLarge(
-                max_size=_MAX_HLS_MANIFEST_BYTES, actual_size=int(content_length)
-            )
-
-        body = bytearray()
-        async for chunk in response.aiter_bytes(chunk_size=65536):
-            remaining = _MAX_HLS_MANIFEST_BYTES + 1 - len(body)
-            body.extend(chunk[:remaining])
-            if len(body) > _MAX_HLS_MANIFEST_BYTES:
-                raise web.HTTPRequestEntityTooLarge(
-                    max_size=_MAX_HLS_MANIFEST_BYTES, actual_size=len(body)
-                )
-        return bytes(body)
 
     async def start(self) -> str:
         # Resolve the initial redirect chain before any subprocess can start.
@@ -310,7 +311,7 @@ class _LocalStreamRelay:
         content_type = response.headers.get("content-type", "")
         is_hls = urlsplit(url).path.lower().endswith(".m3u8") or "mpegurl" in content_type.lower()
         if is_hls:
-            body = await self._read_hls_manifest(response)
+            body = await _read_hls_manifest(response)
             base_url = str(response.extensions.get("ssrf_logical_url", url))
             rewritten = self._rewrite_hls(request, body, base_url)
             return web.Response(body=rewritten, content_type="application/vnd.apple.mpegurl")

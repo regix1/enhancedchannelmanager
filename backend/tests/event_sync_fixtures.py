@@ -107,15 +107,26 @@ class FakeDispatcharrState:
     """
 
     def __init__(self, channels: list[dict] | None = None,
-                 secondary_streams: dict[str, list[dict]] | None = None):
+                 secondary_streams: dict[str, list[dict]] | None = None,
+                 guide_sources: list[dict] | None = None,
+                 guide_rows: list[dict] | None = None,
+                 guide_programmes: list[dict] | None = None,
+                 stream_health: dict[int, dict] | None = None):
         self.channels: dict[int, dict] = {
             c["id"]: copy.deepcopy(c) for c in (channels or [])
         }
         self.secondary_streams: dict[str, list[dict]] = copy.deepcopy(
             secondary_streams or {}
         )
+        self.guide_sources: list[dict] = copy.deepcopy(guide_sources or [])
+        self.guide_rows: list[dict] = copy.deepcopy(guide_rows or [])
+        self.guide_programmes: list[dict] = copy.deepcopy(
+            guide_programmes or []
+        )
+        self.stream_health: dict[int, dict] = copy.deepcopy(stream_health or {})
         self.update_channel_calls: list[tuple[int, dict]] = []
         self.deleted_channel_ids: list[int] = []
+        self.source_refresh_ids: list[int] = []
 
     # --- Dispatcharr-side lifecycle simulations (verified behaviors) ------
 
@@ -158,6 +169,7 @@ def make_stateful_client(state: FakeDispatcharrState,
     canary.
     """
     client = MagicMock()
+    client.base_url = "http://dispatcharr.test"
 
     async def _get_channels(page=1, page_size=100, **kwargs):
         results = [copy.deepcopy(c) for c in state.channels.values()]
@@ -176,6 +188,46 @@ def make_stateful_client(state: FakeDispatcharrState,
             for s in state.secondary_streams.get(channel_group_name, [])
         ]
         return {"count": len(results), "next": None, "results": results}
+
+    async def _get_streams_by_ids(stream_ids):
+        selected = set(stream_ids)
+        return [
+            copy.deepcopy(stream)
+            for streams in state.secondary_streams.values()
+            for stream in streams
+            if stream.get("id") in selected
+        ]
+
+    async def _get_epg_sources():
+        return copy.deepcopy(state.guide_sources)
+
+    async def _get_epg_source(source_id):
+        source = next(
+            (item for item in state.guide_sources if item.get("id") == source_id),
+            None,
+        )
+        if source is None:
+            raise RuntimeError(f"EPG source {source_id} not found (404)")
+        return copy.deepcopy(source)
+
+    async def _refresh_epg_source(source_id):
+        if not any(item.get("id") == source_id for item in state.guide_sources):
+            raise RuntimeError(f"EPG source {source_id} not found (404)")
+        state.source_refresh_ids.append(source_id)
+
+    async def _get_epg_rows(epg_source=None, max_results=None, **kwargs):
+        rows = [
+            copy.deepcopy(row)
+            for row in state.guide_rows
+            if epg_source is None or row.get("epg_source") == epg_source
+        ]
+        return rows[:max_results] if max_results is not None else rows
+
+    async def _get_epg_grid(**kwargs):
+        return copy.deepcopy(state.guide_programmes)
+
+    async def _get_channel_stats():
+        return {"channels": copy.deepcopy(list(state.stream_health.values()))}
 
     async def _update_channel(channel_id, payload):
         state.update_channel_calls.append((channel_id, copy.deepcopy(payload)))
@@ -202,6 +254,13 @@ def make_stateful_client(state: FakeDispatcharrState,
     )
     client._channel_group_name_for_id = AsyncMock(side_effect=_group_name_for_id)
     client.get_streams = AsyncMock(side_effect=_get_streams)
+    client.get_streams_by_ids = AsyncMock(side_effect=_get_streams_by_ids)
+    client.get_epg_sources = AsyncMock(side_effect=_get_epg_sources)
+    client.get_epg_source = AsyncMock(side_effect=_get_epg_source)
+    client.refresh_epg_source = AsyncMock(side_effect=_refresh_epg_source)
+    client.get_epg_data = AsyncMock(side_effect=_get_epg_rows)
+    client.get_epg_grid = AsyncMock(side_effect=_get_epg_grid)
+    client.get_channel_stats = AsyncMock(side_effect=_get_channel_stats)
     client.update_channel = AsyncMock(side_effect=_update_channel)
     client.delete_channel = AsyncMock(side_effect=_delete_channel)
     client.get_all_m3u_group_settings = AsyncMock(return_value=GROUP_SETTINGS_OK)

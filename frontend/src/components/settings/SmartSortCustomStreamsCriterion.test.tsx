@@ -14,7 +14,7 @@
  * is mocked and SettingsTab is rendered on the channel-defaults page.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 vi.mock('../../services/api', () => ({
   getSettings: vi.fn(),
@@ -238,29 +238,68 @@ describe('Smart Sort custom_streams criterion (bead ap1ud / GH #244)', () => {
   });
 
   it('shows the Custom Streams criterion as disabled by default (checkbox unchecked)', async () => {
+    let resolveSettings: ((value: Awaited<ReturnType<typeof api.getSettings>>) => void) | undefined;
+    vi.mocked(api.getSettings).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
     renderOnChannelDefaults();
 
     const checkbox = await findCustomStreamsCheckbox();
+    await act(async () => {
+      resolveSettings!(makeSettings());
+    });
+    await waitFor(() => expect(checkbox.checked).toBe(false));
     expect(checkbox.checked).toBe(false);
   });
 
   it('shows the Custom Streams criterion enabled when the saved setting enables it', async () => {
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
+    let resolveSettings: ((value: Awaited<ReturnType<typeof api.getSettings>>) => void) | undefined;
+    const savedSettings = makeSettings({
       stream_sort_enabled: {
         resolution: true, bitrate: true, framerate: true, video_codec: false,
         m3u_priority: false, audio_channels: false, custom_streams: true,
       } as api.SortEnabledMap,
-    }));
+    });
+    vi.mocked(api.getSettings).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
     renderOnChannelDefaults();
 
     const checkbox = await findCustomStreamsCheckbox();
+    expect(checkbox.checked).toBe(false);
+    await act(async () => {
+      resolveSettings!(savedSettings);
+    });
+    await waitFor(() => expect(checkbox.checked).toBe(true));
     expect(checkbox.checked).toBe(true);
   });
 
   it('toggles the Custom Streams criterion on when its checkbox is clicked', async () => {
+    let resolveSettings: ((value: Awaited<ReturnType<typeof api.getSettings>>) => void) | undefined;
+    const loadedSettings = makeSettings({
+      hide_m3u_urls: true,
+      stream_probe_timeout: 45,
+      stream_sort_enabled: {
+        resolution: true, bitrate: false, framerate: true, video_codec: false,
+        m3u_priority: true, audio_channels: false, custom_streams: false,
+      } as api.SortEnabledMap,
+    });
+    vi.mocked(api.getSettings).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
     renderOnChannelDefaults();
 
     const checkbox = await findCustomStreamsCheckbox();
+    await act(async () => {
+      resolveSettings!(loadedSettings);
+    });
+    await waitFor(() => expect(checkbox.checked).toBe(false));
     expect(checkbox.checked).toBe(false);
 
     fireEvent.click(checkbox);
@@ -268,20 +307,44 @@ describe('Smart Sort custom_streams criterion (bead ap1ud / GH #244)', () => {
     await waitFor(() => {
       expect(checkbox.checked).toBe(true);
     });
+
+    fireEvent.click(screen.getByRole('button', { name: /Save Settings/i }));
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalledTimes(1));
+    const request = vi.mocked(api.saveSettings).mock.calls[0][0];
+    expect(request.stream_sort_enabled).toBeDefined();
+    const savedSortEnabled = request.stream_sort_enabled!;
+    expect(savedSortEnabled.custom_streams).toBe(true);
+    for (const [criterion, enabled] of Object.entries(loadedSettings.stream_sort_enabled)) {
+      if (criterion === 'custom_streams') continue;
+      expect(savedSortEnabled[criterion as api.SortCriterion]).toBe(enabled);
+    }
+    expect(request.stream_probe_timeout).toBe(45);
+    expect(request.hide_m3u_urls).toBe(true);
+    expect(await screen.findByText('Settings saved successfully')).toBeInTheDocument();
   });
 
   it('auto-merges custom_streams (disabled) for existing installs whose saved settings predate it', async () => {
     // Existing install: saved settings have no custom_streams in priority or enabled.
-    vi.mocked(api.getSettings).mockResolvedValue(makeSettings({
+    let resolveSettings: ((value: Awaited<ReturnType<typeof api.getSettings>>) => void) | undefined;
+    const legacySettings = makeSettings({
       stream_sort_priority: ['resolution', 'bitrate', 'framerate'] as api.SortCriterion[],
       stream_sort_enabled: {
         resolution: true, bitrate: true, framerate: true,
       } as unknown as api.SortEnabledMap,
-    }));
+    });
+    vi.mocked(api.getSettings).mockReturnValueOnce(
+      new Promise<Awaited<ReturnType<typeof api.getSettings>>>((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
     renderOnChannelDefaults();
 
     // mergeSortCriteria appends the unknown criterion (disabled) so the row still appears.
     const checkbox = await findCustomStreamsCheckbox();
+    await act(async () => {
+      resolveSettings!(legacySettings);
+    });
+    await waitFor(() => expect(checkbox.checked).toBe(false));
     expect(checkbox.checked).toBe(false);
   });
 });

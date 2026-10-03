@@ -65,6 +65,7 @@ WHAT MUST STILL SURVIVE, AND WHY EACH EXCEPTION IS NARROW
   carries secrets safely, and the migration card depends on it.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import sqlite3
@@ -580,6 +581,152 @@ def _all_member_bytes(zip_path) -> bytes:
     return bytes(out)
 
 
+def _publication_journal(path: Path, *, complete: bool, owned: bool = True) -> Path:
+    """Create one exact publication receipt with its saved rule ownership."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from models import Base, ChannelPipelineRule, DummyEPGProfile, GuidePublication
+    from services import epg_publication
+
+    engine = create_engine("sqlite:///%s" % path)
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    session = session_factory()
+    try:
+        profile = DummyEPGProfile(
+            id=7,
+            name="Guide events",
+            enabled=True,
+            name_source="channel",
+            event_timezone="UTC",
+        )
+        rule = ChannelPipelineRule(
+            id=11,
+            name="Guide promotion",
+            enabled=True,
+            conditions="[]",
+            actions="[]",
+        )
+        rule.set_event_sync_config({
+            "promote_unmatched": True,
+            "dummy_epg_profile_id": 7,
+            "promote_target_group_id": 40,
+        })
+        rule.set_managed_channel_ids([900] if owned else [])
+        session.add_all([profile, rule])
+        session.commit()
+        profile_value = profile.to_dict()
+    finally:
+        session.close()
+
+    now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    candidate = {
+        "event_key": "guide-event",
+        "rule_id": 11,
+        "rule_hash": "a" * 64,
+        "profile_id": 7,
+        "target_group_id": 40,
+        "title": "Guide event",
+        "start": now - timedelta(minutes=5),
+        "stop": now + timedelta(hours=2),
+        "streams": [{
+            "id": 7301,
+            "name": "Guide stream",
+            "account_id": 2,
+            "group_id": 30,
+        }],
+        "channel_name": "Guide event",
+        "channel_id": 900,
+        "channel_uuid": "event-900",
+        "execution_id": "backup-control",
+        "source_hashes": [{
+            "endpoint_hash": "b" * 64,
+            "source_url_hash": "c" * 64,
+        }],
+        "owner_proven": True,
+        "channel_exists": True,
+        "health_playable": True,
+    }
+    with patch.object(epg_publication, "get_session", side_effect=session_factory):
+        admitted = epg_publication.begin_delivery(
+            "profile:7",
+            expected_revision=0,
+            expected_hash=None,
+            profile=profile_value,
+            now=now,
+            pending_channels={"guide-event": candidate},
+        )
+    assert admitted is not None
+    if complete:
+        session = session_factory()
+        try:
+            row = session.get(GuidePublication, "profile:7")
+            state = row.get_state()
+            receipt = state["delivery"]["pending_channels"]["guide-event"]
+            receipt.update({
+                "stage": "complete",
+                "reason": None,
+                "terminal_at": (now + timedelta(minutes=1)).isoformat(),
+                "retry_at": None,
+            })
+            row.set_state(state)
+            session.commit()
+        finally:
+            session.close()
+    engine.dispose()
+    return path
+
+
+def _receiptless_journal(path: Path) -> Path:
+    """Create a legacy database with one eligible guide rule and control rows."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from models import ChannelPipelineRule
+
+    _publication_journal(path, complete=False)
+    engine = create_engine("sqlite:///%s" % path)
+    session_factory = sessionmaker(bind=engine)
+    session = session_factory()
+    try:
+        ordinary = ChannelPipelineRule(
+            id=12,
+            name="Ordinary event rule",
+            enabled=True,
+            conditions="[]",
+            actions="[]",
+        )
+        ordinary.set_event_sync_config({
+            "promote_unmatched": False,
+            "dummy_epg_profile_id": 7,
+        })
+        disabled = ChannelPipelineRule(
+            id=13,
+            name="Disabled guide rule",
+            enabled=False,
+            conditions="[]",
+            actions="[]",
+        )
+        disabled.set_event_sync_config({
+            "promote_unmatched": True,
+            "dummy_epg_profile_id": 7,
+            "promote_target_group_id": 40,
+        })
+        session.add_all([ordinary, disabled])
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DROP TABLE dummy_epg_publications")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 def _category(zip_path, name) -> dict:
     with zipfile.ZipFile(zip_path) as zf:
         return yaml.safe_load(zf.read("categories/%s.yaml" % name))
@@ -839,6 +986,86 @@ def test_every_journal_db_table_is_classified():
     ):
         thin = sorted(t for t, reason in registry.items() if len(reason.strip()) < 30)
         assert thin == [], "%s entries with no substantive reason: %s" % (name, thin)
+
+
+def test_standard_scrub_refuses_active_event_recovery_without_changing_source(tmp_path):
+    journal = _publication_journal(
+        tmp_path / "active-publication.db", complete=False,
+    )
+    before = hashlib.sha256(journal.read_bytes()).hexdigest()
+
+    with pytest.raises(backup_mod.BackupScrubError, match="not complete"):
+        backup_mod._scrub_journal_db_to_temp(journal)
+
+    assert hashlib.sha256(journal.read_bytes()).hexdigest() == before
+
+
+def test_standard_scrub_validates_publication_document_identity(tmp_path):
+    journal = _publication_journal(
+        tmp_path / "mismatched-publication.db", complete=True,
+    )
+    conn = sqlite3.connect(str(journal))
+    try:
+        conn.execute(
+            "UPDATE dummy_epg_publications SET xmltv = ? WHERE scope = ?",
+            ('<tv><channel id="changed" /></tv>', "profile:7"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(backup_mod.BackupScrubError, match="unverified"):
+        backup_mod._scrub_journal_db_to_temp(journal)
+
+
+def test_completed_owned_event_recovery_is_safe_to_drop_from_standard_copy(tmp_path):
+    journal = _publication_journal(
+        tmp_path / "completed-publication.db", complete=True,
+    )
+    before = hashlib.sha256(journal.read_bytes()).hexdigest()
+    scrubbed = backup_mod._scrub_journal_db_to_temp(journal)
+    try:
+        conn = sqlite3.connect(str(scrubbed))
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            managed = conn.execute(
+                "SELECT managed_channel_ids FROM auto_creation_rules WHERE id = 11"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert "dummy_epg_publications" not in tables
+        assert json.loads(managed) == [900]
+        assert hashlib.sha256(journal.read_bytes()).hexdigest() == before
+    finally:
+        scrubbed.unlink()
+
+
+def test_credential_copy_preserves_active_event_recovery_byte_for_byte(tmp_path):
+    journal = _publication_journal(
+        tmp_path / "encrypted-publication.db", complete=False,
+    )
+    copied = backup_mod._scrub_journal_db_to_temp(
+        journal, include_credentials=True,
+    )
+    try:
+        assert copied.read_bytes() == journal.read_bytes()
+        conn = sqlite3.connect(str(copied))
+        try:
+            state = json.loads(conn.execute(
+                "SELECT state FROM dummy_epg_publications WHERE scope = 'profile:7'"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+        receipt = state["delivery"]["pending_channels"]["guide-event"]
+        assert receipt["stage"] == "allocated"
+        assert receipt["channel_id"] == 900
+    finally:
+        copied.unlink()
 
 
 def test_the_permitted_set_is_configuration_not_history():
@@ -1850,6 +2077,194 @@ async def test_an_artifact_written_before_this_change_still_restores():
 # These run against REAL SQLite files rather than mocks, because the defect being
 # guarded is about what is in a database file.
 # ---------------------------------------------------------------------------
+
+
+def test_restore_refuses_uncertain_destination_recovery_before_shutdown(tmp_path):
+    live = _publication_journal(
+        tmp_path / "live-active.db", complete=False,
+    )
+    incoming = _receiptless_journal(tmp_path / "incoming-legacy.db")
+    before = live.read_bytes()
+    conn = sqlite3.connect(str(live))
+    try:
+        receipt_before = conn.execute(
+            "SELECT scope, state FROM dummy_epg_publications"
+        ).fetchone()
+    finally:
+        conn.close()
+    manifest = MagicMock()
+    manifest.staged_paths = {"journal.db"}
+    manifest.file.return_value = incoming
+
+    with patch.object(backup_mod, "JOURNAL_DB_FILE", live), \
+         patch.object(backup_mod, "close_db") as close_db, \
+         patch.object(backup_mod, "_stage_restore_file") as stage:
+        with pytest.raises(backup_mod.BackupScrubError, match="not complete"):
+            backup_mod._restore_from_zip(MagicMock(), manifest)
+
+    close_db.assert_not_called()
+    stage.assert_not_called()
+    assert live.read_bytes() == before
+    conn = sqlite3.connect(str(live))
+    try:
+        assert conn.execute(
+            "SELECT scope, state FROM dummy_epg_publications"
+        ).fetchone() == receipt_before
+    finally:
+        conn.close()
+
+
+def test_receiptless_restore_pauses_only_enabled_guide_rules_and_reports_once(tmp_path):
+    journal = _receiptless_journal(tmp_path / "legacy.db")
+    conn = sqlite3.connect(str(journal))
+    try:
+        before = {
+            row[0]: row[1:]
+            for row in conn.execute(
+                "SELECT id, enabled, event_sync_config, managed_channel_ids "
+                "FROM auto_creation_rules WHERE id IN (11, 12, 13)"
+            )
+        }
+    finally:
+        conn.close()
+
+    paused = backup_mod._pause_guide_promotions(journal)
+
+    conn = sqlite3.connect(str(journal))
+    try:
+        after = {
+            row[0]: row[1:]
+            for row in conn.execute(
+                "SELECT id, enabled, event_sync_config, managed_channel_ids "
+                "FROM auto_creation_rules WHERE id IN (11, 12, 13)"
+            )
+        }
+    finally:
+        conn.close()
+    assert paused == 1
+    assert after[11][0] == 0
+    assert after[12][0] == 1
+    assert after[13][0] == 0
+    assert {rule_id: values[1:] for rule_id, values in after.items()} == {
+        rule_id: values[1:] for rule_id, values in before.items()
+    }
+
+    backup_mod._LAST_RESTORE_GUIDE_PAUSES = paused
+    missing = tmp_path / "no-live-database.db"
+    with patch.object(backup_mod, "JOURNAL_DB_FILE", missing):
+        notices = backup_mod._post_restore_account_notices()
+        assert notices == [
+            "Guide-promotion rules paused: 1. This backup has no event "
+            "recovery records. Inspect the external channels and recovery "
+            "state before you re-enable these rules."
+        ]
+        assert backup_mod._post_restore_account_notices() == []
+
+
+@pytest.mark.asyncio
+async def test_receiptless_paused_guide_rule_cannot_enter_a_pipeline_run(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from channel_pipeline_engine import ChannelPipelineEngine
+
+    journal = _receiptless_journal(tmp_path / "paused-run.db")
+    assert backup_mod._pause_guide_promotions(journal) == 1
+    engine = create_engine("sqlite:///%s" % journal)
+    session_factory = sessionmaker(bind=engine)
+    client = AsyncMock()
+    try:
+        with patch("channel_pipeline_engine.get_session", side_effect=session_factory):
+            rules = await ChannelPipelineEngine(client)._load_rules([11])
+    finally:
+        engine.dispose()
+
+    assert rules == []
+    client.create_channel.assert_not_awaited()
+
+
+def test_failed_receiptless_restore_rolls_back_without_a_pause_notice(tmp_path):
+    live = _auth_db(
+        tmp_path / "live.db", users=[(1, "owner", "$2b$12$OWNERHASH")],
+    )
+    incoming = _receiptless_journal(tmp_path / "incoming.db")
+    before = live.read_bytes()
+    manifest = MagicMock()
+    manifest.staged_paths = {"journal.db"}
+
+    with incoming.open("rb") as source:
+        manifest.file.return_value = source
+        with patch.object(backup_mod, "JOURNAL_DB_FILE", live), \
+             patch.object(backup_mod, "close_db"), \
+             patch.object(
+                 backup_mod,
+                 "init_db",
+                 side_effect=[RuntimeError("initialization failed"), None],
+             ):
+            with pytest.raises(RuntimeError, match="initialization failed"):
+                backup_mod._restore_from_zip(MagicMock(), manifest)
+
+    assert live.read_bytes() == before
+    assert backup_mod._LAST_RESTORE_GUIDE_PAUSES == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["upload", "initial", "saved"])
+async def test_every_legacy_restore_route_waits_for_publication_lock(
+    tmp_path, route,
+):
+    archive = tmp_path / "ecm-backup-2026-10-03_093000.zip"
+    with zipfile.ZipFile(archive, "w"):
+        pass
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldLock:
+        async def __aenter__(self):
+            entered.set()
+            await release.wait()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    manifest = MagicMock()
+    manifest.get.side_effect = lambda _name, default: default
+    restore = MagicMock(return_value=["journal.db"])
+    stream = AsyncMock(return_value=archive)
+    guard = AsyncMock()
+    settings = MagicMock()
+    settings.is_configured.return_value = False
+
+    with patch.object(backup_mod, "publication_lock", HeldLock()), \
+         patch.object(backup_mod, "_validate_backup_zip", return_value=manifest), \
+         patch.object(backup_mod, "_restore_from_zip", restore), \
+         patch.object(backup_mod, "_stream_upload_to_temp", stream), \
+         patch.object(backup_mod, "_guard_initial_restore", guard), \
+         patch.object(backup_mod, "get_settings", return_value=settings), \
+         patch.object(backup_mod, "BACKUPS_DIR", tmp_path), \
+         patch.object(backup_mod, "_post_restore_account_notices", return_value=[]):
+        if route == "upload":
+            task = asyncio.create_task(backup_mod.restore_backup(
+                MagicMock(filename="uploaded.zip"), _admin=None,
+            ))
+        elif route == "initial":
+            task = asyncio.create_task(backup_mod.restore_backup_initial(
+                MagicMock(),
+                MagicMock(filename="uploaded.zip"),
+                session=MagicMock(),
+            ))
+        else:
+            task = asyncio.create_task(backup_mod.restore_saved_backup(
+                backup_mod.RestoreSavedRequest(filename=archive.name), _admin=None,
+            ))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        restore.assert_not_called()
+        release.set()
+        response = await asyncio.wait_for(task, timeout=1)
+
+    assert response["restored_files"] == ["journal.db"]
+    restore.assert_called_once()
+    manifest.close.assert_called_once()
 
 
 def _auth_db(path, users=(), alert_configs=()):

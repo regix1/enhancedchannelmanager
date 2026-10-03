@@ -15,9 +15,6 @@ SCRIPT = Path(
         "IMAGE_PUBLISH_POLICY_SCRIPT", ROOT / "scripts" / "image_publish_policy.py"
     )
 )
-BUILD = ROOT / ".github" / "workflows" / "build.yml"
-PUBLISH = ROOT / ".github" / "workflows" / "publish-images.yml"
-TESTS = ROOT / ".github" / "workflows" / "test.yml"
 
 
 @pytest.fixture(scope="module")
@@ -154,33 +151,6 @@ def test_dependency_change_requires_both_exact_sha_sca_results(policy):
         )
 
 
-def test_workflows_separate_verification_from_publication():
-    build = BUILD.read_text(encoding="utf-8")
-    publish = PUBLISH.read_text(encoding="utf-8")
-    tests = TESTS.read_text(encoding="utf-8")
-    assert "needs.wait-for-tests.result" not in build
-    assert "push: ${{ github.event_name != 'pull_request' }}" not in build
-    assert "workflow_run:" in publish
-    assert "workflow_call:" in publish
-    assert "workflows: [Tests, Build and Push Docker Image]" in publish
-    assert "uses: ./.github/workflows/publish-images.yml" in tests
-    assert "tests_attested: true" in tests
-    assert "github.event.workflow_run.head_sha" in publish
-    # A called workflow sees the caller's github context, so gating the dev
-    # path on `github.event_name == 'workflow_call'` never matches and every
-    # publish job skips silently (enhancedchannelmanager-0dsa4).
-    assert "github.event_name == 'workflow_call'" not in publish
-    assert "(inputs.tests_attested && inputs.candidate_branch == 'dev')" in publish
-    assert "image_publish_policy.py" in publish
-    assert "docker/build-push-action" not in publish
-    assert "skopeo copy --preserve-digests" in publish
-    assert "outputs: type=oci" in build
-    assert build.count("outputs: type=oci") == 4
-    assert "steps.build.outputs.digest" not in build
-    assert "verify-archive" in publish
-    assert "packages: write" not in build
-
-
 def test_every_gh_cli_step_declares_github_authentication():
     """A gh invocation must never depend on ambient or misnamed credentials."""
     import yaml
@@ -196,19 +166,3 @@ def test_every_gh_cli_step_declares_github_authentication():
                     if not ({"GH_TOKEN", "GITHUB_TOKEN"} & set(env)):
                         failures.append(f"{path.name}:{job_id}:steps[{index}]")
     assert failures == [], f"gh CLI steps missing GitHub token env: {failures}"
-
-
-def test_trivy_scans_converted_docker_archives_from_verified_oci_candidates():
-    """Pinned Trivy accepts Docker archives, converted without rebuilding candidates."""
-    workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
-    assert workflow.count("skopeo version 1.13.3") == 4
-    assert workflow.count("candidate_image.py verify-archive ") >= 4
-    assert workflow.count("skopeo copy oci-archive:") == 4
-    assert workflow.count("docker-archive:/tmp/trivy-") == 4
-    assert workflow.count("input: /tmp/trivy-") == 4
-    assert workflow.count("-scan.docker.tar") == 8
-    scan_inputs = re.findall(r"input:\s+(\S+)", workflow)
-    scan_inputs = [value for value in scan_inputs if value.startswith("/tmp/trivy-")]
-    assert len(scan_inputs) == 4
-    assert all(value.endswith("-scan.docker.tar") for value in scan_inputs)
-    assert not re.search(r"input:\s+\S+\.oci\.tar", workflow)

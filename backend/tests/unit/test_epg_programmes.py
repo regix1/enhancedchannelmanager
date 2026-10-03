@@ -19,6 +19,7 @@ from services.epg_migration import stream_xmltv
 NOW = datetime(2026, 9, 5, 2, tzinfo=timezone.utc)
 START = datetime(2026, 9, 4, 4, tzinfo=timezone.utc)
 STOP = datetime(2026, 9, 6, 4, tzinfo=timezone.utc)
+EXPIRES_AT = datetime.now(timezone.utc) + timedelta(hours=24)
 
 
 @pytest.mark.asyncio
@@ -151,10 +152,37 @@ async def test_source_error_ignores_unknown_details_and_classifies_gzip_cause(mo
 
 @pytest.fixture(autouse=True)
 async def clean_sources(monkeypatch):
+    prepare = guides.prepare_profiles
+    load_catalogue = guides._load_catalogue
+    load_source = guides._load_source
+    read_source = guides._read_source
+
+    async def prepare_with_expiry(*args, **kwargs):
+        kwargs.setdefault("expires_at", EXPIRES_AT)
+        return await prepare(*args, **kwargs)
+
+    async def load_with_expiry(*args, **kwargs):
+        kwargs.setdefault("expires_at", EXPIRES_AT)
+        return await load_source(*args, **kwargs)
+
+    async def load_catalogue_with_expiry(*args, **kwargs):
+        kwargs.setdefault("expires_at", EXPIRES_AT)
+        return await load_catalogue(*args, **kwargs)
+
+    async def read_with_expiry(*args, **kwargs):
+        kwargs.setdefault("expires_at", EXPIRES_AT)
+        return await read_source(*args, **kwargs)
+
+    monkeypatch.setattr(guides, "prepare_profiles", prepare_with_expiry)
+    monkeypatch.setattr(guides, "_load_catalogue", load_catalogue_with_expiry)
+    monkeypatch.setattr(guides, "_load_source", load_with_expiry)
+    monkeypatch.setattr(guides, "_read_source", read_with_expiry)
     guides._SOURCE_CACHE.clear()
     guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
     guides._CATALOGUE_CACHE.clear()
     guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
     monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(4))
     monkeypatch.setattr(guides, "_ARTWORK_LOAD", None)
     monkeypatch.setattr(guides, "_ARTWORK_CHECKED", float("-inf"))
@@ -168,7 +196,9 @@ async def clean_sources(monkeypatch):
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
     guides._SOURCE_CACHE.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
 
 
 def source(source_id=50, **fields):
@@ -396,6 +426,51 @@ async def test_source_free_profile_is_prepared_for_stream_events():
         "can_publish": True,
         "reason_codes": [],
     }
+
+
+def test_programme_grid_requires_exact_identity_title_and_interval():
+    start = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    stop = start + timedelta(hours=3)
+    exact = {
+        "tvg_id": "custom-10",
+        "title": "Falcons vs Wolves",
+        "start_time": start.isoformat(),
+        "end_time": stop.isoformat(),
+    }
+
+    assert guides.programme_matches(
+        [exact],
+        xmltv_id="custom-10",
+        channel_uuid="channel-10",
+        title="Falcons vs Wolves",
+        start=start,
+        stop=stop,
+    ) is True
+    for programmes in (
+        [],
+        [{"tvg_id": "custom-10"}],
+        [{**exact, "tvg_id": "custom-11"}],
+        [{**exact, "title": "Other Event"}],
+        [{**exact, "start_time": (start + timedelta(minutes=1)).isoformat()}],
+        [{**exact, "end_time": (stop + timedelta(minutes=1)).isoformat()}],
+    ):
+        assert guides.programme_matches(
+            programmes,
+            xmltv_id="custom-10",
+            channel_uuid="channel-10",
+            title="Falcons vs Wolves",
+            start=start,
+            stop=stop,
+        ) is False
+
+    assert guides.programme_matches(
+        [{**exact, "tvg_id": None, "channel_uuid": "channel-10"}],
+        xmltv_id="custom-10",
+        channel_uuid="channel-10",
+        title="Falcons vs Wolves",
+        start=start,
+        stop=stop,
+    ) is True
 
 
 def test_canonical_sources_reject_recursion_and_disabled_inputs():
@@ -760,7 +835,8 @@ async def test_neutral_gaps_have_no_event_claim_or_art_and_dst_uses_local_midnig
 async def test_cold_budget_deduplicates_load_and_invalidates_output_on_completion(monkeypatch):
     started, release = asyncio.Event(), asyncio.Event()
     calls = 0
-    async def read(*_):
+    async def read(*_, expires_at):
+        assert expires_at == EXPIRES_AT
         nonlocal calls
         calls += 1
         started.set()
@@ -987,7 +1063,7 @@ async def test_catalogue_eviction_does_not_drop_the_current_batch(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_missing_source_cache_entry_has_a_useful_error(monkeypatch):
-    async def disappear(key, *_):
+    async def disappear(key, *_, **__):
         guides._SOURCE_CACHE.pop(key, None)
         guides._SOURCE_LOADS.pop(key, None)
     monkeypatch.setattr(guides, "_load_source", disappear)
@@ -1076,7 +1152,8 @@ async def test_transport_gzip_bounds_and_truncation():
 
 @pytest.mark.asyncio
 async def test_multiple_sources_share_one_cold_wait_budget(monkeypatch):
-    async def read(*_):
+    async def read(*_, expires_at):
+        assert expires_at == EXPIRES_AT
         await asyncio.sleep(0.2)
         return {"headers": {}, "rows": {}, "warnings": [], "size": 0}
     monkeypatch.setattr(guides, "_read_source", read)
@@ -1349,7 +1426,8 @@ async def test_missing_portrait_is_remembered_without_repeated_probes(monkeypatc
 
 @pytest.mark.asyncio
 async def test_cache_aggregate_ceiling_evicts_oldest_complete_schedule(monkeypatch):
-    async def read(*_):
+    async def read(*_, expires_at):
+        assert expires_at == EXPIRES_AT
         return {"headers": {}, "rows": {}, "warnings": [], "size": 60}
     monkeypatch.setattr(guides, "_read_source", read)
     monkeypatch.setattr(guides, "MAX_CACHE", 100)
@@ -1419,7 +1497,8 @@ async def test_open_xml_element_is_bounded_before_its_closing_tag(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failed_cache_entries_have_a_count_limit(monkeypatch):
-    async def fail(*_):
+    async def fail(*_, expires_at):
+        assert expires_at == EXPIRES_AT
         raise ValueError("unavailable")
     monkeypatch.setattr(guides, "_read_source", fail)
     monkeypatch.setattr(guides, "MAX_CACHE_ENTRIES", 1)
@@ -1750,7 +1829,8 @@ async def test_recovery_backoff_coalesces_and_carries_late_public_demand(monkeyp
     entry = next(iter(guides._SOURCE_CACHE.values()))
     entry["checked"] = time.monotonic()
 
-    async def read(_source, queries, _start, _stop, _now):
+    async def read(_source, queries, _start, _stop, _now, *, expires_at):
+        assert expires_at == EXPIRES_AT
         calls.append({query["key"] for query in queries})
         if len(calls) == 1:
             started.set()
@@ -2121,7 +2201,8 @@ async def test_source_resource_and_security_failures_do_not_retry(monkeypatch, f
               "security": HTTPException(400, "XMLTV source URL is blocked by the outbound security policy."),
               "timeout": TimeoutError(), "cancel": asyncio.CancelledError()}
 
-    async def read(*args):
+    async def read(*args, **kwargs):
+        assert kwargs["expires_at"] == EXPIRES_AT
         nonlocal attempts
         attempts += 1
         raise errors[failure]
@@ -2152,7 +2233,8 @@ async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatc
         deadlines.append(deadline)
         return deadline
 
-    async def read(*args):
+    async def read(*args, **kwargs):
+        assert kwargs["expires_at"] == EXPIRES_AT
         nonlocal attempts
         attempts += 1
         assert slots.locked()
@@ -2169,6 +2251,7 @@ async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatc
 
     monkeypatch.setattr(guides, "_SOURCE_SLOTS", slots)
     monkeypatch.setattr(guides, "_read_source", read)
+    monkeypatch.setattr(guides, "_remaining", lambda _expires_at: 24 * 60 * 60)
     monkeypatch.setattr(asyncio, "timeout", timeout)
     await guides._load_source("timed", source(), [], START, STOP, NOW)
     entry = guides._SOURCE_CACHE["timed"]
@@ -2177,6 +2260,29 @@ async def test_source_retries_share_one_deadline_and_concurrency_slot(monkeypatc
     assert entry["error"] == "Request timed out."
     assert entry["diagnostics"] == {"attempts": 2}
     assert "success" not in entry and not entry.get("rows")
+
+
+@pytest.mark.asyncio
+async def test_expired_source_queue_opens_no_transport(monkeypatch):
+    slots = asyncio.Semaphore(0)
+    remaining = iter([60, 0])
+    read = AsyncMock()
+
+    monkeypatch.setattr(guides, "_SOURCE_SLOTS", slots)
+    monkeypatch.setattr(guides, "_remaining", lambda _expires_at: next(remaining))
+    monkeypatch.setattr(guides, "_read_source", read)
+    loading = asyncio.create_task(
+        guides._load_source("queued", source(), [], START, STOP, NOW)
+    )
+    await asyncio.sleep(0)
+    assert read.await_count == 0
+    slots.release()
+    await loading
+
+    assert read.await_count == 0
+    assert slots.locked() is False
+    assert guides._SOURCE_CACHE["queued"]["error"] == "Request timed out."
+    assert "success" not in guides._SOURCE_CACHE["queued"]
 
 
 @pytest.mark.asyncio
@@ -2411,7 +2517,11 @@ async def test_background_completion_rechecks_the_current_programme_time(monkeyp
         clock[0] = NOW + timedelta(hours=4)
     monkeypatch.setattr(guides, "datetime", Clock)
     monkeypatch.setattr(guides, "stream_xmltv", chunks)
-    prepared, coverage = await guides.prepare_profiles([profile()], {1: channel()}, client(), wait_for_sources=True)
+    prepared, coverage = await guides.prepare_profiles(
+        [profile()], {1: channel()}, client(),
+        expires_at=Clock.fromtimestamp(EXPIRES_AT.timestamp(), timezone.utc),
+        wait_for_sources=True,
+    )
     assert coverage["generated_at"] == clock[0].isoformat()
     assert coverage["sources"][0]["last_success"] == clock[0].isoformat()
     assert coverage["channels"][0]["current"] is None
@@ -2536,9 +2646,10 @@ async def test_source_phase_totals_include_failed_validation_before_retry(monkey
             await asyncio.sleep(0.01)
         return await to_thread(function, *args, **kwargs)
 
-    async def capture(*args):
+    async def capture(*args, **kwargs):
+        assert kwargs["expires_at"] == EXPIRES_AT
         try:
-            loaded = await read(*args)
+            loaded = await read(*args, **kwargs)
         except ET.ParseError as exc:
             attempts.append(dict(exc.diagnostics))
             raise

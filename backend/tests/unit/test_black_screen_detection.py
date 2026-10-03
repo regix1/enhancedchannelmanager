@@ -58,7 +58,7 @@ def create_mock_stats(
 class TestDetectBlackScreen:
     """Tests for _detect_black_screen method (signalstats YAVG-based)."""
 
-    def _make_mock_process(self, stderr_output):
+    def _make_mock_process(self, stderr_output, *, returncode=0):
         """Create a mock process that works with asyncio.wait_for."""
         mock_process = AsyncMock()
 
@@ -68,14 +68,18 @@ class TestDetectBlackScreen:
         mock_process.communicate = mock_communicate
         mock_process.kill = Mock()
         mock_process.wait = AsyncMock()
+        mock_process.returncode = returncode
         return mock_process
 
-    def _make_yavg_output(self, *values):
+    def _make_yavg_output(self, *values, span=5.0):
         """Build ffmpeg signalstats stderr output from YAVG values."""
-        lines = [
-            f"[Parsed_metadata_1 @ 0x1234] lavfi.signalstats.YAVG={v}\n".encode()
-            for v in values
-        ]
+        lines = []
+        for index, value in enumerate(values):
+            frame_time = span * index / max(1, len(values) - 1)
+            lines.extend([
+                f"frame:{index} pts:{index} pts_time:{frame_time:.3f}\n".encode(),
+                f"[Parsed_metadata_1 @ 0x1234] lavfi.signalstats.YAVG={value}\n".encode(),
+            ])
         return b"".join(lines)
 
     @pytest.mark.asyncio
@@ -175,6 +179,116 @@ class TestDetectBlackScreen:
 
         assert result is False  # < threshold, not <=
 
+    @pytest.mark.asyncio
+    async def test_dark_opening_then_normal_content_is_not_persistent(self):
+        prober = create_prober(
+            black_screen_detection_enabled=True,
+            black_screen_sample_duration=10,
+        )
+        stderr_output = self._make_yavg_output(
+            16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 88.0, 88.0,
+            span=10.0,
+        )
+
+        with patch(
+            "stream_prober.asyncio.create_subprocess_exec",
+            return_value=self._make_mock_process(stderr_output),
+        ):
+            result = await prober._detect_black_screen("http://example.com/stream")
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_truncated_frame_span_is_indeterminate(self):
+        prober = create_prober(
+            black_screen_detection_enabled=True,
+            black_screen_sample_duration=10,
+        )
+        stderr_output = self._make_yavg_output(16.0, 16.0, span=2.0)
+
+        with patch(
+            "stream_prober.asyncio.create_subprocess_exec",
+            return_value=self._make_mock_process(stderr_output),
+        ):
+            result = await prober._detect_black_screen("http://example.com/stream")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_nonzero_decoder_exit_is_indeterminate(self):
+        prober = create_prober(
+            black_screen_detection_enabled=True,
+            black_screen_sample_duration=5,
+        )
+        stderr_output = self._make_yavg_output(16.0, 16.0)
+
+        with patch(
+            "stream_prober.asyncio.create_subprocess_exec",
+            return_value=self._make_mock_process(stderr_output, returncode=1),
+        ):
+            result = await prober._detect_black_screen("http://example.com/stream")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_and_reaps_decoder(self):
+        prober = create_prober(
+            black_screen_detection_enabled=True,
+            black_screen_sample_duration=5,
+        )
+        process = AsyncMock()
+        process.returncode = None
+
+        async def never_returns():
+            await asyncio.Event().wait()
+
+        process.communicate.side_effect = never_returns
+        process.kill = Mock()
+        process.wait = AsyncMock()
+
+        with patch(
+            "stream_prober.asyncio.create_subprocess_exec",
+            return_value=process,
+        ):
+            task = asyncio.create_task(
+                prober._detect_black_screen("http://example.com/stream")
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once_with()
+        process.wait.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_and_reaps_ffprobe(self):
+        prober = create_prober()
+        process = AsyncMock()
+        process.returncode = None
+
+        async def never_returns():
+            await asyncio.Event().wait()
+
+        process.communicate.side_effect = never_returns
+        process.kill = Mock()
+        process.wait = AsyncMock()
+
+        with patch(
+            "stream_prober.asyncio.create_subprocess_exec",
+            return_value=process,
+        ):
+            task = asyncio.create_task(
+                prober._run_ffprobe("http://example.com/stream")
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once_with()
+        process.wait.assert_awaited_once_with()
+
 
 class TestSmartSortBlackScreen:
     """Tests for black screen deprioritization in smart sort."""
@@ -219,6 +333,8 @@ class TestSaveProbeResultBlackScreen:
         prober = create_prober(black_screen_detection_enabled=True)
         mock_stats = Mock(spec=StreamStats)
         mock_stats.consecutive_failures = 0
+        mock_stats.stream_name = "Test"
+        mock_stats.black_screen_checked_at = None
 
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.first.return_value = mock_stats
@@ -228,12 +344,14 @@ class TestSaveProbeResultBlackScreen:
             prober._save_probe_result(1, "Test", {}, "success", None, is_black_screen=True)
 
         assert mock_stats.is_black_screen is True
+        assert mock_stats.black_screen_checked_at == mock_stats.last_probed
 
     def test_clears_black_screen_on_failure(self):
         """is_black_screen is cleared when probe fails."""
         prober = create_prober()
         mock_stats = Mock(spec=StreamStats)
         mock_stats.consecutive_failures = 0
+        mock_stats.stream_name = "Test"
         mock_stats.is_black_screen = True
 
         mock_session = MagicMock()
@@ -250,6 +368,8 @@ class TestSaveProbeResultBlackScreen:
         prober = create_prober(black_screen_detection_enabled=True)
         mock_stats = Mock(spec=StreamStats)
         mock_stats.consecutive_failures = 0
+        mock_stats.stream_name = "Test"
+        mock_stats.black_screen_checked_at = None
 
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.first.return_value = mock_stats
@@ -259,23 +379,26 @@ class TestSaveProbeResultBlackScreen:
             prober._save_probe_result(1, "Test", {}, "success", None, is_black_screen=False)
 
         assert mock_stats.is_black_screen is False
+        assert mock_stats.black_screen_checked_at == mock_stats.last_probed
 
-    def test_preserves_black_screen_when_detection_disabled(self):
-        """is_black_screen is NOT overwritten when detection is disabled."""
+    def test_stores_disabled_probe_result(self):
+        """An event-requested result is saved even when the global flag is off."""
         prober = create_prober(black_screen_detection_enabled=False)
         mock_stats = Mock(spec=StreamStats)
         mock_stats.consecutive_failures = 0
+        mock_stats.stream_name = "Test"
         mock_stats.is_black_screen = True  # Set by prior black screen scan
+        mock_stats.black_screen_checked_at = None
 
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.first.return_value = mock_stats
-        mock_stats.to_dict.return_value = {"is_black_screen": True}
+        mock_stats.to_dict.return_value = {"is_black_screen": False}
 
         with patch("stream_prober.get_session", return_value=mock_session):
             prober._save_probe_result(1, "Test", {}, "success", None, is_black_screen=False)
 
-        # Should still be True — probe didn't run detection, so it preserves the existing value
-        assert mock_stats.is_black_screen is True
+        assert mock_stats.is_black_screen is False
+        assert mock_stats.black_screen_checked_at == mock_stats.last_probed
 
     def test_preserves_black_screen_when_detection_indeterminate(self):
         """is_black_screen is NOT overwritten when detection returns None.
@@ -289,6 +412,7 @@ class TestSaveProbeResultBlackScreen:
         prober = create_prober(black_screen_detection_enabled=True)
         mock_stats = Mock(spec=StreamStats)
         mock_stats.consecutive_failures = 0
+        mock_stats.stream_name = "Test"
         mock_stats.is_black_screen = True  # Earlier detection flagged this stream
 
         mock_session = MagicMock()
@@ -299,6 +423,27 @@ class TestSaveProbeResultBlackScreen:
             prober._save_probe_result(1, "Test", {}, "success", None, is_black_screen=None)
 
         assert mock_stats.is_black_screen is True
+
+    def test_name_change_resets_prior_content_and_failure_count(self):
+        prober = create_prober()
+        mock_stats = Mock(spec=StreamStats)
+        mock_stats.stream_name = "Old event"
+        mock_stats.consecutive_failures = 4
+        mock_stats.is_black_screen = True
+        mock_stats.black_screen_checked_at = object()
+
+        mock_session = MagicMock()
+        mock_session.query.return_value.filter_by.return_value.first.return_value = mock_stats
+        mock_stats.to_dict.return_value = {"consecutive_failures": 1}
+
+        with patch("stream_prober.get_session", return_value=mock_session):
+            prober._save_probe_result(
+                1, "New event", None, "failed", "Connection refused"
+            )
+
+        assert mock_stats.consecutive_failures == 1
+        assert mock_stats.is_black_screen is False
+        assert mock_stats.black_screen_checked_at is None
 
 
 class TestConstructorBlackScreenSettings:

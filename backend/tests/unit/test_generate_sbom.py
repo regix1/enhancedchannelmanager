@@ -403,6 +403,37 @@ def test_verify_passes_on_a_freshly_generated_directory(sbom, tree, generated):
     assert sbom.verify(tree, generated, "9.9.9") == []
 
 
+def test_source_text_hashes_are_identical_for_lf_and_crlf(sbom, tree, generated):
+    source_paths = (
+        Path("backend/requirements.txt"),
+        Path("frontend/package-lock.json"),
+        Path("Dockerfile"),
+        Path("mcp-server/requirements.txt"),
+        Path("mcp-server/Dockerfile"),
+    )
+    lf_render = sbom.render(tree, "9.9.9", CREATED)
+
+    for relative in source_paths:
+        path = tree / relative
+        text = path.read_text(encoding="utf-8")
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        path.write_bytes(normalized.replace("\n", "\r\n").encode("utf-8"))
+
+    crlf_render = sbom.render(tree, "9.9.9", CREATED)
+
+    assert crlf_render == lf_render
+    assert sbom.verify(tree, generated, "9.9.9") == []
+
+
+def test_default_file_hash_preserves_raw_line_endings(sbom, tmp_path):
+    lf = tmp_path / "lf.bin"
+    crlf = tmp_path / "crlf.bin"
+    lf.write_bytes(b"\x00\xff\n")
+    crlf.write_bytes(b"\x00\xff\r\n")
+
+    assert sbom.sha256_file(lf) != sbom.sha256_file(crlf)
+
+
 def test_a_dependency_edited_without_regenerating_is_caught(sbom, tree, generated):
     """The mutation the gate exists for: a bump that never reached the SBOM."""
     _write(
@@ -877,8 +908,6 @@ def test_the_sbom_for_the_current_version_matches_the_current_tree(sbom):
     time buys nothing, while a dependency sweep landing without a regeneration
     is exactly the drift that made `sbom/v0.18.1-0144/` wrong.
 
-    Release currency is the stricter question and is enforced by the Release Cut
-    Gate, which `test_release_cut_gate_enforces_the_sbom` proves is wired up.
     Past releases are historical records of their own cut and covered by `audit`.
     """
     version = sbom.read_version(ROOT)
@@ -905,14 +934,3 @@ def test_no_committed_directory_is_a_dev_snapshot_in_the_release_namespace(sbom)
         f"{offenders} name dev builds but sit in the permanent release namespace; "
         f"a transient snapshot belongs in sbom/{sbom.DEV_DIRNAME}/"
     )
-
-
-def test_release_cut_gate_enforces_the_sbom():
-    """The gate step is the enforcement; a test asserting it is present is the guard.
-
-    Without this, deleting the workflow step would leave every SBOM test above
-    green while nothing checked the release at all.
-    """
-    workflow = (ROOT / ".github/workflows/release-cut-gate.yml").read_text(encoding="utf-8")
-    assert "scripts/generate_sbom.py verify" in workflow
-    assert "G8" in workflow

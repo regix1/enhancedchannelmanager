@@ -3,7 +3,7 @@
  */
 import type * as React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { JournalTab } from './JournalTab';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import * as api from '../../services/api';
@@ -91,29 +91,36 @@ describe('JournalTab', () => {
     it('shows the Source column header', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      expect(screen.getByText('Source')).toBeInTheDocument();
+      expect(
+        await screen.findByText('Source', { selector: '.list-header span' })
+      ).toBeInTheDocument();
     });
   });
 
   describe('mutation_source badge display', () => {
     it('renders UI label for source=ui', async () => {
-      vi.mocked(api.getJournalEntries).mockResolvedValue(
-        mockResponse([makeEntry({ mutation_source: 'ui' })])
-      );
+      let resolveEntries!: (value: JournalResponse) => void;
+      const entriesRequest = new Promise<JournalResponse>((resolve) => {
+        resolveEntries = resolve;
+      });
+      vi.mocked(api.getJournalEntries).mockReturnValueOnce(entriesRequest);
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
+      expect(api.getJournalEntries).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText('UI', { selector: '.source-badge' })).not.toBeInTheDocument();
+
+      const completion = waitFor(() => {
+        const badges = document.querySelectorAll('.source-badge');
+        const texts = Array.from(badges).map((b) => b.textContent);
+        expect(texts).toContain('UI');
       });
 
-      const badges = document.querySelectorAll('.source-badge');
-      const texts = Array.from(badges).map((b) => b.textContent);
-      expect(texts).toContain('UI');
+      await act(async () => {
+        resolveEntries(mockResponse([makeEntry({ mutation_source: 'ui' })]));
+        await entriesRequest;
+      });
+      await completion;
     });
 
     it('renders AI label for source=mcp_ai', async () => {
@@ -123,9 +130,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByText('AI', { selector: '.source-badge' });
 
       const badges = document.querySelectorAll('.source-badge');
       const texts = Array.from(badges).map((b) => b.textContent);
@@ -139,9 +144,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByText('Scheduler', { selector: '.source-badge' });
 
       const badges = document.querySelectorAll('.source-badge');
       const texts = Array.from(badges).map((b) => b.textContent);
@@ -155,9 +158,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByText('Channel Pipeline', { selector: '.source-badge' });
 
       const badges = document.querySelectorAll('.source-badge');
       const texts = Array.from(badges).map((b) => b.textContent);
@@ -171,9 +172,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByText('—', { selector: '.source-badge' });
 
       const badges = document.querySelectorAll('.source-badge');
       const texts = Array.from(badges).map((b) => b.textContent);
@@ -209,9 +208,7 @@ describe('JournalTab', () => {
     it('passes mutation_source param to API when filter is set', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByRole('button', { name: /Test Channel/i });
 
       // Verify initial call has no mutation_source
       expect(api.getJournalEntries).toHaveBeenCalledWith(
@@ -222,12 +219,9 @@ describe('JournalTab', () => {
     it('renders All Sources option in the filter dropdown', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
       // The CustomSelect shows the active value as its trigger label
       expect(screen.getByText('All Sources')).toBeInTheDocument();
+      await screen.findByRole('button', { name: /Test Channel/i });
     });
   });
 
@@ -245,9 +239,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await screen.findByRole('button', { name: /Peacock 14: Mercury vs\. Aces/i });
 
       expect(screen.getByText('Event Sync')).toBeInTheDocument();
       const icons = Array.from(document.querySelectorAll('.material-icons')).map(
@@ -264,11 +256,7 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const stat = document.querySelector('[title="Event Sync entries"]');
+      const stat = await screen.findByTitle('Event Sync entries');
       expect(stat).not.toBeNull();
       expect(stat?.textContent).toContain('7');
     });
@@ -276,11 +264,7 @@ describe('JournalTab', () => {
     it('defaults the event_sync header stat to 0 when the category is absent', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const stat = document.querySelector('[title="Event Sync entries"]');
+      const stat = await screen.findByTitle('Event Sync entries');
       expect(stat).not.toBeNull();
       expect(stat?.textContent).toContain('0');
     });
@@ -309,10 +293,8 @@ describe('JournalTab', () => {
   describe('an unreadable before-state (bd-kz089)', () => {
     const expandFirstRow = async () => {
       renderWithProviders(<JournalTab />);
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-      fireEvent.keyDown(document.querySelector('.entry-row') as HTMLElement, { key: 'Enter' });
+      const row = await screen.findByRole('button', { name: /Test Channel/i });
+      fireEvent.keyDown(row, { key: 'Enter' });
     };
 
     it('never shows the operator the reserved key', async () => {
@@ -380,26 +362,35 @@ describe('JournalTab', () => {
 
   describe('entry-row keyboard accessibility (bd-6n14l)', () => {
     it('exposes the entry row as a focusable button with aria-expanded reflecting collapsed state', async () => {
+      let resolveEntries!: (value: JournalResponse) => void;
+      const entriesRequest = new Promise<JournalResponse>((resolve) => {
+        resolveEntries = resolve;
+      });
+      vi.mocked(api.getJournalEntries).mockReturnValueOnce(entriesRequest);
+
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
+      expect(api.getJournalEntries).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('button', { name: /Test Channel/i })).not.toBeInTheDocument();
+
+      const completion = waitFor(() => {
+        const row = screen.getByRole('button', { name: /Test Channel/i });
+        expect(row).toHaveAttribute('role', 'button');
+        expect(row).toHaveAttribute('tabIndex', '0');
+        expect(row).toHaveAttribute('aria-expanded', 'false');
       });
 
-      const row = document.querySelector('.entry-row') as HTMLElement;
-      expect(row).toHaveAttribute('role', 'button');
-      expect(row).toHaveAttribute('tabIndex', '0');
-      expect(row).toHaveAttribute('aria-expanded', 'false');
+      await act(async () => {
+        resolveEntries(mockResponse([makeEntry()]));
+        await entriesRequest;
+      });
+      await completion;
     });
 
     it('Enter toggles the row open and updates aria-expanded', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const row = document.querySelector('.entry-row') as HTMLElement;
+      const row = await screen.findByRole('button', { name: /Test Channel/i });
       fireEvent.keyDown(row, { key: 'Enter' });
 
       expect(row).toHaveAttribute('aria-expanded', 'true');
@@ -409,11 +400,7 @@ describe('JournalTab', () => {
     it('Space toggles the row open and updates aria-expanded', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const row = document.querySelector('.entry-row') as HTMLElement;
+      const row = await screen.findByRole('button', { name: /Test Channel/i });
       fireEvent.keyDown(row, { key: ' ' });
 
       expect(row).toHaveAttribute('aria-expanded', 'true');
@@ -422,11 +409,7 @@ describe('JournalTab', () => {
     it('Enter toggles the row closed again on a second press (aria-expanded flips back)', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const row = document.querySelector('.entry-row') as HTMLElement;
+      const row = await screen.findByRole('button', { name: /Test Channel/i });
       fireEvent.keyDown(row, { key: 'Enter' });
       expect(row).toHaveAttribute('aria-expanded', 'true');
 
@@ -437,11 +420,7 @@ describe('JournalTab', () => {
     it('ignores other keys (e.g. Tab) without toggling', async () => {
       renderWithProviders(<JournalTab />);
 
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
-
-      const row = document.querySelector('.entry-row') as HTMLElement;
+      const row = await screen.findByRole('button', { name: /Test Channel/i });
       fireEvent.keyDown(row, { key: 'Tab' });
 
       expect(row).toHaveAttribute('aria-expanded', 'false');
@@ -450,22 +429,50 @@ describe('JournalTab', () => {
 
   describe('refresh', () => {
     it('re-fetches data when refresh button is clicked', async () => {
+      let resolveEntries!: (value: JournalResponse) => void;
+      let resolveStats!: (value: JournalStats) => void;
+      const entriesRequest = new Promise<JournalResponse>((resolve) => {
+        resolveEntries = resolve;
+      });
+      const statsRequest = new Promise<JournalStats>((resolve) => {
+        resolveStats = resolve;
+      });
+      vi.mocked(api.getJournalEntries).mockReturnValueOnce(entriesRequest);
+      vi.mocked(api.getJournalStats).mockReturnValueOnce(statsRequest);
+
       renderWithProviders(<JournalTab />);
 
       await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
+        expect(api.getJournalEntries).toHaveBeenCalledTimes(1);
+        expect(api.getJournalStats).toHaveBeenCalledTimes(1);
       });
+
+      const refreshButton = screen.getByRole('button', { name: /refresh/i });
+      expect(refreshButton).toBeDisabled();
+      fireEvent.click(refreshButton);
+      expect(api.getJournalEntries).toHaveBeenCalledTimes(1);
+      expect(api.getJournalStats).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolveEntries(mockResponse([makeEntry()]));
+        resolveStats(mockStats);
+        await Promise.all([entriesRequest, statsRequest]);
+      });
+
+      expect(await screen.findByText('Test Channel')).toBeInTheDocument();
+      await waitFor(() => expect(refreshButton).toBeEnabled());
 
       vi.mocked(api.getJournalEntries).mockClear();
       vi.mocked(api.getJournalStats).mockClear();
 
-      const refreshButton = screen.getByRole('button', { name: /refresh/i });
       fireEvent.click(refreshButton);
 
       await waitFor(() => {
-        expect(api.getJournalEntries).toHaveBeenCalled();
-        expect(api.getJournalStats).toHaveBeenCalled();
+        expect(api.getJournalEntries).toHaveBeenCalledTimes(1);
+        expect(api.getJournalStats).toHaveBeenCalledTimes(1);
       });
+      await waitFor(() => expect(refreshButton).toBeEnabled());
+      expect(screen.getByText('Test Channel')).toBeInTheDocument();
     });
 
     it('retains populated rows as stale after refresh failure and recovers on retry', async () => {
@@ -531,19 +538,17 @@ describe('JournalTab', () => {
 
     it('defaults the day count to 90', async () => {
       renderWithProviders(<JournalTab />);
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
 
       expect(screen.getByLabelText('Days to keep')).toHaveValue(90);
+      await waitFor(() => expect(screen.getByLabelText('Days to keep')).toBeEnabled());
     });
 
     it('does not purge when the confirm dialog is declined', async () => {
       confirmSpy.mockReturnValue(false);
       renderWithProviders(<JournalTab />);
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /purge old entries/i })).toBeEnabled()
+      );
 
       fireEvent.click(screen.getByRole('button', { name: /purge old entries/i }));
 
@@ -557,7 +562,8 @@ describe('JournalTab', () => {
 
       renderWithProviders(<JournalTab />);
       await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
+        expect(screen.getByLabelText('Days to keep')).toBeEnabled();
+        expect(screen.getByRole('button', { name: /purge old entries/i })).toBeEnabled();
       });
 
       fireEvent.change(screen.getByLabelText('Days to keep'), { target: { value: '30' } });
@@ -578,9 +584,7 @@ describe('JournalTab', () => {
 
     it('rejects a day count below 1 without calling the API', async () => {
       renderWithProviders(<JournalTab />);
-      await waitFor(() => {
-        expect(screen.queryByText('Loading journal...')).not.toBeInTheDocument();
-      });
+      await waitFor(() => expect(screen.getByLabelText('Days to keep')).toBeEnabled());
 
       fireEvent.change(screen.getByLabelText('Days to keep'), { target: { value: '0' } });
 

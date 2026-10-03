@@ -42,6 +42,7 @@ from auth.mcp_service import (
     load_mcp_service_credentials,
     reset_mcp_projection_failure_log_latch,
 )
+from tests.auth.test_mcp_sidecar_boundary import _deny_projection_opens
 
 BACKEND_DIR = Path(config.__file__).resolve().parent
 
@@ -155,18 +156,17 @@ class TestDegradedProjectionLogsNameTheVariableNotThePath:
         reset_mcp_projection_failure_log_latch()
         try:
             with caplog.at_level(logging.DEBUG, logger="auth.mcp_service"):
-                projection_dir.chmod(0o500)
-                # First failure of the episode — the latched traceback.
-                assert load_mcp_service_credentials(projection) is None
-                # Repeat failure — the DEBUG one-liner.
-                assert load_mcp_service_credentials(projection) is None
-                projection_dir.chmod(0o700)
+                with _deny_projection_opens(projection_dir) as denied:
+                    # First failure of the episode — the latched traceback.
+                    assert load_mcp_service_credentials(projection) is None
+                    # Repeat failure — the DEBUG one-liner.
+                    assert load_mcp_service_credentials(projection) is None
                 # Recovery — the INFO line.
                 assert load_mcp_service_credentials(projection) is not None
         finally:
-            projection_dir.chmod(0o700)
             reset_mcp_projection_failure_log_latch()
 
+        assert denied
         messages = [
             record.getMessage()
             for record in caplog.records
@@ -189,8 +189,7 @@ class TestDegradedProjectionLogsNameTheVariableNotThePath:
 
         projection_dir = tmp_path / "sentinel-secrets-04c0u8-rotate"
         projection_dir.mkdir()
-        projection_dir.chmod(0o500)
-        try:
+        with _deny_projection_opens(projection_dir) as denied:
             with caplog.at_level(logging.DEBUG, logger="routers.settings"):
                 with patch.object(
                     settings_router,
@@ -199,9 +198,9 @@ class TestDegradedProjectionLogsNameTheVariableNotThePath:
                 ):
                     with pytest.raises(HTTPException) as raised:
                         settings_router._rotate_private_projection_or_503()
-        finally:
-            projection_dir.chmod(0o700)
 
+        assert denied
+        assert any(path.name.endswith(".tmp") for path in denied)
         messages = [
             record.getMessage()
             for record in caplog.records

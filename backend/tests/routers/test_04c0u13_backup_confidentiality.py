@@ -634,6 +634,7 @@ def test_a_symlink_at_a_local_artifact_path_is_not_followed(tmp_path):
     """
     victim = tmp_path / "victim.txt"
     victim.write_text("do not truncate me")
+    victim.chmod(0o644)
 
     for label, opener in (
         ("routers.backup", backup_mod._open_private_binary),
@@ -646,7 +647,7 @@ def test_a_symlink_at_a_local_artifact_path_is_not_followed(tmp_path):
         assert excinfo.value.errno == errno.ELOOP, (label, excinfo.value)
 
     assert victim.read_text() == "do not truncate me"
-    assert stat.S_IMODE(victim.stat().st_mode) != 0o600
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
 
 
 @pytest.mark.asyncio

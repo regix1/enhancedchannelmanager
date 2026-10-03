@@ -86,13 +86,13 @@ Located in `backend/tests/`. **Run them with `scripts/backend-gate.sh`** — see
 
 ## What the backend gate runs
 
-**One invocation: `scripts/backend-gate.sh`.** It takes no arguments, selects the project interpreter itself, and runs exactly what `.github/workflows/test.yml` runs. `backend/tests/unit/test_backend_gate_contract.py` asserts the two still match flag for flag, so they cannot drift apart.
+**One invocation: `scripts/backend-gate.sh`.** It takes no arguments, selects the project interpreter itself, and runs the canonical local backend gate. `backend/tests/unit/test_backend_gate_contract.py` pins all seven flags: both ignored trees, the `not slow` marker, short tracebacks, no header, and disabled warnings.
 
 ```bash
 scripts/backend-gate.sh    # THE gate. Check $? — do not pipe to `tail` and read that.
 ```
 
-Two invocations used to circulate — one from `backend/CLAUDE.md` prose, one from CI — differing by **72 collected tests** (bead `enhancedchannelmanager-c9lb9`). Nothing was failing, so it was an instrument gap rather than a live defect, but it is the false-green class: "backend gate green" could be reported by a run that never executed those 72, and the figure looked authoritative because every handover repeated it.
+Two invocations used to circulate, one from `backend/CLAUDE.md` prose and one from a deleted test workflow. They differed by **72 collected tests** (bead `enhancedchannelmanager-c9lb9`). Nothing was failing, so this was an instrument gap rather than a live defect. The script and its contract test now define the local gate without requiring that deleted workflow.
 
 ### What the backend gate excludes, and why
 
@@ -100,12 +100,12 @@ Every exclusion is named. A bare "2 deselected" is an unreadable signal.
 
 | Excluded | How | Why |
 | --- | --- | --- |
-| `tests/e2e/` (10 files) | `--ignore` | Hits a live ECM container on `localhost:6100`. Without one it self-skips; with one it exercises whatever that container happens to be running — a result that depends on unrelated local state cannot gate a PR. E2E as a CI gate is deferred to bead `enhancedchannelmanager-2lw25`. |
-| `tests/performance/` (2 files) | `--ignore` | Seeds a 250k-row fixture; runs in the dedicated `perf-benchmarks` workflow (`bd-skqln.10`). |
+| `tests/e2e/` (10 files) | `--ignore` | Hits a live ECM container on `localhost:6100`. Run it separately only when you explicitly select the target described in [E2E Tests](#3-e2e-tests). Local state must not change the backend gate result. |
+| `tests/performance/` (2 files) | `--ignore` | Seeds a 250k-row fixture. Run it explicitly as a local performance suite with the project interpreter (`bd-skqln.10`); no installed workflow runs it. |
 | `test_find_candidate_under_5ms_per_call_for_500_candidates` | `-m "not slow"` | Wall-clock microbenchmark with a 5 ms soft cap. Host contention on a runner false-fails it, and the latency figure is informational, not a gate. Still runs under an explicit `-m slow`. |
 | `test_migration_up_down_against_5m_rows` | `-m "not slow"` | Times an Alembic up/down against ~5M `session_telemetry` rows. Local pre-merge only (`bd-skqln.2`); also guarded by `ECM_RUN_VOLUME_TESTS`, so it self-skips even when selected. |
 
-Expected shape on a green `dev`: **`3 skipped, 2 deselected`**. A full-tree run (`pytest tests/`, no ignores) reports **9 skipped** instead — the other 6 live in the excluded trees. **`18 skipped` from either means the wrong interpreter** (see below).
+Historical snapshot: one green `dev` run reported **`3 skipped, 2 deselected`**, while a full-tree run reported **9 skipped**. Treat those figures as observations from that source snapshot, not as permanent pass criteria. The contract test still verifies the exact two tests marked `slow` and requires a reason for each. A larger TLS-related skip count can indicate the wrong interpreter; check the named skip reasons instead of relying on a fixed total.
 
 ### The interpreter is part of the gate
 
@@ -113,7 +113,7 @@ Ambient `python` commonly resolves an older `cryptography` build and **silently 
 
 ### The subset-run coverage trap
 
-`pytest.ini` sets `--cov=. --cov-fail-under=56`, and coverage is measured over the **whole tree** regardless of what you selected. So *any* subset run exits non-zero even when every test in it passes — a bare `--collect-only` reports `Required test coverage of 56% not reached. Total coverage: 18.39%`. Read as a real failure, that has sent agents off to "fix" a healthy tree.
+`pytest.ini` sets `--cov=. --cov-fail-under=56`, and coverage is measured over the **whole tree** regardless of what you selected. A direct subset run can therefore exit nonzero even when every selected test passes. Use the script's subset mode so the focused check disables whole-tree coverage.
 
 ```bash
 scripts/backend-gate.sh --subset tests/unit/test_foo.py -k some_case
@@ -461,7 +461,10 @@ Adding a dialog to the harness:
 Never change a component to suit the harness. If a dialog cannot be reached
 without editing it, record it as a gap.
 
-## Coverage ratchet cadence
+## Upstream history: coverage ratchet cadence
+
+> This section records the upstream test-workflow policy. It is not installed
+> in this fork. Local coverage thresholds still apply when their commands run.
 
 Coverage is enforced in CI as a **one-way ratchet**: the current floor is the
 baseline measured 2026-04-20 during bead `enhancedchannelmanager-nmlxi`, minus
@@ -532,8 +535,8 @@ rates above) and the whole-codebase thresholds stay as a floor.
 ### Running coverage locally
 
 ```bash
-# Backend — from the host. This IS the CI invocation; coverage is auto-enabled
-# via pytest.ini addopts, so the ratchet is enforced by the same run.
+# Backend — from the host. This is the canonical local invocation; coverage is
+# auto-enabled through pytest.ini addopts.
 scripts/backend-gate.sh
 
 # Frontend — from the host.
@@ -552,9 +555,13 @@ Do **not** lower the threshold in the config.
 
 - **Backend tests**: MANDATORY for any backend code changes
 - **Frontend tests**: MANDATORY for any frontend code changes
-- **E2E tests**: Run on merge to main only (CI/CD pipeline)
+- **E2E tests**: Run locally when the change affects browser behavior. Set an explicit `E2E_BASE_URL`, or use `E2E_START_SERVER=true E2E_EXACT_BUILD=true` for the checked-out source. No installed workflow runs Playwright.
 
-## One source of truth per required check
+## Upstream history: one source of truth per required check
+
+> This section records the upstream required-check design before the test
+> workflows were removed from this fork. Present-tense contract descriptions
+> below apply to that upstream design, not to the installed image-only workflow.
 
 `dev` branch protection requires four status checks: `Backend Tests` and
 `Frontend Tests` (from `.github/workflows/test.yml`), and

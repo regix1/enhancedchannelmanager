@@ -4,7 +4,7 @@ EPG Refresh Task.
 Scheduled task to refresh EPG (Electronic Program Guide) data from sources.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dispatcharr_client import get_client
@@ -131,9 +131,13 @@ class EPGRefreshTask(TaskScheduler):
 
                 try:
                     from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+                    expires_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=MAX_WAIT_SECONDS
+                    )
                     completed = await wait_for_epg_source_refresh(
                         client, source_id, source_name,
-                        poll_interval=POLL_INTERVAL_SECONDS, max_wait=MAX_WAIT_SECONDS,
+                        poll_interval=POLL_INTERVAL_SECONDS,
+                        expires_at=expires_at,
                         cancelled=lambda: self._cancel_requested,
                     )
                     if self._cancel_requested:

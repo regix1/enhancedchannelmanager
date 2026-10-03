@@ -5,7 +5,7 @@
  * The manifest records both accessible callers and explicit current debt. It
  * is bidirectional: production callers and reviewed entries must match exactly.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as ts from 'typescript';
@@ -155,7 +155,7 @@ function auditModalOverlays(): AuditedEntry[] {
           : null;
       if (opening && overlayNames.has(opening.tagName.getText(source))) {
         index += 1;
-        const identity = `${path.relative(SRC, file)}#${index}`;
+        const identity = `${path.relative(SRC, file).split(path.sep).join('/')}#${index}`;
         const descendants = ts.isJsxElement(node) ? semanticDescendants(node, source, overlayNames) : [];
         const overlayIsSurface = isPartialSemanticSurface(opening, source);
         if (overlayIsSurface && descendants.length > 0) throw new Error(`${identity}: nested dialog semantics`);
@@ -284,6 +284,58 @@ describe('ModalOverlay caller semantics ledger', () => {
   it('has zero remaining role, modal-state, or accessible-name debt', () => {
     expect(MODAL_OVERLAY_MANIFEST.filter(({ role, modal, name }) =>
       role === null || modal !== 'true' || name !== 'named')).toEqual([]);
+  });
+
+  it('keeps synthetic root and nested identities portable and rejects caller drift', () => {
+    const portableDir = path.join(SRC, 'components');
+    const portableFile = path.join(portableDir, 'PortableModal.tsx');
+    const portableSource = `
+      import { ModalOverlay } from './ModalOverlay';
+      export function PortableModal() {
+        return (
+          <>
+            <ModalOverlay role="dialog" aria-modal="true" aria-label="Portable root" />
+            <ModalOverlay>
+              <ModalOverlay role="dialog" aria-modal="true" aria-label="Portable child" />
+            </ModalOverlay>
+          </>
+        );
+      }
+    `;
+    const originalReaddirSync = fs.readdirSync.bind(fs);
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const readdirSpy = vi.spyOn(fs, 'readdirSync').mockImplementation(((...args: unknown[]) => {
+      if (path.resolve(String(args[0])) === SRC) {
+        return [{
+          name: 'PortableModal.tsx',
+          parentPath: portableDir,
+          isFile: () => true,
+        }];
+      }
+      return Reflect.apply(originalReaddirSync, fs, args);
+    }) as typeof fs.readdirSync);
+    const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((...args: unknown[]) => {
+      if (path.resolve(String(args[0])) === portableFile) return portableSource;
+      return Reflect.apply(originalReadFileSync, fs, args);
+    }) as typeof fs.readFileSync);
+
+    try {
+      const audit = auditModalOverlays();
+      expect(audit.map(({ identity }) => identity)).toEqual([
+        'components/PortableModal.tsx#1',
+        'components/PortableModal.tsx#2',
+        'components/PortableModal.tsx#3',
+      ]);
+      expect(audit[2].relation).toBe('nested:components/PortableModal.tsx#2');
+
+      const missingListedCaller = audit.slice(0, 1);
+      expect(missingListedCaller).not.toEqual(audit);
+      const unlistedCaller = [...audit, { ...audit[0], identity: 'components/PortableModal.tsx#3' }];
+      expect(unlistedCaller).not.toEqual(audit);
+    } finally {
+      readFileSpy.mockRestore();
+      readdirSpy.mockRestore();
+    }
   });
 
   it('discovers named and namespace import aliases', () => {

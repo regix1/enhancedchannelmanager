@@ -2,8 +2,8 @@
 
 THE INVARIANT
 -------------
-**The gate an engineer runs locally and the gate CI runs to decide the PR are
-the same invocation, and everything it excludes is named.**
+**The local gate has one canonical invocation, and everything it excludes is
+named.**
 
 WHY THIS EXISTS
 ---------------
@@ -13,7 +13,7 @@ Two backend gate invocations were circulating, differing by 72 collected tests:
 invocation                              collected   where it came from
 ======================================  ==========  ==================
 ``pytest tests/``                       11304       backend/CLAUDE.md prose
-``pytest --ignore=... -m "not slow"``   11232       .github/workflows/test.yml
+``pytest --ignore=... -m "not slow"``   11232       canonical local gate
 ======================================  ==========  ==================
 
 Nothing was failing, so this was an instrument gap and not a live defect. It is
@@ -24,13 +24,13 @@ was filed, and again at f9f7522: ``tests/e2e/`` is 10 files and
 ``tests/performance/`` is 2.)
 
 Prose gets copied and mutated. ``scripts/backend-gate.sh`` is the single
-invocation; this module is what stops it drifting away from CI, by parsing
-both and comparing them flag for flag.
+invocation; this module stops it drifting by parsing the script and comparing
+its flags with the exact local contract.
 
 WHAT THIS MODULE PINS
 ---------------------
 1. ``scripts/backend-gate.sh`` exists and is executable.
-2. Its pytest flags equal the flags in ``.github/workflows/test.yml``.
+2. Its pytest flags equal the canonical local contract.
 3. The tests deselected by ``-m "not slow"`` are exactly the two that are
    documented, so "2 deselected" is never an unexplained number again.
 4. ``backend/CLAUDE.md`` cites the script instead of spelling out flags.
@@ -47,13 +47,19 @@ import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 GATE_SCRIPT = REPO_ROOT / "scripts/backend-gate.sh"
-CI_WORKFLOW = REPO_ROOT / ".github/workflows/test.yml"
 BACKEND_CLAUDE_MD = REPO_ROOT / "backend/CLAUDE.md"
 
-#: Flags that are CI plumbing rather than gate semantics, normalised away
-#: before comparison. ``--junitxml`` writes the report the flake-PR-comment
-#: workflow consumes; it changes no test outcome.
-PLUMBING_PREFIXES = ("--junitxml",)
+#: The complete local gate contract. Presentation flags stay included because
+#: they preserve readable summaries and warnings behavior for local runs.
+EXPECTED_LOCAL_FLAGS: Set[str] = {
+    "--ignore=tests/e2e",
+    "--ignore=tests/performance",
+    "-m=not slow",
+    "--tb=short",
+    "--no-header",
+    "-p",
+    "no:warnings",
+}
 
 #: The complete set of tests excluded by ``-m "not slow"``, each with the
 #: reason it is excluded. "2 deselected" with no explanation is unreadable;
@@ -111,27 +117,8 @@ def _normalise(command: str) -> Set[str]:
             continue
         if tok in ("$@", "exec"):
             continue
-        if tok.startswith(PLUMBING_PREFIXES):
-            continue
         keep.append(tok)
     return set(keep)
-
-
-def ci_pytest_flags() -> Set[str]:
-    """The flags of the backend 'Run pytest' step in test.yml."""
-    lines = CI_WORKFLOW.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if "python -m pytest" in line and not line.strip().startswith("#"):
-            command = _join_continued_lines(lines, i)
-            # The backend gate is the one that ignores tests/e2e; the
-            # mcp-server job in the same file runs `pytest tests/`.
-            if "--ignore=tests/e2e" in command:
-                return _normalise(command)
-    raise AssertionError(
-        "Could not find the backend 'Run pytest' invocation in "
-        f"{CI_WORKFLOW}. If the workflow was restructured, update this parser "
-        "— do not delete the check."
-    )
 
 
 def gate_script_pytest_flags() -> Set[str]:
@@ -156,7 +143,7 @@ def gate_script_pytest_flags() -> Set[str]:
         f"Could not find a gate pytest invocation in {GATE_SCRIPT}. "
         f"Found {len(candidates)} pytest invocation(s), all of which pass "
         "--no-cov (i.e. all subset-mode). The gate must run with coverage, "
-        "as CI does."
+        "as the local gate requires."
     )
     assert len(gate) == 1, (
         f"{GATE_SCRIPT} has {len(gate)} non-subset pytest invocations. There "
@@ -240,28 +227,24 @@ def test_gate_script_pins_the_interpreter_rather_than_trusting_path():
 
 
 # --------------------------------------------------------------------------
-# Clause 2 — script and CI cannot drift apart
+# Clause 2 — the script cannot drift from the local contract
 # --------------------------------------------------------------------------
-def test_gate_script_invocation_matches_ci_exactly():
-    """INVARIANT: the local gate and the required check run the same thing."""
-    ci = ci_pytest_flags()
+def test_gate_script_invocation_matches_local_contract():
+    """INVARIANT: the local gate uses exactly the canonical local flags."""
     gate = gate_script_pytest_flags()
 
-    only_ci = sorted(ci - gate)
-    only_gate = sorted(gate - ci)
+    missing = sorted(EXPECTED_LOCAL_FLAGS - gate)
+    unexpected = sorted(gate - EXPECTED_LOCAL_FLAGS)
 
-    assert not (only_ci or only_gate), (
-        "scripts/backend-gate.sh has drifted from the CI backend gate.\n"
-        f"  in CI but not the script : {only_ci}\n"
-        f"  in the script but not CI : {only_gate}\n"
-        "  A local gate that runs a different set than the required check is "
-        "not a gate. Change both, or neither.\n"
-        "  (Pure-plumbing flags are normalised away: "
-        f"{list(PLUMBING_PREFIXES)}.)"
+    assert EXPECTED_LOCAL_FLAGS
+    assert not (missing or unexpected), (
+        "scripts/backend-gate.sh has drifted from the canonical local gate.\n"
+        f"  missing from the script : {missing}\n"
+        f"  unexpected in the script: {unexpected}\n"
+        "  Update the contract and its documentation together when the local "
+        "gate intentionally changes."
     )
-    # Guard against a vacuous pass if both parsers silently return nothing.
-    assert "--ignore=tests/e2e" in gate
-    assert '-m=not slow' in gate
+    assert len(gate) == len(EXPECTED_LOCAL_FLAGS)
 
 
 # --------------------------------------------------------------------------
@@ -312,9 +295,9 @@ def test_ignored_directories_are_named_in_the_script():
         "scripts/backend-gate.sh must say why tests/e2e is excluded "
         "(it needs a live container)."
     )
-    assert "tests/performance" in body and "perf-benchmarks" in body, (
+    assert "tests/performance" in body and "local performance suite" in body, (
         "scripts/backend-gate.sh must say why tests/performance is excluded "
-        "(it runs in the perf-benchmarks workflow)."
+        "(it seeds a large fixture and runs only when selected locally)."
     )
 
 
@@ -367,9 +350,10 @@ def test_coverage_subset_trap_is_documented_where_an_agent_will_hit_it():
 class TestParserMechanics:
     def test_normalise_strips_plumbing_and_wrapper_tokens(self):
         assert _normalise(
-            'exec "$PY" -m pytest --ignore=tests/e2e -m "not slow" '
-            '--junitxml=junit.xml "$@"'
-        ) == {"--ignore=tests/e2e", "-m=not slow"}
+            'exec "$PY" -m pytest --ignore=tests/e2e '
+            '--ignore=tests/performance -m "not slow" --tb=short '
+            '--no-header -p no:warnings "$@"'
+        ) == EXPECTED_LOCAL_FLAGS
 
     def test_normalise_keeps_marker_expression_attached_to_its_flag(self):
         # A bare set would make `-m "not slow"` and `-m "slow"` compare equal
@@ -382,12 +366,25 @@ class TestParserMechanics:
             "python -m pytest --ignore=tests/e2e -q"
         )
 
-    def test_detects_a_drifted_script(self):
+    @pytest.mark.parametrize(
+        ("dropped", "fragment"),
+        [
+            ("--ignore=tests/e2e", "--ignore=tests/e2e "),
+            ("--ignore=tests/performance", "--ignore=tests/performance "),
+            ("-m=not slow", '-m "not slow" '),
+        ],
+    )
+    def test_detects_a_drifted_script(self, dropped, fragment):
         """The comparison must be able to fail — prove it on synthetic input."""
-        ci = _normalise('pytest --ignore=tests/e2e --ignore=tests/performance -m "not slow"')
-        drifted = _normalise('pytest --ignore=tests/e2e -m "not slow"')
-        assert ci != drifted
-        assert sorted(ci - drifted) == ["--ignore=tests/performance"]
+        command = (
+            'pytest --ignore=tests/e2e --ignore=tests/performance '
+            '-m "not slow" --tb=short --no-header -p no:warnings'
+        )
+        canonical = _normalise(command)
+        drifted = _normalise(command.replace(fragment, "", 1))
+        assert canonical == EXPECTED_LOCAL_FLAGS
+        assert canonical != drifted
+        assert sorted(canonical - drifted) == [dropped]
 
     def test_slow_detection_finds_a_decorated_function(self, tmp_path):
         src = "import pytest\n\n@pytest.mark.slow\ndef test_x():\n    pass\n"
@@ -395,14 +392,6 @@ class TestParserMechanics:
         node = tree.body[-1]
         dec = node.decorator_list[0]
         assert isinstance(dec, ast.Attribute) and dec.attr == "slow"
-
-    def test_ci_parser_finds_the_backend_job_not_the_mcp_job(self):
-        flags = ci_pytest_flags()
-        assert "--ignore=tests/e2e" in flags, (
-            "The parser matched the wrong 'Run pytest' step — the mcp-server "
-            "job in the same workflow runs a plain `pytest tests/`."
-        )
-
 
 @pytest.mark.parametrize("name", sorted(DOCUMENTED_SLOW_TESTS))
 def test_documented_slow_test_file_exists(name):

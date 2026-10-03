@@ -46,10 +46,22 @@ _ARTWORK_LOAD: asyncio.Task | None = None
 _ARTWORK_CHECKED = float("-inf")
 _CATALOGUE_CACHE: dict = {}
 _CATALOGUE_LOADS: dict = {}
+_CATALOGUE_EXPIRIES: dict = {}
 _CATALOGUE_SLOTS = asyncio.Semaphore(4)
 _SOURCE_CACHE: dict = {}
 _SOURCE_LOADS: dict = {}
+_SOURCE_EXPIRIES: dict = {}
 _SOURCE_SLOTS = asyncio.Semaphore(2)
+
+
+def _expiry(value: datetime, field_name: str = "expires_at") -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be a datetime with an offset.")
+    return value.astimezone(timezone.utc)
+
+
+def _remaining(expires_at: datetime) -> float:
+    return (_expiry(expires_at) - datetime.now(timezone.utc)).total_seconds()
 
 
 def resolve_sources(epg_source_ids: list[int], sources: list[dict]) -> list[dict]:
@@ -146,6 +158,48 @@ def _resolve_group_assignments(channel_group_ids: list, channel_map: dict) -> li
     return assignments
 
 
+def _profile_owners(
+    profiles: list[dict], channel_map: dict, coverage: dict,
+) -> tuple[dict, set[int]]:
+    """Apply shared channel and outward guide identity ownership checks."""
+    from dummy_epg_engine import get_xmltv_id
+
+    owners, xmltv_owners, collisions, owner_conflicts = {}, {}, set(), set()
+    for profile in profiles:
+        if not profile.get("enabled", True):
+            continue
+        for assignment in profile.get("channel_assignments") or []:
+            channel_id = assignment.get("channel_id")
+            if channel_id not in channel_map:
+                continue
+            if channel_id in owners:
+                owner_conflicts.add(channel_id)
+                continue
+            owners[channel_id] = profile
+            xmltv_id = get_xmltv_id(assignment, channel_map[channel_id], profile)
+            if xmltv_id in xmltv_owners:
+                collisions.add(channel_id)
+                collisions.add(xmltv_owners[xmltv_id])
+            else:
+                xmltv_owners[xmltv_id] = channel_id
+    records = coverage.get("profiles")
+    if not isinstance(records, dict):
+        raise ValueError("Publication coverage requires profile readiness records.")
+    for profile in profiles:
+        record = records.get(str(profile.get("id")))
+        if record is None:
+            continue
+        owned = set(record.get("owned_channel_ids") or [])
+        reasons = set(record.get("reason_codes") or [])
+        if owned & owner_conflicts:
+            reasons.add("GUIDE_OWNERSHIP_CONFLICT")
+        if owned & collisions:
+            reasons.add("GUIDE_XMLTV_ID_COLLISION")
+        record["reason_codes"] = sorted(reasons)
+        record["can_publish"] = record.get("can_publish") is True and not reasons
+    return owners, collisions
+
+
 async def _fetch_all_channels(client=None) -> dict:
     """Fetch a complete channel list and expand stream IDs in one batch."""
     if client is None:
@@ -202,6 +256,66 @@ def programme_times(programme: ET.Element) -> tuple[datetime, datetime]:
     if values[1] <= values[0]:
         raise ValueError("Programme stop must follow its start.")
     return values[0], values[1]
+
+
+def _grid_time(value, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        return _expiry(value, field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be an ISO datetime with an offset.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO datetime with an offset.") from exc
+    return _expiry(parsed, field_name)
+
+
+def programme_matches(
+    programmes,
+    *,
+    xmltv_id: str,
+    channel_uuid: str | None,
+    title: str,
+    start: datetime | str,
+    stop: datetime | str,
+) -> bool:
+    """Return whether a grid row proves the exact generated programme."""
+    if not isinstance(programmes, list):
+        return False
+    if not isinstance(xmltv_id, str) or not xmltv_id:
+        raise ValueError("Generated XMLTV ID is required.")
+    if channel_uuid is not None and (not isinstance(channel_uuid, str) or not channel_uuid):
+        raise ValueError("Channel UUID must be a nonempty string when supplied.")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("Programme title is required.")
+    expected_start = _grid_time(start, "expected programme start")
+    expected_stop = _grid_time(stop, "expected programme stop")
+    if expected_stop <= expected_start:
+        raise ValueError("Expected programme stop must follow its start.")
+    identities = {xmltv_id}
+    if channel_uuid is not None:
+        identities.add(channel_uuid)
+    for programme in programmes:
+        if not isinstance(programme, Mapping):
+            continue
+        if programme.get("tvg_id") not in identities and programme.get("channel_uuid") not in identities:
+            continue
+        if programme.get("title") != title.strip():
+            continue
+        raw_start = programme.get("start_time")
+        raw_stop = programme.get("end_time")
+        if raw_start is None:
+            raw_start = programme.get("start")
+        if raw_stop is None:
+            raw_stop = programme.get("stop")
+        try:
+            actual_start = _grid_time(raw_start, "grid programme start")
+            actual_stop = _grid_time(raw_stop, "grid programme stop")
+        except ValueError:
+            continue
+        if actual_start == expected_start and actual_stop == expected_stop:
+            return True
+    return False
 
 
 def _event(programme: ET.Element, start: datetime) -> ParsedEvent:
@@ -313,7 +427,15 @@ def _identity(query: dict, source_id: int, tvg_id: str, header: ET.Element | Non
     return None
 
 
-async def _read_source(source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> dict:
+async def _read_source(
+    source: dict,
+    queries: list[dict],
+    start: datetime,
+    stop: datetime,
+    now: datetime,
+    *,
+    expires_at: datetime,
+) -> dict:
     """Keep only useful identities and strictly matched events from a complete XMLTV."""
     import tempfile
     from contextlib import aclosing
@@ -505,8 +627,12 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
             if retained > MAX_RETAINED or count > MAX_PROGRAMMES:
                 raise ValueError("Selected XMLTV schedules exceed the retained size limit.")
 
+    expires_at = _expiry(expires_at)
+    remaining = _remaining(expires_at)
+    if remaining <= 0:
+        raise TimeoutError("XMLTV source lifetime expired before transport.")
     try:
-        async with asyncio.timeout(SOURCE_TIMEOUT):
+        async with asyncio.timeout(min(SOURCE_TIMEOUT, remaining)):
             # Selection must not slow delivery of a time-limited upstream response.
             with tempfile.TemporaryFile(mode="w+b", dir=CONFIG_DIR) as spool:
                 download_started = time.monotonic()
@@ -530,9 +656,14 @@ async def _read_source(source: dict, queries: list[dict], start: datetime, stop:
                         diagnostics["write_max_ms"] = max(diagnostics["write_max_ms"], int(elapsed * 1000))
 
                 try:
+                    transport_time = _remaining(expires_at)
+                    if transport_time <= 0:
+                        raise TimeoutError("XMLTV source lifetime expired before transport.")
                     async with aclosing(stream_xmltv(
                         source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
-                        timeout=SOURCE_TIMEOUT, read_timeout=SOURCE_READ_TIMEOUT, diagnostics=diagnostics,
+                        timeout=min(SOURCE_TIMEOUT, transport_time),
+                        read_timeout=SOURCE_READ_TIMEOUT,
+                        diagnostics=diagnostics,
                     )) as chunks:
                         async for chunk in chunks:
                             offset = 0
@@ -660,18 +791,40 @@ def _error_reason(exc: Exception) -> str:
     return reason
 
 
-async def _load_source(key: str, source: dict, queries: list[dict], start: datetime, stop: datetime, now: datetime) -> None:
+async def _load_source(
+    key: str,
+    source: dict,
+    queries: list[dict],
+    start: datetime,
+    stop: datetime,
+    now: datetime,
+    *,
+    expires_at: datetime,
+) -> None:
     previous = _SOURCE_CACHE.get(key, {})
     attempt = 0
     diagnostics = {}
     totals = {}
+    expires_at = _expiry(expires_at)
     try:
-        async with _SOURCE_SLOTS:
-            async with asyncio.timeout(SOURCE_TIMEOUT):
+        remaining = _remaining(expires_at)
+        if remaining <= 0:
+            raise TimeoutError("XMLTV source lifetime expired before queue admission.")
+        async with asyncio.timeout(remaining):
+            async with _SOURCE_SLOTS:
+                if _remaining(expires_at) <= 0:
+                    raise TimeoutError("XMLTV source lifetime expired before transport.")
                 for attempt in range(1, 3):
                     diagnostics = {}
                     try:
-                        loaded = await _read_source(source, queries, start, stop, now)
+                        loaded = await _read_source(
+                            source,
+                            queries,
+                            start,
+                            stop,
+                            now,
+                            expires_at=expires_at,
+                        )
                         diagnostics = loaded.get("diagnostics", {})
                     except (Exception, asyncio.CancelledError) as exc:
                         diagnostics = getattr(exc, "diagnostics", {})
@@ -707,6 +860,7 @@ async def _load_source(key: str, source: dict, queries: list[dict], start: datet
                               "diagnostics": {**diagnostics, **totals, "attempts": attempt}}
     finally:
         _SOURCE_LOADS.pop(key, None)
+        _SOURCE_EXPIRIES.pop(key, None)
         total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
         for oldest in sorted(_SOURCE_CACHE, key=lambda item: _SOURCE_CACHE[item].get("checked", 0)):
             if total <= MAX_CACHE and len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
@@ -764,11 +918,23 @@ def can_cache(coverage: dict) -> bool:
                    for warning in channel.get("warnings", ()))
 
 
-async def _load_catalogue(key: tuple, client, link: int | None) -> dict:
+async def _load_catalogue(
+    key: tuple,
+    client,
+    link: int | None,
+    *,
+    expires_at: datetime,
+) -> dict:
     previous = _CATALOGUE_CACHE.get(key, {})
+    expires_at = _expiry(expires_at)
     try:
-        async with _CATALOGUE_SLOTS:
-            async with asyncio.timeout(120):
+        remaining = _remaining(expires_at)
+        if remaining <= 0:
+            raise TimeoutError("EPG catalogue lifetime expired before queue admission.")
+        async with asyncio.timeout(remaining):
+            async with _CATALOGUE_SLOTS:
+                if _remaining(expires_at) <= 0:
+                    raise TimeoutError("EPG catalogue lifetime expired before transport.")
                 if link is None:
                     value = await client.get_epg_sources()
                 else:
@@ -782,6 +948,7 @@ async def _load_catalogue(key: tuple, client, link: int | None) -> dict:
         _CATALOGUE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": True}
     finally:
         _CATALOGUE_LOADS.pop(key, None)
+        _CATALOGUE_EXPIRIES.pop(key, None)
         for oldest in sorted(_CATALOGUE_CACHE, key=lambda item: _CATALOGUE_CACHE[item].get("checked", 0)):
             if len(_CATALOGUE_CACHE) <= 2048:
                 break
@@ -913,7 +1080,8 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
     return programmes, result
 
 
-async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, now: datetime | None = None,
+async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, expires_at: datetime,
+                           now: datetime | None = None,
                            wait_for_sources: bool = False,
                            recover_sources: bool = False) -> tuple[list[dict], dict]:
     """Prepare the same selected schedules for HTTP, diagnostics and scheduled generation."""
@@ -922,7 +1090,9 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
     artwork, artwork_cache = {}, None
     realtime = now is None
     now = now or datetime.now(timezone.utc)
-    deadline = time.monotonic() + HTTP_WAIT
+    expires_at = _expiry(expires_at)
+    if _remaining(expires_at) <= 0:
+        raise TimeoutError("Guide preparation lifetime has expired.")
     enriched, coverage = [], {"generated_at": now.isoformat(), "window_start": None, "window_stop": None,
                               "sources": [], "channels": [], "profiles": {}}
     profiles = sorted(profiles, key=lambda profile: (profile.get("id") is None, profile.get("id") or 0))
@@ -950,12 +1120,16 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         for key in keys:
             entry = _CATALOGUE_CACHE.get(key, {})
             if time.monotonic() - entry.get("checked", float("-inf")) >= SOURCE_RETRY and key not in _CATALOGUE_LOADS:
-                _CATALOGUE_LOADS[key] = asyncio.create_task(_load_catalogue(key, client, key[1]))
+                _CATALOGUE_EXPIRIES[key] = expires_at
+                _CATALOGUE_LOADS[key] = asyncio.create_task(
+                    _load_catalogue(key, client, key[1], expires_at=expires_at)
+                )
+        if not wait_for_sources and any(key in _CATALOGUE_LOADS for key in keys):
+            await asyncio.sleep(0)
         catalogue = {key: _CATALOGUE_CACHE.get(key, {}) for key in keys}
         loading = {key: _CATALOGUE_LOADS[key] for key in keys if key in _CATALOGUE_LOADS}
-        if loading:
-            await asyncio.wait(loading.values(), timeout=130 * max(1, (len(loading) + 3) // 4) if wait_for_sources
-                               else max(0, deadline - time.monotonic()))
+        if loading and wait_for_sources:
+            await asyncio.wait(loading.values(), timeout=max(0, _remaining(expires_at)))
         for key, task in loading.items():
             if task.done() and not task.cancelled():
                 catalogue[key] = task.result()
@@ -1108,15 +1282,20 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         age = time.monotonic() - entry.get("checked", float("-inf"))
         if ((wait_for_sources or (recover_sources and recovery_needed))
                 and age >= (SOURCE_RETRY if recovery_needed else SOURCE_TTL)
-                and key not in _SOURCE_LOADS):
+                and key not in _SOURCE_LOADS
+                and _remaining(expires_at) > 0):
+            _SOURCE_EXPIRIES[key] = expires_at
             _SOURCE_LOADS[key] = asyncio.create_task(_load_source(
                 key, job["source"], [request["query"] for request in demand.values()],
                 min(request["start"] for request in demand.values()),
                 max(request["stop"] for request in demand.values()), now,
+                expires_at=expires_at,
             ))
+    if not wait_for_sources and any(job["key"] in _SOURCE_LOADS for job in jobs.values()):
+        await asyncio.sleep(0)
     pending = [_SOURCE_LOADS[job["key"]] for job in jobs.values() if job["key"] in _SOURCE_LOADS]
     if pending and wait_for_sources:
-        await asyncio.wait(pending, timeout=(SOURCE_TIMEOUT + 10) * max(1, (len(pending) + 1) // 2))
+        await asyncio.wait(pending, timeout=max(0, _remaining(expires_at)))
     for key in list(_SOURCE_CACHE):
         if len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
             break
@@ -1190,37 +1369,9 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, n
         profile_coverage["reason_codes"] = sorted(reasons)
         profile_coverage["can_publish"] = not reasons and len(resolved) == len(profile_coverage["source_ids"])
 
-    owners, xmltv_owners, collisions, owner_conflicts = {}, {}, set(), set()
-    for item in enriched:
-        if not item.get("enabled", True):
-            continue
-        for assignment in item.get("channel_assignments") or []:
-            channel_id = assignment.get("channel_id")
-            if channel_id not in channel_map:
-                continue
-            if channel_id in owners:
-                owner_conflicts.add(channel_id)
-                continue
-            owners[channel_id] = item
-            xmltv_id = get_xmltv_id(assignment, channel_map[channel_id], item)
-            if xmltv_id in xmltv_owners:
-                collisions.add(channel_id)
-                collisions.add(xmltv_owners[xmltv_id])
-            else:
-                xmltv_owners[xmltv_id] = channel_id
-    for item in enriched:
-        profile_id = item.get("id")
-        record = coverage["profiles"].get(str(profile_id))
-        if record is None:
-            continue
-        owned = set(record["owned_channel_ids"])
-        reasons = set(record["reason_codes"])
-        if owned & owner_conflicts:
-            reasons.add("GUIDE_OWNERSHIP_CONFLICT")
-        if owned & collisions:
-            reasons.add("GUIDE_XMLTV_ID_COLLISION")
-        record["reason_codes"] = sorted(reasons)
-        record["can_publish"] = record["can_publish"] and not reasons
+    ownership = _profile_owners(enriched, channel_map, coverage)
+    owners = ownership[0]
+    collisions = ownership[1]
     seen_channels = set()
     if prepared:
         from config import CONFIG_DIR

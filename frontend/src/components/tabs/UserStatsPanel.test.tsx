@@ -20,7 +20,7 @@
  * elements expose accessible names.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import {
   UserStatsPanel,
   formatLocalDayLabel,
@@ -561,28 +561,33 @@ describe('UserStatsPanel — chart data-table labels & in-progress marker (bd-1q
     });
     fireEvent.click(screen.getByRole('button', { name: /show chart data/i }));
 
-    // Raw YYYY-MM-DD should NOT appear in the table any more.
-    expect(screen.queryByText('2026-05-12')).not.toBeInTheDocument();
-    expect(screen.queryByText('2026-05-14')).not.toBeInTheDocument();
     // Localized short label should appear (en-US default in test env).
     // Match leniently — month name in the user's locale will lead, then day.
     const tbody = screen.getByRole('table', { name: /daily watch-minutes data table/i });
-    expect(tbody.textContent).toMatch(/May\s*1[234]/);
+    await waitFor(() => {
+      expect(tbody.textContent).toMatch(/May\s*1[234]/);
+    });
+
+    // Raw YYYY-MM-DD should NOT appear in the table any more.
+    expect(screen.queryByText('2026-05-12')).not.toBeInTheDocument();
+    expect(screen.queryByText('2026-05-14')).not.toBeInTheDocument();
   });
 
   it('marks "today" as in-progress in the data-table (yesterday is not marked)', async () => {
-    vi.mocked(api.getWatchTimeByUser).mockImplementation(async ({ groupBy } = {}) => {
-      if (groupBy === 'day') {
-        return {
-          data: [
-            { user_id: 1, username: 'a', attribution_source: 'dispatcharr', day: '2026-05-13', watch_seconds: 1200 },
-            { user_id: 1, username: 'a', attribution_source: 'dispatcharr', day: '2026-05-14', watch_seconds: 300 },
-          ],
-          meta: { from_iso: null, to_iso: null, group_by: 'day' as const, total_rows: 2 },
-          pagination: null,
-        };
-      }
-      return mockTotalsResponse;
+    const daily: WatchTimeDailyResponse = {
+      data: [
+        { user_id: 1, username: 'a', attribution_source: 'dispatcharr', day: '2026-05-13', watch_seconds: 1200 },
+        { user_id: 1, username: 'a', attribution_source: 'dispatcharr', day: '2026-05-14', watch_seconds: 300 },
+      ],
+      meta: { from_iso: null, to_iso: null, group_by: 'day', total_rows: 2 },
+      pagination: null,
+    };
+    let complete!: () => void;
+    const request = new Promise<WatchTimeDailyResponse>((resolve) => {
+      complete = () => resolve(daily);
+    });
+    vi.mocked(api.getWatchTimeByUser).mockImplementation(({ groupBy } = {}) => {
+      return groupBy === 'day' ? request : Promise.resolve(mockTotalsResponse);
     });
 
     render(<UserStatsPanel />);
@@ -590,11 +595,20 @@ describe('UserStatsPanel — chart data-table labels & in-progress marker (bd-1q
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /show chart data/i })).toBeInTheDocument();
     });
+    expect(screen.getByRole('table', { name: /daily watch-minutes data table/i }))
+      .toHaveTextContent('No data');
+    expect(screen.queryByTestId('chart-data-row-today')).not.toBeInTheDocument();
+
+    const completion = screen.findByTestId('chart-data-row-today');
+    await act(async () => {
+      complete();
+      await request;
+    });
 
     // Today's row in the data table carries an in-progress class/marker;
     // yesterday's does not. We assert via the "in-progress" cell content
     // tag so screen-reader users hear the asymmetry too.
-    const inProgressRow = screen.getByTestId('chart-data-row-today');
+    const inProgressRow = await completion;
     expect(inProgressRow).toBeInTheDocument();
     expect(inProgressRow.textContent).toMatch(/in progress/i);
 
