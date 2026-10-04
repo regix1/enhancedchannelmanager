@@ -233,6 +233,138 @@ async def test_reconciliation_prepares_profiles_with_their_stored_expiries():
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["rule", "profile"])
+async def test_reconciliation_allows_runtime_updates(change):
+    before = ATTEMPT_ADMITTED_AT - timedelta(minutes=1)
+    profile = _profile(
+        channel_assignments=[],
+        created_at=before.isoformat(),
+        updated_at=before.isoformat(),
+        last_generated_at=before.isoformat(),
+    )
+    rule = SimpleNamespace(
+        id=3, enabled=True, event_sync_config={"secondary": []},
+        last_run_at=before, match_count=1, updated_at=before,
+    )
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+    publication = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"profile:1": "<tv/>"},
+    )
+    stored = _publication("profile:1", pending=False)
+    publications = {"profile:1": stored}
+    task = EventVisibilityTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock()
+
+    async def prepare(*args, **kwargs):
+        assert kwargs["expires_at"] == ATTEMPT_EXPIRES_AT
+        if change == "rule":
+            rule.last_run_at = ATTEMPT_ADMITTED_AT
+            rule.match_count = 0
+            rule.updated_at = ATTEMPT_ADMITTED_AT
+        else:
+            profile["last_generated_at"] = ATTEMPT_ADMITTED_AT.isoformat()
+            profile["created_at"] = ATTEMPT_ADMITTED_AT.isoformat()
+            profile["updated_at"] = ATTEMPT_ADMITTED_AT.isoformat()
+        return [copy.deepcopy(profile)], coverage
+
+    async def publish(*args, **kwargs):
+        assert kwargs["expected"]["profile:1"]["attempt_id"] == "1" * 32
+        task._cancel_requested = True
+        return publication
+
+    preparation = AsyncMock(side_effect=prepare)
+    publishing = AsyncMock(side_effect=publish)
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [rule])) as load, \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=preparation), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=publishing), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("cache.get_cache"), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()) as emby:
+        outcome = await reconcile_profiles(task, wait_for_sources=False)
+
+    assert preparation.await_count == 1
+    assert load.call_count == 2
+    publishing.assert_awaited_once()
+    assert outcome.error == "CANCELLED"
+    assert outcome.details["published_profile_ids"] == [1]
+    assert "GUIDE_SOURCES_PENDING" not in outcome.details["reason_codes"]
+    client.update_channel.assert_not_awaited()
+    emby.assert_not_awaited()
+    if change == "rule":
+        assert rule.last_run_at == ATTEMPT_ADMITTED_AT
+        assert rule.match_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["pattern", "timezone", "secondary"])
+async def test_reconciliation_rejects_changed_config(change):
+    profile = _profile(channel_assignments=[])
+    rule = SimpleNamespace(
+        id=3, enabled=True, event_sync_config={"secondary": []},
+        updated_at=ATTEMPT_ADMITTED_AT,
+    )
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+    stored = _publication("profile:1", pending=False)
+    publications = {"profile:1": stored}
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock()
+    client.refresh_epg_source = AsyncMock()
+
+    async def prepare(*args, **kwargs):
+        assert kwargs["expires_at"] == ATTEMPT_EXPIRES_AT
+        if change == "pattern":
+            profile["title_pattern"] = rf"^(?P<title>Event {preparation.await_count})$"
+        elif change == "timezone":
+            profile["event_timezone"] = (
+                "America/Chicago" if preparation.await_count == 1 else "US/Eastern"
+            )
+        else:
+            rule.event_sync_config["secondary"].append({
+                "group_id": 5 + preparation.await_count,
+                "m3u_account_id": 2,
+            })
+        return [copy.deepcopy(profile)], coverage
+
+    preparation = AsyncMock(side_effect=prepare)
+    publishing = _publication_run(PublicationResult())
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [rule])) as load, \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=preparation), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=publishing), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()) as emby:
+        outcome = await reconcile_profiles(EventVisibilityTask(), wait_for_sources=False)
+
+    assert preparation.await_count == 2
+    assert load.call_count == 4
+    assert outcome.success is False
+    assert outcome.error == "GUIDE_SOURCES_PENDING"
+    assert outcome.details["reason_codes"] == ["GUIDE_SOURCES_PENDING"]
+    assert outcome.details["published_profile_ids"] == []
+    publishing.assert_not_awaited()
+    client.update_channel.assert_not_awaited()
+    client.refresh_epg_source.assert_not_awaited()
+    emby.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "url, expected",
     [

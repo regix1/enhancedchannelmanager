@@ -229,7 +229,12 @@ def _source_refresh_key(client, source: dict, scope: str) -> tuple[str, str, str
 
 
 def _profile_token(profiles: list[dict]) -> str:
-    value = json.dumps(profiles, sort_keys=True, separators=(",", ":"), default=str)
+    from services.epg_publication import _config_hash
+
+    value = json.dumps(
+        [_config_hash(profile) for profile in profiles],
+        sort_keys=True, separators=(",", ":"), default=str,
+    )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -239,7 +244,6 @@ def _rule_token(rules: list) -> str:
             "id": getattr(rule, "id", None),
             "enabled": getattr(rule, "enabled", None),
             "event_sync_config": getattr(rule, "event_sync_config", None),
-            "updated_at": getattr(rule, "updated_at", None),
         }
         for rule in rules
     ]

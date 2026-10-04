@@ -442,7 +442,7 @@ async def _read_source(
     from config import CONFIG_DIR, get_settings
     from stream_normalization import strip_country_prefix
     alias_index = build_team_alias_index(get_settings().event_sync_team_aliases or [])
-    dated_queries = [query for query in queries if query["event"].start is not None]
+    dated_queries = [query for query in queries if query["dynamic"] and query["event"].start is not None]
     ended_queries = [query for query in dated_queries if query["dynamic"]]
     query_terms = {id(query): set(normalize_alias_term(query["event"].title or ""))
                    for query in dated_queries}
@@ -459,7 +459,7 @@ async def _read_source(
         if not query["dynamic"] and query["name"]:
             named_queries.setdefault(query["name"], []).append(query)
     parser = ET.XMLPullParser(events=("start", "end"))
-    root = None
+    root, depth = None, 0
     headers, rows, warnings = {}, {}, set()
     matches = {}
     ended = {}
@@ -476,7 +476,7 @@ async def _read_source(
     event_headers = bool(ended_queries)
 
     def consume(chunk: bytes | None, select: bool = True) -> None:
-        nonlocal root, retained, count, pending_size, prefix, invalid_utf8, forbidden
+        nonlocal root, depth, retained, count, pending_size, prefix, invalid_utf8, forbidden
         if chunk is not None:
             prefix = (prefix + chunk)[:1024]
             forbidden |= re.search(rb"[\x01-\x08\x0b\x0c\x0e-\x1f]", chunk) is not None
@@ -492,15 +492,19 @@ async def _read_source(
         else:
             parser.feed(chunk)
         for event, element in parser.read_events():
-            if event == "start" and root is None:
-                root = element
-                diagnostics["root"] = "tv" if root.tag == "tv" else "other"
-                if root.tag != "tv":
-                    raise ValueError("XMLTV root must be tv.")
-            if event != "end":
+            if event == "start":
+                depth += 1
+                if root is None:
+                    root = element
+                    diagnostics["root"] = "tv" if root.tag == "tv" else "other"
+                    if root.tag != "tv":
+                        raise ValueError("XMLTV root must be tv.")
+                continue
+            depth -= 1
+            if depth != 1:
                 continue
             if not select:
-                if root is not None and element in root:
+                if root is not None:
                     root.remove(element)
                     pending_size = 0
                 continue
@@ -621,7 +625,7 @@ async def _read_source(
                 if root is not None:
                     root.remove(element)
                     pending_size = 0
-            elif root is not None and element in root:
+            elif root is not None:
                 root.remove(element)
                 pending_size = 0
             if retained > MAX_RETAINED or count > MAX_PROGRAMMES:
@@ -682,7 +686,7 @@ async def _read_source(
                 # Reject incomplete documents before spending time matching their programmes.
                 for select, phase in ((False, "validation"), (True, "selection")):
                     parser = ET.XMLPullParser(events=("start", "end"))
-                    root, pending_size = None, 0
+                    root, depth, pending_size = None, 0, 0
                     decoder = codecs.getincrementaldecoder("utf-8")()
                     prefix, invalid_utf8, forbidden = b"", False, False
                     phase_started = time.monotonic()

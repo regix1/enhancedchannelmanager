@@ -2793,6 +2793,55 @@ async def test_selection_identity_checks_follow_candidates_not_query_cross_produ
 
 
 @pytest.mark.asyncio
+async def test_static_selection_preserves_nested_xml_without_root_walks(monkeypatch):
+    from dataclasses import replace
+
+    walks = []
+
+    class Element(ET.Element):
+        def __contains__(self, element):
+            walks.append(len(self))
+            return any(child is element for child in self)
+
+    parser = ET.XMLPullParser
+    monkeypatch.setattr(
+        guides.ET, "XMLPullParser",
+        lambda **kwargs: parser(
+            _parser=ET.XMLParser(target=ET.TreeBuilder(element_factory=Element)), **kwargs,
+        ),
+    )
+    queries = [guides._query(
+        profile(), channel(id=index, name=f"Mapped {index}", tvg_id=""),
+        {"channel_id": index, "source_id": 50, "tvg_id": f"mapped-{index}"}, NOW,
+    ) for index in range(100)]
+    for query in queries:
+        query["event"] = replace(query["event"], start=NOW, title="Mapped show")
+        assert query["dynamic"] is False
+    children = '<sub-title>Highlights</sub-title><category>Sports</category><icon src="https://images.example/icon.jpg"/>'
+    selected = [programme(f"mapped-{index}", f"Mapped show {index}", children=children)
+                for index in range(100)]
+    unrelated = [programme(f"other-{index}", "Unrelated show", children=children)
+                 for index in range(1000)]
+    unrelated[0].set("start", NOW.strftime("%Y%m%d%H%M%S %z"))
+    headers = "".join(f'<channel id="mapped-{index}"><display-name>Mapped {index}</display-name></channel>'
+                      for index in range(100))
+    document = feed(*selected, *unrelated, headers=headers)
+    assert 64 * 1024 < len(document) < 1 << 20
+    install_feed(monkeypatch, document)
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+
+    assert walks == []
+    assert score.call_count == 0
+    assert set(loaded["rows"]) == {f"mapped-{index}" for index in range(100)}
+    for index, row in enumerate(selected):
+        assert ET.tostring(loaded["rows"][f"mapped-{index}"][0]) == ET.tostring(row)
+    diagnostics = loaded["diagnostics"]
+    assert diagnostics["xml_complete"] is True
+    assert diagnostics["validation_bytes"] == diagnostics["selection_bytes"] == len(document)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["wire", "decoded", "declaration", "gzip", "transport", "cancel"])
 async def test_source_staging_discards_residual_bytes_after_upstream_failure(monkeypatch, tmp_path, failure):
     import tempfile
