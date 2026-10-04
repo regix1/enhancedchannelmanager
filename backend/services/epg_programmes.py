@@ -7,6 +7,7 @@ import copy
 from collections.abc import Mapping
 import hashlib
 import json
+import math
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -1106,6 +1107,8 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     unresolved_links = set()
     pending_links = set()
     catalogue_status = "pending"
+    mapping_captured_at = ""
+    catalogue_checks = {}
     if selected_ids:
         channel_ids = set()
         for profile in profiles:
@@ -1139,6 +1142,70 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
                 catalogue[key] = task.result()
             else:
                 catalogue[key] = _CATALOGUE_CACHE.get(key, catalogue[key])
+        mapping_captured_at = datetime.now(timezone.utc).isoformat()
+        mapping_checked_at = time.monotonic()
+        catalogue_sources = catalogue.get((client, None), {}).get("value") or []
+        for key in keys:
+            link = key[1]
+            if link is None:
+                continue
+            entry = catalogue.get(key, {})
+            active = key in _CATALOGUE_LOADS
+            error = bool(entry.get("error"))
+            value_present = "value" in entry
+            cached = bool(entry.get("value"))
+            row = entry.get("value") if isinstance(entry.get("value"), dict) else None
+            row_id = row.get("id") if row else None
+            if isinstance(row_id, bool) or not isinstance(row_id, int):
+                row_id = None
+            source_id = None
+            if row:
+                try:
+                    source_id = _epg_source_id(row.get("epg_source") or row.get("epg_source_id"))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(source_id, bool) or not isinstance(source_id, int):
+                source_id = None
+            source_kind = "unknown"
+            source = next(
+                (item for item in catalogue_sources if item.get("id") == source_id),
+                None,
+            ) if source_id is not None else None
+            if source is not None and source_id is not None:
+                try:
+                    source_url = source.get("url")
+                    urlsplit(source_url or "")
+                    if _dummy_source(source_id, [source]):
+                        source_kind = "generated"
+                    elif isinstance(source_url, str) and source_url:
+                        source_kind = "external"
+                except (TypeError, ValueError):
+                    pass
+            checked = entry.get("checked")
+            checked_age = None
+            if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                    and math.isfinite(checked)):
+                checked_age = max(0.0, mapping_checked_at - checked)
+            load_expires_at = None
+            load_expiry = _CATALOGUE_EXPIRIES.get(key)
+            if (active and isinstance(load_expiry, datetime) and load_expiry.tzinfo is not None
+                    and load_expiry.utcoffset() is not None):
+                load_expires_at = load_expiry.isoformat()
+            pending = active or error or not value_present
+            catalogue_checks[link] = {
+                "active": active,
+                "error": error,
+                "value_present": value_present,
+                "cached": cached,
+                "cached_row_id": row_id,
+                "cached_row_matches_link": row_id == link if row_id is not None else None,
+                "cached_source_id": source_id,
+                "cached_source_kind": source_kind,
+                "checked_age_seconds": checked_age,
+                "load_expires_at": load_expires_at,
+                "pending": pending,
+                "unresolved": pending and not cached,
+            }
         sources = catalogue.get((client, None), {}).get("value") or []
         for key in keys:
             entry = catalogue.get(key, {})
@@ -1212,6 +1279,60 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         except ValueError:
             queries = []
             profile_coverage["reason_codes"].append("GUIDE_CONFIG_INVALID")
+        profile_links = {}
+        for query in queries:
+            if query["dynamic"]:
+                continue
+            channel_id = query["channel_id"]
+            link = channel_map[channel_id].get("epg_data_id") or channel_map[channel_id].get("epg_data")
+            if isinstance(link, int) and not isinstance(link, bool):
+                profile_links.setdefault(link, []).append(channel_id)
+        pending_profile_links = sorted(
+            link for link in profile_links if catalogue_checks[link]["pending"]
+        )
+        if pending_profile_links:
+            profile_coverage["mapping_checks"] = {
+                "captured_at": mapping_captured_at,
+                "counts": {
+                    "linked": len(profile_links),
+                    "pending": len(pending_profile_links),
+                    "active_cached": sum(
+                        check["active"] and check["cached"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                    "active_uncached": sum(
+                        check["active"] and not check["cached"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                    "error_cached": sum(
+                        check["error"] and check["cached"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                    "error_uncached": sum(
+                        check["error"] and not check["cached"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                    "ready_value": sum(
+                        not check["pending"] and check["cached"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                    "unresolved": sum(
+                        check["unresolved"]
+                        for link, check in catalogue_checks.items() if link in profile_links
+                    ),
+                },
+                "links": [
+                    {
+                        "channel_id": min(profile_links[link]),
+                        "link_id": link,
+                        **{
+                            name: value for name, value in catalogue_checks[link].items()
+                            if name not in {"pending", "unresolved"}
+                        },
+                    }
+                    for link in pending_profile_links[:5]
+                ],
+            }
         if any(
             not query["dynamic"]
             and isinstance((link := (

@@ -307,6 +307,83 @@ async def test_reconciliation_allows_runtime_updates(change):
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_copies_only_present_profile_mapping_checks():
+    profiles = [
+        _profile(id=7, name="Arena Seven", channel_assignments=[]),
+        _profile(id=12, name="Arena Twelve", channel_assignments=[]),
+    ]
+    mapping = {
+        "captured_at": "2026-10-04T19:00:00+00:00",
+        "counts": {
+            "linked": 1,
+            "pending": 1,
+            "active_cached": 1,
+            "active_uncached": 0,
+            "error_cached": 0,
+            "error_uncached": 0,
+            "ready_value": 0,
+            "unresolved": 0,
+        },
+        "links": [{
+            "channel_id": 70,
+            "link_id": 700,
+            "active": True,
+            "error": False,
+            "value_present": True,
+            "cached": True,
+            "cached_row_id": 700,
+            "cached_row_matches_link": True,
+            "cached_source_id": 50,
+            "cached_source_kind": "external",
+            "checked_age_seconds": 61.0,
+            "load_expires_at": ATTEMPT_EXPIRES_AT.isoformat(),
+        }],
+    }
+    publications = {
+        f"profile:{profile['id']}": _publication(f"profile:{profile['id']}", pending=False)
+        for profile in profiles
+    }
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    client.update_channel = AsyncMock()
+    task = EventVisibilityTask()
+
+    async def prepare(selected, *args, **kwargs):
+        profile_id = selected[0]["id"]
+        record = {"can_publish": True, "reason_codes": []}
+        if profile_id == 7:
+            record["mapping_checks"] = mapping
+        return selected, {"profiles": {str(profile_id): record}, "channels": []}
+
+    async def publish(*args, **kwargs):
+        task._cancel_requested = True
+        return PublicationResult(
+            published_profile_ids=(7, 12),
+            xmltv_by_scope={"profile:7": "<tv/>", "profile:12": "<tv/>"},
+        )
+
+    with patch("tasks.event_visibility._load_profiles", return_value=(profiles, [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(side_effect=prepare)), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("cache.get_cache"), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()):
+        outcome = await reconcile_profiles(task, wait_for_sources=False)
+
+    assert outcome.error == "CANCELLED"
+    assert outcome.details["mapping_checks"] == {"7": mapping}
+    assert "12" not in outcome.details["mapping_checks"]
+    assert outcome.details["mapping_checks"]["7"] is not mapping
+    mapping["counts"]["linked"] = 99
+    assert outcome.details["mapping_checks"]["7"]["counts"]["linked"] == 1
+    assert outcome.details["mapping_checks"]["7"]["captured_at"] == "2026-10-04T19:00:00+00:00"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["pattern", "timezone", "secondary"])
 async def test_reconciliation_rejects_changed_config(change):
     profile = _profile(channel_assignments=[])
@@ -1238,6 +1315,7 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(flow_case)
             "unavailable_profile_ids": [],
             "publication_times": {"1": "2026-09-20T12:00:00+00:00"},
             "source_reason_codes": {"1": []},
+            "mapping_checks": {},
             "idle_channel_count": 1,
             "active_channel_count": 1,
             "unknown_channel_count": 0,

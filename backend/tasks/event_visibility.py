@@ -673,6 +673,7 @@ def _result_details(profile_count: int) -> dict:
         "unavailable_profile_ids": [],
         "publication_times": {},
         "source_reason_codes": {},
+        "mapping_checks": {},
         "idle_channel_count": 0,
         "active_channel_count": 0,
         "unknown_channel_count": 0,
@@ -1083,9 +1084,10 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     observations[profile_id] = plan["observations"]
             for profile in prepared:
                 profile_id = profile["id"]
-                details["source_reason_codes"][str(profile_id)] = list(
-                    coverage.get("profiles", {}).get(str(profile_id), {}).get("reason_codes") or []
-                )
+                profile_coverage = coverage.get("profiles", {}).get(str(profile_id), {})
+                details["source_reason_codes"][str(profile_id)] = list(profile_coverage.get("reason_codes") or [])
+                if "mapping_checks" in profile_coverage:
+                    details["mapping_checks"][str(profile_id)] = copy.deepcopy(profile_coverage["mapping_checks"])
             for key in scope_failures:
                 for profile in prepared:
                     if key in {_scope_key(scope) for scope in configs.get(profile["id"], {}).get("secondary", [])}:

@@ -885,6 +885,282 @@ async def test_slow_catalogue_continues_once_after_public_wait_expires(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_active_cached_mapping_reports_the_frozen_retry_state(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    selected = profile()
+    channels = {1: channel(epg_data_id=90)}
+    install_feed(monkeypatch, feed(programme()))
+
+    _, ready = await guides.prepare_profiles(
+        [selected], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert ready["profiles"]["1"]["can_publish"] is True
+    guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
+
+    async def reread(link):
+        assert link == 90
+        started.set()
+        await release.wait()
+        return row
+
+    upstream.get_epg_data_by_id.side_effect = reread
+    _, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
+    await started.wait()
+
+    observation = coverage["profiles"]["1"]["mapping_checks"]
+    assert observation["counts"] == {
+        "linked": 1,
+        "pending": 1,
+        "active_cached": 1,
+        "active_uncached": 0,
+        "error_cached": 0,
+        "error_uncached": 0,
+        "ready_value": 0,
+        "unresolved": 0,
+    }
+    assert observation["links"] == [{
+        "channel_id": 1,
+        "link_id": 90,
+        "active": True,
+        "error": False,
+        "value_present": True,
+        "cached": True,
+        "cached_row_id": 90,
+        "cached_row_matches_link": True,
+        "cached_source_id": 50,
+        "cached_source_kind": "external",
+        "checked_age_seconds": observation["links"][0]["checked_age_seconds"],
+        "load_expires_at": EXPIRES_AT.isoformat(),
+    }]
+    assert observation["links"][0]["checked_age_seconds"] >= guides.SOURCE_RETRY
+    assert coverage["profiles"]["1"]["can_publish"] is False
+    assert coverage["profiles"]["1"]["reason_codes"] == [
+        "GUIDE_MAPPING_UNAVAILABLE", "GUIDE_SOURCES_PENDING",
+    ]
+
+    release.set()
+    await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
+
+
+@pytest.mark.asyncio
+async def test_cold_failed_and_ready_mappings_report_independent_counts(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    rows = [
+        {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"},
+        {"id": 91, "epg_source": 50, "tvg_id": "ESPN.2"},
+    ]
+    upstream = client(rows=rows)
+    selected = profile()
+    channels = {1: channel(epg_data_id=90)}
+    install_feed(monkeypatch, feed(programme()))
+
+    async def first_read(link):
+        assert link == 90
+        started.set()
+        await release.wait()
+        return rows[0]
+
+    upstream.get_epg_data_by_id.side_effect = first_read
+    _, cold = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
+    await started.wait()
+    check = cold["profiles"]["1"]["mapping_checks"]
+    assert check["counts"]["active_uncached"] == 1
+    assert check["counts"]["unresolved"] == 1
+    assert check["links"][0]["value_present"] is False
+    assert check["links"][0]["cached_row_id"] is None
+    assert check["links"][0]["checked_age_seconds"] is None
+
+    release.set()
+    await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
+    upstream.get_epg_data_by_id.side_effect = lambda link: rows[0]
+    _, ready = await guides.prepare_profiles(
+        [selected], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert "mapping_checks" not in ready["profiles"]["1"]
+    assert ready["profiles"]["1"]["can_publish"] is True
+
+    def fail_second(link):
+        if link == 91:
+            raise RuntimeError("catalogue-secret")
+        return rows[0]
+
+    upstream.get_epg_data_by_id.side_effect = fail_second
+    mixed_channels = {
+        1: channels[1],
+        2: channel(id=2, name="ESPN 2", tvg_id="ESPN.2", epg_data_id=91),
+    }
+    _, mixed = await guides.prepare_profiles(
+        [selected], mixed_channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    observation = mixed["profiles"]["1"]["mapping_checks"]
+    assert observation["counts"] == {
+        "linked": 2,
+        "pending": 1,
+        "active_cached": 0,
+        "active_uncached": 0,
+        "error_cached": 0,
+        "error_uncached": 1,
+        "ready_value": 1,
+        "unresolved": 1,
+    }
+    assert observation["links"][0]["link_id"] == 91
+
+
+@pytest.mark.asyncio
+async def test_mapping_checks_count_queued_links_and_bound_the_sample(monkeypatch):
+    release = asyncio.Event()
+    rows = [
+        {"id": link, "epg_source": 50, "tvg_id": f"ESPN.{link}"}
+        for link in range(1, 9)
+    ]
+    upstream = client(rows=rows)
+
+    def initial_read(link):
+        if link == 20:
+            raise RuntimeError("dynamic link unavailable")
+        return next(row for row in rows if row["id"] == link)
+
+    upstream.get_epg_data_by_id.side_effect = initial_read
+    channels = {
+        link: channel(id=link, name=f"ESPN {link}", tvg_id=f"ESPN.{link}", epg_data_id=link)
+        for link in range(1, 9)
+    }
+    channels[9] = channel(id=9, name="ESPN duplicate", epg_data_id=1)
+    channels[20] = channel(
+        id=20,
+        name="ONE Fight Night 47 Stamp vs. Flores @ Sep 04 09:00 PM",
+        tvg_id="",
+        epg_data_id=20,
+    )
+    channels[99] = channel(id=99, channel_group_id=66, epg_data_id=99)
+    install_feed(monkeypatch, feed(programme()))
+    await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    for link in [*range(1, 9), 20]:
+        guides._CATALOGUE_CACHE[(upstream, link)]["checked"] -= guides.SOURCE_RETRY + 1
+
+    async def reread(link):
+        await release.wait()
+        if link == 20:
+            raise RuntimeError("dynamic link unavailable")
+        return next(row for row in rows if row["id"] == link)
+
+    upstream.get_epg_data_by_id.side_effect = reread
+    _, coverage = await guides.prepare_profiles([profile()], channels, upstream, now=NOW)
+    observation = coverage["profiles"]["1"]["mapping_checks"]
+    assert observation["counts"]["linked"] == 8
+    assert observation["counts"]["pending"] == 8
+    assert observation["counts"]["active_cached"] == 8
+    assert [item["link_id"] for item in observation["links"]] == [1, 2, 3, 4, 5]
+    assert observation["links"][0]["channel_id"] == 1
+    assert len(guides._CATALOGUE_LOADS) == 9
+
+    release.set()
+    await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
+
+
+@pytest.mark.asyncio
+async def test_mapping_capture_stays_fixed_while_later_preparation_waits(monkeypatch):
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    channels = {1: channel(epg_data_id=90)}
+    install_feed(monkeypatch, feed(programme()))
+    await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] = 100.0
+    monkeypatch.setattr(guides.time, "monotonic", lambda: 200.0)
+    catalogue_started, release_catalogue = asyncio.Event(), asyncio.Event()
+    compose_started, release_compose = asyncio.Event(), asyncio.Event()
+
+    async def reread(_link):
+        catalogue_started.set()
+        await release_catalogue.wait()
+        return row
+
+    real_to_thread = asyncio.to_thread
+
+    async def pause_compose(function, *args):
+        if function is guides._compose:
+            compose_started.set()
+            await release_compose.wait()
+        return await real_to_thread(function, *args)
+
+    upstream.get_epg_data_by_id.side_effect = reread
+    monkeypatch.setattr(guides.asyncio, "to_thread", pause_compose)
+    preparation = asyncio.create_task(guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW,
+    ))
+    await catalogue_started.wait()
+    await compose_started.wait()
+    retry = guides._CATALOGUE_LOADS[(upstream, 90)]
+    release_catalogue.set()
+    await retry
+    assert (upstream, 90) not in guides._CATALOGUE_LOADS
+    release_compose.set()
+    _, coverage = await preparation
+
+    observation = coverage["profiles"]["1"]["mapping_checks"]
+    assert observation["captured_at"] != NOW.isoformat()
+    assert observation["links"][0]["active"] is True
+    assert observation["links"][0]["checked_age_seconds"] == 100.0
+    assert observation["links"][0]["load_expires_at"] == EXPIRES_AT.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_mapping_checks_expose_only_bounded_identity_primitives(monkeypatch):
+    secret = "private-catalogue-sentinel"
+    sources = [
+        source(50, name=secret, url=f"https://guide.invalid/{secret}.xml"),
+        source(51, name=secret, url="/api/dummy-epg/xmltv/3"),
+        source(52, name=secret, url="http://["),
+    ]
+    upstream = client(sources=sources)
+    checked = time.monotonic()
+    guides._CATALOGUE_CACHE[(upstream, None)] = {
+        "value": sources, "checked": checked, "error": False,
+    }
+    for link, source_id, row_id, tvg_id in [
+        (90, 50, 999, secret),
+        (91, 51, 91, ""),
+        (92, 52, 92, ""),
+    ]:
+        guides._CATALOGUE_CACHE[(upstream, link)] = {
+            "value": {"id": row_id, "epg_source": source_id, "tvg_id": tvg_id},
+            "checked": checked,
+            "error": True,
+            "exception": secret,
+        }
+    channels = {
+        link - 89: channel(id=link - 89, name=f"ESPN {link}", epg_data_id=link)
+        for link in (90, 91, 92)
+    }
+    install_feed(monkeypatch, feed(programme()))
+
+    _, coverage = await guides.prepare_profiles([profile()], channels, upstream, now=NOW)
+    observation = coverage["profiles"]["1"]["mapping_checks"]
+    assert set(observation) == {"captured_at", "counts", "links"}
+    assert set(observation["counts"]) == {
+        "linked", "pending", "active_cached", "active_uncached",
+        "error_cached", "error_uncached", "ready_value", "unresolved",
+    }
+    assert all(set(item) == {
+        "channel_id", "link_id", "active", "error", "value_present", "cached",
+        "cached_row_id", "cached_row_matches_link", "cached_source_id",
+        "cached_source_kind", "checked_age_seconds", "load_expires_at",
+    } for item in observation["links"])
+    assert [item["cached_source_kind"] for item in observation["links"]] == [
+        "external", "generated", "unknown",
+    ]
+    assert observation["links"][0]["cached_row_id"] == 999
+    assert observation["links"][0]["cached_row_matches_link"] is False
+    assert secret not in json.dumps(observation)
+
+
+@pytest.mark.asyncio
 async def test_failed_catalogue_reports_error_and_retries_after_backoff(monkeypatch):
     upstream = client()
     upstream.get_epg_sources.side_effect = RuntimeError("unreachable")
@@ -985,6 +1261,33 @@ async def test_known_current_mapping_survives_a_failed_recheck(monkeypatch):
     assert coverage["sources"][0]["status"] == "ready"
     assert "GUIDE_MAPPING_UNAVAILABLE" in coverage["profiles"]["1"]["reason_codes"]
     assert not guides.can_cache(coverage)
+    observation = coverage["profiles"]["1"]["mapping_checks"]
+    assert observation["counts"]["error_cached"] == 1
+    assert observation["counts"]["active_cached"] == 0
+    assert observation["links"][0]["active"] is False
+    assert observation["links"][0]["error"] is True
+    assert observation["links"][0]["cached"] is True
+    assert observation["links"][0]["cached_row_id"] == 90
+    assert observation["links"][0]["load_expires_at"] is None
+
+    guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def reread(_link):
+        started.set()
+        await release.wait()
+        return {"id": 90, "epg_source": 50, "tvg_id": "111"}
+
+    upstream.get_epg_data_by_id.side_effect = reread
+    _, retrying = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
+    await started.wait()
+    observation = retrying["profiles"]["1"]["mapping_checks"]
+    assert observation["counts"]["active_cached"] == 1
+    assert observation["counts"]["error_cached"] == 1
+    assert observation["links"][0]["active"] is True
+    assert observation["links"][0]["error"] is True
+    release.set()
+    await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
 
 
 @pytest.mark.asyncio
