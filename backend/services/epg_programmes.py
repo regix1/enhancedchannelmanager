@@ -32,6 +32,7 @@ MAX_DOWNLOAD = 4 * 1024 * 1024 * 1024
 MAX_DECODED = 4 * 1024 * 1024 * 1024
 SOURCE_TIMEOUT = 24 * 60 * 60.0
 SOURCE_READ_TIMEOUT = 300.0
+CATALOGUE_TIMEOUT = 120.0
 # Keep guide freshness independent of the time allowed for a replacement scan.
 SOURCE_MAX_AGE = 80 * 60
 MAX_QUERIES = 4096
@@ -926,11 +927,14 @@ def can_cache(coverage: dict) -> bool:
 async def _load_catalogue(
     key: tuple,
     client,
-    link: int | None,
     *,
     expires_at: datetime,
 ) -> dict:
-    previous = _CATALOGUE_CACHE.get(key, {})
+    owner = asyncio.current_task()
+    claimed = [key] if key[1] is None else [(client, link) for link in key[1]]
+    previous = {item: _CATALOGUE_CACHE.get(item, {}) for item in claimed}
+    completed = {}
+    failed = False
     expires_at = _expiry(expires_at)
     try:
         remaining = _remaining(expires_at)
@@ -940,28 +944,207 @@ async def _load_catalogue(
             async with _CATALOGUE_SLOTS:
                 if _remaining(expires_at) <= 0:
                     raise TimeoutError("EPG catalogue lifetime expired before transport.")
-                if link is None:
-                    value = await client.get_epg_sources()
-                else:
-                    row = await client.get_epg_data_by_id(link)
-                    value = {name: row.get(name) for name in ("id", "epg_source", "epg_source_id", "tvg_id")}
-        _CATALOGUE_CACHE[key] = {"value": value, "checked": time.monotonic(), "error": False}
+                read_expires_at = min(
+                    expires_at,
+                    type(expires_at).fromtimestamp(
+                        (datetime.now(timezone.utc) + timedelta(seconds=CATALOGUE_TIMEOUT)).timestamp(),
+                        timezone.utc,
+                    ),
+                )
+                for item in claimed:
+                    if _CATALOGUE_LOADS.get(item) is owner:
+                        _CATALOGUE_EXPIRIES[item] = read_expires_at
+                async with asyncio.timeout(max(0, _remaining(read_expires_at))):
+                    if key[1] is None:
+                        value = await client.get_epg_sources()
+                        completed[key] = {
+                            "value": value,
+                            "checked": time.monotonic(),
+                            "error": False,
+                        }
+                    else:
+                        ids = frozenset(key[1])
+                        rows = await client.get_epg_data(
+                            max_results=len(ids), ids=ids, expires_at=read_expires_at,
+                        )
+                        if not isinstance(rows, list):
+                            raise ValueError("Dispatcharr EPG row selection is unavailable")
+                        selected = {}
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            link = row.get("id")
+                            source_id = _epg_source_id(
+                                row.get("epg_source") or row.get("epg_source_id")
+                            )
+                            tvg_id = row.get("tvg_id")
+                            if (type(link) is int and link in ids
+                                    and type(source_id) is int and source_id > 0
+                                    and isinstance(tvg_id, str) and tvg_id.strip()):
+                                selected[link] = {
+                                    name: row.get(name)
+                                    for name in ("id", "epg_source", "epg_source_id", "tvg_id")
+                                }
+                        checked = time.monotonic()
+                        for item in claimed:
+                            link = item[1]
+                            if link in selected:
+                                completed[item] = {
+                                    "value": selected[link],
+                                    "checked": checked,
+                                    "error": False,
+                                }
+                            else:
+                                completed[item] = {
+                                    **previous[item],
+                                    "checked": checked,
+                                    "error": True,
+                                }
     except asyncio.CancelledError:
-        _CATALOGUE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": True}
+        failed = True
         raise
     except Exception:
-        _CATALOGUE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": True}
+        failed = True
     finally:
-        _CATALOGUE_LOADS.pop(key, None)
-        _CATALOGUE_EXPIRIES.pop(key, None)
+        if failed:
+            checked = time.monotonic()
+            completed = {
+                item: {**previous[item], "checked": checked, "error": True}
+                for item in claimed
+            }
+        for item, entry in completed.items():
+            _CATALOGUE_CACHE[item] = entry
+        for item in claimed:
+            if _CATALOGUE_LOADS.get(item) is owner:
+                _CATALOGUE_LOADS.pop(item, None)
+                _CATALOGUE_EXPIRIES.pop(item, None)
         for oldest in sorted(_CATALOGUE_CACHE, key=lambda item: _CATALOGUE_CACHE[item].get("checked", 0)):
             if len(_CATALOGUE_CACHE) <= 2048:
                 break
             del _CATALOGUE_CACHE[oldest]
-        current = _CATALOGUE_CACHE.get(key, {})
-        if previous.get("value") != current.get("value"):
+        if any(previous[item].get("value") != completed[item].get("value") for item in claimed):
             get_cache().invalidate_prefix("dummy_epg_xmltv")
-    return current
+    return completed
+
+
+def _mapping_checks(
+    profile_links: dict,
+    entries: dict,
+    sources: list[dict],
+    client,
+    captured_at: str,
+    expected: dict | None = None,
+) -> tuple[dict, dict]:
+    checked_at = time.monotonic()
+    checks = {}
+    for link in profile_links:
+        key = (client, link)
+        entry = entries.get(key, {})
+        active = key in _CATALOGUE_LOADS
+        error = bool(entry.get("error"))
+        value_present = "value" in entry
+        cached = bool(entry.get("value"))
+        row = entry.get("value") if isinstance(entry.get("value"), dict) else None
+        row_id = row.get("id") if row else None
+        if isinstance(row_id, bool) or not isinstance(row_id, int):
+            row_id = None
+        source_id = None
+        if row:
+            try:
+                source_id = _epg_source_id(row.get("epg_source") or row.get("epg_source_id"))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(source_id, bool) or not isinstance(source_id, int):
+            source_id = None
+        source_kind = "unknown"
+        source = next(
+            (item for item in sources if item.get("id") == source_id),
+            None,
+        ) if source_id is not None else None
+        if source is not None and source_id is not None:
+            try:
+                source_url = source.get("url")
+                urlsplit(source_url or "")
+                if _dummy_source(source_id, [source]):
+                    source_kind = "generated"
+                elif isinstance(source_url, str) and source_url:
+                    source_kind = "external"
+            except (TypeError, ValueError):
+                pass
+        checked = entry.get("checked")
+        checked_age = None
+        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                and math.isfinite(checked)):
+            checked_age = max(0.0, checked_at - checked)
+        load_expires_at = None
+        load_expiry = _CATALOGUE_EXPIRIES.get(key)
+        if (active and isinstance(load_expiry, datetime) and load_expiry.tzinfo is not None
+                and load_expiry.utcoffset() is not None):
+            load_expires_at = load_expiry.isoformat()
+        pending = (
+            active or error or not value_present
+            or checked_age is None or checked_age >= SOURCE_RETRY
+            or (expected is not None
+                and expected.get(key, {}).get("value") != entry.get("value"))
+        )
+        checks[link] = {
+            "active": active,
+            "error": error,
+            "value_present": value_present,
+            "cached": cached,
+            "cached_row_id": row_id,
+            "cached_row_matches_link": row_id == link if row_id is not None else None,
+            "cached_source_id": source_id,
+            "cached_source_kind": source_kind,
+            "checked_age_seconds": checked_age,
+            "load_expires_at": load_expires_at,
+            "pending": pending,
+            "unresolved": pending and not cached,
+        }
+    pending = sorted(link for link in profile_links if checks[link]["pending"])
+    observation = {
+        "captured_at": captured_at,
+        "counts": {
+            "linked": len(profile_links),
+            "pending": len(pending),
+            "active_cached": sum(
+                check["active"] and check["cached"]
+                for check in checks.values()
+            ),
+            "active_uncached": sum(
+                check["active"] and not check["cached"]
+                for check in checks.values()
+            ),
+            "error_cached": sum(
+                check["error"] and check["cached"]
+                for check in checks.values()
+            ),
+            "error_uncached": sum(
+                check["error"] and not check["cached"]
+                for check in checks.values()
+            ),
+            "ready_value": sum(
+                not check["pending"] and check["cached"]
+                for check in checks.values()
+            ),
+            "unresolved": sum(
+                check["unresolved"]
+                for check in checks.values()
+            ),
+        },
+        "links": [
+            {
+                "channel_id": min(profile_links[link]),
+                "link_id": link,
+                **{
+                    name: value for name, value in checks[link].items()
+                    if name not in {"pending", "unresolved"}
+                },
+            }
+            for link in pending[:5]
+        ],
+    }
+    return observation, checks
 
 
 def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, stop: datetime, now: datetime,
@@ -1109,6 +1292,11 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     catalogue_status = "pending"
     mapping_captured_at = ""
     catalogue_checks = {}
+    catalogue = {}
+    catalogue_tasks = {}
+    source_key = None
+    catalogue_sources_pending = False
+    wait_expires_at = None
     if selected_ids:
         channel_ids = set()
         for profile in profiles:
@@ -1124,89 +1312,62 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
             if isinstance(link, int) and not isinstance(link, bool):
                 links.add(link)
         keys = [(client, link) for link in [None, *sorted(links)]]
-        for key in keys:
-            entry = _CATALOGUE_CACHE.get(key, {})
-            if time.monotonic() - entry.get("checked", float("-inf")) >= SOURCE_RETRY and key not in _CATALOGUE_LOADS:
-                _CATALOGUE_EXPIRIES[key] = expires_at
-                _CATALOGUE_LOADS[key] = asyncio.create_task(
-                    _load_catalogue(key, client, key[1], expires_at=expires_at)
-                )
-        if not wait_for_sources and any(key in _CATALOGUE_LOADS for key in keys):
+        source_key = (client, None)
+        source_entry = _CATALOGUE_CACHE.get(source_key, {})
+        if (time.monotonic() - source_entry.get("checked", float("-inf")) >= SOURCE_RETRY
+                and source_key not in _CATALOGUE_LOADS):
+            task = asyncio.create_task(_load_catalogue(source_key, client, expires_at=expires_at))
+            _CATALOGUE_LOADS[source_key] = task
+        due = [
+            key for key in keys if key[1] is not None
+            and time.monotonic() - _CATALOGUE_CACHE.get(key, {}).get(
+                "checked", float("-inf")
+            ) >= SOURCE_RETRY
+            and key not in _CATALOGUE_LOADS
+        ]
+        if due:
+            batch = (client, tuple(key[1] for key in due))
+            task = asyncio.create_task(_load_catalogue(batch, client, expires_at=expires_at))
+            for key in due:
+                _CATALOGUE_LOADS[key] = task
+        if wait_for_sources or recover_sources:
+            wait_expires_at = min(
+                expires_at,
+                type(expires_at).fromtimestamp(
+                    (datetime.now(timezone.utc) + timedelta(seconds=CATALOGUE_TIMEOUT)).timestamp(),
+                    timezone.utc,
+                ),
+            )
+        if wait_expires_at is None and any(key in _CATALOGUE_LOADS for key in keys):
             await asyncio.sleep(0)
         catalogue = {key: _CATALOGUE_CACHE.get(key, {}) for key in keys}
         loading = {key: _CATALOGUE_LOADS[key] for key in keys if key in _CATALOGUE_LOADS}
-        if loading and wait_for_sources:
-            await asyncio.wait(loading.values(), timeout=max(0, _remaining(expires_at)))
+        catalogue_tasks = dict(loading)
+        if loading and wait_expires_at is not None:
+            await asyncio.wait(
+                set(loading.values()), timeout=max(0, _remaining(wait_expires_at))
+            )
         for key, task in loading.items():
             if task.done() and not task.cancelled():
-                catalogue[key] = task.result()
+                result = task.result()
+                catalogue[key] = result.get(key, _CATALOGUE_CACHE.get(key, catalogue[key]))
             else:
                 catalogue[key] = _CATALOGUE_CACHE.get(key, catalogue[key])
         mapping_captured_at = datetime.now(timezone.utc).isoformat()
-        mapping_checked_at = time.monotonic()
-        catalogue_sources = catalogue.get((client, None), {}).get("value") or []
-        for key in keys:
-            link = key[1]
-            if link is None:
-                continue
-            entry = catalogue.get(key, {})
-            active = key in _CATALOGUE_LOADS
-            error = bool(entry.get("error"))
-            value_present = "value" in entry
-            cached = bool(entry.get("value"))
-            row = entry.get("value") if isinstance(entry.get("value"), dict) else None
-            row_id = row.get("id") if row else None
-            if isinstance(row_id, bool) or not isinstance(row_id, int):
-                row_id = None
-            source_id = None
-            if row:
-                try:
-                    source_id = _epg_source_id(row.get("epg_source") or row.get("epg_source_id"))
-                except (TypeError, ValueError):
-                    pass
-            if isinstance(source_id, bool) or not isinstance(source_id, int):
-                source_id = None
-            source_kind = "unknown"
-            source = next(
-                (item for item in catalogue_sources if item.get("id") == source_id),
-                None,
-            ) if source_id is not None else None
-            if source is not None and source_id is not None:
-                try:
-                    source_url = source.get("url")
-                    urlsplit(source_url or "")
-                    if _dummy_source(source_id, [source]):
-                        source_kind = "generated"
-                    elif isinstance(source_url, str) and source_url:
-                        source_kind = "external"
-                except (TypeError, ValueError):
-                    pass
-            checked = entry.get("checked")
-            checked_age = None
-            if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                    and math.isfinite(checked)):
-                checked_age = max(0.0, mapping_checked_at - checked)
-            load_expires_at = None
-            load_expiry = _CATALOGUE_EXPIRIES.get(key)
-            if (active and isinstance(load_expiry, datetime) and load_expiry.tzinfo is not None
-                    and load_expiry.utcoffset() is not None):
-                load_expires_at = load_expiry.isoformat()
-            pending = active or error or not value_present
-            catalogue_checks[link] = {
-                "active": active,
-                "error": error,
-                "value_present": value_present,
-                "cached": cached,
-                "cached_row_id": row_id,
-                "cached_row_matches_link": row_id == link if row_id is not None else None,
-                "cached_source_id": source_id,
-                "cached_source_kind": source_kind,
-                "checked_age_seconds": checked_age,
-                "load_expires_at": load_expires_at,
-                "pending": pending,
-                "unresolved": pending and not cached,
-            }
         sources = catalogue.get((client, None), {}).get("value") or []
+        _, catalogue_checks = _mapping_checks(
+            {link: [link] for link in links},
+            catalogue,
+            sources,
+            client,
+            mapping_captured_at,
+        )
+        source_entry = catalogue.get(source_key, {})
+        catalogue_sources_pending = (
+            source_key in _CATALOGUE_LOADS
+            or bool(source_entry.get("error"))
+            or "value" not in source_entry
+        )
         for key in keys:
             entry = catalogue.get(key, {})
             if key in _CATALOGUE_LOADS or entry.get("error") or "value" not in entry:
@@ -1255,7 +1416,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         coverage["window_start"] = min(coverage["window_start"] or start.isoformat(), start.isoformat())
         coverage["window_stop"] = max(coverage["window_stop"] or stop.isoformat(), stop.isoformat())
         if not profile.get("epg_source_ids"):
-            prepared.append((profile, [], [], start, stop, profile_coverage))
+            prepared.append((profile, [], [], start, stop, profile_coverage, {}))
             continue
         try:
             resolved = resolve_sources(profile["epg_source_ids"], sources)
@@ -1287,52 +1448,10 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
             link = channel_map[channel_id].get("epg_data_id") or channel_map[channel_id].get("epg_data")
             if isinstance(link, int) and not isinstance(link, bool):
                 profile_links.setdefault(link, []).append(channel_id)
-        pending_profile_links = sorted(
-            link for link in profile_links if catalogue_checks[link]["pending"]
-        )
-        if pending_profile_links:
-            profile_coverage["mapping_checks"] = {
-                "captured_at": mapping_captured_at,
-                "counts": {
-                    "linked": len(profile_links),
-                    "pending": len(pending_profile_links),
-                    "active_cached": sum(
-                        check["active"] and check["cached"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                    "active_uncached": sum(
-                        check["active"] and not check["cached"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                    "error_cached": sum(
-                        check["error"] and check["cached"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                    "error_uncached": sum(
-                        check["error"] and not check["cached"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                    "ready_value": sum(
-                        not check["pending"] and check["cached"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                    "unresolved": sum(
-                        check["unresolved"]
-                        for link, check in catalogue_checks.items() if link in profile_links
-                    ),
-                },
-                "links": [
-                    {
-                        "channel_id": min(profile_links[link]),
-                        "link_id": link,
-                        **{
-                            name: value for name, value in catalogue_checks[link].items()
-                            if name not in {"pending", "unresolved"}
-                        },
-                    }
-                    for link in pending_profile_links[:5]
-                ],
-            }
+        if any(catalogue_checks[link]["pending"] for link in profile_links):
+            profile_coverage["mapping_checks"] = _mapping_checks(
+                profile_links, catalogue, sources, client, mapping_captured_at,
+            )[0]
         if any(
             not query["dynamic"]
             and isinstance((link := (
@@ -1346,7 +1465,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
             profile_coverage["reason_codes"].extend([
                 "GUIDE_MAPPING_UNAVAILABLE", "GUIDE_SOURCES_PENDING",
             ])
-        prepared.append((profile, resolved, queries, start, stop, profile_coverage))
+        prepared.append((profile, resolved, queries, start, stop, profile_coverage, profile_links))
         for query in queries:
             channel = channel_map[query["channel_id"]]
             link = channel.get("epg_data_id") or channel.get("epg_data")
@@ -1420,7 +1539,10 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         await asyncio.sleep(0)
     pending = [_SOURCE_LOADS[job["key"]] for job in jobs.values() if job["key"] in _SOURCE_LOADS]
     if pending and wait_for_sources:
-        await asyncio.wait(pending, timeout=max(0, _remaining(expires_at)))
+        await asyncio.wait(
+            pending,
+            timeout=max(0, _remaining(wait_expires_at)),
+        )
     for key in list(_SOURCE_CACHE):
         if len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
             break
@@ -1451,8 +1573,10 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     if catalogue_error:
         coverage["sources"] = [{"source_id": source, "status": catalogue_status, "last_success": None, "error": catalogue_error}
                                for source in sorted(selected_ids)]
-    for profile, resolved, queries, start, stop, profile_coverage in prepared:
+    for profile, resolved, queries, start, stop, profile_coverage, profile_links in prepared:
         reasons = set(profile_coverage["reason_codes"])
+        if profile.get("epg_source_ids") and catalogue_sources_pending:
+            reasons.add("GUIDE_SOURCES_PENDING")
         for query in queries:
             if query.get("blocked"):
                 reasons.add("GUIDE_QUERY_PENDING")
@@ -1502,7 +1626,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         from config import CONFIG_DIR
         from services.epg_artwork import ArtworkCache
         artwork_cache = ArtworkCache(CONFIG_DIR / "epg_artwork_cache.json")
-    for profile, resolved, queries, start, stop, profile_coverage in prepared:
+    for profile, resolved, queries, start, stop, profile_coverage, profile_links in prepared:
         for query in queries:
             channel_id = query["channel_id"]
             programmes, result = await asyncio.to_thread(
@@ -1544,6 +1668,59 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
                 if real and all(row.find("icon") is not None for row in real):
                     result["warnings"] = [warning for warning in result["warnings"] if warning != "missing_artwork"]
             coverage["channels"].append(result)
+    final_captured_at = datetime.now(timezone.utc).isoformat()
+    final_catalogue = {}
+    for key in catalogue:
+        active = _CATALOGUE_LOADS.get(key)
+        if active is not None:
+            final_catalogue[key] = _CATALOGUE_CACHE.get(key, catalogue[key])
+            continue
+        task = catalogue_tasks.get(key)
+        if task is not None and task.done() and not task.cancelled():
+            result = task.result()
+            final_catalogue[key] = result.get(key, _CATALOGUE_CACHE.get(key, catalogue[key]))
+        else:
+            final_catalogue[key] = _CATALOGUE_CACHE.get(key, catalogue[key])
+    final_sources_pending = False
+    final_sources = sources
+    if source_key is not None:
+        source_entry = final_catalogue.get(source_key, {})
+        source_checked = source_entry.get("checked")
+        source_age = None
+        if (isinstance(source_checked, (int, float)) and not isinstance(source_checked, bool)
+                and math.isfinite(source_checked)):
+            source_age = max(0.0, time.monotonic() - source_checked)
+        final_sources_pending = (
+            source_key in _CATALOGUE_LOADS
+            or bool(source_entry.get("error"))
+            or "value" not in source_entry
+            or source_age is None
+            or source_age >= SOURCE_RETRY
+            or catalogue.get(source_key, {}).get("value") != source_entry.get("value")
+        )
+        final_sources = source_entry.get("value") or []
+    for profile, resolved, queries, start, stop, profile_coverage, profile_links in prepared:
+        if profile_links:
+            observation, checks = _mapping_checks(
+                profile_links,
+                final_catalogue,
+                final_sources,
+                client,
+                final_captured_at,
+                expected=catalogue,
+            )
+            if any(check["pending"] for check in checks.values()):
+                profile_coverage["mapping_checks"] = observation
+                profile_coverage["reason_codes"] = sorted(
+                    set(profile_coverage["reason_codes"])
+                    | {"GUIDE_MAPPING_UNAVAILABLE", "GUIDE_SOURCES_PENDING"}
+                )
+                profile_coverage["can_publish"] = False
+        if profile.get("epg_source_ids") and final_sources_pending:
+            profile_coverage["reason_codes"] = sorted(
+                set(profile_coverage["reason_codes"]) | {"GUIDE_SOURCES_PENDING"}
+            )
+            profile_coverage["can_publish"] = False
     coverage["artwork_pending"] = bool(artwork)
     if artwork and _ARTWORK_LOAD is None and time.monotonic() - _ARTWORK_CHECKED >= SOURCE_RETRY:
         _ARTWORK_LOAD = asyncio.create_task(_probe_artwork(artwork))

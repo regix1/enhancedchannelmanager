@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import httpx
@@ -502,5 +503,185 @@ async def test_filtered_catalogue_does_not_treat_boolean_source_as_integer():
     client = _client(lambda request: httpx.Response(200, json=[{"id": 1, "epg_source": True}]), source_count=1)
     try:
         assert await client.get_epg_data(epg_source=1, max_results=1) == []
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exact_ids_select_flat_rows_without_sending_an_id_filter():
+    requests = []
+    wanted = [
+        {"id": 8, "epg_source": {"id": 46}, "tvg_id": "eight", "name": "Eight"},
+        {"id": 13, "epg_source_id": 47, "tvg_id": "thirteen", "name": "Thirteen"},
+    ]
+    rows = [
+        {"id": 1, "epg_source": 99, "tvg_id": "other"},
+        *wanted,
+        {"id": 21, "epg_source": 99, "tvg_id": "other-21"},
+    ]
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=rows)
+
+    client = _client(handler, source_count=len(rows))
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    try:
+        result = await client.get_epg_data(
+            max_results=2,
+            ids=frozenset({8, 13}),
+            expires_at=expires_at,
+        )
+        assert result == wanted
+        assert len(requests) == 1
+        assert set(requests[0].url.params) == {"page", "page_size"}
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exact_ids_cross_unrelated_pages_and_return_verified_missing_subset():
+    pages = []
+
+    def handler(request):
+        page = request.url.params["page"]
+        pages.append(page)
+        if page == "1":
+            return httpx.Response(200, json={
+                "results": [{"id": 1, "epg_source": 99, "tvg_id": "other"}],
+                "next": "page-2",
+            })
+        if page == "2":
+            return httpx.Response(200, json={
+                "results": [{"id": 8, "epg_source": 46, "tvg_id": "eight"}],
+                "next": None,
+            })
+        raise AssertionError("an ended catalogue must not request another page")
+
+    client = _client(handler, source_count=2)
+    try:
+        result = await client.get_epg_data(
+            max_results=2,
+            ids=frozenset({8, 13}),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+        )
+        assert result == [{"id": 8, "epg_source": 46, "tvg_id": "eight"}]
+        assert pages == ["1", "2"]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exact_ids_read_824_links_in_one_paginated_scan():
+    requested = frozenset(range(5001, 5825))
+    unrelated = [
+        {"id": value, "epg_source": 99, "tvg_id": f"other-{value}"}
+        for value in range(1, 1001)
+    ]
+    selected = [
+        {"id": value, "epg_source": 46, "tvg_id": f"selected-{value}"}
+        for value in sorted(requested)
+    ]
+    pages = []
+
+    def handler(request):
+        page = request.url.params["page"]
+        pages.append(page)
+        if page == "1":
+            return httpx.Response(200, json={"results": unrelated, "next": "page-2"})
+        return httpx.Response(200, json={"results": selected, "next": None})
+
+    client = _client(handler, source_count=len(unrelated) + len(selected))
+    try:
+        result = await client.get_epg_data(
+            max_results=len(requested),
+            ids=requested,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+        )
+        assert {row["id"] for row in result} == requested
+        assert pages == ["1", "2"]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows,reason", [
+    ([
+        {"id": 8, "epg_source": 46, "tvg_id": "eight"},
+        {"id": 8, "epg_source": 46, "tvg_id": "duplicate"},
+    ], "duplicate requested ID"),
+    ([{"id": 8, "epg_source": True, "tvg_id": "eight"}], "malformed requested row"),
+    ([{"id": 8, "epg_source": 46, "tvg_id": ""}], "malformed requested row"),
+])
+async def test_exact_ids_reject_duplicate_and_malformed_requested_rows(rows, reason):
+    import json
+
+    stream = _TrackingStream(json.dumps(rows).encode(), 5)
+    client = _client(lambda request: httpx.Response(200, stream=stream), source_count=len(rows))
+    try:
+        with pytest.raises(ValueError, match=reason):
+            await client.get_epg_data(
+                max_results=1,
+                ids=frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+        assert stream.closed
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kwargs", [
+    {"ids": frozenset(), "max_results": 0},
+    {"ids": frozenset({True}), "max_results": 1},
+    {"ids": frozenset({0}), "max_results": 1},
+    {"ids": frozenset({8}), "max_results": 2},
+    {"ids": frozenset({8}), "max_results": 1, "search": "eight"},
+    {"ids": frozenset({8}), "max_results": 1, "epg_source": 46},
+    {"ids": frozenset({8}), "max_results": 1, "expires_at": datetime.now()},
+])
+async def test_exact_ids_validate_the_internal_call_contract(kwargs):
+    client = _client(lambda request: httpx.Response(200, json=[]), source_count=0)
+    kwargs.setdefault("expires_at", datetime.now(timezone.utc) + timedelta(seconds=30))
+    try:
+        with pytest.raises(ValueError):
+            await client.get_epg_data(**kwargs)
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exact_ids_pass_one_expiry_to_every_page():
+    pages = []
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+
+    def handler(request):
+        page = request.url.params["page"]
+        if page == "1":
+            return httpx.Response(200, json={
+                "results": [{"id": 1, "epg_source": 99, "tvg_id": "other"}],
+                "next": "page-2",
+            })
+        return httpx.Response(200, json={
+            "results": [{"id": 8, "epg_source": 46, "tvg_id": "eight"}],
+            "next": None,
+        })
+
+    client = _client(handler, source_count=2)
+    original = client._get_json_bounded
+
+    async def bounded(*args, **kwargs):
+        pages.append(kwargs["expires_at"])
+        return await original(*args, **kwargs)
+
+    try:
+        with patch.object(client, "_get_json_bounded", side_effect=bounded):
+            result = await client.get_epg_data(
+                max_results=1,
+                ids=frozenset({8}),
+                expires_at=expiry,
+            )
+        assert result == [{"id": 8, "epg_source": 46, "tvg_id": "eight"}]
+        assert pages == [expiry, expiry]
     finally:
         await client._client.aclose()

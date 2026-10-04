@@ -225,8 +225,12 @@ def channel(**fields):
 def client(sources=None, rows=None):
     result = AsyncMock()
     result.get_epg_sources.return_value = sources or [source()]
-    result.get_epg_data.return_value = rows or []
-    result.get_epg_data_by_id.side_effect = lambda link: next(row for row in rows or [] if row["id"] == link)
+    selected = rows or []
+
+    async def get_rows(*, ids=None, **_):
+        return [row for row in selected if ids is None or row.get("id") in ids]
+
+    result.get_epg_data.side_effect = get_rows
     return result
 
 
@@ -899,13 +903,13 @@ async def test_active_cached_mapping_reports_the_frozen_retry_state(monkeypatch)
     assert ready["profiles"]["1"]["can_publish"] is True
     guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
 
-    async def reread(link):
-        assert link == 90
+    async def reread(*, ids, **_):
+        assert ids == frozenset({90})
         started.set()
         await release.wait()
-        return row
+        return [row]
 
-    upstream.get_epg_data_by_id.side_effect = reread
+    upstream.get_epg_data.side_effect = reread
     _, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
     await started.wait()
 
@@ -932,7 +936,7 @@ async def test_active_cached_mapping_reports_the_frozen_retry_state(monkeypatch)
         "cached_source_id": 50,
         "cached_source_kind": "external",
         "checked_age_seconds": observation["links"][0]["checked_age_seconds"],
-        "load_expires_at": EXPIRES_AT.isoformat(),
+        "load_expires_at": upstream.get_epg_data.await_args.kwargs["expires_at"].isoformat(),
     }]
     assert observation["links"][0]["checked_age_seconds"] >= guides.SOURCE_RETRY
     assert coverage["profiles"]["1"]["can_publish"] is False
@@ -956,13 +960,13 @@ async def test_cold_failed_and_ready_mappings_report_independent_counts(monkeypa
     channels = {1: channel(epg_data_id=90)}
     install_feed(monkeypatch, feed(programme()))
 
-    async def first_read(link):
-        assert link == 90
+    async def first_read(*, ids, **_):
+        assert ids == frozenset({90})
         started.set()
         await release.wait()
-        return rows[0]
+        return [rows[0]]
 
-    upstream.get_epg_data_by_id.side_effect = first_read
+    upstream.get_epg_data.side_effect = first_read
     _, cold = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
     await started.wait()
     check = cold["profiles"]["1"]["mapping_checks"]
@@ -974,19 +978,19 @@ async def test_cold_failed_and_ready_mappings_report_independent_counts(monkeypa
 
     release.set()
     await asyncio.gather(*list(guides._CATALOGUE_LOADS.values()))
-    upstream.get_epg_data_by_id.side_effect = lambda link: rows[0]
+    upstream.get_epg_data.side_effect = lambda **_: [rows[0]]
     _, ready = await guides.prepare_profiles(
         [selected], channels, upstream, now=NOW, wait_for_sources=True,
     )
     assert "mapping_checks" not in ready["profiles"]["1"]
     assert ready["profiles"]["1"]["can_publish"] is True
 
-    def fail_second(link):
-        if link == 91:
+    def fail_second(*, ids, **_):
+        if 91 in ids:
             raise RuntimeError("catalogue-secret")
-        return rows[0]
+        return [rows[0]]
 
-    upstream.get_epg_data_by_id.side_effect = fail_second
+    upstream.get_epg_data.side_effect = fail_second
     mixed_channels = {
         1: channels[1],
         2: channel(id=2, name="ESPN 2", tvg_id="ESPN.2", epg_data_id=91),
@@ -1017,12 +1021,10 @@ async def test_mapping_checks_count_queued_links_and_bound_the_sample(monkeypatc
     ]
     upstream = client(rows=rows)
 
-    def initial_read(link):
-        if link == 20:
-            raise RuntimeError("dynamic link unavailable")
-        return next(row for row in rows if row["id"] == link)
+    def initial_read(*, ids, **_):
+        return [row for row in rows if row["id"] in ids]
 
-    upstream.get_epg_data_by_id.side_effect = initial_read
+    upstream.get_epg_data.side_effect = initial_read
     channels = {
         link: channel(id=link, name=f"ESPN {link}", tvg_id=f"ESPN.{link}", epg_data_id=link)
         for link in range(1, 9)
@@ -1042,13 +1044,11 @@ async def test_mapping_checks_count_queued_links_and_bound_the_sample(monkeypatc
     for link in [*range(1, 9), 20]:
         guides._CATALOGUE_CACHE[(upstream, link)]["checked"] -= guides.SOURCE_RETRY + 1
 
-    async def reread(link):
+    async def reread(*, ids, **_):
         await release.wait()
-        if link == 20:
-            raise RuntimeError("dynamic link unavailable")
-        return next(row for row in rows if row["id"] == link)
+        return [row for row in rows if row["id"] in ids]
 
-    upstream.get_epg_data_by_id.side_effect = reread
+    upstream.get_epg_data.side_effect = reread
     _, coverage = await guides.prepare_profiles([profile()], channels, upstream, now=NOW)
     observation = coverage["profiles"]["1"]["mapping_checks"]
     assert observation["counts"]["linked"] == 8
@@ -1076,10 +1076,10 @@ async def test_mapping_capture_stays_fixed_while_later_preparation_waits(monkeyp
     catalogue_started, release_catalogue = asyncio.Event(), asyncio.Event()
     compose_started, release_compose = asyncio.Event(), asyncio.Event()
 
-    async def reread(_link):
+    async def reread(**_):
         catalogue_started.set()
         await release_catalogue.wait()
-        return row
+        return [row]
 
     real_to_thread = asyncio.to_thread
 
@@ -1089,7 +1089,7 @@ async def test_mapping_capture_stays_fixed_while_later_preparation_waits(monkeyp
             await release_compose.wait()
         return await real_to_thread(function, *args)
 
-    upstream.get_epg_data_by_id.side_effect = reread
+    upstream.get_epg_data.side_effect = reread
     monkeypatch.setattr(guides.asyncio, "to_thread", pause_compose)
     preparation = asyncio.create_task(guides.prepare_profiles(
         [profile()], channels, upstream, now=NOW,
@@ -1107,7 +1107,7 @@ async def test_mapping_capture_stays_fixed_while_later_preparation_waits(monkeyp
     assert observation["captured_at"] != NOW.isoformat()
     assert observation["links"][0]["active"] is True
     assert observation["links"][0]["checked_age_seconds"] == 100.0
-    assert observation["links"][0]["load_expires_at"] == EXPIRES_AT.isoformat()
+    assert observation["links"][0]["load_expires_at"] == upstream.get_epg_data.await_args.kwargs["expires_at"].isoformat()
 
 
 @pytest.mark.asyncio
@@ -1191,7 +1191,7 @@ async def test_current_mapping_lookup_overrides_remembered_identity_and_refreshe
     next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_RETRY + 1
     _, third = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     assert third["channels"][0]["source_tvg_id"] == "444"
-    upstream.get_epg_data.assert_not_awaited()
+    assert upstream.get_epg_data.await_count == 3
     assert selected["channel_mappings"][0]["tvg_id"] == "111"
 
 
@@ -1199,9 +1199,9 @@ async def test_current_mapping_lookup_overrides_remembered_identity_and_refreshe
 @pytest.mark.parametrize("link_field", ["epg_data_id", "epg_data"])
 async def test_changed_unresolved_mapping_never_uses_the_remembered_source(monkeypatch, link_field):
     upstream = client()
-    async def row(link):
+    async def row(**_):
         await asyncio.Event().wait()
-    upstream.get_epg_data_by_id.side_effect = row
+    upstream.get_epg_data.side_effect = row
     monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
     install_feed(monkeypatch, feed(programme(tvg="111")))
     selected = profile(channel_mappings=[{"channel_id": 1, "source_id": 50, "tvg_id": "111"}])
@@ -1214,7 +1214,7 @@ async def test_changed_unresolved_mapping_never_uses_the_remembered_source(monke
 @pytest.mark.asyncio
 async def test_dynamic_event_ignores_unresolved_previous_guide_link(monkeypatch):
     upstream = client()
-    upstream.get_epg_data_by_id.side_effect = RuntimeError("generated link pending")
+    upstream.get_epg_data.side_effect = RuntimeError("generated link pending")
     install_feed(monkeypatch, feed(programme(
         tvg="PPV10.art",
         title="ONE FIGHT NIGHT 47 STAMP V FLORES",
@@ -1255,7 +1255,7 @@ async def test_known_current_mapping_survives_a_failed_recheck(monkeypatch):
     selected, channels = profile(), {1: channel(epg_data_id=90, tvg_id="")}
     await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
-    upstream.get_epg_data_by_id.side_effect = RuntimeError("unavailable")
+    upstream.get_epg_data.side_effect = RuntimeError("unavailable")
     prepared, coverage = await guides.prepare_profiles([selected], channels, upstream, now=NOW, wait_for_sources=True)
     assert prepared[0]["source_programmes"][1][0].get("stop") == "20260905050000 +0000"
     assert coverage["sources"][0]["status"] == "ready"
@@ -1273,12 +1273,12 @@ async def test_known_current_mapping_survives_a_failed_recheck(monkeypatch):
     guides._CATALOGUE_CACHE[(upstream, 90)]["checked"] -= guides.SOURCE_RETRY + 1
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def reread(_link):
+    async def reread(**_):
         started.set()
         await release.wait()
-        return {"id": 90, "epg_source": 50, "tvg_id": "111"}
+        return [{"id": 90, "epg_source": 50, "tvg_id": "111"}]
 
-    upstream.get_epg_data_by_id.side_effect = reread
+    upstream.get_epg_data.side_effect = reread
     _, retrying = await guides.prepare_profiles([selected], channels, upstream, now=NOW)
     await started.wait()
     observation = retrying["profiles"]["1"]["mapping_checks"]
@@ -1295,16 +1295,16 @@ async def test_unchanged_catalogue_does_not_invalidate_ready_output():
     upstream = client()
     key = (upstream, None)
     with patch.object(guides, "get_cache") as cache:
-        await guides._load_catalogue(key, upstream, None)
+        await guides._load_catalogue(key, upstream)
         cache.return_value.invalidate_prefix.reset_mock()
-        await guides._load_catalogue(key, upstream, None)
+        await guides._load_catalogue(key, upstream)
         cache.return_value.invalidate_prefix.assert_not_called()
         upstream.get_epg_sources.return_value = [source(priority=9)]
-        await guides._load_catalogue(key, upstream, None)
+        await guides._load_catalogue(key, upstream)
         cache.return_value.invalidate_prefix.assert_called_once_with("dummy_epg_xmltv")
         cache.return_value.invalidate_prefix.reset_mock()
         upstream.get_epg_sources.side_effect = httpx.ReadTimeout("upstream")
-        await guides._load_catalogue(key, upstream, None)
+        await guides._load_catalogue(key, upstream)
         cache.return_value.invalidate_prefix.assert_not_called()
 
 
@@ -1356,12 +1356,150 @@ async def test_inferred_event_keeps_its_source_channel_icon(monkeypatch):
 @pytest.mark.asyncio
 async def test_catalogue_eviction_does_not_drop_the_current_batch(monkeypatch):
     upstream = client()
-    upstream.get_epg_data_by_id.side_effect = lambda link: {"id": link, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream.get_epg_data.side_effect = lambda *, ids, **_: [
+        {"id": link, "epg_source": 50, "tvg_id": "ESPN.us"}
+        for link in ids
+    ]
     channels = {i: channel(id=i, epg_data_id=i) for i in range(1, 2049)}
     monkeypatch.setattr(guides, "_read_source", AsyncMock(return_value={"headers": {}, "rows": {}, "warnings": [], "size": 0}))
     _, coverage = await guides.prepare_profiles([profile()], channels, upstream, now=NOW, wait_for_sources=True)
     assert coverage["sources"][0]["status"] == "ready"
     assert len(guides._CATALOGUE_CACHE) <= 2048
+    upstream.get_epg_data.assert_awaited_once()
+    assert len(upstream.get_epg_data.await_args.kwargs["ids"]) == 2048
+
+
+@pytest.mark.asyncio
+async def test_catalogue_read_expiry_starts_after_queue_admission(monkeypatch):
+    monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(0))
+    upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}])
+    key = (upstream, 90)
+    batch = (upstream, (90,))
+    task = asyncio.create_task(guides._load_catalogue(batch, upstream))
+    guides._CATALOGUE_LOADS[key] = task
+    await asyncio.sleep(0)
+    assert key not in guides._CATALOGUE_EXPIRIES
+
+    admitted_at = datetime.now(timezone.utc)
+    guides._CATALOGUE_SLOTS.release()
+    result = await task
+
+    read_expiry = upstream.get_epg_data.await_args.kwargs["expires_at"]
+    assert admitted_at < read_expiry <= admitted_at + timedelta(
+        seconds=guides.CATALOGUE_TIMEOUT + 1,
+    )
+    assert result[key]["value"]["id"] == 90
+    assert key not in guides._CATALOGUE_LOADS
+    assert key not in guides._CATALOGUE_EXPIRIES
+
+
+@pytest.mark.asyncio
+async def test_cancelled_catalogue_joiner_leaves_shared_owner_running(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    sources = [source()]
+    guides._CATALOGUE_CACHE[(upstream, None)] = {
+        "value": sources,
+        "checked": time.monotonic(),
+        "error": False,
+    }
+
+    async def held(**_):
+        started.set()
+        await release.wait()
+        return [row]
+
+    upstream.get_epg_data.side_effect = held
+    key = (upstream, 90)
+    owner = asyncio.create_task(
+        guides._load_catalogue((upstream, (90,)), upstream)
+    )
+    guides._CATALOGUE_LOADS[key] = owner
+    await started.wait()
+    waiter = asyncio.create_task(guides.prepare_profiles(
+        [profile()],
+        {1: channel(epg_data_id=90)},
+        upstream,
+        now=NOW,
+        recover_sources=True,
+    ))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not owner.done()
+    assert guides._CATALOGUE_LOADS[key] is owner
+    assert key in guides._CATALOGUE_EXPIRIES
+
+    release.set()
+    await owner
+    install_feed(monkeypatch, feed(programme()))
+    _, coverage = await guides.prepare_profiles(
+        [profile()],
+        {1: channel(epg_data_id=90)},
+        upstream,
+        now=NOW,
+        wait_for_sources=True,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is True
+
+
+@pytest.mark.asyncio
+async def test_final_mapping_check_blocks_identity_aged_during_source_wait(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(guides.time, "monotonic", lambda: clock[0])
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    channels = {1: channel(epg_data_id=90)}
+    install_feed(monkeypatch, feed(programme()))
+    _, ready = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert ready["profiles"]["1"]["can_publish"] is True
+    source_entry = next(iter(guides._SOURCE_CACHE.values()))
+    source_entry["checked"] -= guides.SOURCE_TTL + 1
+    read_source = guides._read_source
+
+    async def delayed(*args, **kwargs):
+        result = await read_source(*args, **kwargs)
+        clock[0] += guides.SOURCE_RETRY + 1
+        return result
+
+    monkeypatch.setattr(guides, "_read_source", delayed)
+    _, aged = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert aged["profiles"]["1"]["can_publish"] is False
+    assert aged["profiles"]["1"]["mapping_checks"]["counts"]["pending"] == 1
+    assert upstream.get_epg_data.await_count == 1
+
+    _, refreshed = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert refreshed["profiles"]["1"]["can_publish"] is True
+    assert upstream.get_epg_data.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_catalogue_source_refresh_cannot_authorize_cached_selection(monkeypatch):
+    upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}])
+    channels = {1: channel(epg_data_id=90)}
+    install_feed(monkeypatch, feed(programme()))
+    _, ready = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+    assert ready["profiles"]["1"]["can_publish"] is True
+    guides._CATALOGUE_CACHE[(upstream, None)]["checked"] -= guides.SOURCE_RETRY + 1
+    upstream.get_epg_sources.side_effect = RuntimeError("unavailable")
+
+    _, blocked = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, wait_for_sources=True,
+    )
+
+    assert blocked["profiles"]["1"]["can_publish"] is False
+    assert "GUIDE_SOURCES_PENDING" in blocked["profiles"]["1"]["reason_codes"]
+    assert blocked["sources"][0]["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -1997,12 +2135,13 @@ async def test_unresolved_current_link_warms_saved_mapping_before_verification(m
     upstream = client()
     link_ready = False
 
-    async def read_link(link):
+    async def read_link(*, ids, **_):
+        assert ids == frozenset({91})
         if not link_ready:
             raise RuntimeError("generated link pending")
-        return current
+        return [current]
 
-    upstream.get_epg_data_by_id.side_effect = read_link
+    upstream.get_epg_data.side_effect = read_link
     monkeypatch.setattr(guides, "HTTP_WAIT", 0.01)
     install_feed(monkeypatch, feed(
         programme(tvg="saved-1"),

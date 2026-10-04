@@ -1618,6 +1618,268 @@ class TestActionExecutorPropertyActions:
         self.client.update_channel.assert_called_with(1, {"channel_number": 999})
 
 
+class TestRemoveFromChannelAction:
+    """Tests exact and inferred channel removal targets."""
+
+    @staticmethod
+    def _stream(stream_id=501, channel_id=9000):
+        return StreamContext(
+            stream_id=stream_id,
+            stream_name=f"Stream {stream_id}",
+            m3u_account_id=1,
+            channel_id=channel_id,
+        )
+
+    @staticmethod
+    def _executor(channels, fresh=None):
+        client = MagicMock()
+        client.get_channel = AsyncMock(return_value=fresh)
+        client.update_channel = AsyncMock(return_value={})
+        executor = ActionExecutor(client, existing_channels=channels)
+        return client, executor
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_explicit_target_never_removes_foreign_association(self, reverse):
+        target = {"id": 2933, "name": "Target", "streams": [501, 702]}
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501, 999]}
+        channels = [target, foreign]
+        if reverse:
+            channels.reverse()
+        client, executor = self._executor(
+            channels,
+            fresh={"id": 2933, "name": "Target", "streams": [501, 702]},
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(channel_id=9000),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is True
+        assert result.entity_id == 2933
+        assert result.previous_state == {"streams": [501, 702]}
+        client.update_channel.assert_awaited_once_with(2933, {"streams": [702]})
+        assert executor._channel_by_id[2933]["streams"] == [702]
+        assert executor._channel_by_id[9000]["streams"] == [501, 999]
+
+    def test_explicit_target_works_without_inferred_channel(self):
+        target = {"id": 2968, "name": "Target", "streams": [501]}
+        client, executor = self._executor(
+            [target],
+            fresh={"id": 2968, "name": "Target", "streams": [501]},
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2968},
+                self._stream(channel_id=None),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is True
+        client.update_channel.assert_awaited_once_with(2968, {"streams": []})
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, True, False, 0, -1, 1.5, "2933", [], {}],
+    )
+    def test_invalid_explicit_target_fails_before_reads_or_writes(self, value):
+        client, executor = self._executor([])
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": value},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is False
+        assert result.error == "Channel ID must be a whole number of 1 or greater."
+        client.get_channel.assert_not_awaited()
+        client.update_channel.assert_not_awaited()
+
+    def test_explicit_live_removal_uses_fresh_membership_and_preserves_additions(self):
+        target = {"id": 2933, "name": "Target", "streams": [702]}
+        client, executor = self._executor(
+            [target],
+            fresh={"id": 2933, "name": "Target", "streams": [702, 501, 703]},
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.modified is True
+        assert result.previous_state == {"streams": [702, 501, 703]}
+        client.update_channel.assert_awaited_once_with(2933, {"streams": [702, 703]})
+
+    def test_explicit_live_removal_skips_when_fresh_target_lost_stream(self):
+        target = {"id": 2933, "name": "Target", "streams": [501, 702]}
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501]}
+        client, executor = self._executor(
+            [target, foreign],
+            fresh={"id": 2933, "name": "Target", "streams": [702]},
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.skipped is True
+        assert result.modified is False
+        client.update_channel.assert_not_awaited()
+        assert executor._channel_by_id[9000]["streams"] == [501]
+
+    @pytest.mark.parametrize(
+        "fresh",
+        [None, {"name": "Missing ID", "streams": [501]}, {"id": True, "streams": [501]},
+         {"id": 9000, "streams": [501]}],
+    )
+    def test_explicit_target_rejects_missing_or_mismatched_channel(self, fresh):
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501]}
+        client, executor = self._executor([foreign], fresh=fresh)
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is False
+        client.update_channel.assert_not_awaited()
+        assert executor._channel_by_id[9000]["streams"] == [501]
+
+    def test_explicit_target_read_failure_does_not_fall_back(self):
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501]}
+        client, executor = self._executor([foreign])
+        client.get_channel.side_effect = RuntimeError("missing target")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is False
+        client.update_channel.assert_not_awaited()
+        assert executor._channel_by_id[9000]["streams"] == [501]
+
+    def test_explicit_target_write_failure_preserves_foreign_association(self):
+        target = {"id": 2933, "name": "Target", "streams": [501]}
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501]}
+        client, executor = self._executor(
+            [target, foreign],
+            fresh={"id": 2933, "name": "Target", "streams": [501]},
+        )
+        client.update_channel.side_effect = RuntimeError("write failed")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel", "channel_id": 2933},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is False
+        assert executor._channel_by_id[9000]["streams"] == [501]
+
+    def test_legacy_target_still_uses_inferred_channel(self):
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501, 999]}
+        client, executor = self._executor(
+            [foreign],
+            fresh={"id": 9000, "name": "Foreign", "streams": [501, 999]},
+        )
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel"},
+                self._stream(),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.success is True
+        client.update_channel.assert_awaited_once_with(9000, {"streams": [999]})
+
+    def test_legacy_unassigned_stream_still_skips_without_reads(self):
+        client, executor = self._executor([])
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(
+                {"type": "remove_from_channel"},
+                self._stream(channel_id=None),
+                ExecutionContext(),
+            )
+        )
+
+        assert result.skipped is True
+        client.get_channel.assert_not_awaited()
+        client.update_channel.assert_not_awaited()
+
+    def test_explicit_dry_run_reuses_simulated_target_state(self):
+        target = {"id": 2933, "name": "Target", "streams": [501, 502]}
+        foreign = {"id": 9000, "name": "Foreign", "streams": [501, 502]}
+        client, executor = self._executor([target, foreign])
+        exec_ctx = ExecutionContext(dry_run=True)
+        action = {"type": "remove_from_channel", "channel_id": 2933}
+
+        first = asyncio.get_event_loop().run_until_complete(
+            executor.execute(action, self._stream(501), exec_ctx)
+        )
+        second = asyncio.get_event_loop().run_until_complete(
+            executor.execute(action, self._stream(502), exec_ctx)
+        )
+        repeated = asyncio.get_event_loop().run_until_complete(
+            executor.execute(action, self._stream(501), exec_ctx)
+        )
+
+        assert first.modified is True
+        assert second.modified is True
+        assert repeated.skipped is True
+        assert executor._channel_by_id[2933]["streams"] == []
+        assert executor._channel_by_id[9000]["streams"] == [501, 502]
+        client.get_channel.assert_not_awaited()
+        client.update_channel.assert_not_awaited()
+
+    def test_explicit_dry_run_fetches_an_uncached_target_once(self):
+        client, executor = self._executor(
+            [],
+            fresh={"id": 2933, "name": "Target", "streams": [501]},
+        )
+        exec_ctx = ExecutionContext(dry_run=True)
+        action = {"type": "remove_from_channel", "channel_id": 2933}
+
+        first = asyncio.get_event_loop().run_until_complete(
+            executor.execute(action, self._stream(), exec_ctx)
+        )
+        repeated = asyncio.get_event_loop().run_until_complete(
+            executor.execute(action, self._stream(), exec_ctx)
+        )
+
+        assert first.modified is True
+        assert repeated.skipped is True
+        client.get_channel.assert_awaited_once_with(2933)
+        client.update_channel.assert_not_awaited()
+
+
 class TestSortGroupAction:
     """Tests for the sort_group action (enhancedchannelmanager-vy4fl).
 

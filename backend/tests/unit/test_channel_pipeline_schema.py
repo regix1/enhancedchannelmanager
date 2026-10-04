@@ -538,6 +538,35 @@ class TestActionValidation:
         assert len(errors) > 0
         assert "message" in errors[0]
 
+    def test_remove_from_channel_without_target_stays_legacy(self):
+        action = Action(type="remove_from_channel")
+
+        assert action.validate() == []
+        assert "channel_id" not in action.params
+
+    def test_remove_from_channel_accepts_positive_integer_target(self):
+        action = Action(type="remove_from_channel", params={"channel_id": 2933})
+
+        assert action.validate() == []
+        assert action.to_dict() == {"type": "remove_from_channel", "channel_id": 2933}
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, True, False, 0, -1, 1.5, "2933", [], {}],
+    )
+    def test_remove_from_channel_rejects_invalid_explicit_target(self, value):
+        action = Action(type="remove_from_channel", params={"channel_id": value})
+
+        assert action.validate() == ["Channel ID must be a whole number of 1 or greater."]
+
+    def test_remove_from_channel_target_round_trips_flat(self):
+        stored = {"type": "remove_from_channel", "channel_id": 2968}
+
+        action = Action.from_dict(stored)
+
+        assert action.params == {"channel_id": 2968}
+        assert action.to_dict() == stored
+
     def test_unknown_action_type(self):
         """Rejects unknown action type."""
         action = Action(type="unknown_action")

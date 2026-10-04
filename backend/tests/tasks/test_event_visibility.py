@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import hashlib
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -9,8 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from sqlalchemy.orm import sessionmaker
 
+import database
+from services import epg_programmes as guides
 from services.epg_publication import PublicationResult
+from services.epg_publication import publish_profiles, read_publication
 from stream_prober import StreamProber
 from task_scheduler import ScheduleType
 from tasks.event_visibility import (
@@ -231,6 +236,316 @@ async def test_reconciliation_prepares_profiles_with_their_stored_expiries():
         first_expiry,
         second_expiry,
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mapping_age", [guides.SOURCE_RETRY + 1, 301])
+async def test_reconciliation_waits_for_due_identity_and_publishes_fresh_programme(
+    monkeypatch, test_engine, mapping_age,
+):
+    sessions = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "_SessionLocal", sessions)
+    guides._SOURCE_CACHE.clear()
+    guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
+    guides._CATALOGUE_CACHE.clear()
+    guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
+    monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(4))
+    monkeypatch.setattr(guides, "_SOURCE_SLOTS", asyncio.Semaphore(2))
+
+    now = datetime.now(timezone.utc)
+    begin = now - timedelta(minutes=30)
+    end = now + timedelta(hours=2)
+    selected = _profile(
+        epg_source_ids=[50],
+        channel_group_ids=[],
+        hide_empty_group_ids=[],
+        stream_match_group_ids=[],
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+    )
+    channels = {10: {
+        "id": 10,
+        "name": "Arena 1",
+        "channel_number": 10,
+        "channel_group_id": 7,
+        "tvg_id": "ESPN.us",
+        "epg_data_id": 90,
+        "streams": [],
+    }}
+    source = {
+        "id": 50,
+        "name": "Selected guide",
+        "source_type": "xmltv",
+        "is_active": True,
+        "url": "https://guide.invalid/selected.xml",
+        "priority": 0,
+    }
+    identity = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    document = (
+        '<tv><channel id="ESPN.us"><display-name>ESPN</display-name></channel>'
+        f'<programme channel="ESPN.us" start="{begin.strftime("%Y%m%d%H%M%S %z")}" '
+        f'stop="{end.strftime("%Y%m%d%H%M%S %z")}">'
+        '<title>Fresh programme</title></programme></tv>'
+    ).encode()
+
+    async def xmltv(*_, **__):
+        yield document
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    hold = False
+    request_shapes = []
+
+    async def bulk(*, ids, expires_at, **kwargs):
+        request_shapes.append((ids, expires_at, kwargs))
+        if hold:
+            started.set()
+            await release.wait()
+        return [identity]
+
+    async def single(link):
+        assert link == 90
+        if hold:
+            started.set()
+            await release.wait()
+        return identity
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[source])
+    client.get_epg_data = AsyncMock(side_effect=bulk)
+    client.get_epg_data_by_id = AsyncMock(side_effect=single)
+    client.update_channel = AsyncMock()
+    monkeypatch.setattr(guides, "stream_xmltv", xmltv)
+
+    prepared, coverage = await guides.prepare_profiles(
+        [selected],
+        channels,
+        client,
+        expires_at=now + timedelta(hours=1),
+        now=now,
+        wait_for_sources=True,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is True
+    retained = copy.deepcopy(prepared)
+    retained[0]["source_programmes"][10][0].find("title").text = "Retained programme"
+    publish_profiles(retained, channels, coverage, observations={}, now=now)
+    before = read_publication("profile:1")
+    assert "Retained programme" in {
+        row.findtext("title") for row in ET.fromstring(before["xmltv"]).findall("programme")
+    }
+
+    guides._CATALOGUE_CACHE[(client, 90)]["checked"] -= mapping_age
+    hold = True
+    task = EventVisibilityTask()
+
+    async def publish(function, *args, **kwargs):
+        result = await asyncio.to_thread(function, *args, **kwargs)
+        task._cancel_requested = True
+        return result
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([selected], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
+         patch("cache.get_cache"), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()):
+        reconciliation = asyncio.create_task(
+            reconcile_profiles(task, wait_for_sources=False)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(reconciliation), timeout=0.05)
+        finally:
+            release.set()
+        outcome = await reconciliation
+
+    after = read_publication("profile:1")
+    assert outcome.error == "CANCELLED"
+    assert outcome.details["published_profile_ids"] == [1]
+    assert after["revision"] > before["revision"]
+    assert after["state"]["published_at"] != before["state"]["published_at"]
+    assert "Fresh programme" in {
+        row.findtext("title") for row in ET.fromstring(after["xmltv"]).findall("programme")
+    }
+    assert request_shapes[-1][0] == frozenset({90})
+    assert set(request_shapes[-1][2]) == {"max_results"}
+    assert request_shapes[-1][1] < datetime.fromisoformat(
+        after["state"]["delivery"]["guide_attempt"]["expires_at"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_identity_read_publishes_824_owned_channels(monkeypatch, test_engine):
+    sessions = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "_SessionLocal", sessions)
+    guides._SOURCE_CACHE.clear()
+    guides._SOURCE_LOADS.clear()
+    guides._SOURCE_EXPIRIES.clear()
+    guides._CATALOGUE_CACHE.clear()
+    guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
+    monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(4))
+    monkeypatch.setattr(guides, "_SOURCE_SLOTS", asyncio.Semaphore(2))
+
+    now = datetime.now(timezone.utc)
+    begin = now - timedelta(minutes=15)
+    end = now + timedelta(hours=1)
+    channel_ids = range(1, 825)
+    links = frozenset(5000 + channel_id for channel_id in channel_ids)
+    selected = _profile(
+        epg_source_ids=[50],
+        channel_group_ids=[],
+        hide_empty_group_ids=[],
+        stream_match_group_ids=[],
+        channel_assignments=[
+            {"channel_id": channel_id, "channel_name": f"Arena {channel_id}"}
+            for channel_id in channel_ids
+        ],
+    )
+    channels = {
+        channel_id: {
+            "id": channel_id,
+            "name": f"Arena {channel_id}",
+            "channel_number": channel_id,
+            "channel_group_id": 7,
+            "tvg_id": f"selected-{channel_id}",
+            "epg_data_id": 5000 + channel_id,
+            "streams": [],
+        }
+        for channel_id in channel_ids
+    }
+    source = {
+        "id": 50,
+        "name": "Selected guide",
+        "source_type": "xmltv",
+        "is_active": True,
+        "url": "https://guide.invalid/selected.xml",
+        "priority": 0,
+    }
+    rows = {
+        link: {"id": link, "epg_source": 50, "tvg_id": f"selected-{link - 5000}"}
+        for link in links
+    }
+    parts = ["<tv>"]
+    for channel_id in channel_ids:
+        tvg_id = f"selected-{channel_id}"
+        parts.append(
+            f'<channel id="{tvg_id}"><display-name>Arena {channel_id}</display-name></channel>'
+        )
+        parts.append(
+            f'<programme channel="{tvg_id}" start="{begin.strftime("%Y%m%d%H%M%S %z")}" '
+            f'stop="{end.strftime("%Y%m%d%H%M%S %z")}">'
+            f'<title>Fresh {channel_id}</title></programme>'
+        )
+    parts.append("</tv>")
+    document = "".join(parts).encode()
+
+    async def xmltv(*_, **__):
+        for offset in range(0, len(document), 65536):
+            yield document[offset:offset + 65536]
+
+    barrier = {"started": None, "release": None}
+
+    async def bulk(*, ids, **_):
+        if barrier["started"] is not None:
+            barrier["started"].set()
+            await barrier["release"].wait()
+        return [rows[link] for link in sorted(ids)]
+
+    async def single(link):
+        if barrier["started"] is not None:
+            barrier["started"].set()
+            await barrier["release"].wait()
+        return rows[link]
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[source])
+    client.get_epg_data = AsyncMock(side_effect=bulk)
+    client.get_epg_data_by_id = AsyncMock(side_effect=single)
+    client.update_channel = AsyncMock()
+    monkeypatch.setattr(guides, "stream_xmltv", xmltv)
+
+    prepared, coverage = await guides.prepare_profiles(
+        [selected],
+        channels,
+        client,
+        expires_at=now + timedelta(hours=1),
+        now=now,
+        wait_for_sources=True,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is True
+    retained = copy.deepcopy(prepared)
+    for programme_rows in retained[0]["source_programmes"].values():
+        programme_rows[0].find("title").text = "Retained programme"
+    publish_profiles(retained, channels, coverage, observations={}, now=now)
+    previous = read_publication("profile:1")
+    guides._CATALOGUE_CACHE.clear()
+    guides._CATALOGUE_LOADS.clear()
+    guides._CATALOGUE_EXPIRIES.clear()
+    client.get_epg_data.reset_mock()
+    client.get_epg_data_by_id.reset_mock()
+    active_task = [None]
+
+    async def publish(function, *args, **kwargs):
+        result = await asyncio.to_thread(function, *args, **kwargs)
+        active_task[0]._cancel_requested = True
+        return result
+
+    revisions = []
+    with patch("tasks.event_visibility._load_profiles", return_value=([selected], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
+         patch("cache.get_cache"), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock()):
+        for pass_number in range(2):
+            if pass_number == 1:
+                for link in links:
+                    guides._CATALOGUE_CACHE[(client, link)]["checked"] -= 301
+            barrier["started"] = asyncio.Event()
+            barrier["release"] = asyncio.Event()
+            active_task[0] = EventVisibilityTask()
+            reconciliation = asyncio.create_task(
+                reconcile_profiles(active_task[0], wait_for_sources=False)
+            )
+            await asyncio.wait_for(barrier["started"].wait(), timeout=2)
+            try:
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(reconciliation), timeout=0.05)
+            finally:
+                barrier["release"].set()
+            outcome = await reconciliation
+            stored = read_publication("profile:1")
+            assert outcome.error == "CANCELLED"
+            assert outcome.details["published_profile_ids"] == [1]
+            assert stored["revision"] > previous["revision"]
+            revisions.append(stored["revision"])
+            previous = stored
+
+    assert revisions[1] > revisions[0]
+    assert client.get_epg_data.await_count == 2
+    assert all(call.kwargs["ids"] == links for call in client.get_epg_data.await_args_list)
+    assert all(5824 in call.kwargs["ids"] for call in client.get_epg_data.await_args_list)
+    assert client.get_epg_data_by_id.await_count == 0
+    titles = {
+        row.findtext("title") for row in ET.fromstring(stored["xmltv"]).findall("programme")
+    }
+    assert {f"Fresh {channel_id}" for channel_id in channel_ids} <= titles
+    assert len(ET.fromstring(stored["xmltv"]).findall("channel")) == 824
 
 
 @pytest.mark.asyncio

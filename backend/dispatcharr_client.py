@@ -6,6 +6,7 @@ import re
 import secrets
 import httpx
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 from config import get_settings, DispatcharrSettings
 from concurrency import run_cpu_bound
@@ -1616,8 +1617,22 @@ class DispatcharrClient:
         search: Optional[str] = None,
         epg_source: Optional[int] = None,
         max_results: Optional[int] = None,
+        *,
+        ids: frozenset[int] | None = None,
+        expires_at: datetime | None = None,
     ) -> list:
         """Read EPG rows from flat or paginated responses, selecting before limiting."""
+        if ids is not None:
+            if (not isinstance(ids, frozenset) or not ids
+                    or any(type(value) is not int or value <= 0 for value in ids)):
+                raise ValueError("EPG row IDs must be a nonempty frozenset of positive integers")
+            if max_results != len(ids):
+                raise ValueError("EPG row ID reads require one result slot per requested ID")
+            if search or epg_source is not None:
+                raise ValueError("EPG row ID reads cannot use search or source restrictions")
+            if (not isinstance(expires_at, datetime) or expires_at.tzinfo is None
+                    or expires_at.utcoffset() is None):
+                raise ValueError("EPG row ID reads require an aware expiry")
         params = {"page": page, "page_size": page_size}
         if search:
             params["search"] = search
@@ -1628,8 +1643,13 @@ class DispatcharrClient:
         deadline = asyncio.get_running_loop().time() + 120
         if max_results is not None:
             max_bytes = max(_EPG_DATA_MIN_RESPONSE_BYTES, max_results * _EPG_DATA_BYTES_PER_RESULT)
-            if search or epg_source is not None:
-                async with asyncio.timeout_at(deadline):
+            if ids is not None or search or epg_source is not None:
+                if ids is not None:
+                    remaining = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+                    timeout = asyncio.timeout(remaining)
+                else:
+                    timeout = asyncio.timeout_at(deadline)
+                async with timeout:
                     sources = await self.get_epg_sources()
                 if isinstance(sources, dict):
                     sources = sources.get("results", sources.get("sources"))
@@ -1647,6 +1667,8 @@ class DispatcharrClient:
                 rows = min(200000, total + max(page_size, (total + 9) // 10))
                 limits = {"rows": rows, "bytes": max(_EPG_DATA_MIN_RESPONSE_BYTES,
                                                       rows * _EPG_DATA_BYTES_PER_RESULT)}
+                if ids is not None:
+                    limits.update({"ids": ids, "observed": set()})
                 max_bytes = limits["bytes"]
 
         all_results = []
@@ -1659,7 +1681,8 @@ class DispatcharrClient:
                 data = await self._get_json_bounded(
                     "/api/epg/epgdata/", params=params, max_bytes=max_bytes,
                     max_results=max_results - len(all_results) if limits is not None else None,
-                    limits=limits, deadline=deadline,
+                    limits=limits, deadline=deadline if ids is None else None,
+                    ids=ids, expires_at=expires_at,
                 )
             rows = data if isinstance(data, list) else data.get("results", [])
             all_results.extend(rows)
@@ -1673,14 +1696,20 @@ class DispatcharrClient:
     async def _get_json_bounded(
         self, path: str, *, params: dict, max_bytes: int,
         max_results: int | None = None, limits: dict | None = None,
-        deadline: float | None = None,
+        deadline: float | None = None, ids: frozenset[int] | None = None,
+        expires_at: datetime | None = None,
     ):
         """Read bounded JSON, retaining only selected rows from a filtered catalogue."""
         import codecs
         from epg_matching import _epg_source_id
 
-        deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 120
-        async with asyncio.timeout_at(deadline):
+        if expires_at is not None:
+            remaining = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+            timeout = asyncio.timeout(remaining)
+        else:
+            deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 120
+            timeout = asyncio.timeout_at(deadline)
+        async with timeout:
             await self._ensure_authenticated()
             headers = {}
             if self._uses_api_key:
@@ -1816,6 +1845,23 @@ class DispatcharrClient:
                             limits["rows"] -= 1
                             if limits["rows"] < 0:
                                 raise ValueError("Dispatcharr EPG response exceeds its source row counts")
+                            if ids is not None:
+                                row_id = value.get("id")
+                                if type(row_id) is int and row_id > 0 and row_id in ids:
+                                    if row_id in limits["observed"]:
+                                        raise ValueError("Dispatcharr EPG response contains a duplicate requested ID")
+                                    limits["observed"].add(row_id)
+                                    row_source = _epg_source_id(
+                                        value.get("epg_source") or value.get("epg_source_id")
+                                    )
+                                    tvg_id = value.get("tvg_id")
+                                    if (type(row_source) is not int or row_source <= 0
+                                            or not isinstance(tvg_id, str) or not tvg_id.strip()):
+                                        raise ValueError("Dispatcharr EPG response contains a malformed requested row")
+                                    if len(selected) < max_results:
+                                        selected.append(value)
+                                state = "array_delimiter"
+                                continue
                             row_source = _epg_source_id(value.get("epg_source") or value.get("epg_source_id"))
                             source_matches = (source_id is None or (type(row_source) is int and source_id == row_source))
                             name_matches = (not query or any(

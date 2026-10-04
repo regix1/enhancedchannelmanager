@@ -162,7 +162,7 @@ const ACTION_TYPES: {
   // Variables
   { type: 'set_variable', label: 'Set Variable', description: 'Define a reusable variable from stream data', category: 'variables', hasVariableConfig: true },
   // Management actions
-  { type: 'remove_from_channel', label: 'Remove From Channel', description: 'Remove this stream from its current channel', category: 'management' },
+  { type: 'remove_from_channel', label: 'Remove From Channel', description: 'Remove this stream from a channel', category: 'management' },
   { type: 'set_stream_priority', label: 'Set Stream Priority', description: 'Move stream to lowest or highest priority in its channel', category: 'management', hasPriority: true },
   { type: 'probe_streams', label: 'Probe Streams', description: 'Queue streams for probing after pipeline completes', category: 'management' },
   { type: 'sort_group', label: 'Sort Group', description: "Alphabetically sort and renumber a group's channels (runs once per group after processing)", category: 'management', hasSortGroupConfig: true },
@@ -320,8 +320,17 @@ export function ActionEditor({
       ? ''
       : String(action.starting_number)
   );
+  const [channelIdText, setChannelIdText] = useState(() =>
+    action.channel_id === undefined || action.channel_id === null
+      ? ''
+      : String(action.channel_id)
+  );
   const channelNumberStartError = wholeChannelNumberInputError(channelNumberStartText);
   const sortGroupStartError = wholeChannelNumberInputError(sortGroupStartText);
+  const channelIdResult = parseWholeChannelNumberInput(channelIdText);
+  const channelIdError = channelIdResult.ok
+    ? null
+    : 'Channel ID must be a whole number of 1 or greater.';
 
   // Fetch channel groups for group selector
   useEffect(() => {
@@ -380,6 +389,10 @@ export function ActionEditor({
   useReportedFieldError(
     `${id}-sort-group-start`,
     actionDef?.hasSortGroupConfig ? sortGroupStartError : null,
+  );
+  useReportedFieldError(
+    `${id}-remove-channel-id`,
+    action.type === 'remove_from_channel' ? channelIdError : null,
   );
 
   // Check for dependency warnings
@@ -499,6 +512,7 @@ export function ActionEditor({
     onChange(newAction);
     setTypeSelectOpen(false);
     setNameTransformEnabled(false);
+    setChannelIdText('');
   };
 
   const handleInsertVariable = (variable: string) => {
@@ -1414,6 +1428,43 @@ export function ActionEditor({
               and <strong>removed from all other</strong> channel profiles. Profiles you do not select
               here will have this channel disabled.
             </span>
+          </div>
+        )}
+
+        {action.type === 'remove_from_channel' && (
+          <div className="action-field">
+            <label htmlFor={`${id}-remove-channel-id`}>Channel ID (optional)</label>
+            <input
+              id={`${id}-remove-channel-id`}
+              type="text"
+              inputMode="numeric"
+              className="action-input"
+              value={channelIdText}
+              onChange={e => {
+                const text = e.target.value;
+                setChannelIdText(text);
+                const parsed = parseWholeChannelNumberInput(text);
+                if (!parsed.ok || parsed.value === null) {
+                  const { channel_id: _dropped, ...rest } = action;
+                  onChange(rest);
+                } else {
+                  onChange({ ...action, channel_id: parsed.value });
+                }
+              }}
+              disabled={readonly}
+              aria-invalid={!!channelIdError}
+              aria-describedby={channelIdError
+                ? `${id}-remove-channel-id-hint ${id}-remove-channel-id-error`
+                : `${id}-remove-channel-id-hint`}
+            />
+            <span id={`${id}-remove-channel-id-hint`} className="field-hint">
+              Leave blank to use the stream&apos;s current channel. Enter a channel ID to limit removal to that channel.
+            </span>
+            {channelIdError && (
+              <span id={`${id}-remove-channel-id-error`} className="field-error" role="alert">
+                {channelIdError}
+              </span>
+            )}
           </div>
         )}
 

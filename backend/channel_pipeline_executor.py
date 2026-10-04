@@ -3917,7 +3917,19 @@ class ActionExecutor:
     async def _execute_remove_from_channel(self, action: Action, stream_ctx: StreamContext,
                                             exec_ctx: ExecutionContext) -> ActionResult:
         """Execute remove_from_channel action — unassign a stream from its current channel."""
-        if not stream_ctx.channel_id:
+        has_explicit_target = "channel_id" in action.params
+        if has_explicit_target:
+            errors = action.validate()
+            if errors:
+                return ActionResult(
+                    success=False,
+                    action_type=action.type,
+                    description=errors[0],
+                    error=errors[0]
+                )
+
+        channel_id = action.params["channel_id"] if has_explicit_target else stream_ctx.channel_id
+        if not channel_id:
             return ActionResult(
                 success=True,
                 action_type=action.type,
@@ -3925,9 +3937,8 @@ class ActionExecutor:
                 skipped=True
             )
 
-        channel_id = stream_ctx.channel_id
         channel = self._channel_by_id.get(channel_id)
-        if not channel:
+        if not channel or (has_explicit_target and not exec_ctx.dry_run):
             try:
                 channel = await self.client.get_channel(channel_id)
             except Exception as e:
@@ -3937,6 +3948,16 @@ class ActionExecutor:
                     description=f"Failed to fetch channel {channel_id}",
                     error=str(e)
                 )
+            if has_explicit_target:
+                returned_id = channel.get("id") if isinstance(channel, dict) else None
+                if isinstance(returned_id, bool) or returned_id != channel_id:
+                    return ActionResult(
+                        success=False,
+                        action_type=action.type,
+                        description=f"Failed to fetch channel {channel_id}",
+                        error=f"Channel {channel_id} response did not match the requested channel"
+                    )
+                self._channel_by_id[channel_id] = channel
 
         channel_name = channel.get("name", f"ID:{channel_id}")
 
@@ -3973,18 +3994,19 @@ class ActionExecutor:
             # The cached channel was read when the run started, and this writes
             # the whole stream list back, so anything added since would be
             # dropped. Re-read and filter that instead.
-            fresh = await self.client.get_channel(channel_id)
-            current_streams = [s["id"] if isinstance(s, dict) else s
-                               for s in fresh.get("streams", [])]
-            if stream_ctx.stream_id not in current_streams:
-                channel["streams"] = current_streams
-                return ActionResult(
-                    success=True,
-                    action_type=action.type,
-                    description=f"Stream already gone from channel '{channel_name}', skipped",
-                    skipped=True
-                )
-            filtered_streams = [s for s in current_streams if s != stream_ctx.stream_id]
+            if not has_explicit_target:
+                fresh = await self.client.get_channel(channel_id)
+                current_streams = [s["id"] if isinstance(s, dict) else s
+                                   for s in fresh.get("streams", [])]
+                if stream_ctx.stream_id not in current_streams:
+                    channel["streams"] = current_streams
+                    return ActionResult(
+                        success=True,
+                        action_type=action.type,
+                        description=f"Stream already gone from channel '{channel_name}', skipped",
+                        skipped=True
+                    )
+                filtered_streams = [s for s in current_streams if s != stream_ctx.stream_id]
 
             previous_state = {"streams": current_streams.copy()}
             await self.client.update_channel(channel_id, {"streams": filtered_streams})

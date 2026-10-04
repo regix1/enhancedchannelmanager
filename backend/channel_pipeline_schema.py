@@ -679,6 +679,14 @@ class Action:
             if priority not in ("lowest", "highest"):
                 errors.append("set_stream_priority.priority must be 'lowest' or 'highest'")
 
+        # Validate remove_from_channel
+        elif action_type == ActionType.REMOVE_FROM_CHANNEL:
+            if "channel_id" in self.params:
+                channel_id = self.params["channel_id"]
+                if (isinstance(channel_id, bool) or not isinstance(channel_id, int)
+                        or channel_id < 1):
+                    errors.append("Channel ID must be a whole number of 1 or greater.")
+
         # Validate log_match
         elif action_type == ActionType.LOG_MATCH:
             message = self.params.get("message")

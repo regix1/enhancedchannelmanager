@@ -1517,4 +1517,203 @@ describe('RuleBuilder', () => {
       ));
     });
   });
+
+  describe('remove-from-channel target save ownership', () => {
+    function ruleWith(actions: ChannelPipelineRule['actions']): ChannelPipelineRule {
+      return {
+        name: 'Targeted cleanup',
+        conditions: [{ type: 'always' }],
+        actions,
+      } as ChannelPipelineRule;
+    }
+
+    async function replaceTarget(
+      user: ReturnType<typeof userEvent.setup>,
+      value: string,
+    ) {
+      const input = screen.getByLabelText('Channel ID (optional)');
+      await user.clear(input);
+      if (value) await user.type(input, value);
+      return input;
+    }
+
+    it('blocks Save and focuses a refused target from another step', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel', channel_id: 2933 }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '1.5');
+      await gotoStep(user, 3);
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      expect(onSave).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(screen.getByLabelText('Channel ID (optional)')).toHaveFocus()
+      );
+    });
+
+    it('blocks Enter while refused text is visible', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      const input = await replaceTarget(user, 'not-a-channel');
+      await user.keyboard('{Enter}');
+
+      expect(onSave).not.toHaveBeenCalled();
+      expect(input).toHaveFocus();
+    });
+
+    it('saves the corrected exact target', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '1.5');
+      await replaceTarget(user, '2968');
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].actions).toEqual([
+        { type: 'remove_from_channel', channel_id: 2968 },
+      ]);
+    });
+
+    it('saves a cleared target as the legacy action', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel', channel_id: 2933 }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '');
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].actions).toEqual([{ type: 'remove_from_channel' }]);
+    });
+
+    it('preserves a saved target when the editor reopens', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      const rule = ruleWith([{ type: 'remove_from_channel', channel_id: 2933 }]);
+      const view = render(
+        <RuleBuilder rule={rule} onSave={onSave} onCancel={vi.fn()} />
+      );
+
+      expect(screen.getByLabelText('Channel ID (optional)')).toHaveValue('2933');
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      view.unmount();
+
+      render(<RuleBuilder rule={rule} onSave={vi.fn()} onCancel={vi.fn()} />);
+      expect(screen.getByLabelText('Channel ID (optional)')).toHaveValue('2933');
+    });
+
+    it('releases a refusal when the action type changes', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '1.5');
+      await user.click(screen.getByRole('combobox', { name: /action type/i }));
+      await user.click(screen.getByRole('option', { name: /^skip/i }));
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].actions).toEqual([{ type: 'skip' }]);
+    });
+
+    it('releases a refusal when its action is removed', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel' }, { type: 'skip' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '1.5');
+      await user.click(screen.getAllByRole('button', { name: 'Remove action' })[0]);
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].actions).toEqual([{ type: 'skip' }]);
+    });
+
+    it('keeps the refusal with the action when reordered', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'skip' }, { type: 'remove_from_channel' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+
+      await replaceTarget(user, '1.5');
+      const moveUp = screen.getAllByRole('button', { name: 'Move up' });
+      await user.click(moveUp[moveUp.length - 1]);
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      expect(onSave).not.toHaveBeenCalled();
+      expect(screen.getByLabelText('Channel ID (optional)')).toHaveValue('1.5');
+    });
+
+    it('does not leak a refusal into a reopened editor', async () => {
+      const user = userEvent.setup();
+      const first = render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'remove_from_channel' }])}
+          onSave={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      );
+      await replaceTarget(user, '1.5');
+      first.unmount();
+
+      const onSave = vi.fn();
+      render(
+        <RuleBuilder
+          rule={ruleWith([{ type: 'skip' }])}
+          onSave={onSave}
+          onCancel={vi.fn()}
+        />
+      );
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    });
+  });
 });

@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { useState } from 'react';
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -15,6 +16,7 @@ import {
   createMockChannelGroup,
 } from '../../test/mocks/server';
 import { ActionEditor } from './ActionEditor';
+import type { Action } from '../../types/channelPipeline';
 
 // Setup MSW server
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
@@ -23,6 +25,28 @@ afterEach(() => {
   resetMockDataStore();
 });
 afterAll(() => server.close());
+
+function renderControlledAction(initial: Action, readOnlyMode = false): Action[] {
+  const calls: Action[] = [];
+
+  function Harness() {
+    const [action, setAction] = useState(initial);
+    return (
+      <ActionEditor
+        action={action}
+        onChange={next => {
+          calls.push(next);
+          setAction(next);
+        }}
+        onRemove={vi.fn()}
+        readonly={readOnlyMode}
+      />
+    );
+  }
+
+  render(<Harness />);
+  return calls;
+}
 
 describe('ActionEditor', () => {
   describe('rendering', () => {
@@ -491,6 +515,81 @@ describe('ActionEditor', () => {
       await waitFor(() => {
         expect(onChange).toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('remove_from_channel action', () => {
+    it('shows an existing exact target with associated help text', () => {
+      renderControlledAction({ type: 'remove_from_channel', channel_id: 2933 });
+
+      const input = screen.getByLabelText('Channel ID (optional)');
+      expect(input).toHaveValue('2933');
+      expect(input).toHaveAccessibleDescription(
+        "Leave blank to use the stream's current channel. Enter a channel ID to limit removal to that channel."
+      );
+    });
+
+    it('stores valid text as a number and blank text as an absent target', async () => {
+      const user = userEvent.setup();
+      const calls = renderControlledAction({ type: 'remove_from_channel' });
+      const input = screen.getByLabelText('Channel ID (optional)');
+
+      await user.type(input, '2968');
+      expect(calls[calls.length - 1]).toEqual({
+        type: 'remove_from_channel',
+        channel_id: 2968,
+      });
+
+      await user.clear(input);
+      expect(calls[calls.length - 1]).toEqual({ type: 'remove_from_channel' });
+    });
+
+    it.each(['1.5', '-1', 'not-a-channel', '9007199254740992'])(
+      'keeps refused text visible for %s',
+      async value => {
+        const user = userEvent.setup();
+        const calls = renderControlledAction({ type: 'remove_from_channel', channel_id: 2933 });
+        const input = screen.getByLabelText('Channel ID (optional)');
+
+        await user.clear(input);
+        await user.type(input, value);
+
+        expect(input).toHaveValue(value);
+        expect(input).toHaveAttribute('aria-invalid', 'true');
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          'Channel ID must be a whole number of 1 or greater.'
+        );
+        expect(calls[calls.length - 1]).toEqual({ type: 'remove_from_channel' });
+      }
+    );
+
+    it('honors readonly mode', () => {
+      renderControlledAction({ type: 'remove_from_channel', channel_id: 2933 }, true);
+
+      expect(screen.getByLabelText('Channel ID (optional)')).toBeDisabled();
+    });
+
+    it('clears refused local text when the action type changes', async () => {
+      const user = userEvent.setup();
+      const calls = renderControlledAction({ type: 'remove_from_channel', channel_id: 2933 });
+      const input = screen.getByLabelText('Channel ID (optional)');
+      await user.clear(input);
+      await user.type(input, '1.5');
+
+      await user.click(screen.getByRole('combobox', { name: /action type/i }));
+      await user.click(screen.getByRole('option', { name: /^skip/i }));
+
+      expect(screen.queryByLabelText('Channel ID (optional)')).not.toBeInTheDocument();
+      expect(calls[calls.length - 1]).toEqual({ type: 'skip' });
+    });
+
+    it('uses wording that covers exact and inferred targets', async () => {
+      const user = userEvent.setup();
+      renderControlledAction({ type: 'remove_from_channel' });
+
+      await user.click(screen.getByRole('combobox', { name: /action type/i }));
+
+      expect(screen.getByText('Remove this stream from a channel')).toBeInTheDocument();
     });
   });
 

@@ -466,6 +466,16 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         return copy.deepcopy(rows[link])
 
     async def get_guide_rows(**kwargs):
+        ids = kwargs.get("ids")
+        if ids is not None:
+            assert isinstance(ids, frozenset) and ids
+            assert all(type(value) is int and value > 0 for value in ids)
+            assert kwargs["max_results"] == len(ids)
+            expires_at = kwargs["expires_at"]
+            assert expires_at.tzinfo is not None and expires_at.utcoffset() is not None
+            assert kwargs.get("epg_source") is None
+            assert not kwargs.get("search")
+            return [await get_link(link) for link in sorted(ids)]
         if kwargs["epg_source"] == 46:
             return [
                 {"id": 500, "epg_source": 46, "tvg_id": "event-10"},
