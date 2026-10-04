@@ -10,6 +10,7 @@ The main orchestrator for the auto-creation pipeline. Coordinates:
 - Conflict detection and resolution
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -1772,7 +1773,7 @@ class ChannelPipelineEngine:
         rules: list[ChannelPipelineRule],
         results: dict,
         dry_run: bool
-    ):
+    ) -> list[tuple[StreamContext, ChannelPipelineRule]]:
         """
         Probe streams that haven't been probed yet, for rules that have
         probe_on_sort=True and sort_field='quality'.
@@ -1784,7 +1785,7 @@ class ChannelPipelineEngine:
 
         # Collect streams that need probing
         rule_map = {r.id: r for r in rules}
-        streams_to_probe = {}  # stream_id -> (url, name, stream_ctx)
+        streams_to_probe = {}  # stream_id -> (url, name, stream_ctx, rule)
 
         for stream, winning_rule, _losing, _log in matched_entries:
             rule = rule_map.get(winning_rule.id)
@@ -1801,31 +1802,38 @@ class ChannelPipelineEngine:
             if not stream.stream_url:
                 continue
             streams_to_probe[stream.stream_id] = (
-                stream.stream_url, stream.stream_name, stream
+                stream.stream_url, stream.stream_name, stream, rule
             )
 
         if not streams_to_probe:
-            return
+            return []
 
-        prober = get_prober()
-        if not prober:
-            logger.warning("[AUTO-CREATE-ENGINE] Prober not available, skipping probe step")
-            return
+        selected = [
+            (stream, rule)
+            for _url, _name, stream, rule in streams_to_probe.values()
+        ]
 
         count = len(streams_to_probe)
         logger.info("[AUTO-CREATE-ENGINE] Probing %s unprobed stream(s) for quality sorting", count)
 
         if dry_run:
-            results["dry_run_results"].append({
-                "stream_id": None,
-                "stream_name": "[AUTO-CREATE-ENGINE]",
-                "rule_id": None,
-                "rule_name": None,
-                "action": f"Would probe {count} unprobed stream(s) for quality data",
-                "would_create": False,
-                "would_modify": False
-            })
-            return
+            for stream, rule in selected:
+                results["dry_run_results"].append({
+                    "stream_id": stream.stream_id,
+                    "stream_name": stream.stream_name,
+                    "rule_id": rule.id,
+                    "rule_name": rule.name,
+                    "phase": "probe",
+                    "action": "Would probe stream for quality sorting",
+                    "would_create": False,
+                    "would_modify": False,
+                })
+            return selected
+
+        prober = get_prober()
+        if not prober:
+            logger.warning("[AUTO-CREATE-ENGINE] Prober not available, skipping probe step")
+            return []
 
         await prober.refresh_account_probe_limits()
 
@@ -1843,7 +1851,7 @@ class ChannelPipelineEngine:
 
         tasks = [
             probe_one(sid, url, name, stream)
-            for sid, (url, name, stream) in streams_to_probe.items()
+            for sid, (url, name, stream, _rule) in streams_to_probe.items()
         ]
         await asyncio.gather(*tasks)
 
@@ -1878,6 +1886,7 @@ class ChannelPipelineEngine:
                 "error": None
             }]
         })
+        return selected
 
     async def _reorder_channel_streams(
         self,
@@ -2741,6 +2750,8 @@ class ChannelPipelineEngine:
             # ownership marker write failed — surfaced as a run-level warning.
             "profile_ownership_unestablished_channel_ids": set(),
         }
+        if plan_only:
+            results["planned_sort_probes"] = []
 
         # Track which streams have been processed by which rules
         stream_rule_matches = {}  # stream_id -> list of (rule_id, priority)
@@ -2874,10 +2885,23 @@ class ChannelPipelineEngine:
         # =====================================================================
         # Pass 1.5: Probe unprobed streams (for rules with probe_on_sort)
         # =====================================================================
-        await self._probe_unprobed_streams(
+        probe_candidates = await self._probe_unprobed_streams(
             matched_entries, rules, results,
             dry_run or not planning.allow_internal_side_effects,
         )
+        if plan_only:
+            results["planned_sort_probes"] = [
+                {
+                    "stream_id": stream.stream_id,
+                    "rule_id": rule.id,
+                    "stream_name": stream.stream_name,
+                    "m3u_account_id": stream.m3u_account_id,
+                    "stream_url_hash": hashlib.sha256(
+                        stream.stream_url.encode("utf-8")
+                    ).hexdigest(),
+                }
+                for stream, rule in probe_candidates
+            ]
 
         # =====================================================================
         # Between passes: Sort matched entries by rule's sort configuration
@@ -6405,7 +6429,11 @@ class ChannelPipelineEngine:
                     current_ids = set(rule_channel_order.get(rule.id, []))
                     if current_ids and not dry_run:
                         rule.set_managed_channel_ids(list(current_ids))
-                        session.merge(rule)
+                        session.query(ChannelPipelineRule).filter(
+                            ChannelPipelineRule.id == rule.id
+                        ).update({
+                            ChannelPipelineRule.managed_channel_ids: rule.managed_channel_ids,
+                        }, synchronize_session=False)
                     continue
 
                 current_ids = set(rule_channel_order.get(rule.id, []))
@@ -6416,7 +6444,11 @@ class ChannelPipelineEngine:
                 if rule.managed_channel_ids is None:
                     if current_ids and not dry_run:
                         rule.set_managed_channel_ids(list(current_ids))
-                        session.merge(rule)
+                        session.query(ChannelPipelineRule).filter(
+                            ChannelPipelineRule.id == rule.id
+                        ).update({
+                            ChannelPipelineRule.managed_channel_ids: rule.managed_channel_ids,
+                        }, synchronize_session=False)
                     logger.info(
                         "[AUTO-CREATE-ENGINE] Rule '%s': first run, populated "
                         "%s managed channel IDs",
@@ -6513,7 +6545,11 @@ class ChannelPipelineEngine:
                     # No orphans — just update managed set
                     if persist and current_ids != previous_ids:
                         rule.set_managed_channel_ids(list(current_ids))
-                        session.merge(rule)
+                        session.query(ChannelPipelineRule).filter(
+                            ChannelPipelineRule.id == rule.id
+                        ).update({
+                            ChannelPipelineRule.managed_channel_ids: rule.managed_channel_ids,
+                        }, synchronize_session=False)
                     continue
 
                 logger.info(
@@ -6696,7 +6732,11 @@ class ChannelPipelineEngine:
                 # the execution_log, and aggregated into completed_with_errors.
                 if persist:
                     rule.set_managed_channel_ids(list(current_ids))
-                    session.merge(rule)
+                    session.query(ChannelPipelineRule).filter(
+                        ChannelPipelineRule.id == rule.id
+                    ).update({
+                        ChannelPipelineRule.managed_channel_ids: rule.managed_channel_ids,
+                    }, synchronize_session=False)
 
             if persist:
                 session.commit()
@@ -6907,7 +6947,12 @@ class ChannelPipelineEngine:
                 rule.last_run_at = datetime.utcnow()
                 matches = rule_match_counts.get(rule.id, 0)
                 rule.match_count = matches
-                session.merge(rule)
+                session.query(ChannelPipelineRule).filter(
+                    ChannelPipelineRule.id == rule.id
+                ).update({
+                    ChannelPipelineRule.last_run_at: rule.last_run_at,
+                    ChannelPipelineRule.match_count: rule.match_count,
+                }, synchronize_session=False)
             session.commit()
         finally:
             session.close()

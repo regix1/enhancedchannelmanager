@@ -1,10 +1,13 @@
 """Registry-level safety contract for every ECM MCP tool (04c0u.7)."""
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -497,6 +500,161 @@ async def test_pipeline_prerefresh_requires_two_distinct_confirmations(tool_name
     assert "complete" in _text(final).lower()
     assert client.call_endpoint.await_args_list[1].kwargs["body"]["phase"] == "refresh"
     assert client.call_endpoint.await_args_list[2].kwargs["body"]["phase"] == "execute"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["run_channel_pipeline", "run_auto_creation"])
+async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmations(tool_name):
+    mcp = _registry()
+    client = AsyncMock()
+    repository = Path(__file__).parents[2]
+    backend_root = repository / "backend"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(backend_root)
+    process = await asyncio.create_subprocess_exec(
+        os.environ.get("ECM_PYTHON", sys.executable),
+        "-u",
+        "-c",
+        (
+            "import asyncio; "
+            "from tests.routers.test_channel_pipeline_plans import _serve_pipeline_pipe; "
+            "asyncio.run(_serve_pipeline_pipe())"
+        ),
+        cwd=backend_root,
+        env=environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    ready_line = await asyncio.wait_for(process.stdout.readline(), timeout=20)
+    ready = json.loads(ready_line)
+    assert ready["ready"] is True
+    backend_calls = []
+
+    async def request_backend(message):
+        process.stdin.write(json.dumps(message).encode() + b"\n")
+        await process.stdin.drain()
+        line = await asyncio.wait_for(process.stdout.readline(), timeout=20)
+        reply = json.loads(line)
+        assert reply["ok"] is True, reply
+        return reply["response"]
+
+    async def call_endpoint(endpoint, *, body=None, path_args=None, **_kwargs):
+        if endpoint.name == "ac_prepare_run":
+            message = {"operation": "prepare", "body": body}
+        elif endpoint.name == "ac_commit_run":
+            message = {"operation": "commit", "body": body}
+        elif endpoint.name == "ac_get_execution":
+            message = {
+                "operation": "execution",
+                "execution_id": path_args["execution_id"],
+            }
+        else:
+            raise AssertionError(f"unexpected endpoint {endpoint.name}")
+        response = await request_backend(message)
+        backend_calls.append({"endpoint": endpoint.name, "body": body, "response": response})
+        return response
+
+    client.call_endpoint.side_effect = call_endpoint
+    try:
+        with patch("tools.channel_pipeline.get_ecm_client", return_value=client), patch(
+            "tools.channel_pipeline._poll_sleep", AsyncMock()
+        ):
+            first = await mcp.call_tool(tool_name, {"dry_run": False})
+            refresh_token = _token(_text(first))
+            assert backend_calls[-1]["response"]["phase"] == "refresh"
+            state = await request_backend({"operation": "state"})
+            assert state["writes"] == []
+            assert state["media_calls"] == 0
+
+            second = await mcp.call_tool(
+                tool_name, {"dry_run": False, "confirmation_token": refresh_token}
+            )
+            probe_token = _token(_text(second))
+            assert probe_token != refresh_token
+            assert "provider refresh completed" in _text(second).lower()
+            assert backend_calls[-1]["body"]["phase"] == "refresh"
+            assert backend_calls[-1]["response"]["completed_phase"] == "refresh"
+            assert backend_calls[-1]["response"]["phase"] == "probe"
+            state = await request_backend({"operation": "state"})
+            assert state["writes"] == []
+            assert state["media_calls"] == 0
+            assert state["refresh_calls"] == 1
+
+            third = await mcp.call_tool(
+                tool_name, {"dry_run": False, "confirmation_token": probe_token}
+            )
+            execute_token = _token(_text(third))
+            assert execute_token not in {refresh_token, probe_token}
+            assert "stream quality probes completed" in _text(third).lower()
+            assert backend_calls[-1]["body"]["phase"] == "probe"
+            assert backend_calls[-1]["response"]["completed_phase"] == "probe"
+            assert backend_calls[-1]["response"]["phase"] == "execute"
+            state = await request_backend({"operation": "state"})
+            assert state["writes"] == []
+            assert state["media_calls"] == 3
+
+            final = await mcp.call_tool(
+                tool_name, {"dry_run": False, "confirmation_token": execute_token}
+            )
+            assert "complete" in _text(final).lower()
+            assert backend_calls[-2]["body"]["phase"] == "execute"
+            state = await request_backend({"operation": "state"})
+            assert state["writes"] == [{
+                "args": [200, {"streams": [102, 101, 104]}],
+                "kwargs": {},
+            }]
+            assert state["channels"]["201"]["streams"] == [105]
+    finally:
+        if process.returncode is None:
+            process.stdin.write(b'{"operation":"close"}\n')
+            await process.stdin.drain()
+            closed = json.loads(await asyncio.wait_for(process.stdout.readline(), timeout=10))
+            assert closed["closed"] is True
+            await asyncio.wait_for(process.wait(), timeout=10)
+        stderr = (await process.stderr.read()).decode()
+
+    assert process.returncode == 0, stderr
+    assert [
+        call["body"]["phase"]
+        for call in backend_calls
+        if call["endpoint"] == "ac_commit_run"
+    ] == ["refresh", "probe", "execute"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [None, "unknown"])
+async def test_pipeline_staged_result_requires_known_completed_phase(stage):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    mcp = _registry()
+    client = AsyncMock()
+    staged = {
+        "requires_confirmation": True,
+        "phase": "execute",
+        "plan_id": "write-plan",
+        "plan_hash": "write-hash",
+        "preview": {"channels_created": 1},
+        "write_count": 1,
+        "unique_target_count": 1,
+    }
+    if stage is not None:
+        staged["completed_phase"] = stage
+    client.call_endpoint.side_effect = [
+        {
+            "phase": "refresh", "plan_id": "refresh-plan", "plan_hash": "refresh-hash",
+            "preview": {"m3u_account_ids_to_refresh": [7]},
+            "write_count": 1, "unique_target_count": 1,
+        },
+        staged,
+    ]
+    with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+        first = await mcp.call_tool("run_channel_pipeline", {"dry_run": False})
+        with pytest.raises((ToolError, ValueError), match="completed phase"):
+            await mcp.call_tool(
+                "run_channel_pipeline",
+                {"dry_run": False, "confirmation_token": _token(_text(first))},
+            )
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ["run_channel_pipeline", "run_auto_creation"])

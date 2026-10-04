@@ -589,9 +589,22 @@ def install_safety_policy(mcp) -> None:
                 and isinstance(staged_text, str) and staged_text.startswith("ECM_STAGED_PLAN:")
             ):
                 next_plan = json.loads(staged_text.removeprefix("ECM_STAGED_PLAN:"))
+                stage_messages = {
+                    "refresh": (
+                        "Provider refresh completed. A second review is required for the exact "
+                        "post-refresh pipeline writes.\n"
+                    ),
+                    "probe": (
+                        "Stream quality probes completed. A second review is required for the exact "
+                        "post-probe pipeline writes.\n"
+                    ),
+                }
+                completed_phase = next_plan.get("completed_phase")
+                if completed_phase not in stage_messages:
+                    raise ValueError("Pipeline staged result has an invalid completed phase")
                 return present(
-                    "Provider refresh completed. A second review is required for the exact "
-                    "post-refresh pipeline writes.\n" + _issue_preview(_name, arguments, next_plan)
+                    stage_messages[completed_phase]
+                    + _issue_preview(_name, arguments, next_plan)
                 )
             return result
 

@@ -4,6 +4,7 @@ Auto-creation router — auto-creation pipeline CRUD, execution, import/export, 
 Extracted from main.py (Phase 3 of v0.13.0 backend refactor).
 """
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -241,7 +242,10 @@ class CommitPipelinePlanRequest(BaseModel):
 def _pipeline_plan_view(result: dict) -> dict:
     """Keep only exact actions/targets and non-sensitive counters in a plan."""
     return {
-        "dry_run_results": result.get("dry_run_results", []),
+        "dry_run_results": [
+            item for item in result.get("dry_run_results", [])
+            if item.get("phase") != "probe"
+        ],
         "streams_evaluated": result.get("streams_evaluated", 0),
         "streams_matched": result.get("streams_matched", 0),
         "channels_created": result.get("channels_created", 0),
@@ -1648,6 +1652,7 @@ async def _compute_pipeline_plan_payload(request: RunPipelineRequest) -> dict:
         rule_ids=request.rule_ids, record_execution=False, plan_only=True,
         skip_prerefresh=True,
     )
+    sort_probes = result.pop("planned_sort_probes", [])
     from channel_pipeline_executor import _advance_event_probe
 
     for summary in result.get("event_sync", []):
@@ -1680,6 +1685,7 @@ async def _compute_pipeline_plan_payload(request: RunPipelineRequest) -> dict:
         "result": result,
         "write_plan": planning_client.plan.as_dict(),
         "snapshot": snapshot,
+        "sort_probes": sort_probes,
     }
     return payload
 
@@ -1691,6 +1697,7 @@ def _canonical_pipeline_decision(payload: dict) -> dict:
     return {
         "write_plan": payload["write_plan"], "result": result,
         "snapshot": payload["snapshot"],
+        "sort_probes": payload["sort_probes"],
     }
 
 
@@ -1847,10 +1854,48 @@ def _retain_event_ownership(executor, *, works: list[dict] | None = None) -> Non
         session.close()
 
 
-async def _materialize_pipeline_plan(request: RunPipelineRequest, principal: str = "api") -> dict:
+async def _materialize_pipeline_plan(
+    request: RunPipelineRequest,
+    principal: str = "api",
+    probe_before_run: bool = True,
+) -> dict:
     """Build and persist the exact post-refresh write plan without side effects."""
     from services.mutation_plan_store import canonical_hash, mutation_plan_store
     payload = await _compute_pipeline_plan_payload(request)
+    sort_probes = payload["sort_probes"]
+    if probe_before_run and sort_probes:
+        stream_ids = list(dict.fromkeys(item["stream_id"] for item in sort_probes))
+        accounting = {
+            "write_count": len(stream_ids),
+            "unique_target_count": len(stream_ids),
+        }
+        if max(accounting.values()) >= 500:
+            raise HTTPException(status_code=413, detail={
+                "message": "planned stream probes reach the 500-operation hard cap",
+                **accounting,
+            })
+        payload["accounting"] = accounting
+        plan = mutation_plan_store.create(
+            "channel_pipeline_probe",
+            payload,
+            canonical_hash(_canonical_pipeline_decision(payload)),
+            principal,
+        )
+        descriptions = [
+            item for item in payload["result"].get("dry_run_results", [])
+            if item.get("phase") == "probe" and item.get("stream_id") in stream_ids
+        ]
+        return {
+            "phase": "probe",
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.payload_hash,
+            "expires_at": plan.expires_at,
+            "preview": {
+                "stream_ids": stream_ids,
+                "dry_run_results": descriptions,
+            },
+            **accounting,
+        }
     summary = _pipeline_plan_view(payload["result"])
     from services.pipeline_write_plan import PipelineWritePlan, PlannedWrite
     raw = payload["write_plan"]
@@ -1927,8 +1972,15 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
         replay_write_plan, validate_read_set,
         journal_entries_for_plan,
     )
+    operations = {
+        "refresh": "channel_pipeline_refresh",
+        "probe": "channel_pipeline_probe",
+        "execute": "channel_pipeline",
+    }
+    operation = operations.get(request.phase)
+    if operation is None:
+        raise HTTPException(status_code=409, detail="unknown pipeline plan phase")
     try:
-        operation = "channel_pipeline_refresh" if request.phase == "refresh" else "channel_pipeline"
         plan = mutation_plan_store.consume(
             request.plan_id, operation, request.plan_hash,
             principal=_plan_principal(_admin),
@@ -1952,8 +2004,110 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
             "completed_phase": "refresh",
             **next_plan,
         }
-    if request.phase != "execute":
-        raise HTTPException(status_code=409, detail="unknown pipeline plan phase")
+    if request.phase == "probe":
+        async with _MCP_PLANNED_RUN_LOCK:
+            from channel_pipeline_engine import ChannelPipelineEngine
+            from channel_pipeline_evaluator import StreamContext
+            from services.mutation_plan_store import canonical_hash
+            from stream_prober import get_prober
+
+            original_decision_hash = canonical_hash(
+                _canonical_pipeline_decision(plan.payload)
+            )
+            next_payload = await _compute_pipeline_plan_payload(
+                RunPipelineRequest(dry_run=False, **plan.payload["request"])
+            )
+            current_decision_hash = canonical_hash(
+                _canonical_pipeline_decision(next_payload)
+            )
+            if current_decision_hash != original_decision_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="pipeline decision inputs drifted; prepare a new plan",
+                )
+
+            approved = plan.payload["sort_probes"]
+            stream_ids = list(dict.fromkeys(item["stream_id"] for item in approved))
+            live_engine = await _ensure_engine()
+            current_streams = await live_engine.client.get_streams_by_ids(stream_ids)
+            current_by_id = {
+                item.get("id"): item
+                for item in current_streams
+                if isinstance(item, dict)
+            }
+            if (
+                any(
+                    not isinstance(item, dict)
+                    or type(item.get("id")) is not int
+                    for item in current_streams
+                )
+                or set(current_by_id) != set(stream_ids)
+                or len(current_streams) != len(stream_ids)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="planned stream probe identities drifted; prepare a new plan",
+                )
+
+            prober = get_prober()
+            if prober is None:
+                raise HTTPException(status_code=503, detail="Stream prober not available")
+
+            probe_engine = ChannelPipelineEngine(live_engine.client)
+            await probe_engine._load_stream_stats()
+            rule_ids = list(dict.fromkeys(item["rule_id"] for item in approved))
+            rules = await probe_engine._load_rules(rule_ids)
+            rules_by_id = {rule.id: rule for rule in rules}
+            if set(rules_by_id) != set(rule_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="planned stream probe rules drifted; prepare a new plan",
+                )
+
+            matched_entries = []
+            for item in approved:
+                current = current_by_id[item["stream_id"]]
+                stream_url = current.get("url")
+                account_id = prober._extract_m3u_account_id(
+                    current.get("m3u_account")
+                )
+                if (
+                    current.get("name") != item["stream_name"]
+                    or account_id != item["m3u_account_id"]
+                    or type(account_id) is not type(item["m3u_account_id"])
+                    or not isinstance(stream_url, str)
+                    or hashlib.sha256(stream_url.encode("utf-8")).hexdigest()
+                    != item["stream_url_hash"]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="planned stream probe identities drifted; prepare a new plan",
+                    )
+                stream = StreamContext.from_dispatcharr_stream(
+                    current,
+                    m3u_account_id=account_id,
+                    stream_stats=probe_engine._stream_stats_cache.get(item["stream_id"]),
+                )
+                matched_entries.append(
+                    (stream, rules_by_id[item["rule_id"]], [], [])
+                )
+
+            await probe_engine._probe_unprobed_streams(
+                matched_entries,
+                rules,
+                {"execution_log": [], "dry_run_results": []},
+                dry_run=False,
+            )
+            next_plan = await _materialize_pipeline_plan(
+                RunPipelineRequest(dry_run=False, **plan.payload["request"]),
+                plan.principal,
+                probe_before_run=False,
+            )
+            return {
+                "requires_confirmation": True,
+                "completed_phase": "probe",
+                **next_plan,
+            }
     raw = plan.payload["write_plan"]
     write_plan = PipelineWritePlan(
         writes=[PlannedWrite(**item) for item in raw["writes"]],

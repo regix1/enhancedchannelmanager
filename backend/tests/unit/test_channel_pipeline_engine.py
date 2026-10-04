@@ -2018,27 +2018,192 @@ class TestChannelPipelineEngineExecutionTracking:
         assert conflict.conflict_type == "duplicate_match"
         assert conflict.get_losing_rule_ids() == [2]
 
-    @patch("channel_pipeline_engine.get_session")
-    def test_update_rule_stats(self, mock_get_session):
-        """Update rule statistics after execution."""
-        mock_session = MagicMock()
-        mock_get_session.return_value = mock_session
+    def test_update_rule_stats_preserves_newer_configuration(self, test_engine):
+        """A detached run snapshot updates statistics without replacing later edits."""
+        from models import ChannelPipelineRule
+        from sqlalchemy.orm import sessionmaker
 
-        mock_rule = MagicMock()
-        mock_rule.id = 1
-
-        results = {
-            "channels_created": 5,
-            "streams_matched": 10,
-        }
-
-        asyncio.get_event_loop().run_until_complete(
-            self.engine._update_rule_stats([mock_rule], results)
+        sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+        loaded = sessions()
+        rule = ChannelPipelineRule(
+            name="Concurrent statistics",
+            description="start",
+            enabled=True,
+            priority=0,
+            conditions="[]",
+            actions="[]",
         )
+        rule.set_event_sync_config({"cap": 25})
+        rule.set_managed_channel_ids([10])
+        loaded.add(rule)
+        loaded.commit()
+        loaded.expunge(rule)
+        loaded.close()
 
-        assert mock_rule.last_run_at is not None
-        mock_session.merge.assert_called_once_with(mock_rule)
-        mock_session.commit.assert_called_once()
+        edited = sessions()
+        current = edited.get(ChannelPipelineRule, rule.id)
+        current.set_event_sync_config({"cap": 1})
+        current.description = "edited while running"
+        current.set_managed_channel_ids([20])
+        edited.commit()
+        edited.close()
+
+        writer = sessions()
+        with patch("channel_pipeline_engine.get_session", return_value=writer):
+            asyncio.get_event_loop().run_until_complete(
+                self.engine._update_rule_stats(
+                    [rule], {"rule_match_counts": {rule.id: 7}}
+                )
+            )
+
+        observed = sessions()
+        current = observed.get(ChannelPipelineRule, rule.id)
+        assert current.get_event_sync_config() == {"cap": 1}
+        assert current.description == "edited while running"
+        assert current.get_managed_channel_ids() == [20]
+        assert current.match_count == 7
+        assert current.last_run_at is not None
+        observed.close()
+
+    @pytest.mark.parametrize("branch", ["none", "first", "current", "cleanup"])
+    def test_managed_membership_preserves_newer_configuration(
+        self, test_engine, branch,
+    ):
+        """Every reconciliation write changes only managed membership."""
+        from models import ChannelPipelineRule
+        from sqlalchemy.orm import sessionmaker
+
+        sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+        loaded = sessions()
+        rule = ChannelPipelineRule(
+            name=f"Concurrent membership {branch}",
+            description="start",
+            enabled=True,
+            priority=0,
+            conditions="[]",
+            actions="[]",
+            orphan_action="none" if branch == "none" else "delete",
+            match_count=3,
+            last_run_at=datetime(2025, 1, 2, 3, 4, 5),
+        )
+        rule.set_event_sync_config({
+            "cap": 25,
+            "promote_unmatched": True,
+            "promote_target_group_id": 40,
+        })
+        if branch == "current":
+            rule.set_managed_channel_ids([10])
+        elif branch == "cleanup":
+            rule.set_managed_channel_ids([10, 11])
+        elif branch == "none":
+            rule.set_managed_channel_ids([])
+        loaded.add(rule)
+        loaded.commit()
+        loaded.expunge(rule)
+        loaded.close()
+
+        edited = sessions()
+        current = edited.get(ChannelPipelineRule, rule.id)
+        current.set_event_sync_config({
+            "cap": 1,
+            "promote_unmatched": True,
+            "promote_target_group_id": 40,
+        })
+        current.description = "edited while running"
+        current.match_count = 99
+        current.last_run_at = datetime(2026, 2, 3, 4, 5, 6)
+        edited.commit()
+        edited.close()
+
+        current_ids = [10, 12] if branch == "current" else [10]
+        if branch == "first":
+            current_ids = [12]
+        executor = MagicMock()
+        executor._channel_by_id = {
+            11: {"id": 11, "name": "Retired", "channel_group_id": 40},
+        }
+        action = MagicMock(
+            success=True,
+            action_type="delete_channel",
+            description="Removed retired channel",
+            error=None,
+        )
+        executor.remove_channel = AsyncMock(return_value=action)
+        results = {
+            "channels_removed": 0,
+            "channels_moved": 0,
+            "execution_log": [],
+            "dry_run_results": [],
+        }
+        writer = sessions()
+        with patch("channel_pipeline_engine.get_session", return_value=writer):
+            asyncio.get_event_loop().run_until_complete(
+                self.engine._reconcile_orphans(
+                    [rule], {rule.id: current_ids}, executor, MagicMock(),
+                    results, dry_run=False,
+                )
+            )
+
+        observed = sessions()
+        current = observed.get(ChannelPipelineRule, rule.id)
+        assert current.get_event_sync_config()["cap"] == 1
+        assert current.description == "edited while running"
+        assert current.match_count == 99
+        assert current.last_run_at == datetime(2026, 2, 3, 4, 5, 6)
+        assert current.get_managed_channel_ids() == sorted(current_ids)
+        if branch == "cleanup":
+            executor.remove_channel.assert_awaited_once_with(11)
+        observed.close()
+
+    @pytest.mark.parametrize("writer_name", ["statistics", "membership"])
+    def test_run_result_writer_does_not_recreate_deleted_rule(
+        self, test_engine, writer_name,
+    ):
+        """A rule deleted after loading stays deleted when a run completes."""
+        from models import ChannelPipelineRule
+        from sqlalchemy.orm import sessionmaker
+
+        sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+        loaded = sessions()
+        rule = ChannelPipelineRule(
+            name=f"Deleted before {writer_name}",
+            enabled=True,
+            priority=0,
+            conditions="[]",
+            actions="[]",
+            orphan_action="none",
+        )
+        rule.set_managed_channel_ids([])
+        loaded.add(rule)
+        loaded.commit()
+        loaded.expunge(rule)
+        loaded.close()
+
+        deleted = sessions()
+        deleted.delete(deleted.get(ChannelPipelineRule, rule.id))
+        deleted.commit()
+        deleted.close()
+
+        writer = sessions()
+        with patch("channel_pipeline_engine.get_session", return_value=writer):
+            if writer_name == "statistics":
+                asyncio.get_event_loop().run_until_complete(
+                    self.engine._update_rule_stats(
+                        [rule], {"rule_match_counts": {rule.id: 4}}
+                    )
+                )
+            else:
+                asyncio.get_event_loop().run_until_complete(
+                    self.engine._reconcile_orphans(
+                        [rule], {rule.id: [10]}, MagicMock(), MagicMock(),
+                        {"execution_log": [], "dry_run_results": []},
+                        dry_run=False,
+                    )
+                )
+
+        observed = sessions()
+        assert observed.get(ChannelPipelineRule, rule.id) is None
+        observed.close()
 
 
 class TestChannelPipelineEngineRollbackHelpers:
@@ -3265,7 +3430,7 @@ class TestOrdinaryStreamAdmission:
         }
         results = {"execution_log": [], "dry_run_results": []}
         with patch("stream_prober.get_prober", return_value=available_prober):
-            await engine._probe_unprobed_streams(
+            selected = await engine._probe_unprobed_streams(
                 self._matched([stream], rule), [rule], results, dry_run=dry_run
             )
 
@@ -3275,8 +3440,12 @@ class TestOrdinaryStreamAdmission:
         prober.probe_stream.assert_not_awaited()
         if case == "dryrun":
             assert len(results["dry_run_results"]) == 1
+            assert results["dry_run_results"][0]["phase"] == "probe"
+            assert results["dry_run_results"][0]["stream_id"] == 90
+            assert selected == [(stream, rule)]
         else:
             assert results["dry_run_results"] == []
+            assert selected == []
 
 
 class TestSmartSortMeasuredBitrate:
