@@ -882,6 +882,7 @@ class TemplateVariables:
 # rejected — a typo'd optional key ("attach_treshold") would otherwise
 # silently fall back to its default, which for a threshold is a safety knob.
 _EVENT_SYNC_ALLOWED_KEYS = frozenset({
+    "mode",
     # Provider-scoped canonical shape (bead 3p2af).
     "master",
     "secondary",
@@ -1381,13 +1382,32 @@ def validate_event_sync_config(
     # data migration). The derived flat keys are kept in sync below so every
     # existing reader of master_group_id / secondary_group_ids is untouched;
     # only the provider-aware fetch/preflight read the nested provider ids.
+    dedicated = config.get("mode") == "dedicated"
+    if "mode" in config and not dedicated:
+        errors.append(_event_sync_error("mode", config["mode"], '"dedicated" or an omitted mode'))
+    if dedicated:
+        for field, expected in (
+            ("promote_unmatched", True),
+            ("include_master_group_streams", False),
+            ("parse_master_from_stream", False),
+            ("assume_current_date", False),
+            ("skip_dead_streams", True),
+            ("skip_past_events", True),
+            ("retire_finished_events", True),
+        ):
+            if config.get(field) is not expected:
+                errors.append(_event_sync_error(field, config.get(field), str(expected).lower()))
+        if not _is_group_id(config.get("dummy_epg_profile_id")):
+            errors.append(_event_sync_error("dummy_epg_profile_id", config.get("dummy_epg_profile_id"), "an existing positive profile id"))
+        if config.get("master") is not None or config.get("master_group_id") is not None:
+            errors.append(_event_sync_error("master", config.get("master"), "null masters in dedicated mode"))
     include_master_streams = config.get("include_master_group_streams") is True
 
     raw_master = config.get("master")
     if raw_master is None and "master_group_id" in config:
         raw_master = config.get("master_group_id")
     master_scope = _normalize_scope(raw_master)
-    if master_scope is None:
+    if master_scope is None and not dedicated:
         errors.append(_event_sync_error(
             "master_group_id", raw_master,
             'the master event group as a positive integer group id, or '
@@ -1397,7 +1417,7 @@ def validate_event_sync_config(
         ))
 
     raw_secondary = config.get("secondary")
-    if raw_secondary is None and "secondary_group_ids" in config:
+    if raw_secondary is None and "secondary_group_ids" in config and not dedicated:
         raw_secondary = config.get("secondary_group_ids")
     # bead 3ux85: an empty secondary list is allowed ONLY when the master
     # group is itself the stream source (include_master_group_streams).
@@ -1424,6 +1444,12 @@ def validate_event_sync_config(
                 ))
             else:
                 secondary_scopes.append(sc)
+        if dedicated:
+            pairs = [(sc["group_id"], sc["m3u_account_id"]) for sc in secondary_scopes]
+            if any(not _is_group_id(sc["m3u_account_id"]) for sc in secondary_scopes):
+                errors.append(_event_sync_error("secondary", raw_secondary, "positive account ids for every dedicated scope"))
+            if len(set(pairs)) != len(pairs):
+                errors.append(_event_sync_error("secondary", raw_secondary, "unique ordered group/account pairs"))
         if secondary_ok and not secondary_scopes and not include_master_streams:
             errors.append(_event_sync_error(
                 "secondary_group_ids", raw_secondary,
@@ -1450,7 +1476,10 @@ def validate_event_sync_config(
 
     # Write canonical nested + derived flat. Downstream readers use the flat
     # keys (unchanged); provider-aware code reads master/secondary.
-    if master_scope is not None:
+    if dedicated:
+        config["master"] = None
+        config["master_group_id"] = master_group_id = None
+    elif master_scope is not None:
         config["master"] = master_scope
         config["master_group_id"] = master_group_id = master_scope["group_id"]
     else:
@@ -1734,6 +1763,34 @@ def validate_event_sync_config(
                     "→ Dummy EPG, or omit the key to disable dummy EPG "
                     "auto-assignment)",
                 ))
+            elif dedicated:
+                target = config.get("promote_target_group_id")
+                for field, expected in (
+                    ("channel_group_ids", [target]),
+                    ("hide_empty_group_ids", [target]),
+                    ("epg_source_ids", []),
+                    ("channel_mappings", []),
+                ):
+                    raw_value = getattr(profile, field)
+                    try:
+                        value = [] if raw_value is None else json.loads(raw_value)
+                    except (ValueError, TypeError):
+                        value = None
+                    if (value != expected or not isinstance(value, list)
+                            or field in {"channel_group_ids", "hide_empty_group_ids"} and any(not _is_group_id(group_id) for group_id in value)):
+                        errors.append(_event_sync_error("dummy_epg_profile_id", dummy_epg_profile_id, f"a profile whose {field} is exactly {expected}"))
+                try:
+                    profile_config = json.loads(profile.event_sync_config)
+                except (ValueError, TypeError):
+                    profile_config = None
+                if (
+                    not isinstance(profile_config, dict)
+                    or profile_config.get("assume_current_date") is not False
+                    or validate_event_sync_config(profile_config, profile_group_ids=[target])
+                    or profile_config.get("slot_patterns") != []
+                    or profile_config.get("secondary") != secondary_scopes
+                ):
+                    errors.append(_event_sync_error("dummy_epg_profile_id", dummy_epg_profile_id, "a canonical source-free profile with the same ordered account scopes and no assumed date"))
 
     # --- Unmatched-stream promotion (bead ti939.4.1) ----------------------
     # OPT-IN and default-invisible: like dummy_epg_profile_id, an ABSENT

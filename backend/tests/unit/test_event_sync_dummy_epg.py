@@ -214,7 +214,7 @@ def _wire_epg(state, client, session_factory,
     headers = copy.deepcopy(regenerated_entries or [])
     now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
 
-    from services.epg_publication import begin_delivery, publish_profiles
+    from services.epg_publication import begin_delivery, publish_profiles, read_publication
 
     def available_headers():
         return [
@@ -296,6 +296,9 @@ def _wire_epg(state, client, session_factory,
         )
 
     if initial_entries:
+        with patch("services.epg_publication.get_session", side_effect=session_factory):
+            publication = read_publication(f"profile:{profile_id}")
+    if initial_entries and publication is None:
         session = session_factory()
         try:
             saved = session.get(DummyEPGProfile, profile_id)
@@ -392,6 +395,8 @@ def _manual_run(client, session_factory, regenerate, wait_refresh,
     task_cls = MagicMock()
     task_cls.return_value._regenerate_xmltv = regenerate
     with patch("channel_pipeline_engine.get_session",
+               side_effect=session_factory), \
+         patch("routers.channel_pipeline.get_session",
                side_effect=session_factory), \
          patch("database.get_session", side_effect=session_factory), \
          patch("services.epg_publication.get_session",
@@ -1152,3 +1157,67 @@ class TestGracefulDegradation:
             str(r.get("stream_name", "")).startswith("[Pass 5")
             for r in result["dry_run_results"]
         )
+
+
+class TestDedicatedGuide:
+    def test_deferred_assignment_keeps_target_only_profile(self, db_session_factory, monkeypatch):
+        from services import epg_publication
+        from tests.unit.test_event_sync_promotion import _pending_completion
+
+        with patch("services.epg_publication.add_groups", wraps=epg_publication.add_groups) as add_groups:
+            setup, executor, _ = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        add_groups.assert_not_called()
+        assert executor._combined_dummy_source_ids == []
+        assert executor._dummy_source_by_profile[setup["profile_id"]] == setup["source_id"]
+        assert setup["state"].channels[900]["epg_data_id"] == 502
+        assert "epg_data_id" not in setup["state"].channels[100]
+        assert setup["state"].source_refresh_ids
+        assert set(setup["state"].source_refresh_ids) == {setup["source_id"]}
+
+    @pytest.mark.parametrize("fault", ["pending_lost", "extra_group", "wrong_source", "combined_source", "outside_target"])
+    def test_deferred_scope_drift_fails_without_profile_repair(self, db_session_factory, monkeypatch, fault):
+        from channel_pipeline_executor import ExecutionContext
+        from channel_pipeline_evaluator import StreamContext
+        from channel_pipeline_schema import Action, ActionType
+        from tests.unit.test_event_sync_promotion import _pending_completion
+
+        setup, executor, _ = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        channel_id = 900
+        source_id = setup["source_id"]
+        action = Action(type=ActionType.ASSIGN_EPG, params={"epg_id": source_id})
+        context = ExecutionContext(current_channel_id=channel_id)
+        executor._deferred_epg_assignments = [(channel_id, action, StreamContext(stream_id=7301, stream_name=setup["event_name"]), context)]
+        executor._deferred_epg_profiles[channel_id] = setup["profile_id"]
+        if fault == "pending_lost":
+            executor._event_pending.clear()
+        elif fault == "extra_group":
+            session = db_session_factory()
+            try:
+                session.get(DummyEPGProfile, setup["profile_id"]).set_channel_group_ids([40, MASTER_GROUP_ID])
+                session.commit()
+            finally:
+                session.close()
+        elif fault == "wrong_source":
+            executor._dummy_source_by_profile[setup["profile_id"]] = 999
+        elif fault == "combined_source":
+            executor._epg_sources[0]["url"] = "http://ecm.test/api/dummy-epg/xmltv"
+        else:
+            setup["state"].channels[channel_id]["channel_group_id"] = MASTER_GROUP_ID
+        engine = ChannelPipelineEngine(setup["client"])
+        results = _refresh_results()
+        results.update({"execution_log": [], "dry_run_results": []})
+        before = copy.deepcopy(setup["state"].channels)
+        with patch("database.get_session", side_effect=db_session_factory), patch(
+            "channel_pipeline_engine.get_session", side_effect=db_session_factory
+        ), patch("services.epg_publication.get_session", side_effect=db_session_factory), patch(
+            "services.epg_publication.add_groups"
+        ) as add_groups:
+            if fault == "extra_group":
+                with pytest.raises(ValueError, match="Dedicated deferred guide configuration"):
+                    _run(engine._refresh_dummy_epg_and_retry(executor, results, executor._epg_sources, False))
+            else:
+                _run(engine._refresh_dummy_epg_and_retry(executor, results, executor._epg_sources, False))
+        add_groups.assert_not_called()
+        assert setup["state"].channels == before
+        if fault != "extra_group":
+            assert results["failed_actions"]

@@ -2,7 +2,7 @@
 Unit tests for the Dummy EPG generation engine.
 """
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytz
 
@@ -1533,6 +1533,53 @@ def test_preview_pipeline_drops_url_the_guide_will_not_emit():
     assert result["matched"] is True
     # away and home resolved, league never appears in the pattern.
     assert result["rendered"]["channel_logo_url"] == ""
+
+
+def test_external_source_gap_control_preserves_headers_and_real_programmes():
+    from dummy_epg_engine import generate_channel_xml, generate_xmltv
+
+    start = datetime(2026, 10, 3, 15, tzinfo=timezone.utc)
+    real_start = start + timedelta(hours=2)
+    real_stop = real_start + timedelta(hours=1)
+    stop = start + timedelta(hours=6)
+    real = ET.fromstring(
+        f'<programme start="{real_start:%Y%m%d%H%M%S %z}" '
+        f'stop="{real_stop:%Y%m%d%H%M%S %z}">'
+        '<title>Confirmed event</title><icon src="https://example.com/real.jpg"/>'
+        '</programme>'
+    )
+    profile = {
+        **_variant_profile(180, []),
+        "epg_source_ids": [46],
+        "guide_start": start,
+        "guide_stop": stop,
+        "source_programmes": {1: [real]},
+        "channel_assignments": [{"channel_id": 1}],
+        "tvg_id_template": "event-{channel_id}",
+    }
+    channel_data = {
+        1: {"id": 1, "name": "Arena 1", "channel_number": 100, "streams": []},
+    }
+
+    default_channel, default_programmes = generate_channel_xml(
+        1, "Arena 1", 100, "event-1", profile,
+    )
+    controlled_channel, controlled_programmes = generate_channel_xml(
+        1, "Arena 1", 100, "event-1", profile, fill_gaps=False,
+    )
+    controlled_document = ET.fromstring(
+        generate_xmltv([profile], channel_data, without_gaps={1})
+    )
+
+    assert default_channel.get("id") == "event-1"
+    assert len(default_programmes) == 3
+    assert [row.findtext("title") for row in controlled_programmes] == ["Confirmed event"]
+    assert controlled_programmes[0].find("icon").get("src") == "https://example.com/real.jpg"
+    assert controlled_channel.get("id") == "event-1"
+    assert controlled_document.find("channel").get("id") == "event-1"
+    assert [row.findtext("title") for row in controlled_document.findall("programme")] == [
+        "Confirmed event",
+    ]
 
 
 def test_source_event_gaps_keep_the_title_without_claiming_a_schedule():

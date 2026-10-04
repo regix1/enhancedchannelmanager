@@ -5058,3 +5058,34 @@ class TestAutoCreateSmartSortCountry:
         assert engine_order[0] == 1407077, (
             f"Expected a US stream at position 1, got {engine_order}"
         )
+
+
+class TestCompleteChannelInventory:
+    @pytest.mark.parametrize("case", ["valid", "negative", "wrong_type", "duplicate", "invalid_id", "early_empty", "changed_total", "failed_groups"])
+    def test_only_complete_stable_channel_and_group_reads_admit_dedicated_work(self, case):
+        first = {"count": 1, "next": None, "results": [{"id": 900, "name": "Owned", "channel_group_id": 40}]}
+        client = MagicMock()
+        client.get_channels = AsyncMock(return_value=first)
+        client.get_channel_groups = AsyncMock(return_value=[{"id": 40, "name": "Target"}])
+        if case == "negative":
+            first["count"] = -1
+        elif case == "wrong_type":
+            first["count"] = "1"
+        elif case == "duplicate":
+            first.update(count=2, results=[first["results"][0], dict(first["results"][0])])
+        elif case == "invalid_id":
+            first["results"][0]["id"] = True
+        elif case == "early_empty":
+            first.update(count=1, results=[])
+        elif case == "changed_total":
+            client.get_channels.side_effect = [
+                {"count": 2, "next": "next", "results": first["results"]},
+                {"count": 3, "next": None, "results": [{"id": 901, "name": "Other"}]},
+                {"count": 3, "next": None, "results": []},
+            ]
+        elif case == "failed_groups":
+            client.get_channel_groups.side_effect = RuntimeError("group read failed")
+        engine = ChannelPipelineEngine(client)
+        asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
+        assert engine._channels_complete is (case == "valid")
+        client.update_channel.assert_not_called()

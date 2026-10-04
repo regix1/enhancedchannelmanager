@@ -417,10 +417,17 @@ class TaskSchedule(Base):
         Index("idx_task_schedule_next_run", next_run_at),
     )
 
-    def get_days_of_week_list(self) -> list:
+    def get_days_of_week_list(self, *, strict: bool = False) -> list:
         """Parse days_of_week string into list of integers."""
+        if strict and self.days_of_week not in (None, "") and not isinstance(self.days_of_week, str):
+            raise ValueError("Invalid stored schedule days")
         if not self.days_of_week:
             return []
+        if strict:
+            tokens = self.days_of_week.split(",")
+            if any(token.strip() not in {"0", "1", "2", "3", "4", "5", "6"} for token in tokens):
+                raise ValueError("Invalid stored schedule days")
+            return [int(token.strip()) for token in tokens]
         try:
             return [int(d.strip()) for d in self.days_of_week.split(",") if d.strip()]
         except ValueError:
@@ -430,8 +437,18 @@ class TaskSchedule(Base):
         """Set days_of_week from list of integers."""
         self.days_of_week = ",".join(str(d) for d in sorted(days)) if days else None
 
-    def get_parameters(self) -> dict:
+    def get_parameters(self, *, strict: bool = False) -> dict:
         """Parse parameters JSON into dictionary."""
+        if strict:
+            if self.parameters in (None, ""):
+                return {}
+            try:
+                parameters = json.loads(self.parameters)
+            except (ValueError, TypeError) as error:
+                raise ValueError("Invalid stored schedule parameters") from error
+            if not isinstance(parameters, dict):
+                raise ValueError("Stored schedule parameters must be an object")
+            return parameters
         if not self.parameters:
             return {}
         try:
@@ -447,8 +464,41 @@ class TaskSchedule(Base):
         """Get a specific parameter value."""
         return self.get_parameters().get(key, default)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, strict: bool = False) -> dict:
         """Convert to dictionary for API responses."""
+        if strict:
+            if self.schedule_type not in {"interval", "daily", "weekly", "biweekly", "monthly"}:
+                raise ValueError("Invalid stored schedule cadence")
+            if self.interval_seconds is not None and (
+                type(self.interval_seconds) is not int or self.interval_seconds <= 0
+            ):
+                raise ValueError("Invalid stored schedule interval")
+            if self.schedule_type == "interval" and self.interval_seconds is None:
+                raise ValueError("Stored interval schedule requires an interval")
+            if self.schedule_time is not None:
+                if not isinstance(self.schedule_time, str) or len(self.schedule_time) != 5:
+                    raise ValueError("Invalid stored schedule time")
+                try:
+                    datetime.strptime(self.schedule_time, "%H:%M")
+                except ValueError as error:
+                    raise ValueError("Invalid stored schedule time") from error
+            if self.schedule_type != "interval" and self.schedule_time is None:
+                raise ValueError("Stored calendar schedule requires a time")
+            if self.day_of_month is not None and (
+                type(self.day_of_month) is not int
+                or self.day_of_month not in {-1, *range(1, 32)}
+            ):
+                raise ValueError("Invalid stored schedule month day")
+            if self.schedule_type == "monthly" and self.day_of_month is None:
+                raise ValueError("Stored monthly schedule requires a day")
+            if self.week_parity is not None and (
+                type(self.week_parity) is not int or self.week_parity not in {0, 1}
+            ):
+                raise ValueError("Invalid stored schedule week parity")
+            if self.schedule_type in {"weekly", "biweekly"} and not self.get_days_of_week_list(strict=True):
+                raise ValueError("Stored weekly schedule requires days")
+            if self.created_at is None or self.updated_at is None:
+                raise ValueError("Stored schedule requires creation and update times")
         return {
             "id": self.id,
             "task_id": self.task_id,
@@ -458,10 +508,10 @@ class TaskSchedule(Base):
             "interval_seconds": self.interval_seconds,
             "schedule_time": self.schedule_time,
             "timezone": self.timezone,
-            "days_of_week": self.get_days_of_week_list(),
+            "days_of_week": self.get_days_of_week_list(strict=strict),
             "day_of_month": self.day_of_month,
             "week_parity": self.week_parity,
-            "parameters": self.get_parameters(),
+            "parameters": self.get_parameters(strict=strict),
             "next_run_at": self.next_run_at.isoformat() + "Z" if self.next_run_at else None,
             "last_run_at": self.last_run_at.isoformat() + "Z" if self.last_run_at else None,
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
@@ -481,6 +531,8 @@ class TaskExecution(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String(50), nullable=False)  # References ScheduledTask.task_id
+    # Historical association survives schedule deletion and remains unknown for old rows.
+    schedule_id = Column(Integer, nullable=True)
     # Execution timing
     started_at = Column(DateTime, nullable=False)
     completed_at = Column(DateTime, nullable=True)
@@ -533,6 +585,7 @@ class TaskExecution(Base):
             "skipped_count": self.skipped_count,
             "details": json.loads(self.details) if self.details else None,
             "triggered_by": self.triggered_by,
+            "schedule_id": self.schedule_id,
         }
 
     def __repr__(self):

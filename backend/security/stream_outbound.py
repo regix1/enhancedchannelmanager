@@ -205,7 +205,7 @@ async def _read_hls_manifest(response: httpx.Response) -> bytes:
         )
 
     body = bytearray()
-    async for chunk in response.aiter_bytes(chunk_size=65536):
+    async for chunk in response.aiter_bytes():
         remaining = _MAX_HLS_MANIFEST_BYTES + 1 - len(body)
         body.extend(chunk[:remaining])
         if len(body) > _MAX_HLS_MANIFEST_BYTES:

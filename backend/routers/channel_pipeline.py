@@ -1051,6 +1051,12 @@ async def update_auto_creation_rule(rule_id: int, request: UpdateChannelPipeline
             # config, reverting the rule to the standard kind), same
             # convention as match_scope_group_id.
             if "event_sync_config" in request.model_fields_set:
+                current_config = rule.get_event_sync_config()
+                if isinstance(current_config, dict) and (
+                    (current_config.get("mode") == "dedicated")
+                    != (isinstance(request.event_sync_config, dict) and request.event_sync_config.get("mode") == "dedicated")
+                ):
+                    raise HTTPException(status_code=400, detail="An existing event rule cannot change ownership mode")
                 if request.event_sync_config is not None:
                     from channel_pipeline_schema import validate_event_sync_config
                     es_errors = validate_event_sync_config(request.event_sync_config)
@@ -1785,12 +1791,12 @@ def _apply_event_results(
     )
 
 
-def _retain_event_ownership(executor) -> None:
-    """Keep receipt-proven channel ownership after interrupted replay."""
+def _retain_event_ownership(executor, *, works: list[dict] | None = None) -> None:
+    """Keep receipt-proven ownership before completion or after interruption."""
     if executor is None:
         return
     owned: dict[int, tuple[int, list[int]]] = {}
-    for work in executor._replayed_event_work:
+    for work in executor._replayed_event_work if works is None else works:
         rule_id = work["rule_id"]
         target_group_id = work["target_group_id"]
         entry = owned.setdefault(rule_id, (target_group_id, []))
@@ -1824,8 +1830,14 @@ def _retain_event_ownership(executor) -> None:
                 or config.get("promote_target_group_id") != target_group_id
             ):
                 raise ValueError("event managed channel scope drifted")
+            if config.get("mode") == "dedicated":
+                from channel_pipeline_schema import validate_event_sync_config
+
+                for work in executor._replayed_event_work if works is None else works:
+                    if work["rule_id"] == rule_id and (validate_event_sync_config(config) or config != work["config"]):
+                        raise ValueError("Dedicated managed rule configuration drifted")
             current = list(rule.get_managed_channel_ids() or [])
-            rule.set_managed_channel_ids(list(dict.fromkeys([*current, *channel_ids])))
+            rule.managed_channel_ids = json.dumps(list(dict.fromkeys([*current, *channel_ids])))
             session.add(rule)
         session.commit()
     except BaseException:
@@ -2064,6 +2076,10 @@ async def commit_auto_creation_pipeline(request: CommitPipelinePlanRequest, _adm
                 staged = await event_executor.replay_event_promotion(
                     operation, result_id,
                 )
+                if staged["stage"] == "allocated":
+                    _retain_event_ownership(
+                        event_executor, works=event_executor._replayed_event_work[-1:],
+                    )
                 await engine.complete_event_replay(event_executor, event_results)
                 return staged
 
@@ -2994,6 +3010,13 @@ async def import_auto_creation_rules_yaml(request: ImportYAMLRequest, _admin=Req
 
                 if existing:
                     if request.overwrite:
+                        current_config = existing.get_event_sync_config()
+                        if isinstance(current_config, dict) and (
+                            (current_config.get("mode") == "dedicated")
+                            != (isinstance(event_sync_config, dict) and event_sync_config.get("mode") == "dedicated")
+                        ):
+                            errors.append({"rule_index": i, "rule_name": rule_name, "errors": ["An existing event rule cannot change ownership mode"]})
+                            continue
                         # Update existing rule
                         existing.description = rule_data.get("description")
                         existing.enabled = rule_data.get("enabled", True)
@@ -3430,10 +3453,11 @@ async def _load_event_sync_preview_config(request: EventSyncPreviewRequest) -> d
 async def _fetch_and_resolve_event_sync(
     config: dict,
     client,
-    effective_master_group_id: int,
+    effective_master_group_id: int | None,
     *,
     decisions=None,
     exclusions=None,
+    rule_id: int | None = None,
 ) -> dict:
     """Fetch master channels + secondary streams and resolve them — the ONE
     fetch/resolve path shared by the preview endpoint and the debug-bundle
@@ -3467,6 +3491,35 @@ async def _fetch_and_resolve_event_sync(
         resolve_event_sync,
     )
     from stream_prober import extract_m3u_account_id
+
+    if config.get("mode") == "dedicated":
+        from channel_pipeline_engine import ChannelPipelineEngine
+        from channel_pipeline_executor import validate_event_target
+
+        engine = ChannelPipelineEngine(client)
+        await engine._load_existing_data(config["promote_target_group_id"])
+        if not engine._channels_complete:
+            raise HTTPException(status_code=409, detail="Dedicated target inventory is incomplete")
+        try:
+            target_channels = validate_event_target(config, rule_id, engine._existing_channels, engine._existing_groups)
+            accounts = await client.get_m3u_accounts()
+            if (not isinstance(accounts, list)
+                    or any(not isinstance(account, dict) or type(account.get("id")) is not int or account["id"] < 1 for account in accounts)
+                    or len({account["id"] for account in accounts}) != len(accounts)):
+                raise ValueError("Dedicated account inventory is incomplete")
+            account_names = {account["id"]: account.get("name") for account in accounts}
+            if any(scope["m3u_account_id"] not in account_names for scope in config["secondary"]):
+                raise ValueError("Dedicated account scope is unavailable")
+            secondary_streams = await engine._fetch_event_sync_secondary_streams(config, account_names)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        resolution = await run_cpu_bound(partial(resolve_event_sync, config, [], secondary_streams, decisions=decisions, exclusions=exclusions))
+        return {
+            "resolution": resolution, "name_to_id": {}, "master_names": [], "master_channels": [],
+            "target_channels": target_channels,
+            "group_names": {group["id"]: group.get("name") for group in engine._existing_groups},
+            "truncated": False, "stale_lookup": {},
+        }
 
     master_group_id = config["master_group_id"]
     secondary_group_ids = config["secondary_group_ids"]
@@ -3781,6 +3834,8 @@ async def preview_event_sync(
                 "for rule %s (%s) — previewing without it",
                 request.rule_id, e,
             )
+            if config.get("mode") == "dedicated":
+                raise HTTPException(status_code=409, detail="Dedicated review or exclusion state is unavailable") from e
             decisions = None
             pending_fps = frozenset()
             exclusion_keys = frozenset()
@@ -3806,7 +3861,7 @@ async def preview_event_sync(
                 enabled_rules, exclude_rule_id=request.rule_id
             )
             # Ownership follows the run's active dates; preflight keeps all enabled rules.
-            if config.get("promote_unmatched"):
+            if config.get("promote_unmatched") and config.get("mode") != "dedicated":
                 engine = await _ensure_engine()
                 managed_channel_ids = {
                     channel_id
@@ -3838,9 +3893,11 @@ async def preview_event_sync(
     # SOURCE, Dispatcharr places its channels in the override TARGET group, so
     # the master channels must be fetched from there — not the raw
     # master_group_id, which would come back empty (bead override).
-    effective_master_group_id = resolve_effective_master_group_id(
+    if config.get("mode") == "dedicated" and not preflight["ok"]:
+        raise HTTPException(status_code=409, detail=preflight)
+    effective_master_group_id = (None if config.get("mode") == "dedicated" else resolve_effective_master_group_id(
         all_settings, master_group_id
-    )
+    ))
 
     # Shared fetch + resolve (bead 03nji) — the ONE fetch/resolve path the
     # preview endpoint and the debug-bundle matching diagnostics both call, so
@@ -3851,6 +3908,7 @@ async def preview_event_sync(
     fetched = await _fetch_and_resolve_event_sync(
         config, client, effective_master_group_id, decisions=decisions,
         exclusions=exclusion_keys,
+        rule_id=request.rule_id,
     )
     resolution = fetched["resolution"]
     name_to_id = fetched["name_to_id"]
@@ -4076,10 +4134,10 @@ async def preview_event_sync(
         from services.event_sync_promote import build_promotion_plan
 
         promote_target_group_id = config["promote_target_group_id"]
-        target_channels: list[dict] = []
+        target_channels: list[dict] = fetched.get("target_channels", [])
         try:
             tpage = 1
-            while True:
+            while config.get("mode") != "dedicated":
                 resp = await client.get_channels(
                     page=tpage, page_size=_PREVIEW_FETCH_PAGE_SIZE,
                     channel_group=promote_target_group_id,
@@ -4120,7 +4178,7 @@ async def preview_event_sync(
         existing_name_to_id = channel_name_to_id(
             (
                 ch for ch in target_channels
-                if ch.get("auto_created", False) or (
+                if config.get("mode") == "dedicated" or ch.get("auto_created", False) or (
                     ch.get("id") is not None
                     and ch.get("id") in managed_channel_ids
                 )
@@ -4488,6 +4546,7 @@ async def preview_event_sync(
         # bead ti939.4.1: promotion keys appear ONLY when the config opted
         # in (promotion_out is None otherwise → the two ** expansions are
         # empty and the payload is byte-identical to the pre-feature shape).
+        **({"mode": "dedicated", "master": None, "master_group_id": None} if config.get("mode") == "dedicated" else {}),
         **({"promotion": promotion_out} if promotion_out is not None else {}),
         "preflight": preflight,
         "summary": {
@@ -5277,9 +5336,9 @@ async def _build_event_sync_matching_section(client) -> dict:
                 continue
 
             master_group_id = config["master_group_id"]
-            effective_master_group_id = resolve_effective_master_group_id(
+            effective_master_group_id = (None if config.get("mode") == "dedicated" else resolve_effective_master_group_id(
                 all_settings, master_group_id
-            )
+            ))
 
             # Pre-flight status (bead yjchp): "why didn't this rule fire on
             # refresh" is not diagnosable from a bundle without it — the
@@ -5303,6 +5362,8 @@ async def _build_event_sync_matching_section(client) -> dict:
                 rule_entry["preflight"] = {
                     "error": f"{type(e).__name__}: {e}",
                 }
+            if config.get("mode") == "dedicated" and rule_entry["preflight"].get("ok") is not True:
+                raise ValueError("Dedicated group preflight failed")
 
             # Review-queue decisions feed the resolver so the bundle predicts
             # exactly what a live run would do (mirrors the preview endpoint).
@@ -5318,6 +5379,8 @@ async def _build_event_sync_matching_section(client) -> dict:
                 logger.warning(
                     "[EVENT-SYNC] debug bundle: review-queue load failed for "
                     "rule %s (%s) — resolving without it", rule.id, e)
+                if config.get("mode") == "dedicated":
+                    raise ValueError("Dedicated review or exclusion state is unavailable") from e
                 decisions = None
                 exclusion_keys = frozenset()
             finally:
@@ -5326,6 +5389,7 @@ async def _build_event_sync_matching_section(client) -> dict:
             fetched = await _fetch_and_resolve_event_sync(
                 config, client, effective_master_group_id, decisions=decisions,
                 exclusions=exclusion_keys,
+                rule_id=rule.id,
             )
             resolution = fetched["resolution"]
             name_to_id = fetched["name_to_id"]

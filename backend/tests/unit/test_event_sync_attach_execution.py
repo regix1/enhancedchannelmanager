@@ -1957,3 +1957,92 @@ class TestWatermarkTaskUnattendedNotifications:
         assert result.success is True
         titles = [c.kwargs.get("title", "") for c in notify.call_args_list]
         assert any("3" in t and "attached" in t for t in titles)
+
+
+class TestDedicatedFetch:
+    def test_only_the_two_ordered_account_scopes_are_read(self):
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        scopes = [{"group_id": 2491, "m3u_account_id": 2}, {"group_id": 1514, "m3u_account_id": 18}]
+        config = dedicated_event_sync_config(secondary=scopes)
+        rows = {
+            ("Group 2491", 2): [{"id": 21, "name": STREAM_UNMATCHED, "m3u_account": 2}],
+            ("Group 1514", 18): [{"id": 181, "name": STREAM_UNMATCHED, "m3u_account": {"id": 18}}],
+            ("Group 1553", 2): [{"id": 1553, "name": "Static channel", "m3u_account": 2}],
+        }
+        client = _scoped_client(rows)
+        engine = ChannelPipelineEngine(client)
+        result = _run(engine._fetch_event_sync_secondary_streams(config, {2: "First", 18: "Second"}))
+        assert [(row.stream_id, row.group_id, row.provider_id) for row in result] == [(21, 2491, 2), (181, 1514, 18)]
+        assert [(call.kwargs["channel_group_name"], call.kwargs["m3u_account"]) for call in client.get_streams.call_args_list] == [("Group 2491", 2), ("Group 1514", 18)]
+        client.get_channels.assert_not_called()
+        client.update_channel.assert_not_awaited()
+
+    def test_dated_variants_resolve_without_iterating_unrelated_channels(self):
+        from datetime import datetime, timezone
+        from services.event_sync_promote import build_promotion_plan
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        pattern = {
+            "name": "dated-event",
+            "title_pattern": r"^Peacock\s+\d+:\s*(?P<title>.+?)\s*@",
+            "date_pattern": r"@\s*(?P<month>[A-Za-z]{3})[ -](?P<day>\d{1,2})[ -](?P<year>\d{4})\s+",
+            "time_pattern": r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[AP]M)\s+ET$",
+        }
+        config = dedicated_event_sync_config(patterns=[pattern], secondary=[{"group_id": 2491, "m3u_account_id": 2}, {"group_id": 1514, "m3u_account_id": 18}])
+        streams = [
+            SecondaryStream(name="Peacock 01: Same Event @ Oct 3 2026 01:00 PM ET", group_id=2491, provider_id=2, stream_id=21),
+            SecondaryStream(name="Peacock 02: Same Event @ Oct-3-2026 01:00 PM ET", group_id=1514, provider_id=18, stream_id=181),
+        ]
+        client = MagicMock()
+        executor = ActionExecutor(client, [{"id": 100, "name": streams[0].name, "channel_group_id": None}])
+        now = datetime(2026, 10, 3, 17, tzinfo=timezone.utc)
+        resolution, names, count = executor._resolve_event_sync(config, streams, now=now)
+        assert names == {}
+        assert count == 0
+        assert all(row.disposition == "unmatched" for row in resolution.resolved)
+        assert resolution.resolved[0].result.parsed.start == resolution.resolved[1].result.parsed.start
+        plan = build_promotion_plan(config, resolution.resolved, {}, now=now)
+        assert len(plan.units) == 1
+        assert [row.stream.stream_id for row in plan.units[0].rows] == [21, 181]
+        client.get_channels.assert_not_called()
+        client.update_channel.assert_not_called()
+
+    @pytest.mark.parametrize("case", ["wrong_account", "unknown_account", "invalid_id", "duplicate_id", "early_empty", "changed_count", "missing_count", "cap", "group_missing"])
+    def test_an_incomplete_scope_is_rejected_as_a_whole(self, case, monkeypatch):
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(secondary=[{"group_id": 2491, "m3u_account_id": 2}])
+        batch = [{"id": 1, "name": STREAM_UNMATCHED, "m3u_account": 2}]
+        response = {"count": 1, "next": None, "results": batch}
+        client = _scoped_client({})
+        if case == "wrong_account":
+            batch[0]["m3u_account"] = 18
+        elif case == "unknown_account":
+            batch[0]["m3u_account"] = None
+        elif case == "invalid_id":
+            batch[0]["id"] = True
+        elif case == "duplicate_id":
+            batch.append(dict(batch[0]))
+            response["count"] = 2
+        elif case == "early_empty":
+            response.update(count=2, next="next", results=[])
+        elif case == "missing_count":
+            response.pop("count")
+        elif case == "cap":
+            monkeypatch.setattr("channel_pipeline_engine.EVENT_SYNC_MAX_SECONDARY_STREAMS", 0)
+        elif case == "group_missing":
+            client._channel_group_name_for_id.return_value = None
+            client._channel_group_name_for_id.side_effect = None
+        if case == "changed_count":
+            client.get_streams.side_effect = [
+                {"count": 2, "next": "next", "results": batch},
+                {"count": 3, "next": None, "results": [{"id": 3, "name": STREAM_UNMATCHED, "m3u_account": 2}]},
+            ]
+        else:
+            client.get_streams.side_effect = None
+            client.get_streams.return_value = response
+        engine = ChannelPipelineEngine(client)
+        with pytest.raises(ValueError):
+            _run(engine._fetch_event_sync_secondary_streams(config, {2: "First"}))
+        client.update_channel.assert_not_awaited()

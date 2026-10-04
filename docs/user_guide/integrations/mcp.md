@@ -738,6 +738,58 @@ task. If the initial `run_task` acceptance call itself ends without returning
 an identity, do not retry it automatically because ECM may already have
 started the task.
 
+## Read complete task settings and history
+
+`list_tasks()` retains its task summaries. To inspect one task's complete safe
+settings and current state, select its exact ID and request details:
+
+```text
+list_tasks(task_id="m3u_refresh", details=true)
+```
+
+The result has two JSON roots, `task` and `engine`. `task.stored` contains the
+persisted parent settings and alert flags. `task.config` contains the runtime
+configuration, which can differ while a run uses temporary parameters.
+`task.schedules` includes each schedule's ID, enabled gate, cadence, nullable
+name and timestamps, and complete parameters. Schedules sort by ID; ordered
+configuration arrays retain their order. `engine` includes active task IDs,
+the check interval and execution capacity. These two reads do not form an
+atomic snapshot. If state changes between them, read again before comparing.
+With `details=false`, a selected ID returns the usual summary for that task.
+
+To read a bounded page of complete execution records, select a task and use
+an integer limit from 1 through 100 and a nonnegative integer offset:
+
+```text
+get_task_history(task_id="m3u_refresh", limit=10, offset=0, details=true)
+```
+
+The JSON result includes `task_id`, `limit`, `offset`, `has_more`, and
+`history`. Records sort by start time and execution ID, newest first.
+`has_more` indicates that another row exists beyond this page. New inserts can
+move offset boundaries, so repeat boundary identities after work has stopped
+before treating several pages as a complete observation. A successful empty
+page differs from a failed storage read, which returns an explicit error.
+Existing calls that omit `details` retain their text summaries.
+
+Each new execution records its selected `schedule_id` before work starts.
+The association survives schedule deletion. Runs without a selected schedule
+and older records have null associations; ECM does not infer old associations
+from timestamps. Use `triggered_by` for the recorded trigger type. Continue
+using the exact execution ID and start timestamp when resuming a wait.
+
+Complete task and execution reads refuse the whole object if required fields
+are missing or invalid, or if any value contains sensitive keys, credentials,
+URLs, redaction markers, unsupported values, or exceeds the output bounds.
+The refusal does not disclose the rejected content. Safe fields added by a
+newer backend remain in the result. A refusal is not a settings baseline.
+Default summaries remain available, but they cannot replace complete evidence.
+
+Deploy the backend and its additive database migration before the matching
+sidecar, then reconnect your MCP client to load the new signatures. Detailed
+calls refuse an older backend shape. Deploying an older application does not
+require removing the additive history column.
+
 ## Going deeper
 
 - **Architecture**: [`docs/architecture.md`](https://github.com/MotWakorb/enhancedchannelmanager/blob/main/docs/architecture.md), covering the MCP

@@ -165,3 +165,82 @@ describe('ProviderScopedGroupPicker', () => {
     expect(screen.getByTestId('psg-secondary-10-7')).toBeInTheDocument();
   });
 });
+
+describe('account-required input scopes', () => {
+  it('emits the real account for a single-account group', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS} value={[]}
+        onChange={onChange} showAll={false} requireAccount />,
+    );
+    expect(screen.queryByTestId('psg-secondary-20-any')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('psg-secondary-20-7'));
+    expect(onChange).toHaveBeenCalledWith([{ group_id: 20, m3u_account_id: 7 }]);
+  });
+
+  it('offers each account without a whole-group choice for a multi-account group', () => {
+    render(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS} value={[]}
+        onChange={vi.fn()} showAll={false} requireAccount />,
+    );
+    expect(screen.getByTestId('psg-secondary-10-3')).toBeInTheDocument();
+    expect(screen.getByTestId('psg-secondary-10-7')).toBeInTheDocument();
+    expect(screen.queryByTestId('psg-secondary-10-any')).not.toBeInTheDocument();
+  });
+
+  it('preserves selection priority after removal and reselection', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const first = { group_id: 20, m3u_account_id: 7 };
+    const second = { group_id: 10, m3u_account_id: 7 };
+    const { rerender } = render(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS} value={[first]}
+        onChange={onChange} showAll={false} requireAccount />,
+    );
+    await user.click(screen.getByTestId('psg-secondary-10-7'));
+    expect(onChange).toHaveBeenLastCalledWith([first, second]);
+    rerender(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS} value={[first, second]}
+        onChange={onChange} showAll={false} requireAccount />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Remove NBA' }));
+    expect(onChange).toHaveBeenLastCalledWith([second]);
+    rerender(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS} value={[second]}
+        onChange={onChange} showAll={false} requireAccount />,
+    );
+    await user.click(screen.getByTestId('psg-secondary-20-7'));
+    expect(onChange).toHaveBeenLastCalledWith([second, first]);
+  });
+
+  it('keeps null and unknown saved scopes visible and removable', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const unknown = { group_id: 999, m3u_account_id: 0 };
+    render(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS}
+        value={[{ group_id: 20, m3u_account_id: null }, unknown]}
+        onChange={onChange} showAll={false} requireAccount />,
+    );
+    expect(screen.getByText('NBA · Any provider')).toBeInTheDocument();
+    expect(screen.getByText('Group 999 · Provider 0')).toBeInTheDocument();
+    expect(screen.getByTestId('psg-secondary-20-7')).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Remove NBA' }));
+    expect(onChange).toHaveBeenLastCalledWith([unknown]);
+    await user.click(screen.getByRole('button', { name: 'Remove 999' }));
+    expect(onChange).toHaveBeenLastCalledWith([{ group_id: 20, m3u_account_id: null }]);
+  });
+
+  it('shows an ON mismatch without a Fix action even when a callback is supplied', () => {
+    const onRequestFix = vi.fn();
+    render(
+      <ProviderScopedGroupPicker role="secondary" rows={ROWS}
+        value={[{ group_id: 10, m3u_account_id: 3 }]}
+        onChange={vi.fn()} onRequestFix={onRequestFix} showAll={false} requireAccount />,
+    );
+    expect(screen.getByText(/Resolve this setting in M3U Manager/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Fix/ })).not.toBeInTheDocument();
+    expect(onRequestFix).not.toHaveBeenCalled();
+  });
+});

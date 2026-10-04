@@ -59,6 +59,7 @@ def _execution(status: str = "running", **changes: Any) -> dict[str, Any]:
         "skipped_count": 0,
         "details": None,
         "triggered_by": "manual",
+        "schedule_id": None,
     }
     response.update(changes)
     return response
@@ -591,3 +592,117 @@ def test_task_execution_reader_is_read_only_and_run_remains_mutating():
     assert runner.annotations is not None
     assert runner.annotations.readOnlyHint is False
     assert runner.annotations.destructiveHint is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit,offset,count,has_more", [(1, 0, 2, True), (2, 4, 2, False), (100, 0, 0, False)])
+async def test_detailed_history_returns_one_complete_bounded_page(limit, offset, count, has_more):
+    rows = [
+        _execution("completed", id=EXECUTION_ID - index, schedule_id=7 if index == 0 else None,
+                   completed_at="2026-09-20T03:00:08Z", success=True)
+        for index in range(count)
+    ]
+    client = ScriptedClient([{"history": rows, "future_field": {"ordered": [9, 2]}}])
+    with patch("tools.tasks.get_ecm_client", return_value=client):
+        result = await _registry().call_tool("get_task_history", {
+            "task_id": TASK_ID, "limit": limit, "offset": offset, "details": True,
+        })
+    assert json.loads(_text(result)) == {
+        "task_id": TASK_ID, "limit": limit, "offset": offset, "has_more": has_more,
+        "history": rows[:limit], "future_field": {"ordered": [9, 2]},
+    }
+    assert client.calls == [("tasks_history", {"path_args": {"task_id": TASK_ID}, "query": {"limit": limit + 1, "offset": offset}})]
+
+
+@pytest.mark.asyncio
+async def test_default_history_keeps_all_task_summary_and_query():
+    client = ScriptedClient([{"history": [_execution("completed", duration_seconds=8.0)]}])
+    with patch("tools.tasks.get_ecm_client", return_value=client):
+        result = await _registry().call_tool("get_task_history", {})
+    assert _text(result) == f"Task history (1 entries):\n  {TASK_ID}: completed (8.0s) — {STARTED_AT}"
+    assert client.calls == [("tasks_history_all", {"query": {"limit": 10}})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    {"details": True}, {"task_id": " ", "details": True},
+    {"task_id": TASK_ID, "details": True, "limit": 0},
+    {"task_id": TASK_ID, "details": True, "limit": 101},
+    {"task_id": TASK_ID, "details": True, "offset": -1},
+])
+async def test_detailed_history_rejects_unbounded_selection_before_http(arguments):
+    client = ScriptedClient([])
+    with patch("tools.tasks.get_ecm_client", return_value=client):
+        result = await _registry().call_tool("get_task_history", arguments)
+    assert _text(result).startswith("Cannot return complete task details:")
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key,value", [("limit", True), ("offset", False), ("limit", "10"), ("offset", 1.5), ("details", 1)])
+async def test_detailed_history_rejects_coerced_integer_and_boolean_inputs(key, value):
+    client = ScriptedClient([])
+    with patch("tools.tasks.get_ecm_client", return_value=client), pytest.raises(ToolError):
+        await _registry().call_tool("get_task_history", {"task_id": TASK_ID, "details": True, key: value})
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", list(_execution()))
+async def test_detailed_history_refuses_missing_execution_fields(key):
+    row = _execution()
+    del row[key]
+    client = ScriptedClient([{"history": [row]}])
+    with patch("tools.tasks.get_ecm_client", return_value=client):
+        result = await _registry().call_tool("get_task_history", {"task_id": TASK_ID, "details": True})
+    assert _text(result).startswith("Cannot return complete task details:")
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows", [
+    [_execution(), _execution()],
+    [_execution(id=40), _execution(id=41)],
+    [_execution(task_id="another_task")],
+    [_execution("completed", completed_at=None)],
+    [_execution(completed_at="2026-09-20T02:59:59Z")],
+    [_execution(schedule_id=True)], [_execution(schedule_id=0)],
+    [_execution(triggered_by=None)], [_execution(total_items=-1)],
+    [_execution(duration_seconds=-1)], [_execution(success="true")],
+    [_execution(details=[])], [_execution(error=False)],
+])
+async def test_detailed_history_refuses_invalid_identity_order_and_values(rows):
+    client = ScriptedClient([{"history": rows}])
+    with patch("tools.tasks.get_ecm_client", return_value=client):
+        result = await _registry().call_tool("get_task_history", {"task_id": TASK_ID, "details": True})
+    assert _text(result).startswith("Cannot return complete task details:")
+
+
+@pytest.mark.asyncio
+async def test_detailed_history_refuses_unsafe_lookahead_and_failed_read_without_retry(caplog):
+    rejected = "https://example.test/private"
+    client = ScriptedClient([{"history": [_execution(), _execution(id=40, message=rejected)]}, RuntimeError(rejected)])
+    with patch("tools.tasks.get_ecm_client", return_value=client), patch("tools.tasks.asyncio.sleep") as sleep:
+        unsafe = await _registry().call_tool("get_task_history", {"task_id": TASK_ID, "limit": 1, "details": True})
+        failed = await _registry().call_tool("get_task_history", {"task_id": TASK_ID, "details": True})
+    assert _text(unsafe).startswith("Cannot return complete task details:")
+    assert _text(failed).startswith("Cannot return complete task details:")
+    assert rejected not in _text(unsafe) + _text(failed) + caplog.text
+    assert len(client.calls) == 2
+    sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "failed"])
+async def test_exact_execution_refuses_unsafe_content_without_retry(status, caplog):
+    rejected = "Bearer " + "x" * 32
+    client = ScriptedClient([_execution(status, error=rejected)])
+    with patch("tools.tasks.get_ecm_client", return_value=client), patch("tools.tasks.asyncio.sleep") as sleep:
+        result = await _registry().call_tool("get_task_execution", {
+            "task_id": TASK_ID, "execution_id": EXECUTION_ID,
+            "started_at": STARTED_AT, "wait_for_completion": True,
+        })
+    assert _text(result).startswith("Cannot return complete task details:")
+    assert rejected not in _text(result) + caplog.text
+    assert len(client.calls) == 1
+    sleep.assert_not_called()

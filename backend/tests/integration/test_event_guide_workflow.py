@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+import xml.etree.ElementTree as ET
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -128,6 +129,61 @@ def _admit(publications):
         return row
 
     return begin
+
+
+def test_generated_document_waits_for_import_completion_before_replacing_old_row():
+    from services.epg_publication import publish_profiles
+
+    now = datetime(2026, 10, 3, 18, 45, tzinfo=timezone.utc)
+    prepared = _profile(1, 65, [46])
+    prepared.update({
+        "name_source": "channel",
+        "title_pattern": r"(?P<title>.+)",
+        "title_template": "{title}",
+        "tvg_id_template": "ecm-{channel_id}",
+        "channel_assignments": [{"channel_id": 5040, "channel_name": "Reported event"}],
+        "guide_start": datetime(2026, 10, 3, 15, tzinfo=timezone.utc),
+        "guide_stop": datetime(2026, 10, 5, 4, tzinfo=timezone.utc),
+        "source_programmes": {5040: []},
+    })
+    channels = {
+        5040: {
+            "id": 5040,
+            "name": "Atlantic Sun Conference Norfolk St Vs. Bellarmine @ Sep 18 10:00 AM",
+            "channel_number": 912,
+            "channel_group_id": 65,
+            "hidden_from_output": False,
+            "streams": [],
+        },
+    }
+    coverage = {
+        "profiles": {"1": {"profile_id": 1, "can_publish": True, "reason_codes": []}},
+    }
+    imported_rows = {
+        "ecm-5040": [{
+            "title": "Programming unavailable",
+            "start": "2026-10-03T15:00:00+00:00",
+            "stop": "2026-10-05T04:00:00+00:00",
+        }],
+    }
+    before_import = copy.deepcopy(imported_rows)
+
+    result = publish_profiles(
+        [prepared], channels, coverage, observations={}, now=now,
+    )
+    document = ET.fromstring(result.xmltv_by_scope["profile:1"])
+
+    assert imported_rows == before_import
+    imported_rows["ecm-5040"] = [
+        {
+            "title": row.findtext("title"),
+            "start": row.attrib["start"],
+            "stop": row.attrib["stop"],
+        }
+        for row in document.findall("programme[@channel='ecm-5040']")
+    ]
+    assert imported_rows["ecm-5040"] == []
+    assert document.find("channel[@id='ecm-5040']") is not None
 
 
 @pytest.mark.asyncio
@@ -279,9 +335,8 @@ async def test_retained_placeholder_continues_safe_profile_work():
     assert outcome.completed_degraded is True
     assert outcome.details["retained_profile_ids"] == [1]
     assert outcome.details["published_profile_ids"] == [2]
-    assert outcome.details["hidden_channel_ids"] == [10, 20]
+    assert outcome.details["hidden_channel_ids"] == [20]
     assert client.update_channel.await_args_list == [
-        ((10, {"hidden_from_output": True}),),
         ((20, {"hidden_from_output": True}),),
     ]
     cache.set.assert_any_call("dummy_epg_xmltv_1", retained_xml)
@@ -495,6 +550,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         converged = await event_visibility.EventVisibilityTask().execute()
 
         first_profile = read_publication("profile:1")["xmltv"]
+        first_document = ET.fromstring(first_profile)
         update_count = len(updates)
         oversized = True
         retained = await event_visibility.EventVisibilityTask().execute()
@@ -506,6 +562,16 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     assert channels[11]["hidden_from_output"] is False
     assert channels[11]["epg_data_id"] == 501
     assert channels[11]["streams"] == [101, 50, 102]
+    assert first_document.find("channel[@id='event-10']") is not None
+    assert first_document.find("channel[@id='event-11']") is not None
+    assert first_document.findall("programme[@channel='event-10']") == []
+    assert [row.findtext("title") for row in first_document.findall(
+        "programme[@channel='event-11']"
+    )] == ["Main Event"]
+    assert all(
+        row.findtext("title") != "Programming unavailable"
+        for row in first_document.findall("programme")
+    )
     assert first_profile != before_profile
     assert read_publication("all")["xmltv"] != before_all
     assert len(source_calls) == 2

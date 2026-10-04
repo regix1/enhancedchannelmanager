@@ -93,6 +93,57 @@ def _make_alembic_config(db_url: str):
     return cfg
 
 
+@pytest.mark.integration
+def test_task_execution_schedule_migration_preserves_rows_without_backfill(tmp_path):
+    from alembic import command
+    from alembic.script import ScriptDirectory
+    from sqlalchemy.exc import OperationalError
+
+    db_url = f"sqlite:///{tmp_path / 'task_history.db'}"
+    cfg = _make_alembic_config(db_url)
+    assert ScriptDirectory.from_config(cfg).get_heads() == ["0057"]
+    command.upgrade(cfg, "0056")
+    engine = create_engine(db_url, future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO task_executions "
+                "(id, task_id, started_at, status, total_items, success_count, failed_count, skipped_count, triggered_by) "
+                "VALUES (73, 'stream_probe', '2026-09-20 03:00:00', 'running', 3, 1, 0, 0, 'scheduled')"
+            ))
+        with engine.connect() as connection:
+            before = dict(connection.execute(text("SELECT * FROM task_executions WHERE id=73")).mappings().one())
+            with pytest.raises(OperationalError):
+                connection.execute(text("SELECT schedule_id FROM task_executions WHERE id=73"))
+        command.upgrade(cfg, "0057")
+        column = next(column for column in inspect(engine).get_columns("task_executions") if column["name"] == "schedule_id")
+        assert column["nullable"] is True
+        assert all("schedule_id" not in key["constrained_columns"] for key in inspect(engine).get_foreign_keys("task_executions"))
+        with engine.begin() as connection:
+            upgraded = dict(connection.execute(text("SELECT * FROM task_executions WHERE id=73")).mappings().one())
+            assert upgraded == {**before, "schedule_id": None}
+            connection.execute(text(
+                "INSERT INTO task_executions "
+                "(id, task_id, schedule_id, started_at, status, total_items, success_count, failed_count, skipped_count, triggered_by) "
+                "VALUES (74, 'stream_probe', 7, '2026-09-20 03:00:01', 'running', 0, 0, 0, 0, 'manual')"
+            ))
+        command.stamp(cfg, "0056")
+        command.upgrade(cfg, "0057")
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT schedule_id FROM task_executions WHERE id=74")).scalar_one() == 7
+        command.downgrade(cfg, "0056")
+        assert "schedule_id" not in {column["name"] for column in inspect(engine).get_columns("task_executions")}
+        with engine.connect() as connection:
+            assert dict(connection.execute(text("SELECT * FROM task_executions WHERE id=73")).mappings().one()) == before
+            assert connection.execute(text("SELECT count(*) FROM task_executions")).scalar_one() == 2
+        command.upgrade(cfg, "0057")
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT schedule_id FROM task_executions ORDER BY id")).scalars().all() == [None, None]
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0057"
+    finally:
+        engine.dispose()
+
+
 def _snapshot_schema(engine) -> dict[str, Any]:
     """Capture a structural snapshot of the DB schema.
 
@@ -1851,6 +1902,9 @@ class TestSmartBootstrapFastPath:
                 ))
                 conn.execute(text(
                     "ALTER TABLE dummy_epg_profiles ADD COLUMN event_sync_config TEXT"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE task_executions ADD COLUMN schedule_id INTEGER"
                 ))
                 conn.execute(text(
                     "ALTER TABLE password_reset_tokens "

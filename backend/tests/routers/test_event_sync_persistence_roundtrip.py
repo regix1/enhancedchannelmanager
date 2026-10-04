@@ -508,3 +508,83 @@ class TestYamlExportImportRoundTrip:
         assert test_session.query(ChannelPipelineRule).filter(
             ChannelPipelineRule.name == "BadImport"
         ).first() is None
+
+
+class TestDedicatedPersistence:
+    @pytest.fixture
+    def dedicated(self, test_session, monkeypatch):
+        import database
+        from sqlalchemy.orm import sessionmaker
+        from channel_pipeline_schema import validate_event_sync_config
+        from tests.event_sync_fixtures import dedicated_event_profile, dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(enabled=False)
+        test_session.add(dedicated_event_profile(config))
+        test_session.commit()
+        monkeypatch.setattr(database, "_SessionLocal", sessionmaker(bind=test_session.bind))
+        assert validate_event_sync_config(config) == []
+        return config
+
+    @pytest.mark.asyncio
+    async def test_create_read_update_and_yaml_preserve_disabled_source_free_mode(self, async_client, test_session, dedicated):
+        body = {"name": "Dedicated events", "enabled": False, "conditions": [{"type": "always"}], "actions": [{"type": "skip"}], "event_sync_config": dedicated}
+        with patch("routers.channel_pipeline.get_client", return_value=_mock_client()), patch("routers.channel_pipeline.journal"):
+            created = await async_client.post("/api/channel-pipeline/rules", json=body)
+            assert created.status_code == 200, created.text
+            rule = test_session.query(ChannelPipelineRule).filter_by(name=body["name"]).one()
+            response = await async_client.get(f"/api/channel-pipeline/rules/{rule.id}")
+            assert response.status_code == 200
+            assert rule.get_event_sync_config() == dedicated
+            updated = await async_client.put(f"/api/channel-pipeline/rules/{rule.id}", json={"description": "Dated events", "event_sync_config": dedicated})
+            assert updated.status_code == 200, updated.text
+            exported = await async_client.get("/api/channel-pipeline/export/yaml")
+            assert exported.status_code == 200
+            document = yaml.safe_load(exported.text)
+            assert document["rules"][0]["event_sync_config"] == dedicated
+            document["rules"][0]["name"] = "Imported dedicated events"
+            imported = await async_client.post("/api/channel-pipeline/import/yaml", json={"yaml_content": yaml.safe_dump(document)})
+            assert imported.status_code == 200, imported.text
+            assert imported.json()["errors"] == []
+        imported_rule = test_session.query(ChannelPipelineRule).filter_by(name="Imported dedicated events").one()
+        assert imported_rule.enabled is False
+        assert imported_rule.get_event_sync_config() == dedicated
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("direction", ["legacy_to_dedicated", "dedicated_to_legacy", "dedicated_clear"])
+    async def test_saved_mode_conversion_is_refused_in_update_and_overwrite_import(self, async_client, test_session, dedicated, direction):
+        original = _event_sync_config() if direction == "legacy_to_dedicated" else dedicated
+        replacement = dedicated if direction == "legacy_to_dedicated" else (_event_sync_config() if direction == "dedicated_to_legacy" else None)
+        rule = _create_rule(test_session, name="Saved mode", event_sync_config=json.dumps(original))
+        with patch("routers.channel_pipeline.get_client", return_value=_mock_client()), patch("routers.channel_pipeline.journal"):
+            response = await async_client.put(f"/api/channel-pipeline/rules/{rule.id}", json={"event_sync_config": replacement})
+            assert response.status_code == 400
+            document = {"rules": [{"name": rule.name, "conditions": [{"type": "always"}], "actions": [{"type": "skip"}], "event_sync_config": replacement}]}
+            imported = await async_client.post("/api/channel-pipeline/import/yaml", json={"yaml_content": yaml.safe_dump(document), "overwrite": True})
+            assert imported.status_code == 200
+            assert imported.json()["errors"]
+        test_session.refresh(rule)
+        assert rule.get_event_sync_config() == original
+
+    def test_backup_restore_validates_and_retains_the_exact_mode(self, test_session, dedicated):
+        from sqlalchemy.orm import sessionmaker
+
+        from models import DummyEPGProfile
+        from routers.backup import _restore_auto_creation_rules
+
+        rule = _create_rule(test_session, name="Dedicated backup", enabled=False, event_sync_config=json.dumps(dedicated))
+        exported = rule.to_dict()
+        with patch("routers.backup.get_session", return_value=test_session), patch(
+            "database.get_session",
+            side_effect=sessionmaker(
+                bind=test_session.connection(), join_transaction_mode="create_savepoint",
+            ),
+        ):
+            result = _restore_auto_creation_rules([exported])
+        assert result["warnings"] == []
+        restored = test_session.query(ChannelPipelineRule).filter_by(name=exported["name"]).one()
+        assert restored.get_event_sync_config() == dedicated
+        profile = test_session.get(DummyEPGProfile, dedicated["dummy_epg_profile_id"])
+        assert profile.get_channel_group_ids() == [40]
+        assert profile.get_hide_empty_group_ids() == [40]
+        assert profile.get_epg_source_ids() == []
+        assert profile.get_channel_mappings() == []

@@ -139,6 +139,7 @@ class TaskExecutionResponse(BaseModel):
     skipped_count: int
     details: Optional[dict] = None
     triggered_by: str
+    schedule_id: Optional[int] = None
 
 
 class CronValidateRequest(BaseModel):
@@ -452,8 +453,8 @@ async def get_all_task_history(limit: int = 100, offset: int = 0):
         engine = get_engine()
         history = engine.get_task_history(task_id=None, limit=limit, offset=offset)
         return {"history": history}
-    except Exception as e:
-        logger.exception("[TASKS] Failed to get all task history: %s", e)
+    except Exception:
+        logger.error("[TASKS] Task history read failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -547,7 +548,7 @@ async def list_tasks():
 
 
 @router.get("/api/tasks/{task_id}", tags=["Tasks"])
-async def get_task(task_id: str):
+async def get_task(task_id: str, details: bool = False):
     """Get status for a specific task, including all schedules."""
     logger.debug("[TASKS] GET /api/tasks/%s", task_id)
     try:
@@ -565,6 +566,10 @@ async def get_task(task_id: str):
         try:
             # Get alert configuration from ScheduledTask
             db_task = session.query(ScheduledTask).filter(ScheduledTask.task_id == task_id).first()
+            if details:
+                if db_task is None:
+                    raise HTTPException(status_code=500, detail="Stored task configuration is unavailable")
+                status['stored'] = db_task.to_dict()
             if db_task:
                 status['send_alerts'] = db_task.send_alerts
                 status['alert_on_success'] = db_task.alert_on_success
@@ -580,13 +585,13 @@ async def get_task(task_id: str):
             schedules = session.query(TaskSchedule).filter(TaskSchedule.task_id == task_id).all()
             status['schedules'] = []
             for schedule in schedules:
-                schedule_dict = schedule.to_dict()
+                schedule_dict = schedule.to_dict(strict=True) if details else schedule.to_dict()
                 schedule_dict['description'] = describe_schedule(
                     schedule_type=schedule.schedule_type,
                     interval_seconds=schedule.interval_seconds,
                     schedule_time=schedule.schedule_time,
                     timezone=schedule.timezone,
-                    days_of_week=schedule.get_days_of_week_list(),
+                    days_of_week=schedule.get_days_of_week_list(strict=True) if details else schedule.get_days_of_week_list(),
                     day_of_month=schedule.day_of_month,
                 )
                 status['schedules'].append(schedule_dict)
@@ -610,7 +615,10 @@ async def get_task(task_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("[TASKS] Failed to get task %s: %s", task_id, e)
+        if details:
+            logger.error("[TASKS] Detailed task read failed")
+        else:
+            logger.exception("[TASKS] Failed to get task %s: %s", task_id, e)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -841,8 +849,8 @@ async def get_task_history(task_id: str, limit: int = 50, offset: int = 0):
         engine = get_engine()
         history = engine.get_task_history(task_id=task_id, limit=limit, offset=offset)
         return {"history": history}
-    except Exception as e:
-        logger.exception("[TASKS] Failed to get history for task %s: %s", task_id, e)
+    except Exception:
+        logger.error("[TASKS] Task history read failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

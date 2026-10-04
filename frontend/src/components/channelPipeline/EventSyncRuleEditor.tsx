@@ -249,10 +249,10 @@ function sameScope(
   return a.group_id === b.group_id && (a.m3u_account_id ?? null) === (b.m3u_account_id ?? null);
 }
 
-/** Set-like equality of two scope lists (S4a dirty check — reordering in the
- * picker is not an edit). */
-function sameScopes(a: EventSyncGroupScope[], b: EventSyncGroupScope[]): boolean {
+/** Dedicated inputs retain priority order; legacy inputs retain set equality. */
+function sameScopes(a: EventSyncGroupScope[], b: EventSyncGroupScope[], ordered = false): boolean {
   if (a.length !== b.length) return false;
+  if (ordered) return a.every((scope, index) => sameScope(scope, b[index]));
   const key = (s: EventSyncGroupScope) => `${s.group_id}:${s.m3u_account_id ?? 'any'}`;
   const bKeys = b.map(key).sort();
   return a.map(key).sort().every((k, i) => k === bKeys[i]);
@@ -288,6 +288,7 @@ export function EventSyncRuleEditor({
 }: EventSyncRuleEditorProps) {
   const id = useId();
   const config = rule?.event_sync_config ?? null;
+  const [dedicated, setDedicated] = useState(config?.mode === 'dedicated');
 
   // Basic info
   const [name, setName] = useState(rule?.name || '');
@@ -435,6 +436,7 @@ export function EventSyncRuleEditor({
     config?.dummy_epg_profile_id ?? null
   );
   const [dummyProfiles, setDummyProfiles] = useState<DummyEPGProfile[]>([]);
+  const [profilesState, setProfilesState] = useState<'loading' | 'ready' | 'error'>('loading');
   // bead io0tv: Pass 3.5 stream ordering within master channels. Stored on
   // the rule's existing stream_sort_field/stream_sort_order COLUMNS (the same
   // surface RuleBuilder uses), NOT in event_sync_config. '' = no sorting
@@ -452,6 +454,7 @@ export function EventSyncRuleEditor({
   // bead 38dzi: (provider, group) junction rows joined to channel-group names,
   // driving the provider-scoped pickers (and their inline auto-sync status).
   const [junctions, setJunctions] = useState<GroupProviderRow[]>([]);
+  const [junctionsState, setJunctionsState] = useState<'loading' | 'ready' | 'error'>('loading');
 
   // Guided setup (ti939.3.4): one-click confirmed auto_channel_sync fix.
   // The toggle API is ONLY called from the confirmation dialog's confirm
@@ -468,6 +471,8 @@ export function EventSyncRuleEditor({
   // last preview ran. Results are marked stale (not cleared) when the current
   // built config diverges from it, via the shared dirty-comparator.
   const [previewSignature, setPreviewSignature] = useState<string | null>(null);
+  const previewRequest = useRef(0);
+  const mounted = useRef(true);
   // Last Test-patterns run verdict, surfaced in the Matching impact block
   // (null = not run yet). Fed by the panel's onParseFailuresChange callback.
   const [lastTestFailures, setLastTestFailures] = useState<boolean | null>(null);
@@ -511,30 +516,77 @@ export function EventSyncRuleEditor({
   const pendingMasterFocus = useRef(false);
 
   useEffect(() => {
+    let current = true;
+    mounted.current = true;
     // The junction rows carry no group name; join them against the channel
     // group list the editor already loads. Load both, then join.
     const groupsRequest = getChannelGroups()
       .then(groups => {
         const simple = groups.map(g => ({ id: g.id, name: g.name }));
+        if (!current) return simple;
         setChannelGroups(simple);
         setGroupsState('ready');
         return simple;
       })
       .catch(() => {
-        setGroupsState('error');
+        if (current) setGroupsState('error');
         return [];
       });
     Promise.all([
       groupsRequest,
-      getProviderGroupSettingsByProvider().catch(() => []),
+      getProviderGroupSettingsByProvider()
+        .then(rows => {
+          if (current) setJunctionsState('ready');
+          return rows;
+        })
+        .catch(() => {
+          if (current) setJunctionsState('error');
+          return [];
+        }),
     ]).then(([groups, rows]) => {
+      if (!current) return;
       const byId = new Map(groups.map(g => [g.id, g.name]));
       setJunctions(joinProviderRows(rows, gid => byId.get(gid)));
     });
     getDummyEPGProfiles()
-      .then(setDummyProfiles)
-      .catch(() => {});
+      .then(profiles => {
+        if (!current) return;
+        setDummyProfiles(profiles);
+        setProfilesState('ready');
+      })
+      .catch(() => {
+        if (current) setProfilesState('error');
+      });
+    return () => {
+      current = false;
+      mounted.current = false;
+      previewRequest.current += 1;
+    };
   }, []);
+
+  const handleModeChange = (next: boolean) => {
+    if (isEditing || saving) return;
+    setDedicated(next);
+    previewRequest.current += 1;
+    setPreview(null);
+    setPreviewSignature(null);
+    setPreviewError(null);
+    setPreviewLoading(false);
+    setSaveError(null);
+    setPendingFix(null);
+    setFixError(null);
+    if (next) {
+      setEnabled(false);
+      setAutoRun(false);
+      setIncludeMasterGroupStreams(false);
+      setParseMasterFromStream(false);
+      setAssumeCurrentDate(false);
+      setPromoteUnmatched(true);
+      setSkipPastEvents(true);
+      setRetireFinishedEvents(true);
+      setSkipDeadStreams(true);
+    }
+  };
 
   /** Guided fix (ti939.3.4): the CONFIRMED toggle, then refetch the junctions
    * so the picker's inline auto-sync status updates. */
@@ -646,16 +698,61 @@ export function EventSyncRuleEditor({
    * different providers. */
   const scopedGroups = useMemo(() => {
     const ids = new Set<number>();
-    if (masterScope != null) ids.add(masterScope.group_id);
+    if (!dedicated && masterScope != null) ids.add(masterScope.group_id);
     for (const s of secondaryScopes) ids.add(s.group_id);
     return [...ids].map(groupId => ({ id: groupId, name: groupName(groupId) }));
-  }, [masterScope, secondaryScopes, groupName]);
+  }, [dedicated, masterScope, secondaryScopes, groupName]);
+
+  const profileError: string | null = (() => {
+    if (!dedicated) return null;
+    if (profilesState === 'loading') return 'Loading dummy EPG profiles';
+    if (profilesState === 'error') return 'Dummy EPG profiles could not be loaded. Close and reopen this editor to try again.';
+    const profile = dummyProfiles.find(p => p.id === dummyEpgProfileId);
+    if (!profile) return 'Choose an available source-free dummy EPG profile';
+    const linked = profile.event_sync_config;
+    if (
+      profile.channel_group_ids.length !== 1 ||
+      profile.channel_group_ids[0] !== promoteTargetGroupId ||
+      profile.hide_empty_group_ids?.length !== 1 ||
+      profile.hide_empty_group_ids[0] !== promoteTargetGroupId ||
+      profile.epg_source_ids?.length !== 0 ||
+      profile.channel_mappings?.length !== 0 ||
+      linked == null || linked.slot_patterns.length !== 0 ||
+      linked.assume_current_date !== false ||
+      !sameScopes(linked.secondary, secondaryScopes, true)
+    ) {
+      return 'The dummy EPG profile must contain only the target and the same ordered account scopes, with no source inputs, mappings, slots or date assumption';
+    }
+    return null;
+  })();
 
   const validationError: string | null = (() => {
     if (activeFrom && activeUntil && activeUntil < activeFrom) {
       return 'End date must be on or after start date';
     }
-    if (masterScope == null) return 'Pick a master group first';
+    if (!dedicated && masterScope == null) return 'Pick a master group first';
+    if (dedicated && groupsState !== 'ready') {
+      return groupsState === 'loading'
+        ? 'Loading channel groups'
+        : 'Channel groups could not be loaded. Close and reopen this editor to try again.';
+    }
+    if (dedicated && junctionsState !== 'ready') {
+      return junctionsState === 'loading'
+        ? 'Loading account-scoped input groups'
+        : 'Account-scoped input groups could not be loaded. Close and reopen this editor to try again.';
+    }
+    if (dedicated && secondaryScopes.length === 0) return 'Pick at least one account-scoped secondary group';
+    if (dedicated && secondaryScopes.some(scope =>
+      !Number.isInteger(scope.group_id) || scope.group_id <= 0 ||
+      scope.m3u_account_id == null || !Number.isInteger(scope.m3u_account_id) || scope.m3u_account_id <= 0 ||
+      !junctions.some(row => row.groupId === scope.group_id && row.m3uAccountId === scope.m3u_account_id)
+    )) return 'Each dedicated input must name an available group and account. Remove invalid saved scopes and select their exact accounts.';
+    if (dedicated && secondaryScopes.some((scope, index) =>
+      secondaryScopes.slice(0, index).some(previous => sameScope(previous, scope))
+    )) return 'Dedicated input scopes must be unique';
+    if (dedicated && (includeMasterGroupStreams || parseMasterFromStream || assumeCurrentDate)) {
+      return 'Dedicated mode requires master stream options and date assumption to be off';
+    }
     // bead 3ux85: no separate secondary is required when the master group is
     // itself the stream source (include_master_group_streams) — the
     // same-named cross-provider case.
@@ -674,7 +771,7 @@ export function EventSyncRuleEditor({
         return 'Pick a target group for promoted channels (Behavior → '
           + 'Promote unmatched events)';
       }
-      if (masterScope != null && promoteTargetGroupId === masterScope.group_id) {
+      if (!dedicated && masterScope != null && promoteTargetGroupId === masterScope.group_id) {
         return 'The promotion target group must not be the master group — '
           + 'Dispatcharr owns the master channels; pick a dedicated group';
       }
@@ -686,6 +783,14 @@ export function EventSyncRuleEditor({
     if (retireFinishedEvents && (!promoteUnmatched || dummyEpgProfileId == null)) {
       return 'Confirmed idle event removal requires promotion and a dummy EPG profile';
     }
+    if (dedicated && (promoteTargetGroupId == null || !Number.isInteger(promoteTargetGroupId) || promoteTargetGroupId <= 0 ||
+      !channelGroups.some(group => group.id === promoteTargetGroupId))) {
+      return 'Choose an available dedicated target group';
+    }
+    if (dedicated && (!promoteUnmatched || !skipDeadStreams || !skipPastEvents || !retireFinishedEvents)) {
+      return 'Dedicated mode requires promotion, stream health checks, past-event filtering and confirmed idle event removal';
+    }
+    if (profileError) return profileError;
     return null;
   })();
 
@@ -695,20 +800,22 @@ export function EventSyncRuleEditor({
     // itself the stream source (include_master_group_streams) — the pure
     // same-named cross-provider case, where Dispatcharr collapses both
     // providers into one channel group so there is no separate secondary.
-    if (masterScope == null) return null;
-    if (secondaryScopes.length === 0 && !includeMasterGroupStreams) return null;
+    if (!dedicated && masterScope == null) return null;
+    if (secondaryScopes.length === 0 && (dedicated || !includeMasterGroupStreams)) return null;
+    if (dedicated && validationError) return null;
 
     const built: EventSyncConfig = {
       // bead 38dzi: emit the nested provider-scoped shape only; the backend
       // validator derives the flat master_group_id / secondary_group_ids.
-      master: masterScope,
+      ...(dedicated ? { mode: 'dedicated' as const, master_group_id: null } : {}),
+      master: dedicated ? null : masterScope,
       secondary: [...secondaryScopes],
       time_window_minutes: Math.min(
         MAX_TIME_WINDOW_MINUTES,
         Math.max(1, parseInt(timeWindowText, 10) || DEFAULT_TIME_WINDOW_MINUTES)
       ),
       attach_threshold: clampAttachThreshold(parseFloat(thresholdText)),
-      enabled: config?.enabled ?? true,
+      enabled: dedicated && !isEditing ? false : config?.enabled ?? true,
     };
     // bead krkm4: emit enforce_time_window when disabled, and preserve an
     // explicit stored value (the backend validator fills the key on save, so
@@ -727,8 +834,8 @@ export function EventSyncRuleEditor({
     // value (the backend validator fills the key on save, so round-trips
     // keep it). A legacy config without the key stays without it while the
     // box is unchecked — absent means false on the backend.
-    if (autoRun || config?.auto_run != null) {
-      built.auto_run = autoRun;
+    if (dedicated || autoRun || config?.auto_run != null) {
+      built.auto_run = dedicated && !isEditing ? false : autoRun;
     }
     // bead y8yby: emit refresh_providers_before_run when checked, and preserve
     // an explicit stored value (the backend validator fills the key on save).
@@ -749,13 +856,13 @@ export function EventSyncRuleEditor({
     // bead 6xxmp: emit the master self-attach flag when checked; preserve an
     // explicit stored value (the backend validator fills it on save). Absent
     // means false on the backend, so an unchecked legacy config stays absent.
-    if (includeMasterGroupStreams || config?.include_master_group_streams != null) {
-      built.include_master_group_streams = includeMasterGroupStreams;
+    if (dedicated || includeMasterGroupStreams || config?.include_master_group_streams != null) {
+      built.include_master_group_streams = dedicated ? false : includeMasterGroupStreams;
     }
     // bead assume-current-date: emit when checked; preserve an explicit
     // stored value (absent means false on the backend).
-    if (assumeCurrentDate || config?.assume_current_date != null) {
-      built.assume_current_date = assumeCurrentDate;
+    if (dedicated || assumeCurrentDate || config?.assume_current_date != null) {
+      built.assume_current_date = dedicated ? false : assumeCurrentDate;
     }
     // bead jqwfq: emit demote_stale_dateless when DISABLED, and preserve an
     // explicit stored value (the backend validator fills the key on save).
@@ -767,8 +874,8 @@ export function EventSyncRuleEditor({
     }
     // bead parse-from-stream: emit when checked; preserve an explicit stored
     // value (absent means false on the backend).
-    if (parseMasterFromStream || config?.parse_master_from_stream != null) {
-      built.parse_master_from_stream = parseMasterFromStream;
+    if (dedicated || parseMasterFromStream || config?.parse_master_from_stream != null) {
+      built.parse_master_from_stream = dedicated ? false : parseMasterFromStream;
     }
     // bead ti939.4.1: emit promotion keys when enabled; preserve explicit
     // stored values (an untouched legacy config stays without the keys —
@@ -895,7 +1002,7 @@ export function EventSyncRuleEditor({
     // an edited group keeps its saved name and its inexpressible extra
     // patterns (patterns[1..]) unchanged behind the edited first pattern.
     const scopedIds = new Set<number>([
-      ...(masterScope != null ? [masterScope.group_id] : []),
+      ...(!dedicated && masterScope != null ? [masterScope.group_id] : []),
       ...secondaryScopes.map(s => s.group_id),
     ]);
     const groupPatternsOut: Record<string, EventSyncPattern[]> = {};
@@ -945,6 +1052,7 @@ export function EventSyncRuleEditor({
   const handleRunPreview = async () => {
     const builtConfig = buildConfig();
     if (!builtConfig) return;
+    const request = ++previewRequest.current;
     // Snapshot the config this run reflects; later edits mark the results stale.
     setPreviewSignature(stableStringify(builtConfig));
     setPreviewLoading(true);
@@ -954,12 +1062,14 @@ export function EventSyncRuleEditor({
         ...(rule?.id != null ? { rule_id: rule.id } : {}),
         event_sync_config: builtConfig,
       });
-      setPreview(response);
+      if (mounted.current && previewRequest.current === request) setPreview(response);
     } catch (err) {
-      setPreviewError(err instanceof Error ? err.message : 'Preview failed');
-      setPreview(null);
+      if (mounted.current && previewRequest.current === request) {
+        setPreviewError(err instanceof Error ? err.message : 'Preview failed');
+        setPreview(null);
+      }
     } finally {
-      setPreviewLoading(false);
+      if (mounted.current && previewRequest.current === request) setPreviewLoading(false);
     }
   };
 
@@ -974,9 +1084,17 @@ export function EventSyncRuleEditor({
       // Save-from-Review (and edit-mode Save on any step): jump to the step
       // that owns the offending field and focus its heading.
       const targetsScope =
-        masterScope == null ||
-        (secondaryScopes.length === 0 && !includeMasterGroupStreams);
-      const [step, fieldId] = targetsScope
+        (!dedicated && masterScope == null) ||
+        (secondaryScopes.length === 0 && (dedicated || !includeMasterGroupStreams)) ||
+        (dedicated && (groupsState !== 'ready' || junctionsState !== 'ready' || secondaryScopes.some((scope, index) =>
+          !Number.isInteger(scope.group_id) || scope.group_id <= 0 ||
+          scope.m3u_account_id == null || !Number.isInteger(scope.m3u_account_id) || scope.m3u_account_id <= 0 ||
+          secondaryScopes.slice(0, index).some(previous => sameScope(previous, scope)) ||
+          !junctions.some(row => row.groupId === scope.group_id && row.m3uAccountId === scope.m3u_account_id)
+        )));
+      const [step, fieldId] = dedicated && !targetsScope && effectivePatterns.length > 0
+        ? ([3, `${id}-behavior-title`] as const)
+        : targetsScope
         ? ([1, `${id}-scope-title`] as const)
         : ([2, `${id}-matching-title`] as const);
       navigateToField(step, fieldId);
@@ -990,7 +1108,9 @@ export function EventSyncRuleEditor({
       await onSave({
         name: name.trim(),
         description: description.trim() || undefined,
-        enabled,
+        enabled: dedicated && !isEditing ? false : enabled,
+        ...(dedicated && !isEditing ? { run_on_refresh: false } :
+          dedicated && rule?.run_on_refresh != null ? { run_on_refresh: rule.run_on_refresh } : {}),
         ...(activeFrom || activeUntil || rule?.active_from != null || rule?.active_until != null
           ? { active_from: activeFrom || null, active_until: activeUntil || null }
           : {}),
@@ -1006,8 +1126,14 @@ export function EventSyncRuleEditor({
         stream_sort_field: streamSortField || '',
         stream_sort_order: streamSortOrder,
       });
+    } catch (err) {
+      if (err instanceof Error) {
+        if (mounted.current) setSaveError(err.message);
+      } else {
+        throw err;
+      }
     } finally {
-      setSaving(false);
+      if (mounted.current) setSaving(false);
     }
   };
 
@@ -1076,8 +1202,9 @@ export function EventSyncRuleEditor({
       enabled !== (rule?.enabled ?? true) ||
       activeFrom !== (rule?.active_from ?? '') ||
       activeUntil !== (rule?.active_until ?? '') ||
-      !sameScope(masterScope, initialMasterScope(config)) ||
-      !sameScopes(secondaryScopes, initialSecondaryScopes(config)) ||
+      dedicated !== (config?.mode === 'dedicated') ||
+      (!dedicated && !sameScope(masterScope, initialMasterScope(config))) ||
+      !sameScopes(secondaryScopes, initialSecondaryScopes(config), dedicated) ||
       !sameIds(selectedPatternIds, initial.patternIds) ||
       !sameDraft(customShared, customSharedMeta.draft) ||
       normalizeOverrides(groupOverrides) !== normalizeOverrides(initial.groupOverrides) ||
@@ -1109,7 +1236,7 @@ export function EventSyncRuleEditor({
       streamSortOrder !== (rule?.stream_sort_order === 'asc' ? 'asc' : 'desc')
     );
   }, [
-    name, description, enabled, activeFrom, activeUntil, masterScope, secondaryScopes, selectedPatternIds,
+    name, description, enabled, activeFrom, activeUntil, dedicated, masterScope, secondaryScopes, selectedPatternIds,
     customShared, groupOverrides, timeWindowText, thresholdText, enforceTimeWindow,
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
@@ -1170,6 +1297,17 @@ export function EventSyncRuleEditor({
   })();
 
   const intent: ReactNode = useMemo(() => {
+    if (dedicated) {
+      return (
+        <>
+          ECM creates one channel per dated event from {secondaryScopes.length} account-scoped input
+          {secondaryScopes.length === 1 ? '' : 's'}
+          {promoteTargetGroupId != null ? <> in <strong>{groupName(promoteTargetGroupId)}</strong>.</> : '. Pick its dedicated target group.'}
+          {' '}{autoRun ? 'Runs automatically after each M3U refresh.' : 'Runs only when you run it manually.'}
+          {!isEditing && ' The new rule is staged with execution disabled.'}
+        </>
+      );
+    }
     if (masterScope == null) {
       return (
         <span className="modal-intent-placeholder">
@@ -1243,6 +1381,9 @@ export function EventSyncRuleEditor({
       </>
     );
   }, [
+    dedicated,
+    isEditing,
+    promoteTargetGroupId,
     masterScope,
     secondaryScopes,
     includeMasterGroupStreams,
@@ -1344,6 +1485,20 @@ export function EventSyncRuleEditor({
   // server dry-run).
   const impactBlock: ReactNode = (() => {
     if (currentStep === 1) {
+      if (dedicated) {
+        return (
+          <>
+            <h4 className="event-sync-impact-title">Scope impact</h4>
+            <p className="event-sync-impact-line">Dedicated event group · {secondaryScopes.length} ordered account scopes</p>
+            {secondaryScopes.map(scope => (
+              <p key={`${scope.group_id}:${scope.m3u_account_id}`} className="event-sync-impact-line">
+                {groupName(scope.group_id)} {syncChip(autoSyncForScope(scope))}
+              </p>
+            ))}
+            {secondaryAutoSyncOnCount > 0 && <p className="form-hint">Resolve input auto-sync settings in M3U Manager before running this rule.</p>}
+          </>
+        );
+      }
       if (masterScope == null) {
         return (
           <p className="form-hint">
@@ -1463,12 +1618,16 @@ export function EventSyncRuleEditor({
         <div className="modal-twopane">
           <div className="modal-main">
             <p className="form-hint event-sync-quick-path">
+              {dedicated ? (
+                <>Choose ordered account-scoped inputs, a dedicated target and a matching source-free dummy EPG profile. ECM creates one channel per dated event in that target. Preview never writes.</>
+              ) : <>
               Quick path: pick the master group, pick the secondary groups, keep
               the default patterns, then Preview. Preview never writes; a manual
               pipeline Run attaches matched streams to master channels — capped
               per run, journaled, and reversible via execution rollback. Event
               Sync runs unattended only if you explicitly enable auto-run under
               Behavior (off by default).
+              </>}
             </p>
 
             {/* ── Step 1: Scope ──────────────────────────────────────────── */}
@@ -1517,7 +1676,7 @@ export function EventSyncRuleEditor({
                     type="checkbox"
                     checked={enabled}
                     onChange={e => setEnabled(e.target.checked)}
-                    disabled={isLoading}
+                    disabled={isLoading || (dedicated && !isEditing)}
                   />
                   <span>Enabled</span>
                 </label>
@@ -1550,6 +1709,23 @@ export function EventSyncRuleEditor({
                 </fieldset>
               </div>
 
+              <div className="event-sync-section-block" role="radiogroup" aria-labelledby={`${id}-mode-title`}>
+                <h3 className="event-sync-section-title" id={`${id}-mode-title`}>Channel ownership</h3>
+                <label className="checkbox-option">
+                  <input type="radio" name={`${id}-mode`} checked={!dedicated}
+                    onChange={() => handleModeChange(false)} disabled={isLoading || isEditing || saving} />
+                  <span>Existing master group</span>
+                </label>
+                <label className="checkbox-option">
+                  <input type="radio" name={`${id}-mode`} checked={dedicated}
+                    onChange={() => handleModeChange(true)} disabled={isLoading || isEditing || saving} />
+                  <span>Dedicated event group</span>
+                </label>
+                {isEditing ? <span className="form-hint">A saved rule keeps its channel ownership mode.</span> : dedicated && (
+                  <span className="form-hint">The new rule, its Event Sync configuration, auto-run and run-on-refresh stay disabled when you save it.</span>
+                )}
+              </div>
+
               {/* Group visibility (bead x82s3): shared toggle for both the
                   master and secondary group pickers below. */}
               <div className="event-sync-section-block">
@@ -1564,15 +1740,17 @@ export function EventSyncRuleEditor({
                   <span>Show all groups</span>
                 </label>
                 <span className="form-hint">
+                  {dedicated ? 'The input picker lists enabled account junctions. Show all groups to include disabled junctions.' : <>
                   The master and secondary pickers below list only groups whose
                   provider (M3U) junction is enabled by default. Turn this on to
                   see every provider junction too — useful for a
                   temporarily-disabled group.
+                  </>}
                 </span>
               </div>
 
               {/* Master group (bead 38dzi: provider-scoped picker) */}
-              <div className="event-sync-section-block">
+              {!dedicated && <div className="event-sync-section-block">
                 <h3 className="event-sync-section-title">Master group</h3>
                 <span className="form-hint">
                   The ONE group whose channels Dispatcharr owns — auto-sync must
@@ -1590,33 +1768,36 @@ export function EventSyncRuleEditor({
                   onRequestFix={t => requestFix(t, true)}
                   disabled={isLoading}
                 />
-              </div>
+              </div>}
 
               {/* Secondary groups (bead 38dzi: provider-scoped picker) */}
               <div className="event-sync-section-block">
                 <h3 className="event-sync-section-title">Secondary groups</h3>
                 <span className="form-hint">
+                  {dedicated ? 'Select each input account explicitly. Selection order sets input priority. Auto-sync must be OFF; resolve mismatches in M3U Manager.' : <>
                   Pure stream sources from other providers — auto-sync should be
                   OFF for each (otherwise Dispatcharr keeps creating duplicate
                   channels from them). The same group under a different provider
                   than the master IS selectable here.
+                  </>}
                 </span>
-                <button
+                {!dedicated && <button
                   type="button"
                   className="event-sync-inline-link"
                   onClick={handleUseMasterStreams}
                   data-testid="event-sync-use-master-streams"
                 >
                   No separate secondary? Use the master group&apos;s own streams →
-                </button>
+                </button>}
                 <ProviderScopedGroupPicker
                   role="secondary"
                   rows={junctions}
                   value={secondaryScopes}
                   onChange={s => setSecondaryScopes(s as EventSyncGroupScope[])}
                   showAll={showAllGroups}
-                  excludeScope={masterScope}
-                  onRequestFix={t => requestFix(t, false)}
+                  excludeScope={dedicated ? null : masterScope}
+                  onRequestFix={dedicated ? undefined : t => requestFix(t, false)}
+                  requireAccount={dedicated}
                   disabled={isLoading}
                 />
               </div>
@@ -1868,7 +2049,7 @@ export function EventSyncRuleEditor({
                         type="checkbox"
                         checked={assumeCurrentDate}
                         onChange={e => setAssumeCurrentDate(e.target.checked)}
-                        disabled={isLoading}
+                        disabled={isLoading || dedicated}
                         data-testid="event-sync-assume-current-date"
                       />
                       <span>Assume today&apos;s date for dateless listings</span>
@@ -2046,7 +2227,7 @@ export function EventSyncRuleEditor({
                         type="checkbox"
                         checked={autoRun}
                         onChange={e => setAutoRun(e.target.checked)}
-                        disabled={isLoading}
+                        disabled={isLoading || (dedicated && !isEditing)}
                         data-testid="event-sync-auto-run"
                       />
                       <span>Run automatically after each M3U refresh (auto-run)</span>
@@ -2135,7 +2316,7 @@ export function EventSyncRuleEditor({
 
               {/* Scope-extension subgroup (S2); controlled open for the S4b
                   secondary anchor. */}
-              <details
+              {!dedicated && <details
                 className="modal-subgroup"
                 ref={scopeExtRef}
                 open={scopeExtOpen}
@@ -2215,23 +2396,27 @@ export function EventSyncRuleEditor({
                     </details>
                   </div>
                 </div>
-              </details>
+              </details>}
 
               {/* Guide-data subgroup (S2). */}
-              <details className="modal-subgroup">
+              <details className="modal-subgroup" open={dedicated || undefined}>
                 <summary>
                   Guide data {changedBadge(guideChanged)}
                 </summary>
                 <div className="event-sync-details-body">
                   <div className="form-group">
-                    <label>Dummy EPG profile (optional)</label>
+                    <label>{dedicated ? 'Source-free dummy EPG profile (required)' : 'Dummy EPG profile (optional)'}</label>
                     <CustomSelect
+                      ariaLabel={dedicated ? 'Source-free dummy EPG profile (required)' : undefined}
                       value={dummyEpgProfileId != null ? dummyEpgProfileId.toString() : ''}
                       onChange={value =>
                         setDummyEpgProfileId(value ? parseInt(value, 10) : null)
                       }
                       options={[
-                        { value: '', label: 'None — no automatic guide data' },
+                        { value: '', label: dedicated ? 'Choose a source-free profile' : 'None — no automatic guide data' },
+                        ...(dummyEpgProfileId != null && !dummyProfiles.some(p => p.id === dummyEpgProfileId)
+                          ? [{ value: dummyEpgProfileId.toString(), label: `Unavailable profile ${dummyEpgProfileId}`, disabled: true }]
+                          : []),
                         ...dummyProfiles.map(p => ({
                           value: p.id.toString(),
                           label: p.enabled ? p.name : `${p.name} (disabled)`,
@@ -2241,11 +2426,14 @@ export function EventSyncRuleEditor({
                       disabled={isLoading}
                     />
                     <span className="form-hint">
+                      {dedicated ? 'The profile must contain only the dedicated target and the same ordered accounts. Disabled profiles can be saved and previewed; execution requires an enabled profile and its active generated source.' : <>
                       Assigns this dummy EPG profile to the master group&apos;s
                       event channels on every run, so new events get guide data
                       automatically.
+                      </>}
                     </span>
-                    <details className="modal-why">
+                    {dedicated && profileError && <span className="field-error" role="status">{profileError}</span>}
+                    {!dedicated && <details className="modal-why">
                       <summary>Why / when to use</summary>
                       <div className="event-sync-details-body">
                         <span className="form-hint">
@@ -2261,7 +2449,7 @@ export function EventSyncRuleEditor({
                           places.
                         </span>
                       </div>
-                    </details>
+                    </details>}
                   </div>
                 </div>
               </details>
@@ -2269,7 +2457,7 @@ export function EventSyncRuleEditor({
               {/* Channel-promotion subgroup (bead ti939.4.1) — the ONE
                   sanctioned ECM-creates-channels exception; strictly
                   opt-in and collapsed by default. */}
-              <details className="modal-subgroup">
+              <details className="modal-subgroup" open={dedicated || undefined}>
                 <summary>
                   Promote unmatched events {changedBadge(promotionChanged)}
                 </summary>
@@ -2280,7 +2468,7 @@ export function EventSyncRuleEditor({
                         type="checkbox"
                         checked={promoteUnmatched}
                         onChange={e => setPromoteUnmatched(e.target.checked)}
-                        disabled={isLoading}
+                        disabled={isLoading || dedicated}
                         data-testid="event-sync-promote-unmatched"
                       />
                       <span>
@@ -2307,7 +2495,7 @@ export function EventSyncRuleEditor({
                         Use a dedicated group and treat it as ECM-owned.
                       </span>
                     )}
-                    <details className="modal-why">
+                    {!dedicated && <details className="modal-why">
                       <summary>Why / when to use</summary>
                       <div className="event-sync-details-body">
                         <span className="form-hint">
@@ -2326,12 +2514,13 @@ export function EventSyncRuleEditor({
                           before you run anything.
                         </span>
                       </div>
-                    </details>
+                    </details>}
                   </div>
                   {promoteUnmatched && (
                     <div className="form-group">
                       <label>Target group for promoted channels</label>
                       <CustomSelect
+                        ariaLabel="Target group for promoted channels"
                         value={
                           promoteTargetGroupId != null
                             ? promoteTargetGroupId.toString()
@@ -2347,7 +2536,7 @@ export function EventSyncRuleEditor({
                           ...channelGroups
                             .filter(
                               g =>
-                                g.id !== masterScope?.group_id &&
+                                (dedicated || g.id !== masterScope?.group_id) &&
                                 !secondaryScopes.some(s => s.group_id === g.id)
                             )
                             .map(g => ({
@@ -2372,7 +2561,7 @@ export function EventSyncRuleEditor({
                           type="checkbox"
                           checked={skipPastEvents}
                           onChange={e => setSkipPastEvents(e.target.checked)}
-                          disabled={isLoading}
+                          disabled={isLoading || dedicated}
                           data-testid="event-sync-skip-past-events"
                         />
                         <span>
@@ -2399,7 +2588,7 @@ export function EventSyncRuleEditor({
                           type="checkbox"
                           checked={retireFinishedEvents}
                           onChange={e => setRetireFinishedEvents(e.target.checked)}
-                          disabled={isLoading}
+                          disabled={isLoading || dedicated}
                           data-testid="event-sync-retire-finished-events"
                         />
                         <span>Remove confirmed idle event channels</span>
@@ -2550,7 +2739,7 @@ export function EventSyncRuleEditor({
                           type="checkbox"
                           checked={skipDeadStreams}
                           onChange={e => setSkipDeadStreams(e.target.checked)}
-                          disabled={isLoading}
+                          disabled={isLoading || dedicated}
                           data-testid="event-sync-skip-dead-streams"
                         />
                         <span>Check that streams play before promoting them</span>
@@ -2667,7 +2856,12 @@ export function EventSyncRuleEditor({
                     Scope
                   </dt>
                   <dd>
-                    {masterScope == null ? (
+                    {dedicated ? (
+                      <>
+                        Dedicated event group · {secondaryScopes.length} ordered account scopes
+                        {promoteTargetGroupId != null && <> · target <strong>{groupName(promoteTargetGroupId)}</strong></>}
+                      </>
+                    ) : masterScope == null ? (
                       <span className="event-sync-review-warn">No master group selected</span>
                     ) : (
                       <>
@@ -2726,6 +2920,7 @@ export function EventSyncRuleEditor({
                     {refreshProvidersBeforeRun ? ' · refresh providers before run (Test writes)' : ''}
                     {parseMasterFromStream ? ' · master time from stream' : ''}
                     {dummyEpgProfileId != null ? ' · dummy EPG guide data' : ''}
+                    {dedicated && !isEditing ? ' · staged with execution disabled' : ''}
                     {streamSortField
                       ? ` · streams ordered by ${STREAM_SORT_LABELS[streamSortField] || streamSortField}`
                       : ''}

@@ -29,6 +29,75 @@ from epg_matching import detect_region
 from match_fold import fold_match_key
 from channel_pipeline_schema import Action, ActionType, TemplateVariables
 
+def validate_event_target(config: dict, rule_id: int | None, channels: list, groups: list) -> list:
+    """Return target channels whose current rule and durable identity agree.
+
+    Args:
+        config: Validated dedicated event configuration.
+        rule_id: Saved rule identity, or None for a new preview.
+        channels: Complete channel inventory.
+        groups: Complete group inventory.
+
+    Returns:
+        The exact owned target channels in inventory order.
+
+    Raises:
+        ValueError: The target or its current ownership cannot be proven.
+    """
+    import copy
+    import hashlib
+    import json
+
+    from channel_pipeline_schema import validate_event_sync_config
+    from database import get_session
+    from models import ChannelPipelineRule, DummyEPGProfile
+    from services.epg_publication import _config_hash, read_publication
+
+    target = config["promote_target_group_id"]
+    if not any(group.get("id") == target for group in groups):
+        raise ValueError("Dedicated target group is unavailable")
+    selected = [channel for channel in channels if channel.get("channel_group_id") == target]
+    if rule_id is None:
+        if selected:
+            raise ValueError("A new dedicated rule requires an empty target")
+        return selected
+    session = get_session()
+    try:
+        rule = session.get(ChannelPipelineRule, rule_id)
+        rule_value = rule.get_event_sync_config() if rule is not None else None
+        current = copy.deepcopy(rule_value)
+        if not isinstance(current, dict) or validate_event_sync_config(current) or current != config:
+            raise ValueError("Dedicated rule configuration drifted")
+        profile = session.get(DummyEPGProfile, config["dummy_epg_profile_id"]).to_dict()
+        try:
+            managed = [] if rule.managed_channel_ids is None else json.loads(rule.managed_channel_ids)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Dedicated target ownership is unavailable") from exc
+        if not isinstance(managed, list) or any(type(value) is not int or value < 1 for value in managed) or len(set(managed)) != len(managed):
+            raise ValueError("Dedicated target ownership is unavailable")
+    finally:
+        session.close()
+    if any(channel.get("id") in managed and channel.get("channel_group_id") != target for channel in channels):
+        raise ValueError("Dedicated owned channel moved outside its target")
+    publication = read_publication(f"profile:{config['dummy_epg_profile_id']}")
+    if selected and (publication is None or publication["state"]["config_hash"] != _config_hash(profile)):
+        raise ValueError("Dedicated target publication identity drifted")
+    receipts = publication["state"]["delivery"]["pending_channels"].values() if publication is not None else ()
+    rule_hash = hashlib.sha256(json.dumps(rule_value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+    for channel in selected:
+        if channel["id"] not in managed or not any(
+            receipt["rule_id"] == rule_id
+            and receipt["rule_hash"] == rule_hash
+            and receipt["profile_id"] == config["dummy_epg_profile_id"]
+            and receipt["target_group_id"] == target
+            and receipt.get("channel_id") == channel["id"]
+            and receipt.get("channel_uuid") == channel.get("uuid")
+            for receipt in receipts
+        ):
+            raise ValueError("Dedicated target contains a foreign or unknown channel")
+    return selected
+
+
 # Alias for use inside methods whose ``fold_match_key`` BOOL parameter (the
 # per-rule flag, kept name-identical to the schema field) shadows the helper.
 _fold_key = fold_match_key
@@ -2662,6 +2731,55 @@ class ActionExecutor:
                 error="Missing epg_id"
             )
 
+        event_key = next((
+            key for key, work in self._event_pending.items()
+            if work["config"].get("mode") == "dedicated"
+            and self._event_publications.get(work["profile_id"], {}).get("state", {}).get("delivery", {}).get("pending_channels", {}).get(key, {}).get("channel_id") == exec_ctx.current_channel_id
+        ), None)
+        from database import get_session
+        from models import ChannelPipelineRule
+
+        session = get_session() if (epg_source_id in self._dummy_source_by_profile.values()
+                                    or exec_ctx.current_channel_id in self._deferred_epg_profiles) else None
+        try:
+            if session is not None:
+                import hashlib
+                import json
+
+                for publication in self._event_publications.values():
+                    for receipt in publication["state"]["delivery"]["pending_channels"].values():
+                        if receipt.get("channel_id") != exec_ctx.current_channel_id:
+                            continue
+                        rule = session.get(ChannelPipelineRule, receipt["rule_id"])
+                        config = rule.get_event_sync_config() if rule is not None else None
+                        rule_hash = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+                        if not isinstance(config, dict) or rule_hash != receipt["rule_hash"]:
+                            return ActionResult(
+                                success=False, action_type=action.type,
+                                description="Event guide assignment refused",
+                                error="Event guide receipt owner changed",
+                            )
+            for rule in session.query(ChannelPipelineRule).all() if session is not None else ():
+                config = rule.get_event_sync_config()
+                if not isinstance(config, dict) or config.get("mode") != "dedicated":
+                    continue
+                profile_id = config.get("dummy_epg_profile_id")
+                if (self._dummy_source_by_profile.get(profile_id) != epg_source_id
+                        and self._deferred_epg_profiles.get(exec_ctx.current_channel_id) != profile_id):
+                    continue
+                if (event_key is None
+                        or self._event_pending[event_key]["rule_id"] != rule.id
+                        or self._event_pending[event_key]["profile_id"] != profile_id
+                        or self._event_pending[event_key]["source_id"] != epg_source_id):
+                    return ActionResult(
+                        success=False, action_type=action.type,
+                        description="Dedicated guide assignment refused",
+                        error="Dedicated guide assignment requires current pending work",
+                    )
+        finally:
+            if session is not None:
+                session.close()
+
         # Resolve EPG source ID -> epg_data_id
         source_entries = self._epg_data_by_source.get(epg_source_id, [])
         if not source_entries:
@@ -2791,7 +2909,18 @@ class ActionExecutor:
                     raise
                 finally:
                     db.close()
-            await self.client.update_channel(exec_ctx.current_channel_id, payload)
+            if event_key is not None:
+                from services.epg_publication import publication_lock
+
+                work = self._event_pending[event_key]
+                publication = self._event_publications.get(work["profile_id"])
+                current_channel = await self.client.get_channel(exec_ctx.current_channel_id)
+                async with publication_lock:
+                    if work["source_id"] != epg_source_id or self._event_receipt_current(publication, event_key, channel=current_channel) is None:
+                        raise ValueError("Dedicated guide assignment ownership changed")
+                    await self.client.update_channel(exec_ctx.current_channel_id, payload)
+            else:
+                await self.client.update_channel(exec_ctx.current_channel_id, payload)
             channel.update(payload)
             if (epg_source_id in self._dummy_epg_source_ids
                     and previous_state["epg_data_id"] != epg_data_id):
@@ -4696,7 +4825,7 @@ class ActionExecutor:
         # drops these when the master group is a self-attach source so the
         # auto-synced provider's own streams are never re-offered.
         attached_stream_ids: set[int] = set()
-        for ch in self.existing_channels:
+        for ch in (() if config.get("mode") == "dedicated" else self.existing_channels):
             if ch.get("channel_group_id") != channel_group_id:
                 continue
             master_channel_count += 1
@@ -4714,6 +4843,7 @@ class ActionExecutor:
         # the channel names. The attach path maps the winning identity back to
         # its channel id via this same map.
         name_to_id = (
+            {} if config.get("mode") == "dedicated" else
             master_name_to_id if master_name_to_id is not None
             else channel_name_to_id
         )
@@ -5545,6 +5675,16 @@ class ActionExecutor:
             rule_value = rule.get_event_sync_config()
             if not isinstance(rule_value, dict):
                 return None
+            if rule_value.get("mode") == "dedicated":
+                import copy
+
+                from channel_pipeline_schema import validate_event_sync_config
+
+                try:
+                    if validate_event_sync_config(copy.deepcopy(rule_value)):
+                        return None
+                except ValueError:
+                    return None
             rule_hash = hashlib.sha256(
                 json.dumps(
                     rule_value,
@@ -5567,6 +5707,8 @@ class ActionExecutor:
 
         channel_id = receipt.get("channel_id")
         if channel_id is not None:
+            if channel_id not in managed:
+                return None
             if channel_missing:
                 if channel is not None:
                     return None
@@ -5583,7 +5725,6 @@ class ActionExecutor:
                 group_id = group_id.get("id")
             if (
                 group_id != receipt["target_group_id"]
-                or channel_id not in managed | self._pipeline_managed_channel_ids
                 or (
                     receipt.get("channel_uuid") is not None
                     and channel.get("uuid") != receipt["channel_uuid"]
@@ -5861,7 +6002,8 @@ class ActionExecutor:
             ),
             None,
         )
-        if source is None or _generated_scope(source) not in {scope, "all"}:
+        dedicated = operation["config"].get("mode") == "dedicated"
+        if source is None or _generated_scope(source) not in ({scope} if dedicated else {scope, "all"}) or dedicated and source.get("is_active") is not True:
             raise ValueError("event guide source drifted")
         _, endpoint_hash, source_url_hash = _source_refresh_key(
             self.client, source, scope,
@@ -5894,11 +6036,14 @@ class ActionExecutor:
 
         unit = self._event_unit_from_plan(operation["unit"])
         target_group_id = operation["config"]["promote_target_group_id"]
+        target_channels = self.existing_channels
+        if dedicated:
+            target_channels = validate_event_target(operation["config"], rule_id, self.existing_channels, self.existing_groups)
         existing = channel_name_to_id(
             (
-                channel for channel in self.existing_channels
+                channel for channel in target_channels
                 if channel.get("channel_group_id") == target_group_id
-                and not self._is_manual_channel(channel)
+                and (dedicated or not self._is_manual_channel(channel))
             ),
             self._channel_number_separator,
         ).get(unit.channel_name.lower())
@@ -6474,15 +6619,19 @@ class ActionExecutor:
 
         target_group_id = config["promote_target_group_id"]
 
+        target_channels = self.existing_channels
+        if config.get("mode") == "dedicated":
+            target_channels = validate_event_target(config, rule_id, self.existing_channels, self.existing_groups)
+
         # Existing-name map for the plan's create-vs-adopt decision — the
         # SAME channel universe the create action's scoped lookup resolves
         # against (self.existing_channels feeds both, and both strip the
         # prefix this run's settings write). [16]
         existing_name_to_id = channel_name_to_id(
             (
-                ch for ch in self.existing_channels
+                ch for ch in target_channels
                 if ch.get("channel_group_id") == target_group_id
-                and not self._is_manual_channel(ch)
+                and (config.get("mode") == "dedicated" or not self._is_manual_channel(ch))
             ),
             self._channel_number_separator,
         )
@@ -6838,15 +6987,17 @@ class ActionExecutor:
                 session.close()
 
             guide_source_id = self._dummy_source_by_profile.get(guide_profile_id)
-            if guide_source_id is None and self._combined_dummy_source_ids:
+            if config.get("mode") != "dedicated" and guide_source_id is None and self._combined_dummy_source_ids:
                 guide_source_id = self._combined_dummy_source_ids[0]
             guide_source = next(
                 (
                     source for source in self._epg_sources
                     if source.get("id") == guide_source_id
-                    and _generated_scope(source) in {
-                        f"profile:{guide_profile_id}", "all",
-                    }
+                    and _generated_scope(source) in (
+                        {f"profile:{guide_profile_id}"} if config.get("mode") == "dedicated"
+                        else {f"profile:{guide_profile_id}", "all"}
+                    )
+                    and (config.get("mode") != "dedicated" or source.get("is_active") is True)
                 ),
                 None,
             )
@@ -7395,7 +7546,7 @@ class ActionExecutor:
     async def _finish_event_promotions(self) -> set[int]:
         """Attach and reveal staged events only after current guide proof."""
         from services.epg_programmes import programme_matches
-        from services.epg_publication import publication_lock
+        from services.epg_publication import RECOVERABLE_REASONS, publication_lock
         from services.event_sync_review import (
             PROVIDER_ID_UNKNOWN,
             stream_name_hash,
@@ -7465,7 +7616,8 @@ class ActionExecutor:
                 "terminal_at": terminal_at.isoformat(),
                 "retry_at": (
                     (terminal_at + timedelta(minutes=5)).isoformat()
-                    if receipt.get("channel_id") is not None else None
+                    if receipt.get("channel_id") is not None
+                    and reason in RECOVERABLE_REASONS else None
                 ),
             }
             if detail is not None:
@@ -7972,18 +8124,19 @@ class ActionExecutor:
         """
         profile_id = config["dummy_epg_profile_id"]
         master_group_id = config["master_group_id"]
+        dedicated = config.get("mode") == "dedicated"
         # bead ti939.4.1: promotion-enabled rules assign the SAME dummy EPG
         # profile to their ECM-promoted channels in the target group — a
         # promoted event needs guide data exactly as much as a master event
         # does. The set stays {master} for every promotion-less config, so
         # pre-feature behavior is byte-identical.
-        epg_group_ids = {master_group_id}
+        epg_group_ids = set() if dedicated else {master_group_id}
         if config.get("promote_unmatched") \
                 and config.get("promote_target_group_id") is not None:
             epg_group_ids.add(config["promote_target_group_id"])
 
         source_id = self._dummy_source_by_profile.get(profile_id)
-        if source_id is None and self._combined_dummy_source_ids:
+        if not dedicated and source_id is None and self._combined_dummy_source_ids:
             # Fallback: a combined all-profiles source serves this profile's
             # entries too (lowest id — the sort in __init__ — for determinism).
             source_id = self._combined_dummy_source_ids[0]
@@ -8008,6 +8161,12 @@ class ActionExecutor:
                 rule_name, profile_id, profile_id,
             )
             return summary
+        if dedicated:
+            from tasks.event_visibility import _generated_scope
+
+            source = next((value for value in self._epg_sources if value.get("id") == source_id), None)
+            if source is None or source.get("is_active") is not True or _generated_scope(source) != f"profile:{profile_id}":
+                raise ValueError("Dedicated guide source is unavailable")
 
         source_entry_ids = {
             e["id"] for e in self._epg_data_by_source.get(source_id, [])
@@ -8029,11 +8188,35 @@ class ActionExecutor:
                 if ch.get("channel_group_id") in epg_group_ids
                 and ch.get("id") not in existing_ids
             )
+        if dedicated:
+            channels_to_assign = validate_event_target(config, rule_id, channels_to_assign, self.existing_groups)
 
         for channel in channels_to_assign:
             if channel.get("channel_group_id") not in epg_group_ids:
                 continue
             channel_id = channel.get("id")
+            if dedicated:
+                from services.epg_publication import publication_lock
+
+                from services.epg_publication import read_publication
+
+                publication = self._event_publications.get(profile_id) or read_publication(f"profile:{profile_id}")
+                if publication is None:
+                    raise ValueError("Dedicated guide publication is unavailable")
+                event_key = next((
+                    key for key, receipt in publication["state"]["delivery"]["pending_channels"].items()
+                    if receipt.get("channel_id") == channel_id and receipt["rule_id"] == rule_id
+                ), None)
+                if event_key is None:
+                    raise ValueError("Dedicated channel has no matching guide receipt")
+                channel = await self.client.get_channel(channel_id)
+                if channel.get("epg_data_id") in source_entry_ids:
+                    summary["already_assigned"] += 1
+                    continue
+                async with publication_lock:
+                    if self._event_receipt_current(publication, event_key, channel=channel) is None:
+                        raise ValueError("Dedicated guide ownership changed")
+                self._channel_by_id[channel_id] = channel
             channel_name = channel.get("name", f"Channel {channel_id}")
             epg_data_id = channel.get("epg_data_id")
 

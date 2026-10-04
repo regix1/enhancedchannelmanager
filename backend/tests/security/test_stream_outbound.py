@@ -83,8 +83,8 @@ class _ChunkedManifestResponse:
             self.headers["Content-Length"] = str(content_length)
         self.chunks_read = 0
 
-    async def aiter_bytes(self, chunk_size):
-        assert chunk_size == 65536
+    async def aiter_bytes(self, chunk_size=None):
+        assert chunk_size is None
         for chunk in self._chunks:
             self.chunks_read += 1
             yield chunk

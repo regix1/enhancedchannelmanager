@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from typing import Annotated
 
 from pydantic import Field
@@ -21,6 +22,15 @@ from _endpoint_contracts import AC_RULE_FIELDS_NOT_EXPOSED, ENDPOINTS
 from ecm_client import get_ecm_client
 
 logger = logging.getLogger(__name__)
+
+_TASK_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://|\bwww\.|(?:^|\s)//\S+|\bmailto:", re.IGNORECASE)
+_TASK_SECRET_RE = re.compile(
+    r"\b(?:basic|bearer)\s+\S+|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r"|\b(?:password|secret|token|api[_-]?key)\s*[:=]\s*\S+"
+    r"|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Polling constants for run_channel_pipeline (bd-1wq7z.8).
@@ -237,13 +247,13 @@ def _action_descriptor(a: dict) -> str:
             return str(a[key])
     return "?"
 
-def _rule_details(rule: dict, *, fields: frozenset[str] | None = None) -> str:
+def _rule_details(rule: dict, *, fields: frozenset[str] | None = None, strict: bool = False) -> str:
     """Return complete copyable configuration or refuse unsafe/unbounded output."""
-    import re
     from urllib.parse import parse_qsl, urlsplit
 
     if fields is None:
         fields = ENDPOINTS["ac_create_rule"].request_fields | AC_RULE_FIELDS_NOT_EXPOSED | {"id"}
+    label = "task" if strict else "rule"
     selected = {key: value for key, value in rule.items() if key in fields}
     pending = [(selected, 0)]
     nodes = 0
@@ -251,25 +261,42 @@ def _rule_details(rule: dict, *, fields: frozenset[str] | None = None) -> str:
         value, depth = pending.pop()
         nodes += 1
         if nodes > 2000 or depth > 12:
-            return "Cannot return complete rule details: configuration exceeds the structural limit."
+            return f"Cannot return complete {label} details: configuration exceeds the structural limit."
         if isinstance(value, dict):
             if len(value) > 2000:
-                return "Cannot return complete rule details: configuration exceeds the structural limit."
+                return f"Cannot return complete {label} details: configuration exceeds the structural limit."
             for key, item in value.items():
                 if not isinstance(key, str):
-                    return "Cannot return complete rule details: unsupported configuration field."
+                    return f"Cannot return complete {label} details: unsupported configuration field."
+                if strict:
+                    normalized = "".join(char for char in key.casefold() if char.isascii() and char.isalnum())
+                    if any(marker in normalized for marker in (
+                        "password", "secret", "token", "credential", "apikey",
+                        "authorization", "authentication", "header", "cookie",
+                        "accesskey", "privatekey", "signingkey",
+                    )):
+                        return "Cannot return complete task details: configuration contains sensitive fields."
                 if any(marker in key.lower() for marker in ("password", "secret", "token", "credential", "api_key", "authorization")) and item not in (None, ""):
-                    return "Cannot return complete rule details: configuration contains sensitive fields."
+                    return f"Cannot return complete {label} details: configuration contains sensitive fields."
                 pending.append((item, depth + 1))
         elif isinstance(value, list):
             if len(value) > 2000:
-                return "Cannot return complete rule details: configuration exceeds the structural limit."
+                return f"Cannot return complete {label} details: configuration exceeds the structural limit."
             pending.extend((item, depth + 1) for item in value)
         elif isinstance(value, str):
             if len(value) > 65536:
-                return "Cannot return complete rule details: configuration exceeds the 64 KiB limit."
+                return f"Cannot return complete {label} details: configuration exceeds the 64 KiB limit."
+            if strict:
+                if _TASK_URL_RE.search(value):
+                    return "Cannot return complete task details: configuration contains URLs."
+                if _TASK_SECRET_RE.search(value):
+                    return "Cannot return complete task details: configuration contains sensitive values."
+                if any(marker in value.casefold() for marker in (
+                    "[redacted", "<redacted", "[hidden]", "<hidden>", "[masked]", "<masked>", "***", "••••",
+                )) or value.strip().casefold() in {"redacted", "***", "masked"}:
+                    return "Cannot return complete task details: configuration contains redaction markers."
             if re.search(r"\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer)\s+\S+", value, re.IGNORECASE):
-                return "Cannot return complete rule details: configuration contains sensitive values."
+                return f"Cannot return complete {label} details: configuration contains sensitive values."
             for match in re.finditer(r"https?://[^\s<>]+", value, re.IGNORECASE):
                 try:
                     url = urlsplit(match.group())
@@ -277,18 +304,18 @@ def _rule_details(rule: dict, *, fields: frozenset[str] | None = None) -> str:
                         any(marker in key.lower() for marker in ("key", "token", "secret", "password", "auth", "signature"))
                         for key, _ in parse_qsl(url.query, keep_blank_values=True)
                     ):
-                        return "Cannot return complete rule details: configuration contains credential-bearing URLs."
+                        return f"Cannot return complete {label} details: configuration contains credential-bearing URLs."
                 except ValueError:
-                    return "Cannot return complete rule details: configuration contains an unrecognized URL."
+                    return f"Cannot return complete {label} details: configuration contains an unrecognized URL."
         elif value is not None and type(value) not in (bool, int, float):
-            return "Cannot return complete rule details: unsupported configuration value."
+            return f"Cannot return complete {label} details: unsupported configuration value."
     try:
-        text = json.dumps(selected, ensure_ascii=False, allow_nan=False)
+        text = json.dumps(selected, ensure_ascii=False, allow_nan=False, sort_keys=strict)
         size = len(text.encode("utf-8"))
     except (ValueError, UnicodeError):
-        return "Cannot return complete rule details: unsupported configuration value."
+        return f"Cannot return complete {label} details: unsupported configuration value."
     if size > 65536:
-        return "Cannot return complete rule details: configuration exceeds the 64 KiB limit."
+        return f"Cannot return complete {label} details: configuration exceeds the 64 KiB limit."
     return text
 
 

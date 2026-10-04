@@ -554,6 +554,116 @@ def test_first_publication_idle_requires_exact_generated_guide_link(guide_row, e
     assert result["desired"] == ({10: []} if expected == "idle" else {})
 
 
+@pytest.mark.parametrize("source", ["current", "retained", "interval"])
+def test_placeholder_activity_does_not_keep_complete_owned_channel_active(source):
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    placeholder = {
+        "channel_id": 10,
+        "title": "Programming unavailable",
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "stop": (now + timedelta(minutes=30)).isoformat(),
+    }
+    current = placeholder if source == "current" else None
+    retained = None
+    intervals = {}
+    if source == "retained":
+        retained = _publication(
+            "profile:1",
+            channels=[{"channel_id": 10, "events": [placeholder]}],
+        )
+    elif source == "interval":
+        intervals = {10: [placeholder]}
+    profile = _profile(
+        epg_source_ids=[100],
+        event_intervals=intervals,
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+    )
+    channel = {
+        "id": 10,
+        "name": "Arena 1",
+        "channel_group_id": 7,
+        "hidden_from_output": False,
+        "epg_data": {"id": 900, "epg_source": 46, "tvg_id": "custom-10"},
+        "streams": [],
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": current}],
+    }
+
+    result = _plan_profile(
+        profile,
+        profile["event_sync_config"],
+        {10: channel},
+        coverage,
+        [],
+        set(),
+        retained,
+        now,
+        {46},
+    )
+
+    assert result["states"] == {10: "idle"}
+    assert result["desired"] == {10: []}
+    assert result["profile"]["event_intervals"] == {}
+
+
+@pytest.mark.parametrize(
+    "complete, guide_row",
+    [
+        (False, {"id": 900, "epg_source": 46, "tvg_id": "custom-10"}),
+        (True, None),
+        (True, {"id": 900, "epg_source": 99, "tvg_id": "custom-10"}),
+        (True, {"id": 900, "epg_source": 46, "tvg_id": "foreign-10"}),
+    ],
+)
+def test_placeholder_current_keeps_incomplete_or_foreign_ownership_unknown(complete, guide_row):
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    scope = {"group_id": 9, "m3u_account_id": None}
+    config = _config([scope])
+    profile = _profile(
+        epg_source_ids=[100],
+        event_sync_config=config,
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+    )
+    channel = {
+        "id": 10,
+        "name": "Arena 1",
+        "channel_group_id": 7,
+        "hidden_from_output": False,
+        "streams": [],
+    }
+    if guide_row is not None:
+        channel["epg_data"] = guide_row
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{
+            "profile_id": 1,
+            "channel_id": 10,
+            "current": {
+                "title": "Programming unavailable",
+                "start": (now - timedelta(minutes=30)).isoformat(),
+                "stop": (now + timedelta(minutes=30)).isoformat(),
+            },
+        }],
+    }
+
+    result = _plan_profile(
+        profile,
+        config,
+        {10: channel},
+        coverage,
+        [],
+        {(9, None)} if complete else set(),
+        None,
+        now,
+        {46},
+    )
+
+    assert result["states"] == {10: "unknown"}
+    assert result["desired"] == {}
+
+
 @pytest.mark.parametrize("bootstrap, expected", [(False, "unknown"), (True, "active")])
 def test_event_stream_activation_honors_family_bootstrap_without_current_guide(bootstrap, expected):
     from services.event_slots import classify_event_slot

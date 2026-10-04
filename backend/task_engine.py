@@ -1155,6 +1155,7 @@ class TaskEngine:
 
             execution = TaskExecution(
                 task_id=task_id,
+                schedule_id=schedule_id,
                 started_at=datetime.utcnow(),
                 status="running",
                 triggered_by=triggered_by,
@@ -1794,6 +1795,7 @@ class TaskEngine:
                 task_id,
                 triggered_by="manual",
                 parameters=parameters,
+                schedule_id=schedule_id,
             )
 
         if schedule_id:
@@ -1921,7 +1923,9 @@ class TaskEngine:
         try:
             session = get_session()
             try:
-                query = session.query(TaskExecution).order_by(TaskExecution.started_at.desc())
+                query = session.query(TaskExecution).order_by(
+                    TaskExecution.started_at.desc(), TaskExecution.id.desc()
+                )
 
                 if task_id:
                     query = query.filter(TaskExecution.task_id == task_id)
@@ -1935,8 +1939,8 @@ class TaskEngine:
             finally:
                 session.close()
         except Exception as e:
-            logger.exception("[TASK-ENGINE] Failed to get task history: %s", e)
-            return []
+            logger.error("[TASK-ENGINE] Task history read failed")
+            raise TaskHistoryError("Task history read failed") from e
 
     def purge_old_history(self, days: int = 30) -> int:
         """

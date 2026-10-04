@@ -12,12 +12,115 @@ NOTE: Routes /api/tasks/engine/status, /api/tasks/history/all, and
 monolith (they're defined after the parameterized route).
 """
 import asyncio
+import json
 import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from models import ScheduledTask, TaskSchedule
 from export_models import SyncTarget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_enabled,children", [(True, []), (True, [False]), (True, [False, True]), (False, [True])])
+async def test_selected_task_details_preserve_parent_runtime_and_child_gates(async_client, test_session, parent_enabled, children):
+    parent = _create_scheduled_task(test_session, enabled=parent_enabled, config=json.dumps({"accounts": [2, 18]}))
+    schedules = [_create_task_schedule(test_session, name="Same name", enabled=enabled,
+                                      parameters=json.dumps({"accounts": [18, 2]})) for enabled in children]
+    registry = MagicMock()
+    registry.get_task_status.return_value = {
+        "task_id": "stream_probe", "enabled": parent_enabled, "status": "running",
+        "config": {"accounts": [18, 2]},
+    }
+    with patch("task_registry.get_registry", return_value=registry), patch("routers.tasks.get_client") as get_client:
+        response = await async_client.get("/api/tasks/stream_probe?details=true")
+    assert response.status_code == 200
+    shown = response.json()
+    assert shown["stored"] == parent.to_dict()
+    assert shown["config"] == {"accounts": [18, 2]}
+    assert shown["effective_enabled"] is (parent_enabled and (not children or any(children)))
+    assert [row["id"] for row in shown["schedules"]] == [row.id for row in schedules]
+    for row in shown["schedules"]:
+        assert row["parameters"] == {"accounts": [18, 2]}
+        assert row["name"] == "Same name"
+        assert row["created_at"] is not None
+        assert row["updated_at"] is not None
+        assert row["last_run_at"] is None
+    get_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cadence,values", [
+    ("interval", {"interval_seconds": 30, "schedule_time": None, "timezone": None}),
+    ("daily", {}), ("weekly", {"days_of_week": "6,1"}),
+    ("biweekly", {"days_of_week": "2,4", "week_parity": 1}),
+    ("monthly", {"day_of_month": -1}),
+])
+async def test_selected_task_details_round_trip_each_schedule_cadence(async_client, test_session, cadence, values):
+    _create_scheduled_task(test_session)
+    schedule = _create_task_schedule(test_session, schedule_type=cadence, name=None, parameters=None, **values)
+    registry = MagicMock()
+    registry.get_task_status.return_value = {"task_id": "stream_probe", "enabled": True}
+    with patch("task_registry.get_registry", return_value=registry):
+        response = await async_client.get("/api/tasks/stream_probe?details=true")
+    assert response.status_code == 200
+    shown = response.json()["schedules"][0]
+    assert {key: value for key, value in shown.items() if key != "description"} == schedule.to_dict(strict=True)
+    assert shown["parameters"] == {}
+    assert shown["name"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("parameters", "{"), ("parameters", "[]"), ("days_of_week", "0,bad"), ("days_of_week", "7"), ("days_of_week", "1,,2")])
+async def test_selected_task_details_refuse_corrupt_schedule_storage(async_client, test_session, field, value, caplog):
+    _create_scheduled_task(test_session)
+    _create_task_schedule(test_session, **{field: value})
+    registry = MagicMock()
+    registry.get_task_status.side_effect = lambda task_id: {"task_id": task_id, "enabled": True}
+    with patch("task_registry.get_registry", return_value=registry):
+        detailed = await async_client.get("/api/tasks/stream_probe?details=true")
+        default = await async_client.get("/api/tasks/stream_probe")
+    assert detailed.status_code == 500
+    assert detailed.json()["detail"] == "Internal server error"
+    assert default.status_code == 200
+    assert "stored" not in default.json()
+    assert "0,bad" not in detailed.text + caplog.text
+
+
+@pytest.mark.asyncio
+async def test_selected_task_details_require_persisted_parent(async_client):
+    registry = MagicMock()
+    registry.get_task_status.return_value = {"task_id": "missing_parent", "enabled": True}
+    with patch("task_registry.get_registry", return_value=registry):
+        response = await async_client.get("/api/tasks/missing_parent?details=true")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
+
+
+@pytest.mark.asyncio
+async def test_selected_task_details_refuse_malformed_parent_config(async_client, test_session):
+    _create_scheduled_task(test_session, config="{")
+    registry = MagicMock()
+    registry.get_task_status.return_value = {"task_id": "stream_probe", "enabled": True}
+    with patch("task_registry.get_registry", return_value=registry):
+        response = await async_client.get("/api/tasks/stream_probe?details=true")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Internal server error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/tasks/stream_probe/history", "/api/tasks/history/all"])
+async def test_failed_task_history_routes_return_an_error(async_client, path, caplog):
+    from task_engine import TaskHistoryError
+
+    rejected = "https://example.test/private"
+    engine = MagicMock()
+    engine.get_task_history.side_effect = TaskHistoryError(rejected)
+    with patch("task_engine.get_engine", return_value=engine):
+        response = await async_client.get(path)
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
+    assert rejected not in response.text + caplog.text
 
 
 def _create_scheduled_task(session, task_id="stream_probe", **overrides):

@@ -4,6 +4,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import xml.etree.ElementTree as ET
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -78,6 +79,30 @@ def coverage(*profile_ids, ready=True):
     }
 
 
+def external_profile(*channel_ids):
+    return {
+        "id": 1,
+        "name": "Live Events",
+        "enabled": True,
+        "name_source": "channel",
+        "title_pattern": r"(?P<title>.+)",
+        "title_template": "{title}",
+        "description_template": "",
+        "program_duration": 180,
+        "event_timezone": "UTC",
+        "tvg_id_template": "ecm-{channel_id}",
+        "channel_assignments": [
+            {"channel_id": channel_id, "channel_name": f"Event {channel_id}"}
+            for channel_id in channel_ids
+        ],
+        "hide_empty_group_ids": [65],
+        "epg_source_ids": [46],
+        "guide_start": datetime(2026, 10, 3, 15, tzinfo=timezone.utc),
+        "guide_stop": datetime(2026, 10, 5, 4, tzinfo=timezone.utc),
+        "source_programmes": {channel_id: [] for channel_id in channel_ids},
+    }
+
+
 def pending_candidate(*, channel_id=1, stream_name="Falcons vs Wolves"):
     return {
         "event_key": "arena:falcons-wolves",
@@ -106,6 +131,112 @@ def pending_candidate(*, channel_id=1, stream_name="Falcons vs Wolves"):
         "channel_exists": channel_id is not None,
         "health_playable": True,
     }
+
+
+@pytest.mark.parametrize("hidden", [True, False, None], ids=["hidden", "visible", "omitted"])
+def test_reported_ended_assignment_keeps_header_without_unconfirmed_programme(hidden):
+    now = datetime(2026, 10, 3, 18, 45, tzinfo=timezone.utc)
+    reported = external_profile(5040)
+    channels = {
+        5040: {
+            "id": 5040,
+            "name": "Atlantic Sun Conference Norfolk St Vs. Bellarmine @ Sep 18 10:00 AM",
+            "channel_number": 912,
+            "channel_group_id": 65,
+            "streams": [],
+        },
+    }
+    if hidden is not None:
+        channels[5040]["hidden_from_output"] = hidden
+
+    result = publish_profiles(
+        [reported], channels, coverage(1), observations={}, now=now,
+    )
+    document = ET.fromstring(result.xmltv_by_scope["profile:1"])
+
+    assert document.find("channel").get("id") == "ecm-5040"
+    assert document.find("channel/display-name").text == channels[5040]["name"]
+    assert document.findall("programme") == []
+    assert result.states_by_profile[1]["channels"][0]["channel_id"] == 5040
+    assert channels[5040]["channel_number"] == 912
+    assert channels[5040]["channel_group_id"] == 65
+    assert channels[5040]["streams"] == []
+
+
+def test_lifecycle_publication_suppresses_only_unconfirmed_gaps():
+    now = datetime(2026, 10, 3, 18, 45, tzinfo=timezone.utc)
+    start = datetime(2026, 10, 3, 15, tzinfo=timezone.utc)
+    stop = datetime(2026, 10, 5, 4, tzinfo=timezone.utc)
+
+    def source_programme(channel_id, begin, end, title, icon=None):
+        programme = ET.Element("programme", {
+            "channel": f"external-{channel_id}",
+            "start": begin.strftime("%Y%m%d%H%M%S %z"),
+            "stop": end.strftime("%Y%m%d%H%M%S %z"),
+        })
+        ET.SubElement(programme, "title").text = title
+        if icon is not None:
+            ET.SubElement(programme, "icon", src=icon)
+        return programme
+
+    prepared = external_profile(1, 2, 3, 4, 5, 6)
+    prepared["source_programmes"] = {
+        1: [source_programme(1, now - timedelta(minutes=15), now + timedelta(hours=1), "Current event")],
+        2: [source_programme(
+            2, now - timedelta(minutes=15), now + timedelta(hours=1), "Hidden current",
+            "https://example.com/hidden-programme.jpg",
+        )],
+        3: [source_programme(3, now - timedelta(minutes=15), now + timedelta(hours=1), "Empty current")],
+        4: [source_programme(4, start + timedelta(minutes=30), start + timedelta(hours=1), "Ended event")],
+        5: [source_programme(5, now + timedelta(hours=8), now + timedelta(hours=10), "Future event")],
+        6: [],
+    }
+    source_channel = ET.Element("channel", id="external-2")
+    ET.SubElement(source_channel, "icon", src="https://example.com/hidden-channel.jpg")
+    prepared["source_channels"] = {2: source_channel}
+    channels = {
+        1: {"id": 1, "name": "Current", "channel_number": 101, "channel_group_id": 65,
+            "hidden_from_output": False, "streams": [{"id": 11}]},
+        2: {"id": 2, "name": "Hidden", "channel_number": 102, "channel_group": {"id": 65},
+            "hidden_from_output": True, "streams": [{"id": 12}]},
+        3: {"id": 3, "name": "Empty", "channel_number": 103, "channel_group_id": 65,
+            "hidden_from_output": False, "streams": []},
+        4: {"id": 4, "name": "Ended", "channel_number": 104, "channel_group_id": 65,
+            "hidden_from_output": False, "streams": [{"id": 14}]},
+        5: {"id": 5, "name": "Future", "channel_number": 105, "channel_group_id": 65,
+            "hidden_from_output": False, "streams": [{"id": 15}]},
+        6: {"id": 6, "name": "Manual", "channel_number": 106, "channel_group_id": 66,
+            "hidden_from_output": False, "streams": []},
+    }
+
+    result = publish_profiles(
+        [prepared], channels, coverage(1), observations={}, now=now,
+    )
+    document = ET.fromstring(result.xmltv_by_scope["profile:1"])
+    titles = {
+        channel_id: [row.findtext("title") for row in document.findall(
+            f"programme[@channel='ecm-{channel_id}']"
+        )]
+        for channel_id in channels
+    }
+
+    assert "Current event" in titles[1]
+    assert "Programming unavailable" in titles[1]
+    assert titles[2] == ["Hidden current"]
+    assert titles[3] == ["Empty current"]
+    assert titles[4] == ["Ended event"]
+    assert titles[5] == ["Future event"]
+    assert titles[6] == ["Programming unavailable"]
+    assert document.find("channel[@id='ecm-2']/icon").get("src") == (
+        "https://example.com/hidden-channel.jpg"
+    )
+    assert document.find("programme[@channel='ecm-2']/icon").get("src") == (
+        "https://example.com/hidden-programme.jpg"
+    )
+    assert {row.get("id") for row in document.findall("channel")} == {
+        f"ecm-{channel_id}" for channel_id in channels
+    }
+    assert stop == prepared["guide_stop"]
 
 
 def test_complete_profile_and_aggregate_survive_a_fresh_read():
@@ -147,6 +278,165 @@ def test_pending_refresh_retains_profile_and_aggregate_byte_for_byte():
     assert second.retained_profile_ids == (1,)
     assert second.xmltv_by_scope == first.xmltv_by_scope
     assert after == before
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("elapsed", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_retained_source_keeps_complete_publication_and_delivery(pending, elapsed, mixed):
+    prepared = external_profile(1)
+    prepared["guide_start"] = NOW - timedelta(hours=1)
+    prepared["guide_stop"] = NOW + timedelta(hours=6)
+    prepared["source_programmes"] = {1: [ET.fromstring(
+        '<programme channel="external-1" start="20260920173000 +0000" '
+        'stop="20260920203000 +0000"><title>Falcons vs Wolves</title>'
+        '<icon src="https://example.com/event.jpg"/></programme>'
+    )]}
+    if mixed:
+        prepared["epg_source_ids"] = [46, 47]
+    channels = channel_map(1)
+    channels[1].update(channel_group_id=65, hidden_from_output=True)
+    ready = coverage(1)
+    ready["profiles"]["1"]["sources"] = [
+        {"source_id": source_id, "status": "ready"}
+        for source_id in prepared["epg_source_ids"]
+    ]
+    publish_profiles(
+        [prepared], channels, ready, now=NOW,
+        observations={1: [{
+            "family": "arena", "slot": "1", "stream_id": 77,
+            "normalized_name": "falcons vs wolves", "title": "Falcons vs Wolves",
+            "start": START, "expires_at": STOP, "provisional": False,
+        }]},
+    )
+    current = read_publication("profile:1")
+    update_delivery(
+        "profile:1", expected_revision=current["revision"],
+        required_dispatcharr_hashes={46: current["state"]["xmltv_hash"]},
+        confirmed_dispatcharr_hashes={46: current["state"]["xmltv_hash"]},
+        pending_emby=False,
+    )
+    if pending:
+        current = read_publication("profile:1")
+        candidate = pending_candidate()
+        candidate.update(start=START, stop=STOP)
+        admitted = begin_delivery(
+            "profile:1", expected_revision=current["revision"],
+            expected_hash=current["state"]["xmltv_hash"], profile=prepared,
+            now=NOW, pending_channels={candidate["event_key"]: candidate},
+        )
+        assert admitted is not None
+        assert admitted["state"]["delivery"]["pending_channels"][
+            candidate["event_key"]
+        ]["expires_at"] == STOP
+    before = copy.deepcopy(read_publication("profile:1"))
+    aggregate = copy.deepcopy(read_publication("all"))
+    channels[1].update(hidden_from_output=False, streams=[{"id": 77}])
+    ready["profiles"]["1"]["sources"][0]["status"] = "retained"
+    refreshed_at = NOW + timedelta(hours=4) if elapsed else NOW + timedelta(minutes=1)
+
+    result = publish_profiles(
+        [prepared], channels, ready, observations={1: []}, now=refreshed_at,
+    )
+
+    assert result.published_profile_ids == ()
+    assert result.retained_profile_ids == (1,)
+    assert result.unavailable_profile_ids == ()
+    assert "GUIDE_SOURCES_PENDING" in result.reason_codes
+    assert result.xmltv_by_scope == {
+        "profile:1": before["xmltv"], "all": aggregate["xmltv"],
+    }
+    assert result.states_by_profile[1] == before["state"]
+    assert read_publication("profile:1") == before
+    assert read_publication("all") == aggregate
+
+
+def test_unselected_degraded_source_does_not_block_ready_profile():
+    prepared = external_profile(1)
+    prepared["guide_start"] = NOW - timedelta(hours=1)
+    prepared["guide_stop"] = NOW + timedelta(hours=6)
+    readiness = coverage(1)
+    readiness["profiles"]["1"]["sources"] = [{"source_id": 46, "status": "ready"}]
+    readiness["sources"] = [{"source_id": 99, "status": "retained"}]
+
+    result = publish_profiles(
+        [prepared], channel_map(1), readiness, observations={}, now=NOW,
+    )
+
+    assert result.published_profile_ids == (1,)
+    assert result.retained_profile_ids == ()
+    assert result.unavailable_profile_ids == ()
+    assert read_publication("all")["state"]["members"] == {
+        "1": result.hashes_by_scope["profile:1"],
+    }
+
+
+def test_retained_profile_keeps_its_row_beside_a_fresh_profile():
+    prepared = external_profile(1)
+    prepared["guide_start"] = NOW - timedelta(hours=1)
+    prepared["guide_stop"] = NOW + timedelta(hours=6)
+    publish_profiles(
+        [prepared, profile(2)], channel_map(1, 2), coverage(1, 2),
+        observations={}, now=NOW,
+    )
+    retained = copy.deepcopy(read_publication("profile:1"))
+    aggregate = read_publication("all")
+    changed = profile(2)
+    changed["event_intervals"][2][0]["title"] = "New sibling event"
+    readiness = coverage(1, 2)
+    readiness["profiles"]["1"]["sources"] = [{"source_id": 46, "status": "retained"}]
+    readiness["profiles"]["2"]["sources"] = []
+
+    result = publish_profiles(
+        [prepared, changed], channel_map(1, 2), readiness,
+        observations={}, now=NOW + timedelta(minutes=1),
+    )
+
+    assert result.published_profile_ids == (2,)
+    assert result.retained_profile_ids == (1,)
+    assert result.unavailable_profile_ids == ()
+    assert result.xmltv_by_scope["profile:1"] == retained["xmltv"]
+    assert read_publication("profile:1") == retained
+    assert read_publication("all")["revision"] == aggregate["revision"] + 1
+    assert read_publication("all")["state"]["members"] == {
+        "1": retained["state"]["xmltv_hash"],
+        "2": result.hashes_by_scope["profile:2"],
+    }
+    assert {row.get("id") for row in ET.fromstring(
+        result.xmltv_by_scope["all"]
+    ).findall("channel")} == {"ecm-1", "arena-2"}
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_retained_source_cannot_create_first_publication(pending):
+    prepared = external_profile(1)
+    prepared["guide_start"] = NOW - timedelta(hours=1)
+    prepared["guide_stop"] = NOW + timedelta(hours=6)
+    if pending:
+        admitted = begin_delivery(
+            "profile:1", expected_revision=0, expected_hash=None,
+            profile=prepared, now=NOW,
+            pending_channels={"arena:falcons-wolves": pending_candidate()},
+        )
+        assert admitted is not None
+        assert admitted["state"]["published"] is False
+    before = copy.deepcopy(read_publication("profile:1"))
+    readiness = coverage(1)
+    readiness["profiles"]["1"]["sources"] = [{"source_id": 46, "status": "retained"}]
+
+    result = publish_profiles(
+        [prepared], channel_map(1), readiness,
+        observations={}, now=NOW + timedelta(minutes=1),
+    )
+
+    assert result.published_profile_ids == ()
+    assert result.retained_profile_ids == ()
+    assert result.unavailable_profile_ids == (1,)
+    assert result.xmltv_by_scope == {}
+    assert result.states_by_profile == {}
+    assert "GUIDE_SOURCES_PENDING" in result.reason_codes
+    assert read_publication("profile:1") == before
+    assert read_publication("all") is None
 
 
 def test_new_pending_member_cannot_replace_complete_aggregate_with_a_partial_one():

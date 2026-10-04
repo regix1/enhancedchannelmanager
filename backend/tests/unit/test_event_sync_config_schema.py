@@ -1108,3 +1108,60 @@ class TestProfileEventConfig:
         }
         errors = validate_event_sync_config(config, profile_group_ids=[])
         assert (not errors) is valid
+
+
+class TestDedicatedConfig:
+    @pytest.fixture
+    def dedicated(self, test_session, monkeypatch):
+        import database
+        from sqlalchemy.orm import sessionmaker
+        from tests.event_sync_fixtures import dedicated_event_profile, dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(enabled=False)
+        test_session.add(dedicated_event_profile(config))
+        test_session.commit()
+        monkeypatch.setattr(database, "_SessionLocal", sessionmaker(bind=test_session.bind))
+        return config
+
+    def test_disabled_source_free_profile_validates_without_a_master(self, dedicated):
+        assert validate_event_sync_config(dedicated) == []
+        assert dedicated["master"] is None
+        assert dedicated["master_group_id"] is None
+        assert dedicated["secondary_group_ids"] == [20, 30]
+
+    @pytest.mark.parametrize("field,value", [
+        ("mode", None), ("mode", "master"), ("mode", "unknown"),
+        ("master", {"group_id": 10, "m3u_account_id": 1}), ("master_group_id", 10),
+        ("secondary", []), ("secondary", [{"group_id": 20, "m3u_account_id": None}]),
+        ("secondary", [{"group_id": 20, "m3u_account_id": 1}] * 2),
+        ("promote_target_group_id", 20), ("dummy_epg_profile_id", None),
+        ("promote_unmatched", False), ("include_master_group_streams", True),
+        ("parse_master_from_stream", True), ("assume_current_date", True),
+        ("skip_dead_streams", False), ("skip_past_events", False),
+        ("retire_finished_events", False),
+    ])
+    def test_dedicated_admission_rejects_unsafe_shapes(self, dedicated, field, value):
+        dedicated[field] = value
+        assert validate_event_sync_config(dedicated)
+
+    @pytest.mark.parametrize("field,value", [
+        ("channel_group_ids", "broken"), ("channel_group_ids", "[40, 10]"),
+        ("hide_empty_group_ids", "[]"), ("hide_empty_group_ids", "[40, 20]"),
+        ("epg_source_ids", "broken"), ("epg_source_ids", "[1]"),
+        ("channel_mappings", "{}"), ("channel_mappings", "[{}]"),
+        ("event_sync_config", None), ("event_sync_config", "broken"),
+        ("event_sync_config", '{"secondary": [], "assume_current_date": false}'),
+        ("event_sync_config", '{"secondary": [{"group_id": 30, "m3u_account_id": 2}, {"group_id": 20, "m3u_account_id": 1}], "assume_current_date": false}'),
+        ("event_sync_config", '{"secondary": [{"group_id": 20, "m3u_account_id": 1}, {"group_id": 30, "m3u_account_id": 2}], "assume_current_date": true}'),
+    ])
+    def test_raw_profile_corruption_cannot_become_source_free(self, dedicated, test_session, field, value):
+        from models import DummyEPGProfile
+
+        profile = test_session.get(DummyEPGProfile, 7)
+        setattr(profile, field, value)
+        test_session.commit()
+        assert any("dummy_epg_profile_id" in error for error in validate_event_sync_config(dedicated))
+
+    def test_omitting_mode_still_requires_a_master(self, dedicated):
+        dedicated.pop("mode")
+        assert any("master_group_id" in error for error in validate_event_sync_config(dedicated))

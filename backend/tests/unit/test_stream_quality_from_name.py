@@ -245,6 +245,7 @@ class TestAnEventSyncOnlyRunReachesTheSortWithNames:
             executor.verify_epg_assignments = AsyncMock(return_value=(0, 0, 0))
             executor.prune_merge_streams = AsyncMock()
             executor._finish_event_promotions = AsyncMock(return_value=set())
+            executor._event_publications = {}
             executor._channel_by_id = {self.MASTER_CHANNEL_ID: channel}
             executor._created_channels = {}
             executor_cls.return_value = executor

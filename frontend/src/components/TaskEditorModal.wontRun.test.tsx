@@ -474,7 +474,7 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
 
   it('prevents a second Save while the first authoritative update is pending', async () => {
     const user = userEvent.setup();
-    const update = deferred<void>();
+    const update = deferred<Awaited<ReturnType<typeof api.updateTask>>>();
     const onClose = vi.fn();
     const onSaved = vi.fn();
     vi.mocked(api.getTaskSchedules).mockResolvedValue({ schedules: [makeSchedule({ enabled: true })] });
@@ -494,7 +494,7 @@ describe('TaskEditorModal — vkktd.4 wontRun UX', () => {
     expect(onClose).not.toHaveBeenCalled();
 
     await act(async () => {
-      update.resolve();
+      update.resolve(makeTask());
     });
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));

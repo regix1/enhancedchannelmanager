@@ -779,3 +779,35 @@ class TestCircuitBreakerCoversEventSync:
         assert run_result["success"] is True
         assert run_result["event_sync"][0]["attached"] == 1
         assert state.stream_ids_of(100) == [9001, 7001]
+
+
+class TestDedicatedRollback:
+    def test_completed_dedicated_run_rolls_back_its_created_target_only(self, db_session_factory, monkeypatch):
+        from copy import deepcopy
+        from datetime import timedelta
+        from unittest.mock import call
+        from tests.unit.test_event_sync_promotion import _staged_event
+
+        setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+        foreign = deepcopy(setup["state"].channels[100])
+        dummy_epg = setup["dummy_epg"]
+        _, regenerate, wait_refresh = dummy_epg._wire_epg(
+            setup["state"], setup["client"], db_session_factory,
+            regenerated_entries=[dummy_epg._dummy_entry(502, 900, setup["event_channel_name"])],
+        )
+        setup["state"].guide_sources[0]["is_active"] = True
+        with patch("services.event_sync_resolver.datetime") as clock:
+            clock.now.return_value = setup["event_start"] + timedelta(minutes=1)
+            result = dummy_epg._manual_run(setup["client"], db_session_factory, regenerate, wait_refresh)
+        assert result["success"] is True
+        assert setup["state"].channels[900]["epg_data_id"] == 502
+        assert setup["state"].channels[900]["streams"] == [7301]
+        assert setup["state"].channels[900]["hidden_from_output"] is False
+        engine = ChannelPipelineEngine(setup["client"])
+        with patch("channel_pipeline_engine.get_session", side_effect=db_session_factory):
+            rolled_back = _run(engine.rollback_execution(result["execution_id"], confirm=True))
+        assert rolled_back["success"] is True
+        assert 900 not in setup["state"].channels
+        assert setup["state"].channels[100] == foreign
+        assert setup["client"].delete_channel.call_args_list == [call(900)]
+        assert_never_touched_group_settings(setup["client"])

@@ -277,6 +277,8 @@ def _stored_active(publication: dict | None, channel_id: int, now: datetime) -> 
         if channel.get("channel_id") != channel_id:
             continue
         for event in channel.get("events", []):
+            if _guide_name(event, "UTC") is None:
+                continue
             try:
                 start = datetime.fromisoformat(event["start"])
                 stop = datetime.fromisoformat(event["stop"])
@@ -419,13 +421,20 @@ def _plan_profile(
             except (TypeError, ValueError):
                 continue
             if isinstance(values, list):
-                intervals[parsed_channel_id] = copy.deepcopy(values)
+                real_events = [
+                    copy.deepcopy(event)
+                    for event in values
+                    if _guide_name(event, event_timezone) is not None
+                ]
+                if real_events:
+                    intervals[parsed_channel_id] = real_events
     if retained is not None:
         for item in retained["state"].get("channels", []):
             retained_events = [
                 copy.deepcopy(event)
                 for event in item.get("events", [])
-                if datetime.fromisoformat(event["stop"]) > now
+                if _guide_name(event, event_timezone) is not None
+                and datetime.fromisoformat(event["stop"]) > now
             ]
             if retained_events:
                 intervals[item["channel_id"]] = retained_events
@@ -500,6 +509,8 @@ def _plan_profile(
         slot = _slot_key(channel.get("name"), config, role="channel")
         direct = list(direct_by_slot.get(slot, [])) if slot is not None else []
         current = (rows.get(channel_id) or {}).get("current")
+        if _guide_name(current, event_timezone) is None:
+            current = None
         bootstrap = next((
             item.get("bootstrap") is True
             for item in config.get("slot_patterns", [])

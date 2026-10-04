@@ -2477,9 +2477,12 @@ class TestDeferredEPGAssignment:
         exec_ctx = ExecutionContext()
         exec_ctx.current_channel_id = 1
 
-        result = asyncio.get_event_loop().run_until_complete(
-            executor.execute(action, self.stream_ctx, exec_ctx)
-        )
+        session = MagicMock()
+        session.query.return_value.all.return_value = []
+        with patch("database.get_session", return_value=session):
+            result = asyncio.get_event_loop().run_until_complete(
+                executor.execute(action, self.stream_ctx, exec_ctx)
+            )
 
         assert result.success is True
         assert result.deferred is True
@@ -2527,9 +2530,12 @@ class TestDeferredEPGAssignment:
         exec_ctx.current_channel_id = 1
 
         # First attempt: deferred
-        result1 = asyncio.get_event_loop().run_until_complete(
-            executor.execute(action, self.stream_ctx, exec_ctx)
-        )
+        session = MagicMock()
+        session.query.return_value.all.return_value = []
+        with patch("database.get_session", return_value=session):
+            result1 = asyncio.get_event_loop().run_until_complete(
+                executor.execute(action, self.stream_ctx, exec_ctx)
+            )
         assert result1.deferred is True
 
         # Simulate EPG refresh — reload with data
@@ -2540,9 +2546,10 @@ class TestDeferredEPGAssignment:
         # Retry: should succeed now
         from channel_pipeline_schema import Action
         action_obj = Action.from_dict(action)
-        result2 = asyncio.get_event_loop().run_until_complete(
-            executor._execute_assign_epg(action_obj, self.stream_ctx, exec_ctx)
-        )
+        with patch("database.get_session", return_value=session):
+            result2 = asyncio.get_event_loop().run_until_complete(
+                executor._execute_assign_epg(action_obj, self.stream_ctx, exec_ctx)
+            )
 
         assert result2.success is True
         assert result2.deferred is False

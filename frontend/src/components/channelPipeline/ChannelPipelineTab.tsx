@@ -420,6 +420,9 @@ export function ChannelPipelineTab() {
       setCreateRuleKind(null);
     } catch (err) {
       notifications.error(err instanceof Error ? err.message : 'Failed to save rule', 'Channel Pipeline');
+      if (data.event_sync_config != null) {
+        throw err;
+      }
     }
   }, [editingRule, updateRule, createRule, rules, notifications]);
 

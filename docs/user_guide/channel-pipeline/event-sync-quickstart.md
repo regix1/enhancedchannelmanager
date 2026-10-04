@@ -3,7 +3,8 @@
 Event Sync is a second rule kind alongside the Standard rule covered in
 [Rules overview](rules-overview.md): instead of conditions and actions, it
 matches secondary providers' event streams onto one "master" provider's
-channels. This page is a thin quick-start pointing at
+channels, or creates ECM-owned channels with an explicit dedicated rule.
+This page is a thin quick-start pointing at
 [`docs/event_sync.md`](https://github.com/MotWakorb/enhancedchannelmanager/blob/main/docs/event_sync.md), which already has the full
 walkthrough, the pattern cookbook, and the troubleshooting reference. Read
 this page to get oriented and reach your first preview, then follow the
@@ -43,6 +44,30 @@ streams would attach, how many are ambiguous or unmatched, and per-stream
 match detail, with nothing written to Dispatcharr. Save the rule once the
 preview looks right, then run it from the Channel Pipeline page's **Run**
 button to actually attach matched streams.
+
+### Prepare a dedicated event rule
+
+Dedicated rules have `mode: "dedicated"` and null master fields. Use exact
+group/account pairs for every secondary and retain their order. The target
+must be separate from those inputs and initially empty. Every input junction
+must have auto-sync OFF, and no enabled automatic source can override into
+the target. A saved event rule cannot switch ownership mode in place.
+
+Link a source-free dummy EPG profile whose group and hide-group lists each
+contain only the target. Keep its source inputs, mappings, and slot patterns
+empty. Match its ordered secondaries to the rule and disable current-date
+assumption. You can save and preview with the profile and rule disabled.
+Keep promotion, dead-stream checks, past-event checks, and finished-event
+retirement enabled in the event config.
+
+Before a live run, the linked profile needs its own active generated guide
+source. ECM stages each new channel hidden, assigns its imported guide row,
+and checks current stream health and ownership before attaching streams and
+revealing it. A failed or incomplete read refuses the rule. The preview
+shows a null master and never adopts an existing foreign target channel.
+
+See [Dedicated events without a master](../../event_sync.md#dedicated-events-without-a-master)
+for the configuration shape and complete admission checks.
 
 ## What to read next
 

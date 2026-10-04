@@ -1,4 +1,5 @@
 """Refresh polling and task entry points share confirmed workflow outcomes."""
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -81,6 +82,56 @@ async def test_cancelled_wait_does_not_trigger_refresh():
         client, 1, "Guide", expires_at=EXPIRES_AT, cancelled=lambda: True,
     )
     client.refresh_epg_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["expired", "cancelled", "live"])
+@pytest.mark.parametrize("wait", [False, True])
+async def test_source_observation_respects_expiry_and_cancellation(outcome, wait):
+    from tests.unit.test_event_sync_promotion import _clock
+
+    admitted_at = datetime.now(timezone.utc)
+    expires_at = admitted_at + timedelta(seconds=30)
+    clock = {"now": admitted_at, "cancelled": False}
+    client = MagicMock()
+
+    async def read(source_id):
+        if client.get_epg_source.await_count == 1:
+            clock["now"] += timedelta(seconds=10)
+            return {"updated_at": "old", "status": "success"}
+        if outcome == "expired":
+            clock["now"] = expires_at + timedelta(seconds=1)
+        elif outcome == "cancelled":
+            clock["cancelled"] = True
+        return {"updated_at": "new", "status": "success"}
+
+    client.get_epg_source = AsyncMock(side_effect=read)
+    client.refresh_epg_source = AsyncMock()
+    progress = {}
+    read_wait = AsyncMock(wraps=asyncio.wait_for)
+
+    with patch("tasks.dummy_epg_refresh.datetime", new=_clock(lambda: clock["now"])), \
+         patch("tasks.dummy_epg_refresh.asyncio.sleep", new=AsyncMock()), \
+         patch("tasks.dummy_epg_refresh.asyncio.wait_for", new=read_wait):
+        completed = await wait_for_epg_source_refresh(
+            client,
+            1,
+            "Guide",
+            poll_interval=0,
+            expires_at=expires_at,
+            cancelled=lambda: clock["cancelled"],
+            progress=progress,
+            wait=wait,
+        )
+
+    if outcome == "live":
+        assert completed is True
+    else:
+        assert completed is False
+    assert client.get_epg_source.await_count == 2
+    client.refresh_epg_source.assert_awaited_once_with(1)
+    assert progress["triggered"] is True
+    assert [call.kwargs["timeout"] for call in read_wait.await_args_list] == [30, 20]
 
 
 @pytest.mark.asyncio

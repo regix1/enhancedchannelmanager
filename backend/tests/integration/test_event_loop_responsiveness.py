@@ -129,7 +129,7 @@ class TestHealthRespondsDuringCpuBoundWork:
         import threading
         in_sync_call = threading.Event()
 
-        def slow_generate_signal(profile_data, channel_map):
+        def slow_generate_signal(profile_data, channel_map, *, without_gaps):
             """Signal once the sync call has been entered, then block."""
             in_sync_call.set()
             time.sleep(0.8)

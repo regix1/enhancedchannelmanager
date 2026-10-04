@@ -58,6 +58,7 @@ export interface ProfileEventSyncConfig {
 }
 
 export interface EventSyncConfig {
+  mode?: 'dedicated';
   /**
    * bead 3p2af / 38dzi: canonical provider-scoped shape. The editor (P4)
    * reads and writes these nested scopes; the backend validator derives the
@@ -67,9 +68,9 @@ export interface EventSyncConfig {
    * a fetched config and are the migration fallback for a legacy rule authored
    * before the nested shape existed.
    */
-  master?: EventSyncGroupScope;
+  master?: EventSyncGroupScope | null;
   secondary?: EventSyncGroupScope[];
-  master_group_id?: number;
+  master_group_id?: number | null;
   secondary_group_ids?: number[];
   /** Shared pattern variants; omit to use the matcher's built-in defaults. */
   patterns?: EventSyncPattern[];

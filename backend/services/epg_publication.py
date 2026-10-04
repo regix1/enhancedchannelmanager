@@ -18,7 +18,13 @@ from sqlalchemy.exc import IntegrityError
 
 from database import get_session
 from models import DummyEPGProfile, GuidePublication
-from services.epg_programmes import MAX_CACHE, MAX_RETAINED, programme_times
+from services.epg_programmes import (
+    MAX_CACHE,
+    MAX_RETAINED,
+    _placeholder,
+    _resolve_group_assignments,
+    programme_times,
+)
 
 
 STATE_VERSION = 1
@@ -992,6 +998,12 @@ def publish_profiles(
         scope = _scope(profile_id)
         readiness = profile_coverage.get(str(profile_id), profile_coverage.get(profile_id))
         ready = isinstance(readiness, Mapping) and readiness.get("can_publish") is True
+        if isinstance(readiness, Mapping) and any(
+            source.get("status") == "retained"
+            for source in readiness.get("sources", ())
+        ):
+            ready = False
+            reasons.add("GUIDE_SOURCES_PENDING")
         prior_state = prior.get(scope, {}).get("state")
         active_claim = bool(
             prior_state
@@ -1006,7 +1018,40 @@ def publish_profiles(
             reasons.add("GUIDE_CONFIG_CHANGED")
         if ready:
             try:
-                document = generate_xmltv([profile], channel_map)
+                without_gaps = set()
+                if profile.get("epg_source_ids"):
+                    assigned_channels = {
+                        assignment.get("channel_id")
+                        for assignment in profile.get("channel_assignments", [])
+                        if assignment.get("channel_id") is not None
+                    }
+                    lifecycle_channels = {
+                        assignment["channel_id"]
+                        for assignment in _resolve_group_assignments(
+                            profile.get("hide_empty_group_ids", []), channel_map,
+                        )
+                    }
+                    for channel_id in assigned_channels & lifecycle_channels:
+                        channel = channel_map[channel_id]
+                        streams = channel.get("streams")
+                        current_programme = False
+                        for programme in profile.get("source_programmes", {}).get(channel_id, []):
+                            try:
+                                start, stop = programme_times(programme)
+                            except ValueError:
+                                continue
+                            if start <= now < stop and not _placeholder(programme):
+                                current_programme = True
+                                break
+                        if (
+                            channel.get("hidden_from_output") is True
+                            or (isinstance(streams, list) and not streams)
+                            or not current_programme
+                        ):
+                            without_gaps.add(channel_id)
+                document = generate_xmltv(
+                    [profile], channel_map, without_gaps=without_gaps,
+                )
                 _document(document, MAX_RETAINED)
                 state = _profile_state(
                     profile, channel_map, document, observations, now,

@@ -125,3 +125,18 @@ async def test_mcp_cannot_start_privileged_task_directly():
         )
     assert exc.value.status_code == 403
     assert "MCP service principal" in exc.value.detail
+
+
+@pytest.mark.parametrize("name,path,queries", [
+    ("tasks_get", "/api/tasks/{task_id}", {"details"}),
+    ("tasks_engine_status", "/api/tasks/engine/status", set()),
+])
+def test_selected_task_and_engine_reads_have_narrow_declared_capabilities(name, path, queries):
+    entry = _endpoint_contracts()[name]
+    assert (entry.method, entry.path) == ("GET", path)
+    assert entry.query_params == queries
+    assert not entry.request_fields
+    assert is_mcp_route_allowed("GET", path)
+    assert ("GET", path) not in MCP_HUMAN_ONLY_ROUTES
+    for method in ("POST", "PATCH", "PUT", "DELETE"):
+        assert not is_mcp_route_allowed(method, path)

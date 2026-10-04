@@ -521,3 +521,31 @@ class TestCountSnapshotCoveredStreams:
         resolved = [self._resolved(1, 34), self._resolved(2, 34)]
         assert count_snapshot_covered_streams(
             resolved, {34: "Fubo Events"}, {}) == 0
+
+
+class TestDedicatedPreflight:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["safe", "missing", "on", "override", "account_override"])
+    async def test_exact_inputs_must_be_off_and_the_target_has_no_automatic_source(self, case):
+        config = {
+            "mode": "dedicated", "master": None, "master_group_id": None,
+            "secondary": [{"group_id": 2491, "m3u_account_id": 2}, {"group_id": 1514, "m3u_account_id": 18}],
+            "promote_target_group_id": 40,
+        }
+        rows = {(2, 2491): _group(False), (18, 1514): _group(False)}
+        collapsed = {2491: _group(False), 1514: _group(False)}
+        if case == "missing":
+            rows.pop((18, 1514))
+        elif case == "on":
+            rows[(18, 1514)] = _group(True)
+        elif case == "override":
+            collapsed[88] = _source(True, 40)
+        elif case == "account_override":
+            rows[(77, 88)] = _source(True, 40)
+        client = _ProviderScopedClient(collapsed, rows)
+        result = await check_event_sync_group_settings(client, config)
+        assert result["ok"] is (case == "safe")
+        assert all(failure["role"] != "master" for failure in result["failures"])
+        assert set(vars(client)) == {"get_all_m3u_group_settings", "get_m3u_group_settings_by_provider"}
+        client.get_all_m3u_group_settings.assert_awaited_once()
+        client.get_m3u_group_settings_by_provider.assert_awaited_once()

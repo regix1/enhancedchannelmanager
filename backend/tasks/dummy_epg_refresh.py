@@ -37,7 +37,20 @@ async def wait_for_epg_source_refresh(
     if datetime.now(timezone.utc) >= expires_at:
         return False
     if initial_source is None:
-        initial_source = await client.get_epg_source(source_id)
+        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            return False
+        try:
+            initial_source = await asyncio.wait_for(
+                client.get_epg_source(source_id), timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
+            return False
+    if cancelled is not None and cancelled():
+        return False
+    if datetime.now(timezone.utc) >= expires_at:
+        return False
     if "initial_updated" not in progress:
         progress["initial_updated"] = (
             initial_source.get("updated_at") or initial_source.get("last_updated")
@@ -49,6 +62,10 @@ async def wait_for_epg_source_refresh(
             return False
         await client.refresh_epg_source(source_id)
         progress["triggered"] = True
+    if cancelled is not None and cancelled():
+        return False
+    if datetime.now(timezone.utc) >= expires_at:
+        return False
 
     running_states = {
         "fetching", "processing", "parsing", "loading", "pending",
@@ -67,9 +84,20 @@ async def wait_for_epg_source_refresh(
             await asyncio.sleep(min(max(0, poll_interval), remaining))
         if cancelled is not None and cancelled():
             return False
+        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            return False
+        try:
+            current_source = await asyncio.wait_for(
+                client.get_epg_source(source_id), timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
+            return False
+        if cancelled is not None and cancelled():
+            return False
         if datetime.now(timezone.utc) >= expires_at:
             return False
-        current_source = await client.get_epg_source(source_id)
         status = str(current_source.get("status") or "").strip().lower()
         current_updated = current_source.get("updated_at") or current_source.get("last_updated")
         if status in {"error", "failed", "failure", "cancelled", "canceled"}:

@@ -11,7 +11,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from export_models import SyncTarget
-from models import TaskExecution
+from models import TaskExecution, TaskSchedule
 from task_engine import TaskEngine, TaskHistoryError
 from task_scheduler import TaskResult, TaskScheduler
 
@@ -110,6 +110,7 @@ async def test_start_task_commits_running_row_before_body_finishes(test_engine):
             assert row.task_id == admitted.task_id
             assert row.started_at == admitted.started_at
             assert row.status == "running"
+            assert row.schedule_id is None
         finally:
             session.close()
 
@@ -707,3 +708,113 @@ def test_restart_repair_terminates_old_identity_even_with_newer_run(test_engine)
 
     assert repaired["status"] == "terminated"
     assert repaired["success"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger,parameters", [("scheduled", None), ("manual", None), ("manual", {"accounts": [2, 18]})])
+async def test_schedule_association_is_durable_before_work_and_survives_deletion(test_engine, trigger, parameters):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    task = _GatedTask(entered, release)
+    engine, sessions, registry = _engine_harness(test_engine, task)
+    session = sessions()
+    schedule = TaskSchedule(task_id=task.task_id, schedule_type="interval", interval_seconds=30)
+    session.add(schedule)
+    session.commit()
+    schedule_id = schedule.id
+    session.close()
+    with patch("task_engine.get_session", side_effect=sessions), patch("task_engine.get_registry", return_value=registry), patch("task_engine.log_entry"):
+        if trigger == "manual":
+            admitted = await engine.start_task(task.task_id, schedule_id=schedule_id, parameters=parameters)
+        else:
+            admitted = await engine._start_task(task.task_id, triggered_by=trigger, schedule_id=schedule_id)
+        session = sessions()
+        try:
+            row = session.get(TaskExecution, admitted.execution_id)
+            assert row.schedule_id == schedule_id
+            assert row.status == "running"
+            assert row.started_at == admitted.started_at
+            assert row.triggered_by == trigger
+            session.delete(session.get(TaskSchedule, schedule_id))
+            session.commit()
+            assert session.get(TaskExecution, admitted.execution_id).schedule_id == schedule_id
+        finally:
+            session.close()
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        release.set()
+        await asyncio.wait_for(asyncio.shield(admitted.completion), timeout=1)
+        terminal = engine.get_task_execution(task.task_id, admitted.execution_id, admitted.started_at)
+    assert terminal["schedule_id"] == schedule_id
+    assert terminal["status"] == "completed"
+    assert terminal["id"] == admitted.execution_id
+    assert terminal["started_at"] == admitted.started_at.isoformat() + "Z"
+
+
+def test_history_orders_equal_starts_by_id_and_preserves_unknown_association(test_engine):
+    sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+    start = datetime(2026, 9, 20, 3)
+    session = sessions()
+    rows = [TaskExecution(task_id="stream_probe", started_at=start, status="running", triggered_by="scheduled") for _ in range(3)]
+    session.add_all(rows)
+    session.commit()
+    ids = sorted((row.id for row in rows), reverse=True)
+    session.close()
+    with patch("task_engine.get_session", side_effect=sessions):
+        history = TaskEngine().get_task_history("stream_probe", limit=2, offset=1)
+        empty = TaskEngine().get_task_history("unknown_task")
+        deleted_target = TaskEngine().get_task_history("dbas_sync_997")
+    assert [row["id"] for row in history] == ids[1:]
+    assert [row["schedule_id"] for row in history] == [None, None]
+    assert empty == deleted_target == []
+
+
+@pytest.mark.parametrize("boundary", ["session", "query", "serialization", "close"])
+def test_failed_history_read_raises_instead_of_claiming_empty_history(boundary, caplog):
+    rejected = "https://example.test/private"
+    session = MagicMock()
+    query = session.query.return_value
+    query.order_by.return_value = query
+    query.filter.return_value = query
+    query.offset.return_value = query
+    query.limit.return_value = query
+    row = MagicMock()
+    row.to_dict.return_value = {"id": 7}
+    query.all.return_value = [row]
+    failure = RuntimeError(rejected)
+    if boundary == "query":
+        session.query.side_effect = failure
+    elif boundary == "serialization":
+        row.to_dict.side_effect = failure
+    elif boundary == "close":
+        session.close.side_effect = failure
+    with patch("task_engine.get_session", side_effect=failure if boundary == "session" else None, return_value=session):
+        with pytest.raises(TaskHistoryError, match="Task history read failed") as caught:
+            TaskEngine().get_task_history("stream_probe")
+    assert caught.value.__cause__ is failure
+    assert rejected not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_schedule_association_survives_failure_and_cancellation(test_engine, cancel):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    task = _ValidatingTask(entered, release) if cancel else _FailingTask()
+    engine, sessions, registry = _engine_harness(test_engine, task)
+    session = sessions()
+    schedule = TaskSchedule(task_id=task.task_id, schedule_type="interval", interval_seconds=30)
+    session.add(schedule)
+    session.commit()
+    schedule_id = schedule.id
+    session.close()
+    with patch("task_engine.get_session", side_effect=sessions), patch("task_engine.get_registry", return_value=registry), patch("task_engine.log_entry"):
+        admitted = await engine.start_task(task.task_id, schedule_id=schedule_id)
+        if cancel:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert (await engine.cancel_task(task.task_id))["status"] == "cancelling"
+            release.set()
+        await asyncio.wait_for(asyncio.shield(admitted.completion), timeout=1)
+        terminal = engine.get_task_execution(task.task_id, admitted.execution_id, admitted.started_at)
+    assert terminal["schedule_id"] == schedule_id
+    assert terminal["status"] == ("cancelled" if cancel else "failed")
+    assert terminal["id"] == admitted.execution_id

@@ -1405,6 +1405,17 @@ ENDPOINTS: dict[str, Endpoint] = {
         method="GET",
         path="/api/tasks",
     ),
+    "tasks_get": Endpoint(
+        name="tasks_get",
+        method="GET",
+        path="/api/tasks/{task_id}",
+        query_params=frozenset({"details"}),
+    ),
+    "tasks_engine_status": Endpoint(
+        name="tasks_engine_status",
+        method="GET",
+        path="/api/tasks/engine/status",
+    ),
     "tasks_run": Endpoint(
         name="tasks_run",
         method="POST",
@@ -1440,6 +1451,7 @@ ENDPOINTS: dict[str, Endpoint] = {
                 "skipped_count",
                 "details",
                 "triggered_by",
+                "schedule_id",
             }
         ),
     ),

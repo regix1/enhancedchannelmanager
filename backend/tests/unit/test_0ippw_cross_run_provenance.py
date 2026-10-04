@@ -307,6 +307,7 @@ class TestEngineSuppliesTheLedger:
             executor.prune_merge_streams = AsyncMock()
             executor.reorder_streams_on_channels = AsyncMock(return_value=0)
             executor._finish_event_promotions = AsyncMock(return_value=set())
+            executor._event_publications = {}
             executor._channel_by_id = {}
             executor._created_channels = {}
             executor_cls.return_value = executor

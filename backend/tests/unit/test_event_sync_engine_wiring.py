@@ -482,3 +482,54 @@ class TestPass4HardBypass:
         self._reconcile(rule, {rule.id: [701]}, test_session)
 
         assert rule.get_managed_channel_ids() == [701]
+
+
+class TestDedicatedRunAdmission:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trigger", ["manual", "m3u_refresh"])
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("fault", ["inventory", "preflight", "review", "exclusion", "account", "profile_disabled", "source_missing", "source_inactive", "source_combined", "target_foreign"])
+    async def test_failed_admission_never_executes_or_reconciles(self, test_session, monkeypatch, dry_run, fault, trigger):
+        import database
+        from sqlalchemy.orm import sessionmaker
+        from tests.event_sync_fixtures import dedicated_event_profile, dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(auto_run=True)
+        test_session.add(dedicated_event_profile(config, enabled=fault != "profile_disabled"))
+        rule = _make_rule("Dedicated events", event_sync=True, es_config=config)
+        test_session.add(rule)
+        test_session.commit()
+        monkeypatch.setattr(database, "_SessionLocal", sessionmaker(bind=test_session.bind))
+        client = MagicMock()
+        client.get_m3u_accounts = AsyncMock(return_value=[{"id": 1, "name": "First"}, {"id": 2, "name": "Second"}])
+        client.get_all_m3u_group_settings = AsyncMock(return_value={})
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, 20): {"auto_channel_sync": False}, (2, 30): {"auto_channel_sync": False}})
+        client.update_channel = AsyncMock()
+        engine = ChannelPipelineEngine(client)
+        engine._channels_complete = fault != "inventory"
+        engine._existing_groups = [{"id": 40}]
+        engine._existing_channels = []
+        engine._fetch_event_sync_secondary_streams = AsyncMock(return_value=[])
+        engine._load_rules = AsyncMock(return_value=[rule])
+        monkeypatch.setattr("tasks.channel_pipeline._run_on_refresh_suppressed", lambda: (False, None))
+        executor = MagicMock()
+        executor.execute_event_sync_rule = AsyncMock()
+        executor.assign_event_sync_dummy_epg = AsyncMock()
+        executor._dummy_source_by_profile = {} if fault == "source_missing" else {7: 42}
+        executor._epg_sources = [{"id": 42, "is_active": fault != "source_inactive", "url": "http://ecm.test/api/dummy-epg/xmltv" if fault == "source_combined" else "http://ecm.test/api/dummy-epg/xmltv/7"}]
+        if fault == "preflight":
+            client.get_m3u_group_settings_by_provider.return_value[(1, 20)]["auto_channel_sync"] = True
+        elif fault == "account":
+            client.get_m3u_accounts.return_value = [{"id": 1, "name": "First"}]
+        elif fault == "target_foreign":
+            engine._existing_channels = [{"id": 900, "uuid": "manual", "channel_group_id": 40}]
+        module = "services.event_sync_review_store.load_review_decisions" if fault == "review" else "services.event_sync_exclusion_store.load_exclusion_keys"
+        results = {}
+        with patch(module, side_effect=RuntimeError("read failed") if fault in {"review", "exclusion"} else lambda *args: frozenset()):
+            await engine._run_event_sync_rules([rule], executor, results, dry_run, trigger, set())
+        executor.execute_event_sync_rule.assert_not_awaited()
+        executor.assign_event_sync_dummy_epg.assert_not_awaited()
+        client.update_channel.assert_not_awaited()
+        assert results["event_sync"] == []
+        assert results["event_sync_warnings"]
+        assert results.get("event_sync_promotion_reconcile_rule_ids", set()) == set()

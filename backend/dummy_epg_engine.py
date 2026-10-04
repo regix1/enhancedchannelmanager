@@ -9,6 +9,7 @@ import copy
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -549,6 +550,8 @@ def generate_channel_xml(
     profile: dict,
     streams: list[dict] = None,
     event_intervals: list[dict] | None = None,
+    *,
+    fill_gaps: bool = True,
 ) -> tuple[ET.Element, list[ET.Element]]:
     """
     Generate XMLTV <channel> and <programme> elements for one channel.
@@ -561,6 +564,7 @@ def generate_channel_xml(
         profile: Profile dict (from DummyEPGProfile.to_dict()).
         streams: Optional list of stream dicts with "name" keys.
         event_intervals: Prepared absolute event intervals for a managed slot.
+        fill_gaps: Whether to generate programmes outside confirmed source rows.
 
     Returns:
         Tuple of (channel_element, list_of_programme_elements).
@@ -729,6 +733,8 @@ def generate_channel_xml(
         poster_url = _render_url(get_template("program_poster_url_template"), template_groups)
 
         def append_gap(begin: datetime, end: datetime) -> None:
+            if not fill_gaps:
+                return
             cuts = {begin, end}
             if hint_start is not None:
                 cuts.update(point for point in (hint_start, hint_stop) if begin < point < end)
@@ -928,6 +934,8 @@ def get_xmltv_id(assignment: dict, channel: dict, profile: dict) -> str:
 def generate_xmltv(
     profiles: list[dict],
     channel_data: dict[int, dict],
+    *,
+    without_gaps: Collection[int] = (),
 ) -> str:
     """
     Generate a complete XMLTV document from profiles and channel data.
@@ -935,6 +943,7 @@ def generate_xmltv(
     Args:
         profiles: List of profile dicts with channel_assignments included.
         channel_data: Maps channel_id -> {name, channel_number, streams}.
+        without_gaps: Channel IDs that retain only confirmed source programmes.
 
     Returns:
         XMLTV XML string.
@@ -977,7 +986,8 @@ def generate_xmltv(
                 continue
             seen_ids.add(tvg_id)
             channel_el, programmes = generate_channel_xml(
-                ch_id, ch_name, ch_number, tvg_id, profile, streams
+                ch_id, ch_name, ch_number, tvg_id, profile, streams,
+                fill_gaps=ch_id not in without_gaps,
             )
             all_channels.append(channel_el)
             all_programmes.extend(programmes)

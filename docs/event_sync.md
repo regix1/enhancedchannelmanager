@@ -25,7 +25,7 @@ same real-world event is named differently by every provider (slot
 prefixes, team abbreviations, date formats). Event Sync collapses those N
 channels down to one.
 
-The model: designate **one** provider's event group as the **master**
+The legacy model: designate **one** provider's event group as the **master**
 group. Dispatcharr's `auto_channel_sync` stays **ON** for it, and
 Dispatcharr owns the full channel lifecycle (create/update/delete) from
 that group, exactly as it does today. Every other provider's event group
@@ -34,8 +34,76 @@ ECM matches each secondary stream to a master channel: it parses the name
 to (event title, start time), blocks by time window, fuzzy-scores the
 parsed titles, and cross-checks team tokens; then, on a manual run, it
 attaches the matched stream to that master channel (failover + quality
-choice on one channel number). **ECM never creates or deletes channels in
-this feature.** Dispatcharr does, from the master group only.
+choice on one channel number). Dispatcharr owns these master channels.
+Optional promotion creates ECM-owned channels in a separate target group.
+
+## Dedicated events without a master
+
+A new rule can use `mode: "dedicated"` to create one ECM-owned target channel
+per dated event from ordered account-scoped inputs. Both `master` and
+`master_group_id` are null. Omitting `mode` retains the legacy master
+contract; a missing master does not select dedicated mode. An existing
+event rule cannot change between these ownership modes through update or
+overwrite import. Create a new rule for a different ownership mode.
+
+Configure every secondary as an exact positive `group_id` and
+`m3u_account_id` pair. Preserve the order and avoid duplicate pairs. Use a
+separate target group that is initially empty. ECM refuses a later target
+inventory containing a channel whose current rule ownership and saved
+event identity cannot be proven. A familiar name or another rule's managed
+channel ID does not establish ownership.
+
+The linked dummy EPG profile must contain exactly the target in both
+`channel_group_ids` and `hide_empty_group_ids`. Keep `epg_source_ids`,
+`channel_mappings`, and `slot_patterns` empty. Its ordered secondaries must
+equal the rule's, and its event config must explicitly set
+`assume_current_date: false`. Corrupt stored JSON is rejected. The profile
+can remain disabled while you save or preview a staged rule.
+
+Dedicated rules require promotion and the dead, past, and retirement safety
+checks. The following configuration illustrates the required shape. Replace
+the sample group, account, target, and profile IDs with your existing IDs.
+The target and profile must satisfy the preceding constraints. Both rule
+gates remain disabled in this example.
+
+```json
+{
+  "mode": "dedicated",
+  "master": null,
+  "master_group_id": null,
+  "secondary": [
+    {"group_id": 210, "m3u_account_id": 2},
+    {"group_id": 310, "m3u_account_id": 18}
+  ],
+  "promote_unmatched": true,
+  "promote_target_group_id": 400,
+  "dummy_epg_profile_id": 70,
+  "include_master_group_streams": false,
+  "parse_master_from_stream": false,
+  "assume_current_date": false,
+  "skip_dead_streams": true,
+  "skip_past_events": true,
+  "retire_finished_events": true,
+  "enabled": false,
+  "auto_run": false
+}
+```
+
+Every dedicated preview, dry run, and live run checks that each exact input
+junction has `auto_channel_sync` OFF and no enabled automatic source points
+at the target through a group override. ECM reads these settings without
+repairing them. Failed channel, group, account, stream, review, or exclusion
+reads refuse the rule. Incomplete paging cannot establish that an event is
+absent or authorize cleanup.
+
+A live run also requires the linked profile enabled and its own active
+generated guide source. ECM does not use the combined all-profiles source
+as a replacement. A newly allocated channel stays hidden with no attached
+streams until the existing deferred guide import assigns its matching guide
+row and current health, publication, ownership, and expiry checks pass.
+The guide profile remains target-only throughout this process. Preview and
+debug diagnostics read the same dedicated inputs and report a null master;
+they do not create, adopt, assign, reveal, or delete channels.
 
 ## Quick start: Consolidate event groups across providers
 

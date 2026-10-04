@@ -1,6 +1,7 @@
 """Direct-ASGI adversarial checks for the MCP service-principal boundary."""
 
 import asyncio
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -264,3 +265,98 @@ async def test_private_sidecar_principal_can_start_ordinary_task(async_client):
     assert response.status_code == 202, response.text
     engine.start_task.assert_awaited_once()
     completion.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/tasks/engine/status", "/api/tasks/stream_probe?details=true"])
+async def test_bound_task_reads_succeed_once_and_replay_is_denied(async_client, test_session, path):
+    from models import ScheduledTask
+
+    test_session.add(ScheduledTask(task_id="stream_probe", task_name="Stream Probe", schedule_type="manual"))
+    test_session.commit()
+    credentials = MCPServiceCredentials("private-backend-key", "private-confirmation-key")
+    claim = issue_test_claim(credentials, "GET", path, None)
+    engine = MagicMock()
+    engine.get_status.return_value = {
+        "running": True, "check_interval": 5, "max_concurrent": 4,
+        "active_tasks": [], "active_task_count": 0, "registered_task_count": 1,
+    }
+    registry = MagicMock()
+    registry.get_task_status.return_value = {"task_id": "stream_probe", "enabled": True}
+    headers = {"Authorization": "Bearer private-backend-key", MCP_CLAIM_HEADER: claim}
+    with (
+        patch("main.get_auth_settings", return_value=_auth_on()),
+        patch("main.get_settings", return_value=_runtime_settings()),
+        patch("main.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.get_auth_settings", return_value=_auth_on()),
+        patch("task_engine.get_engine", return_value=engine),
+        patch("task_registry.get_registry", return_value=registry),
+        patch("routers.tasks.get_client") as get_client,
+    ):
+        accepted = await async_client.get(path, headers=headers)
+        replayed = await async_client.get(path, headers=headers)
+    assert accepted.status_code == 200, accepted.text
+    assert replayed.status_code == 403
+    assert replayed.json()["detail"] == "MCP sidecar claim already used"
+    if "engine/status" in path:
+        assert accepted.json() == engine.get_status.return_value
+        engine.get_status.assert_called_once()
+    else:
+        assert accepted.json()["stored"]["task_id"] == "stream_probe"
+        registry.get_task_status.assert_called_once_with("stream_probe")
+    get_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/tasks/engine/status", "/api/tasks/stream_probe?details=true"])
+@pytest.mark.parametrize("failure", ["missing", "expired", "path", "query", "method"])
+async def test_task_reads_require_fresh_method_path_and_query_bound_claims(async_client, path, failure):
+    credentials = MCPServiceCredentials("private-backend-key", "private-confirmation-key")
+    signed_path = path
+    signed_method = "GET"
+    timestamp = int(time.time())
+    if failure == "expired":
+        timestamp -= 300
+    elif failure == "path":
+        signed_path = "/api/tasks/another_task?details=true"
+    elif failure == "query":
+        signed_path = path.split("?")[0] + "?details=false"
+    elif failure == "method":
+        signed_method = "POST"
+    headers = {"Authorization": "Bearer private-backend-key"}
+    if failure != "missing":
+        headers[MCP_CLAIM_HEADER] = issue_test_claim(credentials, signed_method, signed_path, None, timestamp=timestamp)
+    with (
+        patch("main.get_auth_settings", return_value=_auth_on()),
+        patch("main.get_settings", return_value=_runtime_settings()),
+        patch("main.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.get_auth_settings", return_value=_auth_on()),
+        patch("task_engine.get_engine") as get_engine,
+        patch("task_registry.get_registry") as get_registry,
+    ):
+        response = await async_client.get(path, headers=headers)
+    assert response.status_code == 403, response.text
+    get_engine.assert_not_called()
+    get_registry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_valid_signed_claim_does_not_admit_human_only_write(async_client):
+    credentials = MCPServiceCredentials("private-backend-key", "private-confirmation-key")
+    path = "/api/cloud-targets"
+    body = {"name": "Selected target"}
+    claim = issue_test_claim(credentials, "POST", path, body)
+    with (
+        patch("main.get_auth_settings", return_value=_auth_on()),
+        patch("main.get_settings", return_value=_runtime_settings()),
+        patch("main.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.load_mcp_service_credentials", return_value=credentials),
+        patch("auth.dependencies.get_auth_settings", return_value=_auth_on()),
+    ):
+        response = await async_client.post(path, json=body, headers={
+            "Authorization": "Bearer private-backend-key", MCP_CLAIM_HEADER: claim,
+        })
+    assert response.status_code == 403, response.text
+    assert "MCP service principal" in response.json()["detail"]

@@ -47,7 +47,7 @@ import copy
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytz
@@ -1550,7 +1550,7 @@ class TestLivePromotion:
         assert "1 promoted, 0 promoted-adopted" in line
 
 
-def _staged_event(db_session_factory, monkeypatch):
+def _staged_event(db_session_factory, monkeypatch, *, dedicated=False):
     """Configure one current healthy event with an enabled generated guide."""
     from models import DummyEPGProfile
     from services import event_sync_stream_health
@@ -1569,16 +1569,28 @@ def _staged_event(db_session_factory, monkeypatch):
             output_timezone="UTC",
             program_duration=180,
         )
-        profile.set_channel_group_ids([MASTER_GROUP_ID])
-        profile.set_epg_source_ids([source_id])
+        profile.set_channel_group_ids([PROMOTE_GROUP_ID] if dedicated else [MASTER_GROUP_ID])
+        profile.set_epg_source_ids([] if dedicated else [source_id])
+        if dedicated:
+            profile.set_hide_empty_group_ids([PROMOTE_GROUP_ID])
+            profile.set_event_sync_config({
+                "secondary": [{"group_id": SECONDARY_A, "m3u_account_id": 1}, {"group_id": SECONDARY_B, "m3u_account_id": 2}],
+                "assume_current_date": False, "use_default_patterns": False, "slot_patterns": [],
+            })
         session.add(profile)
         session.commit()
     finally:
         session.close()
 
     config = _promote_config(dummy_epg_profile_id=profile_id)
+    if dedicated:
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(dummy_epg_profile_id=profile_id, promote_target_group_id=PROMOTE_GROUP_ID)
     rule_id = _add_rule(db_session_factory, config)
     state = _promote_state()
+    if dedicated:
+        state.secondary_streams[SECONDARY_A_NAME] = []
     event_start = datetime.now(EASTERN).replace(second=0, microsecond=0) \
         - timedelta(minutes=1)
     event_name = (
@@ -1590,6 +1602,9 @@ def _staged_event(db_session_factory, monkeypatch):
         _parsed("Fury vs. Usyk", event_start)
     )
     client = make_promote_client(state)
+    if dedicated:
+        client.get_channel_groups.return_value = [{"id": PROMOTE_GROUP_ID, "name": "Dedicated events"}]
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, SECONDARY_A): {"auto_channel_sync": False}, (2, SECONDARY_B): {"auto_channel_sync": False}})
     create_channel = client.create_channel.side_effect
 
     async def create_with_uuid(request):
@@ -2068,8 +2083,8 @@ class _CancelledLock:
         return False
 
 
-def _pending_completion(db_session_factory, monkeypatch):
-    setup = _staged_event(db_session_factory, monkeypatch)
+def _pending_completion(db_session_factory, monkeypatch, *, dedicated=False):
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=dedicated)
     profile_id = setup["profile_id"]
     state = setup["state"]
     client = setup["client"]
@@ -2078,11 +2093,15 @@ def _pending_completion(db_session_factory, monkeypatch):
         state,
         client,
         db_session_factory,
-        regenerated_entries=[
+        regenerated_entries=([
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ] if dedicated else [
             dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
             dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
-        ],
+        ]),
     )
+    if dedicated:
+        state.guide_sources[0]["is_active"] = True
     finish = ActionExecutor._finish_event_promotions
     captured = []
 
@@ -2557,7 +2576,21 @@ def test_channel_read_failure_uses_live_failure_or_expiry(
     assert closed["reason"] == (
         "guide_expired" if expire else "channel_missing"
     )
-    assert closed["retry_at"] is not None
+    assert closed["terminal_at"] == current[0].isoformat()
+    assert closed["retry_at"] == (
+        (current[0] + timedelta(minutes=5)).isoformat() if expire else None
+    )
+    for field in (
+        "admitted_at", "expires_at", "attempt_id", "attempt_no", "history",
+        "rule_id", "rule_hash", "profile_id", "target_group_id", "event_key",
+        "channel_id", "channel_uuid", "execution_id", "start", "stop",
+        "guide_attempt_id", "config_hash", "input_hash", "streams", "channel_name", "title",
+    ):
+        assert closed[field] == receipt[field]
+    guide_before = publication["state"]["delivery"]["guide_attempt"]
+    guide_after = after["state"]["delivery"]["guide_attempt"]
+    for field in ("admitted_at", "expires_at", "attempt_id", "config_hash"):
+        assert guide_after[field] == guide_before[field]
 
 
 @pytest.mark.parametrize("stages,changes,guide_stage", [
@@ -2859,6 +2892,60 @@ def test_expired_writer_cannot_close_a_mismatched_owner(
 
     assert closed is None
     assert _read_event_publication(db_session_factory, profile_id) == durable_before
+
+
+@pytest.mark.parametrize("expired", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("foreign", [False, True])
+def test_completion_rejects_removed_current_rule_ownership(
+    expired, missing, foreign, db_session_factory, monkeypatch,
+):
+    setup, executor, finish = _pending_completion(db_session_factory, monkeypatch)
+    before = _read_event_publication(db_session_factory, setup["profile_id"])
+    receipt = next(iter(before["state"]["delivery"]["pending_channels"].values()))
+    assert receipt["channel_id"] == 900
+    assert 900 in executor._pipeline_managed_channel_ids
+    session = db_session_factory()
+    try:
+        rule = session.get(ChannelPipelineRule, receipt["rule_id"])
+        config = rule.get_event_sync_config()
+        assert rule.get_managed_channel_ids() == [900]
+        rule.set_managed_channel_ids([])
+        session.commit()
+    finally:
+        session.close()
+    if foreign:
+        foreign_id = _add_rule(db_session_factory, config)
+        session = db_session_factory()
+        try:
+            other = session.get(ChannelPipelineRule, foreign_id)
+            other.set_managed_channel_ids([900])
+            session.commit()
+            assert other.id != receipt["rule_id"]
+            assert other.get_managed_channel_ids() == [900]
+        finally:
+            session.close()
+    current = (
+        datetime.fromisoformat(receipt["expires_at"]) if expired
+        else datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    )
+    channel = copy.deepcopy(setup["state"].channels[900])
+    setup["client"].update_channel.reset_mock()
+    if missing:
+        setup["client"].get_channel.side_effect = RuntimeError("channel unavailable")
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        assert executor._event_receipt_current(
+            before, receipt["event_key"], channel=None if missing else channel,
+            channel_missing=missing, expired=expired,
+        ) is None
+        _run(finish(executor))
+
+    assert _read_event_publication(db_session_factory, setup["profile_id"]) == before
+    assert setup["state"].channels[900] == channel
+    setup["client"].update_channel.assert_not_awaited()
 
 
 @pytest.mark.parametrize("phase", ["guide", "flow", "lock"])
@@ -4300,7 +4387,7 @@ class TestDummyEpgCoversPromoted:
         )
         return executor, client
 
-    def test_promoted_channel_gets_profile_and_foreign_epg_kept(self):
+    def test_promoted_channel_gets_profile_and_foreign_epg_kept(self, db_session_factory):
         from channel_pipeline_executor import ExecutionContext
 
         channels = [
@@ -4317,18 +4404,19 @@ class TestDummyEpgCoversPromoted:
         ]
         executor, _ = self._executor(channels)
         exec_ctx = ExecutionContext(dry_run=True)
-        summary = _run(executor.assign_event_sync_dummy_epg(
-            1, "Event Rule",
-            _promote_config(dummy_epg_profile_id=9),
-            exec_ctx,
-        ))
+        with patch("database.get_session", side_effect=db_session_factory):
+            summary = _run(executor.assign_event_sync_dummy_epg(
+                1, "Event Rule",
+                _promote_config(dummy_epg_profile_id=9),
+                exec_ctx,
+            ))
         entries = {e["entity_id"] for e in summary["assign_entries"]}
         # Master + bare promoted channel are assigned; the foreign-EPG
         # promoted channel is skipped; the unrelated group is untouched.
         assert entries == {100, 900}
         assert summary["skipped_foreign_epg"] == 1
 
-    def test_promotionless_config_keeps_master_only_filter(self):
+    def test_promotionless_config_keeps_master_only_filter(self, db_session_factory):
         from channel_pipeline_executor import ExecutionContext
 
         channels = [
@@ -4344,9 +4432,10 @@ class TestDummyEpgCoversPromoted:
             secondary_group_ids=[SECONDARY_A],
             dummy_epg_profile_id=9,
         )
-        summary = _run(executor.assign_event_sync_dummy_epg(
-            1, "Event Rule", config, exec_ctx,
-        ))
+        with patch("database.get_session", side_effect=db_session_factory):
+            summary = _run(executor.assign_event_sync_dummy_epg(
+                1, "Event Rule", config, exec_ctx,
+            ))
         entries = {e["entity_id"] for e in summary["assign_entries"]}
         assert entries == {100}
 
@@ -4475,6 +4564,7 @@ def retirement(db_session_factory, monkeypatch):
     monkeypatch.setattr(database, "get_session", db_session_factory)
     monkeypatch.setattr(epg_publication, "get_session", db_session_factory)
     monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
+    monkeypatch.setattr("channel_pipeline_executor.datetime", _clock(now))
     monkeypatch.setattr(event_sync_stream_health, "_load_stats", AsyncMock(side_effect=lambda ids: stats.copy()))
     executor = ActionExecutor(
         client,
@@ -5520,3 +5610,250 @@ async def test_event_preview_does_not_consume_health_progress(promotion_candidat
             assert result["promoted_created"] == 0
     assert setup["batches"] == [[], [], [7301]]
     setup["client"].create_channel.assert_not_awaited()
+
+
+class TestDedicatedDelivery:
+    def test_imported_target_guide_precedes_attachment_and_reveal(self, db_session_factory, monkeypatch):
+        from models import DummyEPGProfile
+
+        setup, executor, finish = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        before = _read_event_publication(db_session_factory, setup["profile_id"])
+        key, receipt = next(iter(before["state"]["delivery"]["pending_channels"].items()))
+        assert setup["state"].channels[900]["epg_data_id"] == 502
+        assert setup["state"].channels[900]["hidden_from_output"] is True
+        assert setup["state"].channels[900]["streams"] == []
+        assert _managed_ids(db_session_factory, setup["rule_id"]) == [900]
+        current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+        with patch("database.get_session", side_effect=db_session_factory), patch(
+            "services.epg_publication.get_session", side_effect=db_session_factory
+        ), patch("channel_pipeline_executor.datetime", _clock(current)):
+            _run(finish(executor))
+        after = _read_event_publication(db_session_factory, setup["profile_id"])
+        assert after["state"]["delivery"]["pending_channels"][key]["stage"] == "complete"
+        assert after["state"]["delivery"]["pending_channels"][key]["expires_at"] == receipt["expires_at"]
+        assert setup["state"].channels[900]["streams"] == [7301]
+        assert setup["state"].channels[900]["hidden_from_output"] is False
+        assert [call.kwargs.get("m3u_account") for call in setup["client"].get_streams.call_args_list] == [1, 2]
+        session = db_session_factory()
+        try:
+            profile = session.get(DummyEPGProfile, setup["profile_id"])
+            assert profile.get_channel_group_ids() == [PROMOTE_GROUP_ID]
+            assert profile.get_hide_empty_group_ids() == [PROMOTE_GROUP_ID]
+            assert profile.get_epg_source_ids() == []
+            assert profile.get_channel_mappings() == []
+        finally:
+            session.close()
+        assert_never_touched_group_settings(setup["client"])
+
+    @pytest.mark.parametrize("fault", [
+        "expired", "rule_disabled", "owner_removed", "wrong_uuid", "wrong_group",
+        "profile_changed", "guide_missing", "health_unknown", "pending_lost",
+    ])
+    def test_lost_delivery_proof_never_attaches_or_reveals(self, db_session_factory, monkeypatch, fault):
+        from models import DummyEPGProfile
+        from services import event_sync_stream_health
+
+        setup, executor, finish = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        before = _read_event_publication(db_session_factory, setup["profile_id"])
+        receipt = next(iter(before["state"]["delivery"]["pending_channels"].values()))
+        current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            if fault == "rule_disabled":
+                rule.enabled = False
+            elif fault == "owner_removed":
+                rule.set_managed_channel_ids([])
+            elif fault == "profile_changed":
+                session.get(DummyEPGProfile, setup["profile_id"]).set_channel_group_ids([MASTER_GROUP_ID])
+            session.commit()
+        finally:
+            session.close()
+        if fault == "expired":
+            current = datetime.fromisoformat(receipt["expires_at"])
+        elif fault == "wrong_uuid":
+            setup["state"].channels[900]["uuid"] = "foreign-channel"
+        elif fault == "wrong_group":
+            setup["state"].channels[900]["channel_group_id"] = MASTER_GROUP_ID
+        elif fault == "guide_missing":
+            setup["state"].guide_programmes.clear()
+        elif fault == "health_unknown":
+            monkeypatch.setattr(event_sync_stream_health, "_load_stats", AsyncMock(return_value={}))
+        elif fault == "pending_lost":
+            executor._event_pending.clear()
+        original = copy.deepcopy(setup["state"].channels[900])
+        write_count = len(setup["state"].update_channel_calls)
+        with patch("database.get_session", side_effect=db_session_factory), patch(
+            "services.epg_publication.get_session", side_effect=db_session_factory
+        ), patch("channel_pipeline_executor.datetime", _clock(current)):
+            _run(finish(executor))
+        assert setup["state"].channels[900] == original
+        assert len(setup["state"].update_channel_calls) == write_count
+        setup["client"].delete_channel.assert_not_awaited()
+
+    @pytest.mark.parametrize("fault", ["manual", "foreign_rule", "wrong_uuid", "wrong_group", "changed_rule", "changed_profile", "unknown_ledger"])
+    def test_target_admission_uses_fresh_rule_ownership(self, db_session_factory, monkeypatch, fault):
+        from channel_pipeline_executor import validate_event_target
+        from channel_pipeline_schema import validate_event_sync_config
+        from models import DummyEPGProfile
+
+        setup, executor, _ = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            config = copy.deepcopy(rule.get_event_sync_config())
+            with patch("database.get_session", side_effect=db_session_factory):
+                assert validate_event_sync_config(config) == []
+            if fault == "manual":
+                setup["state"].channels[901] = {"id": 901, "uuid": "manual", "channel_group_id": PROMOTE_GROUP_ID, "streams": []}
+            elif fault == "foreign_rule":
+                rule.set_managed_channel_ids([])
+                executor._pipeline_managed_channel_ids.add(900)
+            elif fault == "wrong_uuid":
+                setup["state"].channels[900]["uuid"] = "foreign"
+            elif fault == "wrong_group":
+                setup["state"].channels[900]["channel_group_id"] = MASTER_GROUP_ID
+            elif fault == "changed_rule":
+                value = rule.get_event_sync_config()
+                value["max_promote_per_run"] = 1
+                rule.set_event_sync_config(value)
+            elif fault == "changed_profile":
+                session.get(DummyEPGProfile, setup["profile_id"]).set_epg_source_ids([999])
+            else:
+                rule.managed_channel_ids = "broken"
+            session.commit()
+        finally:
+            session.close()
+        original = copy.deepcopy(setup["state"].channels)
+        with patch("database.get_session", side_effect=db_session_factory), patch(
+            "services.epg_publication.get_session", side_effect=db_session_factory
+        ), pytest.raises(ValueError):
+            validate_event_target(config, setup["rule_id"], list(original.values()), [{"id": PROMOTE_GROUP_ID}])
+        assert setup["state"].channels == original
+
+    def test_equal_start_accounts_form_one_ordered_promotion_unit(self):
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        rows = [
+            _resolved("Second event", DISPOSITION_UNMATCHED, _parsed("Same Event", START), provider_id=18, stream_id=181, group_id=1514),
+            _resolved("First event", DISPOSITION_UNMATCHED, _parsed("Same Event", START), provider_id=2, stream_id=21, group_id=2491),
+        ]
+        config = dedicated_event_sync_config(secondary=[{"group_id": 2491, "m3u_account_id": 2}, {"group_id": 1514, "m3u_account_id": 18}])
+        plan = build_promotion_plan(config, rows, {}, now=START)
+        assert len(plan.units) == 1
+        assert [row.stream.provider_id for row in plan.units[0].rows] == [2, 18]
+        assert [row.stream.stream_id for row in plan.units[0].rows] == [21, 181]
+        assert plan.units[0].action == PROMOTE_ACTION_CREATE
+
+
+    @pytest.mark.parametrize("control,args", [
+        ("test_expiry_during_the_completion_grid_closes_only_its_receipt", ()),
+        ("test_expiry_after_flow_stops_before_link_or_channel_mutation", ()),
+        ("test_expiry_at_a_publication_guard_closes_outside_the_lock", ("linking", 1, False)),
+        ("test_expiry_at_a_publication_guard_closes_outside_the_lock", ("attach", 2, False)),
+        ("test_expiry_at_a_publication_guard_closes_outside_the_lock", ("stale_removal", 3, True)),
+        ("test_expiry_at_a_publication_guard_closes_outside_the_lock", ("reveal", 3, False)),
+        ("test_expiry_at_a_publication_guard_closes_outside_the_lock", ("completion", 4, False)),
+        ("test_an_admitted_mutation_that_outlives_expiry_starts_no_followup", ("attach",)),
+        ("test_an_admitted_mutation_that_outlives_expiry_starts_no_followup", ("reveal",)),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (1, False, "failed")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (1, True, "expired")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (3, False, "failed")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (3, True, "expired")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (4, False, "failed")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (4, True, "expired")),
+        ("test_fresh_receipt_cannot_use_the_expired_writer", ()),
+        ("test_receipt_guard_keeps_live_and_expired_authority_separate", ()),
+        *[("test_expired_writer_cannot_close_a_mismatched_owner", (value,)) for value in [
+            "revision", "xmltv_hash", "config_hash", "guide_attempt", "receipt_attempt",
+            "profile_disabled", "profile_changed", "rule_disabled", "rule_changed",
+            "managed_channel", "channel_group", "channel_uuid", "missing_channel",
+            "missing_channel_with_evidence", "replacement",
+        ]],
+        *[("test_completion_rejects_removed_current_rule_ownership", (expired, missing, foreign))
+          for expired in (False, True) for missing in (False, True) for foreign in (False, True)],
+        *[("test_completion_cancellation_never_writes_expiry", (phase,)) for phase in ("guide", "flow", "lock")],
+    ])
+    def test_dedicated_delivery_keeps_existing_expiry_and_owner_controls(self, db_session_factory, monkeypatch, control, args):
+        import sys
+        from functools import partial
+
+        monkeypatch.setattr(sys.modules[__name__], "_pending_completion", partial(_pending_completion, dedicated=True))
+        globals()[control](*args, db_session_factory=db_session_factory, monkeypatch=monkeypatch)
+
+    @pytest.mark.parametrize("fault", ["pending_lost", "owner_deleted", "rule_changed"])
+    def test_direct_guide_write_requires_the_current_work_and_owner(self, db_session_factory, monkeypatch, fault):
+        from channel_pipeline_evaluator import StreamContext
+        from channel_pipeline_schema import Action, ActionType
+        from channel_pipeline_executor import ExecutionContext
+
+        setup, executor, _ = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        executor._event_pending.clear()
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            if fault == "owner_deleted":
+                session.delete(rule)
+            elif fault == "rule_changed":
+                config = rule.get_event_sync_config()
+                config["max_promote_per_run"] = 1
+                rule.set_event_sync_config(config)
+            session.commit()
+        finally:
+            session.close()
+        original = copy.deepcopy(setup["state"].channels[900])
+        count = len(setup["state"].update_channel_calls)
+        with patch("database.get_session", side_effect=db_session_factory):
+            result = _run(executor._execute_assign_epg(
+                Action(type=ActionType.ASSIGN_EPG, params={"epg_id": setup["source_id"]}),
+                StreamContext(stream_id=7301, stream_name=setup["event_name"]),
+                ExecutionContext(current_channel_id=900),
+            ))
+        assert result.success is False
+        assert setup["state"].channels[900] == original
+        assert len(setup["state"].update_channel_calls) == count
+
+    def test_restart_after_guide_completion_keeps_the_same_channel(self, db_session_factory, monkeypatch):
+        setup, executor, finish = _pending_completion(db_session_factory, monkeypatch, dedicated=True)
+        before = _read_event_publication(db_session_factory, setup["profile_id"])
+        receipt = next(iter(before["state"]["delivery"]["pending_channels"].values()))
+        current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+        with patch("database.get_session", side_effect=db_session_factory), patch(
+            "services.epg_publication.get_session", side_effect=db_session_factory
+        ), patch("channel_pipeline_executor.datetime", _clock(current)):
+            _run(finish(executor))
+        client = make_promote_client(setup["state"], next_channel_id=901)
+        client.get_channel_groups.return_value = [{"id": PROMOTE_GROUP_ID, "name": "Dedicated events"}]
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, SECONDARY_A): {"auto_channel_sync": False}, (2, SECONDARY_B): {"auto_channel_sync": False}})
+        dummy_epg = setup["dummy_epg"]
+        _, regenerate, wait_refresh = dummy_epg._wire_epg(
+            setup["state"], client, db_session_factory,
+            initial_entries=[dummy_epg._dummy_entry(502, 900, setup["event_channel_name"])],
+            regenerated_entries=[dummy_epg._dummy_entry(502, 900, setup["event_channel_name"])],
+        )
+        setup["state"].guide_sources[0]["is_active"] = True
+        with patch("services.event_sync_resolver.datetime") as clock:
+            clock.now.return_value = setup["event_start"] + timedelta(minutes=1)
+            result = dummy_epg._manual_run(client, db_session_factory, regenerate, wait_refresh)
+        assert result["success"] is True
+        client.create_channel.assert_not_awaited()
+        assert set(setup["state"].channels) == {100, 900}
+        assert setup["state"].channels[900]["streams"] == [7301]
+        assert setup["state"].channels[900]["epg_data_id"] == 502
+        assert _managed_ids(db_session_factory, setup["rule_id"]) == [900]
+
+    def test_dedicated_plan_keeps_dateless_dead_past_and_early_events_hidden(self):
+        from tests.event_sync_fixtures import dedicated_event_sync_config
+
+        rows = [
+            _resolved("Dateless", DISPOSITION_UNMATCHED, _parsed("Dateless", FROZEN_NOW, matched_pattern="dateless-title-time-ampm"), stream_id=1),
+            _resolved("Past", DISPOSITION_UNMATCHED, _parsed("Past", FROZEN_NOW - timedelta(days=2)), stream_id=2),
+            _resolved("Early", DISPOSITION_UNMATCHED, _parsed("Early", FROZEN_NOW + timedelta(days=2)), stream_id=3),
+            _resolved("Dead", DISPOSITION_UNMATCHED, _parsed("Dead", FROZEN_NOW), stream_id=4),
+        ]
+        plan = build_promotion_plan(dedicated_event_sync_config(promote_lead_hours=12), rows, {}, now=FROZEN_NOW, dead_stream_ids={4})
+        assert plan.units == ()
+        assert plan.skipped_dateless == 1
+        assert plan.skipped_past == 1
+        assert plan.skipped_early == 1
+        assert plan.skipped_all_dead == 1

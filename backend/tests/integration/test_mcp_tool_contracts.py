@@ -193,6 +193,21 @@ def _query_param_names(operation: dict) -> set[str]:
     }
 
 
+def test_pure_task_detail_descriptors_and_schedule_snapshot_match_openapi(openapi_spec):
+    selected = ENDPOINTS["tasks_get"]
+    engine = ENDPOINTS["tasks_engine_status"]
+    assert selected.path == "/api/tasks/{task_id}"
+    assert selected.method == engine.method == "GET"
+    assert selected.query_params == {"details"}
+    assert _query_param_names(_path_item(openapi_spec, selected)) == {"details"}
+    assert engine.path == "/api/tasks/engine/status"
+    assert not _query_param_names(_path_item(openapi_spec, engine))
+    execution = ENDPOINTS["tasks_execution"]
+    schema = _success_response_schema(openapi_spec, _path_item(openapi_spec, execution))
+    assert "schedule_id" in _schema_property_names(openapi_spec, schema)
+    assert "schedule_id" in execution.response_fields
+
+
 # ---------------------------------------------------------------------------
 # Per-endpoint contract checks
 # ---------------------------------------------------------------------------

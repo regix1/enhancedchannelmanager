@@ -43,6 +43,7 @@ export interface ProviderScopedGroupPickerProps {
   /** Offer the "Fix" affordance for a sync mismatch (reuses the editor's
    *  existing auto-sync fix dialog). */
   onRequestFix?: (target: { accountId: number; groupId: number }) => void;
+  requireAccount?: boolean;
   disabled?: boolean;
 }
 
@@ -54,6 +55,7 @@ export function ProviderScopedGroupPicker({
   showAll,
   excludeScope,
   onRequestFix,
+  requireAccount = false,
   disabled,
 }: ProviderScopedGroupPickerProps) {
   const [search, setSearch] = useState('');
@@ -202,14 +204,17 @@ export function ProviderScopedGroupPicker({
             <span className="psg-disabled-hint">(disabled)</span>
           )}
         </label>
-        {checked && mismatch && onRequestFix && (
+        {checked && mismatch && (onRequestFix || requireAccount) && (
           <div className="psg-mismatch" role="alert">
             <span>
               Auto-sync is {p.autoChannelSync ? 'ON' : 'OFF'} — {role === 'master'
                 ? 'a master needs it ON so Dispatcharr owns the channels.'
                 : 'a secondary needs it OFF or Dispatcharr creates duplicate channels.'}
             </span>
-            <button
+            {requireAccount && (
+              <span>Resolve this setting in M3U Manager before running the rule.</span>
+            )}
+            {!requireAccount && onRequestFix && <button
               type="button"
               className="psg-fix-btn"
               disabled={disabled}
@@ -218,7 +223,7 @@ export function ProviderScopedGroupPicker({
               }
             >
               Fix: turn auto-sync {wantsSync ? 'ON' : 'OFF'} for {p.m3uAccountName}…
-            </button>
+            </button>}
           </div>
         )}
       </li>
@@ -270,10 +275,10 @@ export function ProviderScopedGroupPicker({
           );
           if (visibleProviders.length === 0) return null;
 
-          // Single-provider group -> flat row selecting the WHOLE group
-          // (m3u_account_id null); the provider is unambiguous (PO decision).
+          // Legacy callers select the whole single-account group; required
+          // account scopes retain the junction's exact account identity.
           if (visibleProviders.length === 1 && node.providers.length === 1) {
-            return renderProviderRow(visibleProviders[0], true, true);
+            return renderProviderRow(visibleProviders[0], true, !requireAccount);
           }
 
           // Multi-provider group -> expandable parent.
@@ -313,7 +318,7 @@ export function ProviderScopedGroupPicker({
               {isOpen && (
                 <ul className="psg-sublist">
                   {visibleProviders.map(p => renderProviderRow(p, false))}
-                  {renderWholeGroupRow(node)}
+                  {!requireAccount && renderWholeGroupRow(node)}
                 </ul>
               )}
             </li>
@@ -323,7 +328,7 @@ export function ProviderScopedGroupPicker({
 
       {role === 'secondary' && selected.length > 0 && (
         <div className="psg-chips" aria-live="polite">
-          {selected.map(s => {
+          {selected.map((s, index) => {
             const node = nodes.find(n => n.groupId === s.group_id);
             const prov =
               s.m3u_account_id == null
@@ -331,7 +336,7 @@ export function ProviderScopedGroupPicker({
                 : node?.providers.find(p => p.m3uAccountId === s.m3u_account_id)
                     ?.m3uAccountName ?? `Provider ${s.m3u_account_id}`;
             return (
-              <span key={scopeKey(s)} className="psg-chip">
+              <span key={`${scopeKey(s)}:${index}`} className="psg-chip">
                 {(node?.groupName ?? `Group ${s.group_id}`)} · {prov}
                 <button
                   type="button"

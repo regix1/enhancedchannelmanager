@@ -266,6 +266,7 @@ class ChannelPipelineEngine:
         self.client = client
         self._existing_channels = None
         self._existing_groups = None
+        self._channels_complete = False
         self._stream_stats_cache = {}
         self._struck_stream_ids = set()
         # Channel ids the guide-link pass has already matched and could not
@@ -1373,24 +1374,58 @@ class ChannelPipelineEngine:
     # Data Loading
     # =========================================================================
 
-    async def _load_existing_data(self):
+    async def _load_existing_data(self, channel_group_id: int | None = None):
         """Load existing channels and groups from Dispatcharr."""
+        self._channels_complete = False
         try:
             # get_channels() returns paginated dict {"count": N, "results": [...]}
             # Fetch all pages
             all_channels = []
             page = 1
+            total = None
+            complete = True
+            seen = set()
             while True:
-                result = await self.client.get_channels(page=page, page_size=100)
+                result = await self.client.get_channels(page=page, page_size=100, **(
+                    {"channel_group": channel_group_id} if channel_group_id is not None else {}
+                ))
                 channels = result.get("results", [])
+                count = result.get("count")
+                if (type(count) is not int or count < 0 or not isinstance(channels, list)
+                        or result.get("next") is not None and not isinstance(result["next"], str)):
+                    complete = False
+                if total is None:
+                    total = count
+                elif count != total:
+                    complete = False
+                for channel in channels:
+                    channel_id = channel.get("id") if isinstance(channel, dict) else None
+                    if type(channel_id) is not int or channel_id < 1 or channel_id in seen:
+                        complete = False
+                    if channel_group_id is not None and channel.get("channel_group_id") != channel_group_id:
+                        complete = False
+                    seen.add(channel_id)
                 all_channels.extend(channels)
+                if type(count) is int and (
+                    len(all_channels) > count
+                    or not channels and len(all_channels) < count
+                    or bool(result.get("next")) != (len(all_channels) < count)
+                ):
+                    complete = False
                 if len(all_channels) >= result.get("count", 0) or not channels:
                     break
                 page += 1
             self._existing_channels = all_channels
 
             # get_channel_groups() returns a flat list
-            self._existing_groups = await self.client.get_channel_groups() or []
+            groups = await self.client.get_channel_groups()
+            self._existing_groups = groups or []
+            group_ids = [group.get("id") if isinstance(group, dict) else None for group in self._existing_groups]
+            self._channels_complete = (
+                complete and len(all_channels) == total and isinstance(groups, list)
+                and all(type(group_id) is int and group_id > 0 for group_id in group_ids)
+                and len(set(group_ids)) == len(group_ids)
+            )
             logger.debug("[AUTO-CREATE-ENGINE] Loaded %s channels, %s groups", len(self._existing_channels), len(self._existing_groups))
             if self._existing_channels:
                 channel_names = [c.get("name", "<no name>") for c in self._existing_channels]
@@ -3501,6 +3536,8 @@ class ChannelPipelineEngine:
 
         secondary_streams: list = []
         truncated = False
+        dedicated = config.get("mode") == "dedicated"
+        seen = set()
         # bead jiscc: iterate the provider-scoped secondary scopes. When a
         # scope carries an m3u_account_id, the stream fetch is filtered to that
         # provider (get_streams m3u_account=) — the same channel group can then
@@ -3515,6 +3552,8 @@ class ChannelPipelineEngine:
             provider_filter = scope.get("m3u_account_id")
             gname = await self.client._channel_group_name_for_id(gid)
             if not gname:
+                if dedicated:
+                    raise ValueError("Dedicated input group is unavailable")
                 logger.warning(
                     "[EVENT-SYNC] Secondary group %s has no resolvable "
                     "channel-group name; skipping fetch", gid,
@@ -3523,6 +3562,8 @@ class ChannelPipelineEngine:
             if truncated:
                 break
             page = 1
+            total = None
+            received = 0
             while True:
                 resp = await self.client.get_streams(
                     page=page, page_size=_EVENT_SYNC_FETCH_PAGE_SIZE,
@@ -3533,7 +3574,36 @@ class ChannelPipelineEngine:
                     resp.get("results", []) if isinstance(resp, dict)
                     else (resp or [])
                 )
+                if dedicated:
+                    count = resp.get("count") if isinstance(resp, dict) else None
+                    if (
+                        type(count) is not int or count < 0
+                        or not isinstance(batch, list)
+                        or total is not None and count != total
+                    ):
+                        raise ValueError("Dedicated stream inventory is incomplete")
+                    total = count
+                    received += len(batch)
+                    following = resp.get("next")
+                    if (
+                        following is not None and not isinstance(following, str)
+                        or received > total
+                        or not batch and received < total
+                        or bool(following) != (received < total)
+                    ):
+                        raise ValueError("Dedicated stream pagination is incomplete")
                 for s in batch:
+                    if dedicated:
+                        stream_id = s.get("id") if isinstance(s, dict) else None
+                        account_id = extract_m3u_account_id(s.get("m3u_account")) if isinstance(s, dict) else None
+                        if (
+                            type(stream_id) is not int or stream_id < 1 or stream_id in seen
+                            or type(account_id) is not int or account_id != provider_filter
+                            or account_id not in account_names
+                            or not isinstance(s.get("name"), str) or not s["name"]
+                        ):
+                            raise ValueError("Dedicated stream scope identity is invalid")
+                        seen.add(stream_id)
                     # id guard beside the name guard (PR #616 review): a
                     # stream with a name but NO id would resolve normally and
                     # then append None to a master channel's stream list at
@@ -3562,7 +3632,13 @@ class ChannelPipelineEngine:
                         # whole playlist for it. [11][12]
                         is_stale=s.get("is_stale"),
                     ))
-                if len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
+                if dedicated and (
+                    len(secondary_streams) > EVENT_SYNC_MAX_SECONDARY_STREAMS
+                    or len(secondary_streams) == EVENT_SYNC_MAX_SECONDARY_STREAMS
+                    and (resp.get("next") or scope != secondary_scopes[-1])
+                ):
+                    raise ValueError("Dedicated stream inventory exceeds the safety cap")
+                if not dedicated and len(secondary_streams) >= EVENT_SYNC_MAX_SECONDARY_STREAMS:
                     secondary_streams = secondary_streams[
                         :EVENT_SYNC_MAX_SECONDARY_STREAMS]
                     truncated = True
@@ -4000,6 +4076,9 @@ class ChannelPipelineEngine:
                 "names (journal provenance will carry provider=None): %s", e,
             )
             accounts = []
+        accounts_complete = (isinstance(accounts, list)
+                             and all(isinstance(account, dict) and type(account.get("id")) is int and account["id"] > 0 for account in accounts)
+                             and len({account["id"] for account in accounts}) == len(accounts))
         account_names = {a.get("id"): a.get("name") for a in accounts}
 
         # Channel Group Override resolution (bead override): master channels
@@ -4051,7 +4130,20 @@ class ChannelPipelineEngine:
                 )
                 continue
 
-            if unattended:
+            dedicated = config.get("mode") == "dedicated"
+            if dedicated and (
+                not accounts_complete
+                or not self._channels_complete
+                or not any(group.get("id") == config["promote_target_group_id"] for group in self._existing_groups)
+                or any(scope["m3u_account_id"] not in account_names for scope in config["secondary"])
+            ):
+                results["event_sync_warnings"].append({
+                    "type": "event_sync_fetch_failed", "rule_id": rule.id,
+                    "rule_name": rule.name, "message": "Dedicated channel, group or account inventory is incomplete",
+                })
+                continue
+
+            if unattended or dedicated:
                 # ti939.3.1: unattended runs pre-flight the Dispatcharr
                 # group settings and FAIL CLOSED — no operator is watching,
                 # so a rule whose preconditions cannot be verified (master
@@ -4171,10 +4263,37 @@ class ChannelPipelineEngine:
                     "exclusions will not suppress this run",
                     rule.name, rule.id, e,
                 )
+                if dedicated:
+                    results["event_sync_warnings"].append({
+                        "type": "event_sync_fetch_failed", "rule_id": rule.id,
+                        "rule_name": rule.name, "message": "Dedicated review or exclusion state is unavailable",
+                    })
+                    continue
 
-            effective_master_group_id = resolve_effective_master_group_id(
+            effective_master_group_id = (None if dedicated else resolve_effective_master_group_id(
                 all_group_settings, config["master_group_id"]
-            )
+            ))
+            if dedicated:
+                from channel_pipeline_executor import validate_event_target
+                from models import DummyEPGProfile
+                from tasks.event_visibility import _generated_scope
+
+                db = get_session()
+                try:
+                    profile = db.get(DummyEPGProfile, config["dummy_epg_profile_id"])
+                    source_id = executor._dummy_source_by_profile.get(profile.id)
+                    source = next((value for value in executor._epg_sources if value.get("id") == source_id), None)
+                    if profile.enabled is not True or source is None or source.get("is_active") is not True or _generated_scope(source) != f"profile:{profile.id}":
+                        raise ValueError("Dedicated profile or guide source is disabled or unavailable")
+                    validate_event_target(config, rule.id, self._existing_channels, self._existing_groups)
+                except Exception as exc:
+                    results["event_sync_warnings"].append({
+                        "type": "event_sync_fetch_failed", "rule_id": rule.id,
+                        "rule_name": rule.name, "message": str(exc),
+                    })
+                    continue
+                finally:
+                    db.close()
             exec_ctx = ExecutionContext(dry_run=dry_run)
             summary = await executor.execute_event_sync_rule(
                 rule.id, rule.name, config, secondary_streams, exec_ctx,
@@ -4662,6 +4781,13 @@ class ChannelPipelineEngine:
             # Deferred assignments ride the EXISTING Pass 5 refresh-and-
             # retry via executor._deferred_epg_assignments.
             if config.get("dummy_epg_profile_id"):
+                if dedicated and not dry_run and not plan_only and promotion is not None:
+                    from routers.channel_pipeline import _retain_event_ownership
+
+                    _retain_event_ownership(executor, works=[{
+                        "rule_id": rule.id, "target_group_id": config["promote_target_group_id"],
+                        "config": config, "promo": promotion,
+                    }])
                 epg_summary = await self._assign_event_sync_dummy_epg(
                     rule, config, executor, exec_ctx, results, dry_run
                 )
@@ -5344,7 +5470,7 @@ class ChannelPipelineEngine:
         5. Retry each deferred assign_epg action
         """
         from database import get_session
-        from models import DummyEPGProfile
+        from models import ChannelPipelineRule, DummyEPGProfile
 
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
@@ -5403,8 +5529,29 @@ class ChannelPipelineEngine:
         # Resolve profile names for reporting
         profile_names = {}
         admitted_by_id = {}
+        dedicated_profiles = {}
         db = get_session()
         try:
+            assigned_profile_ids = set(executor._deferred_epg_profiles.values())
+            dedicated_profiles.update({
+                work["profile_id"]: (work["rule_id"], work["config"])
+                for work in executor._event_pending.values()
+                if work["config"].get("mode") == "dedicated" and work["profile_id"] in assigned_profile_ids
+            })
+            for channel_id in executor._deferred_epg_profiles:
+                for publication in executor._event_publications.values():
+                    for receipt in publication["state"]["delivery"]["pending_channels"].values():
+                        if receipt.get("channel_id") == channel_id and db.get(ChannelPipelineRule, receipt["rule_id"]) is None:
+                            self._record_failed_phase(results, phase="dummy_epg_refresh", stream_name="Event guide admission", error="Deferred guide receipt owner is unavailable")
+                            return
+            for rule in db.query(ChannelPipelineRule).all():
+                config = rule.get_event_sync_config()
+                if isinstance(config, dict) and config.get("mode") == "dedicated" and config.get("dummy_epg_profile_id") in assigned_profile_ids:
+                    from channel_pipeline_schema import validate_event_sync_config
+
+                    if validate_event_sync_config(config):
+                        raise ValueError("Dedicated deferred guide configuration is invalid")
+                    dedicated_profiles[config["dummy_epg_profile_id"]] = (rule.id, config)
             if profile_ids_to_update is None:
                 profiles = db.query(DummyEPGProfile).filter(
                     DummyEPGProfile.enabled == True  # noqa: E712
@@ -5432,6 +5579,38 @@ class ChannelPipelineEngine:
             existing_groups = set(profile.get("channel_group_ids") or [])
             desired_groups = profile_groups.get(profile_id, target_group_ids)
             missing = desired_groups - existing_groups
+            if profile_id in dedicated_profiles:
+                rule_id, config = dedicated_profiles[profile_id]
+                target_id = config["promote_target_group_id"]
+                expected = executor._event_publications.get(profile_id)
+                works = [work for work in executor._event_pending.values() if work["profile_id"] == profile_id and work["rule_id"] == rule_id and work["config"] == config]
+                admitted_channels = set()
+                if expected is not None:
+                    admitted_channels = {
+                        receipt.get("channel_id") for event_key, receipt in expected["state"]["delivery"]["pending_channels"].items()
+                        if any(work["unit"].event_key == event_key for work in works)
+                    }
+                deferred_channels = {channel_id for channel_id, _, _, _ in executor._deferred_epg_assignments if executor._deferred_epg_profiles.get(channel_id) == profile_id}
+                source_ids = {action.params.get("epg_id") for channel_id, action, _, _ in executor._deferred_epg_assignments if channel_id in deferred_channels}
+                if (
+                    existing_groups != {target_id} or desired_groups != {target_id}
+                    or profile.get("hide_empty_group_ids") != [target_id]
+                    or expected is None or not works or not deferred_channels or not deferred_channels <= admitted_channels
+                    or any(source_id != executor._dummy_source_by_profile.get(profile_id) or _generated_scope(source_by_id.get(source_id, {})) != f"profile:{profile_id}" or source_by_id.get(source_id, {}).get("is_active") is not True for source_id in source_ids)
+                ):
+                    self._record_failed_phase(results, phase="dummy_epg_refresh", stream_name="Dedicated guide admission", error="Dedicated deferred guide scope or ownership changed")
+                    return
+                try:
+                    for channel_id in deferred_channels:
+                        channel = await self.client.get_channel(channel_id)
+                        event_key = next(key for key, receipt in expected["state"]["delivery"]["pending_channels"].items() if receipt.get("channel_id") == channel_id and any(work["unit"].event_key == key for work in works))
+                        async with publication_lock:
+                            if executor._event_receipt_current(expected, event_key, channel=channel) is None:
+                                raise ValueError("Dedicated deferred channel ownership changed")
+                        executor._channel_by_id[channel_id] = channel
+                except Exception as exc:
+                    self._record_failed_phase(results, phase="dummy_epg_refresh", stream_name="Dedicated guide admission", error=str(exc))
+                    return
             if missing:
                 group_names = [
                     executor._group_by_id.get(group_id, {}).get(
@@ -5658,10 +5837,18 @@ class ChannelPipelineEngine:
                         for profile_id, row in admitted_by_id.items()
                         if scope_kind in {f"profile:{profile_id}", "all"}
                     }
+                    dedicated_ids = set(served) & set(dedicated_profiles)
+                    refresh_expires_at = expires_at
+                    if dedicated_ids:
+                        if len(served) != 1 or scope_kind != f"profile:{next(iter(dedicated_ids))}":
+                            raise ValueError("Dedicated guide import requires one exact publication")
+                        refresh_expires_at = datetime.fromisoformat(next(iter(served.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
+                    elif any(source_id == src_id for profile_id, (rule_id, config) in dedicated_profiles.items() for source_id in [executor._dummy_source_by_profile.get(profile_id)]):
+                        raise ValueError("Dedicated guide import has no publication admission")
                     completed = await self._refresh_epg_source(
                         src or {"id": src_id, "name": source_name},
                         served,
-                        expires_at=expires_at,
+                        expires_at=refresh_expires_at,
                     )
                     if not completed:
                         raise RuntimeError("EPG source refresh did not complete successfully")
@@ -5925,8 +6112,10 @@ class ChannelPipelineEngine:
 
     async def _refresh_linked_epg(self, executor, results: dict, epg_sources: list) -> None:
         """Import programmes after their channels have acquired guide links."""
-        from services.epg_publication import read_publication
+        from services.epg_publication import get_session, read_publication
         from tasks.event_visibility import _generated_scope
+
+        from models import ChannelPipelineRule
 
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         sources = {source["id"]: source for source in epg_sources}
@@ -5973,6 +6162,18 @@ class ChannelPipelineEngine:
         )
         executor._epg_import_sources.clear()
         executor._epg_import_attempts = attempted
+        dedicated_profiles = set()
+        if pending_by_source or executor._event_publications:
+            session = get_session()
+            try:
+                dedicated_profiles = {
+                    config["dummy_epg_profile_id"]
+                    for rule in session.query(ChannelPipelineRule).all()
+                    if isinstance(config := rule.get_event_sync_config(), dict)
+                    and config.get("mode") == "dedicated"
+                }
+            finally:
+                session.close()
         for source_id in sorted(source_ids):
             source = sources.get(source_id, {})
             try:
@@ -6002,10 +6203,17 @@ class ChannelPipelineEngine:
                 if attempt_key in attempted:
                     continue
                 attempted.add(attempt_key)
+                dedicated_works = [work for work in executor._event_pending.values() if work["source_id"] == source_id and work["config"].get("mode") == "dedicated"]
+                refresh_expires_at = expires_at
+                if dedicated_works or set(publications) & dedicated_profiles:
+                    profile_ids = {work["profile_id"] for work in dedicated_works}
+                    if len(profile_ids) != 1 or set(publications) != profile_ids or scope_kind != f"profile:{next(iter(profile_ids))}" or source.get("is_active") is not True:
+                        raise ValueError("Dedicated linked guide import scope changed")
+                    refresh_expires_at = datetime.fromisoformat(next(iter(publications.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
                 completed = await self._refresh_epg_source(
                     source or {"id": source_id, "name": f"Source {source_id}"},
                     publications,
-                    expires_at=expires_at,
+                    expires_at=refresh_expires_at,
                     after_link=bool(publications),
                 )
                 if not completed:

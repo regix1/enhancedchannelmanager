@@ -2988,3 +2988,542 @@ describe('EventSyncRuleEditor', () => {
     });
   });
 });
+
+const DEDICATED_PROFILE = {
+  id: 7,
+  name: 'Event Guide',
+  enabled: false,
+  channel_group_ids: [40],
+  hide_empty_group_ids: [40],
+  epg_source_ids: [],
+  channel_mappings: [],
+  event_sync_config: {
+    secondary: [{ group_id: 2, m3u_account_id: 1 }],
+    time_window_minutes: 30,
+    enforce_time_window: true,
+    attach_threshold: 0.8,
+    assume_current_date: false,
+    demote_stale_dateless: true,
+    use_default_patterns: false,
+    slot_patterns: [],
+  },
+};
+
+const DEDICATED_RULE: Partial<ChannelPipelineRule> = {
+  ...EXISTING_RULE,
+  enabled: false,
+  run_on_refresh: false,
+  event_sync_config: {
+    mode: 'dedicated',
+    master: null,
+    master_group_id: null,
+    secondary: [{ group_id: 2, m3u_account_id: 1 }],
+    time_window_minutes: 30,
+    attach_threshold: 0.8,
+    enabled: false,
+    auto_run: false,
+    include_master_group_streams: false,
+    parse_master_from_stream: false,
+    assume_current_date: false,
+    promote_unmatched: true,
+    promote_target_group_id: 40,
+    dummy_epg_profile_id: 7,
+    skip_dead_streams: true,
+    skip_past_events: true,
+    retire_finished_events: true,
+  },
+};
+
+const DEDICATED_PREVIEW: EventSyncPreviewResponse = {
+  preflight: { ok: true, failures: [] },
+  summary: {
+    secondary_streams: 1,
+    would_attach: 0,
+    ambiguous_skipped: 0,
+    unmatched: 1,
+    parse_failed: 0,
+    master_channels: 0,
+    master_channels_unparsed: 0,
+    would_attach_via_review: 0,
+    candidates_pending_review: 0,
+  },
+  streams: [],
+  unmatched_streams: [],
+  parse_failures: [],
+  unparsed_master_channels: [],
+  truncated: false,
+};
+
+function seedDedicated() {
+  seedGroups();
+  mockDataStore.channelGroups.push(createMockChannelGroup({ id: 40, name: 'Dedicated Events' }));
+  stubGroupSettings({ 1: true, 2: false });
+  server.use(http.get('/api/dummy-epg/profiles', () => HttpResponse.json([DEDICATED_PROFILE])));
+}
+
+async function fillDedicatedDraft(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(screen.getByLabelText('Rule Name *'), 'Dated Events');
+  await user.click(screen.getByRole('radio', { name: 'Dedicated event group' }));
+  await user.click(await screen.findByTestId('psg-secondary-2-1'));
+  await goToStep(user, 3);
+  await user.click(screen.getByRole('button', { name: 'Target group for promoted channels' }));
+  await user.click(await screen.findByRole('option', { name: 'Dedicated Events' }));
+  await user.click(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' }));
+  await user.click(await screen.findByRole('option', { name: 'Event Guide (disabled)' }));
+  await goToStep(user, 4);
+}
+
+describe('dedicated event group ownership', () => {
+  it('selects the labeled ownership radio from the keyboard', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    render(<EventSyncRuleEditor onSave={vi.fn()} onCancel={vi.fn()} />);
+    const group = screen.getByRole('radiogroup', { name: 'Channel ownership' });
+    const radio = within(group).getByRole('radio', { name: 'Dedicated event group' });
+    radio.focus();
+    await user.keyboard(' ');
+    expect(radio).toBeChecked();
+    expect(screen.queryByTestId('psg-master')).not.toBeInTheDocument();
+    expect(screen.getByText(/execution gates|stay disabled when you save/)).toBeInTheDocument();
+  });
+
+  it('defaults a new draft to legacy ownership and locks a saved legacy rule', async () => {
+    seedDedicated();
+    const { unmount } = render(<EventSyncRuleEditor onSave={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).not.toBeChecked();
+    await screen.findByTestId('psg-master-1-any');
+    unmount();
+    render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeDisabled();
+  });
+
+  it('saves a new dedicated draft with null masters and all execution gates off', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    let previewConfig: unknown;
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', async ({ request }) => {
+      const body = await request.json() as { event_sync_config: unknown };
+      previewConfig = body.event_sync_config;
+      return HttpResponse.json(DEDICATED_PREVIEW);
+    }));
+    render(<EventSyncRuleEditor onSave={onSave} onCancel={vi.fn()} />);
+    await user.click(await screen.findByTestId('psg-master-1-any'));
+    await fillDedicatedDraft(user);
+    await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+    await screen.findByTestId('event-sync-summary');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const saved = onSave.mock.calls[0][0];
+    expect(saved).toEqual(expect.objectContaining({ enabled: false, run_on_refresh: false }));
+    expect(saved.event_sync_config).toEqual(expect.objectContaining({
+      mode: 'dedicated', master: null, master_group_id: null,
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      enabled: false, auto_run: false, include_master_group_streams: false,
+      parse_master_from_stream: false, assume_current_date: false,
+      promote_unmatched: true, promote_target_group_id: 40, dummy_epg_profile_id: 7,
+      skip_dead_streams: true, skip_past_events: true, retire_finished_events: true,
+    }));
+    expect(previewConfig).toEqual(saved.event_sync_config);
+    expect(screen.getByTestId('event-sync-review')).toHaveTextContent('Dedicated event group');
+    expect(screen.getByTestId('event-sync-review')).not.toHaveTextContent('Master Events');
+  });
+
+  it.each([false, true])('preserves saved dedicated gates set to %s', async gate => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{
+      ...DEDICATED_RULE, enabled: gate, run_on_refresh: gate,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, enabled: gate, auto_run: gate },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeDisabled();
+    expect(screen.getByLabelText('Enabled')).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0]).toEqual(expect.objectContaining({ enabled: gate, run_on_refresh: gate }));
+    expect(onSave.mock.calls[0][0].event_sync_config).toEqual(expect.objectContaining({
+      mode: 'dedicated', enabled: gate, auto_run: gate, master: null, master_group_id: null,
+    }));
+  });
+
+  it('hides master controls, locks required safety values and offers no input Fix action', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    stubGroupSettings({ 1: true, 2: true });
+    render(<EventSyncRuleEditor rule={DEDICATED_RULE} onSave={vi.fn()} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    expect(screen.queryByTestId('psg-master')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('event-sync-use-master-streams')).not.toBeInTheDocument();
+    expect(screen.getByText(/Resolve this setting in M3U Manager/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Fix/ })).not.toBeInTheDocument();
+    await goToStep(user, 2);
+    expect(screen.getByTestId('event-sync-assume-current-date')).toBeDisabled();
+    expect(screen.getByTestId('event-sync-assume-current-date')).not.toBeChecked();
+    await goToStep(user, 3);
+    expect(screen.queryByTestId('event-sync-include-master-group-streams')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('event-sync-parse-master-from-stream')).not.toBeInTheDocument();
+    for (const key of ['promote-unmatched', 'skip-dead-streams', 'skip-past-events', 'retire-finished-events']) {
+      expect(screen.getByTestId('event-sync-' + key)).toBeChecked();
+      expect(screen.getByTestId('event-sync-' + key)).toBeDisabled();
+    }
+  });
+
+  it.each([
+    { group_id: 2, m3u_account_id: null },
+    { group_id: 2, m3u_account_id: 999 },
+    { group_id: 999, m3u_account_id: 1 },
+    { group_id: 2, m3u_account_id: 0 },
+  ])('blocks invalid saved input %j without rewriting it', async scope => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, secondary: [scope] },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    const label = scope.group_id === 999 ? 'Remove 999' : 'Remove Secondary Events';
+    expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '1 Scope' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: /Preview matches/ })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: label }));
+    expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+  });
+
+  it('requires a dedicated target and focuses Behavior from Review', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, promote_target_group_id: undefined },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '3 Behavior' })).toHaveFocus();
+    expect(screen.getByRole('alert')).toHaveTextContent('Pick a target group');
+  });
+});
+
+describe('dedicated draft validation and request ownership', () => {
+  it('preserves the exact order of two account scopes on save', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const secondary = [{ group_id: 2, m3u_account_id: 1 }, { group_id: 1, m3u_account_id: 1 }];
+    server.use(http.get('/api/dummy-epg/profiles', () => HttpResponse.json([
+      { ...DEDICATED_PROFILE, event_sync_config: { ...DEDICATED_PROFILE.event_sync_config, secondary } },
+    ])));
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, secondary },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].event_sync_config.secondary).toEqual(secondary);
+  });
+
+  it('rejects duplicate saved scopes and focuses Scope', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, secondary: [
+        { group_id: 2, m3u_account_id: 1 }, { group_id: 2, m3u_account_id: 1 },
+      ] },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '1 Scope' })).toHaveFocus();
+    expect(screen.getByRole('alert')).toHaveTextContent('Dedicated input scopes must be unique');
+  });
+
+  it('refuses a target that overlaps an input group', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, promote_target_group_id: 2 },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '3 Behavior' })).toHaveFocus();
+    expect(screen.getByRole('alert')).toHaveTextContent('must not be a secondary group');
+  });
+
+  it('refuses empty loaded inventories without creating a scope, target or profile', async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get('/api/channel-groups', () => HttpResponse.json([])),
+      http.get('/api/providers/group-settings/by-provider', () => HttpResponse.json([])),
+      http.get('/api/dummy-epg/profiles', () => HttpResponse.json([])),
+    );
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor onSave={onSave} onCancel={vi.fn()} />);
+    await user.type(screen.getByLabelText('Rule Name *'), 'Empty Events');
+    await user.click(screen.getByRole('radio', { name: 'Dedicated event group' }));
+    await screen.findByText('No matching groups');
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ }))
+      .toHaveAttribute('title', 'Pick at least one account-scoped secondary group'));
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '1 Scope' })).toHaveFocus();
+    expect(screen.getByRole('alert')).toHaveTextContent('Pick at least one account-scoped secondary group');
+    expect(screen.queryByRole('button', { name: /Remove/ })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { label: 'different target', profile: { ...DEDICATED_PROFILE, channel_group_ids: [2] } },
+    { label: 'different hidden group', profile: { ...DEDICATED_PROFILE, hide_empty_group_ids: [] } },
+    { label: 'source input', profile: { ...DEDICATED_PROFILE, epg_source_ids: [88] } },
+    { label: 'channel mapping', profile: { ...DEDICATED_PROFILE, channel_mappings: [{ channel_id: 10, tvg_id: 'external' }] } },
+    { label: 'slot', profile: { ...DEDICATED_PROFILE, event_sync_config: { ...DEDICATED_PROFILE.event_sync_config, slot_patterns: [{}] } } },
+    { label: 'date assumption', profile: { ...DEDICATED_PROFILE, event_sync_config: { ...DEDICATED_PROFILE.event_sync_config, assume_current_date: true } } },
+    { label: 'different account', profile: { ...DEDICATED_PROFILE, event_sync_config: { ...DEDICATED_PROFILE.event_sync_config,
+      secondary: [{ group_id: 2, m3u_account_id: 9 }] } } },
+  ])('rejects a profile with $label and focuses Behavior', async ({ profile }) => {
+    const user = userEvent.setup();
+    seedDedicated();
+    server.use(http.get('/api/dummy-epg/profiles', () => HttpResponse.json([profile])));
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={DEDICATED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ }))
+      .toHaveAttribute('title', expect.stringContaining('same ordered account scopes')));
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: '3 Behavior' })).toHaveFocus();
+    expect(screen.getByRole('alert')).toHaveTextContent('no source inputs, mappings, slots or date assumption');
+  });
+
+  it.each(['skip_dead_streams', 'skip_past_events', 'retire_finished_events', 'promote_unmatched'] as const)(
+    'refuses a saved dedicated rule with %s disabled', async flag => {
+      const user = userEvent.setup();
+      seedDedicated();
+      const onSave = vi.fn();
+      render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+        event_sync_config: { ...DEDICATED_RULE.event_sync_config!, [flag]: false },
+      }} onSave={onSave} onCancel={vi.fn()} />);
+      await screen.findByTestId('psg-secondary-2-1');
+      await goToStep(user, 4);
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      expect(onSave).not.toHaveBeenCalled();
+      expect(screen.getByRole('heading', { name: '3 Behavior' })).toHaveFocus();
+      expect(screen.getByRole('button', { name: /Preview matches/ })).toBeDisabled();
+    },
+  );
+
+  it('treats reordered dedicated scopes as dirty and invalidates a differently ordered profile', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const secondary = [{ group_id: 2, m3u_account_id: 1 }, { group_id: 1, m3u_account_id: 1 }];
+    server.use(http.get('/api/dummy-epg/profiles', () => HttpResponse.json([
+      { ...DEDICATED_PROFILE, event_sync_config: { ...DEDICATED_PROFILE.event_sync_config, secondary } },
+    ])));
+    const onCancel = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, secondary },
+    }} onSave={vi.fn()} onCancel={onCancel} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: 'Remove Secondary Events' }));
+    await user.click(screen.getByTestId('psg-secondary-2-1'));
+    expect(screen.getByRole('button', { name: /Preview matches/ })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByTestId('event-sync-discard-dialog')).toBeInTheDocument();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it('waits for profiles without guessing a profile or enabling save', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    server.use(http.get('/api/dummy-epg/profiles', async () => {
+      await pending;
+      return HttpResponse.json([DEDICATED_PROFILE]);
+    }));
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={DEDICATED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+    try {
+      await screen.findByTestId('psg-secondary-2-1');
+      expect(screen.getByRole('button', { name: /Preview matches/ })).toHaveAttribute('title', 'Loading dummy EPG profiles');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      expect(onSave).not.toHaveBeenCalled();
+      expect(screen.getByRole('heading', { name: '3 Behavior' })).toHaveFocus();
+    } finally {
+      await act(async () => { release(); });
+    }
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    expect(onSave).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].event_sync_config.dummy_epg_profile_id).toBe(7);
+    expect(onSave.mock.calls[0][0].event_sync_config.enabled).toBe(false);
+  });
+
+  it.each([
+    ['/api/channel-groups', 'Channel groups could not be loaded'],
+    ['/api/providers/group-settings/by-provider', 'Account-scoped input groups could not be loaded'],
+    ['/api/dummy-epg/profiles', 'Dummy EPG profiles could not be loaded'],
+  ])('refuses a failed inventory at %s without saving', async (path, message) => {
+    const user = userEvent.setup();
+    seedDedicated();
+    server.use(http.get(path, () => HttpResponse.json({ detail: message }, { status: 500 })));
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={DEDICATED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ }))
+      .toHaveAttribute('title', expect.stringContaining(message)));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent(message);
+    expect(screen.getByRole('heading', { name: path === '/api/dummy-epg/profiles' ? '3 Behavior' : '1 Scope' })).toHaveFocus();
+  });
+
+  it('keeps an unavailable saved profile visible and refuses the stale selection', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, dummy_epg_profile_id: 99 },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await screen.findByTestId('psg-secondary-2-1');
+    await goToStep(user, 3);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' }))
+      .toHaveTextContent('Unavailable profile 99'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Choose an available source-free dummy EPG profile');
+  });
+
+  it('retains staged gates after a rejected save and sends the same draft on retry', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn().mockRejectedValueOnce(new Error('Target changed; reload its settings')).mockResolvedValueOnce(undefined);
+    render(<EventSyncRuleEditor onSave={onSave} onCancel={vi.fn()} />);
+    await fillDedicatedDraft(user);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Target changed; reload its settings');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    await goToStep(user, 1);
+    expect(screen.getByLabelText('Enabled')).not.toBeChecked();
+    expect(screen.getByLabelText('Enabled')).toBeDisabled();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeChecked();
+    await goToStep(user, 3);
+    expect(screen.getByTestId('event-sync-auto-run')).not.toBeChecked();
+    expect(screen.getByTestId('event-sync-auto-run')).toBeDisabled();
+    await goToStep(user, 4);
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual(onSave.mock.calls[0][0]);
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
+  it('marks an edited dedicated preview stale and rejects it as authority for a missing target', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', () => HttpResponse.json(DEDICATED_PREVIEW)));
+    const onSave = vi.fn();
+    render(<EventSyncRuleEditor rule={DEDICATED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+    await screen.findByTestId('event-sync-summary');
+    await goToStep(user, 3);
+    await user.click(screen.getByRole('button', { name: 'Target group for promoted channels' }));
+    await user.click(screen.getByRole('option', { name: 'Pick a dedicated group…' }));
+    expect(screen.getByTestId('event-sync-preview-stale')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Pick a target group');
+  });
+
+  it('rejects a late legacy preview after switching mode and completing a newer dedicated preview', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let legacyReturned = false;
+    const requests: { event_sync_config: { mode?: string; master: unknown } }[] = [];
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', async ({ request }) => {
+      const body = await request.json() as typeof requests[number];
+      requests.push(body);
+      if (body.event_sync_config.mode !== 'dedicated') {
+        await pending;
+        legacyReturned = true;
+        return HttpResponse.json({ ...DEDICATED_PREVIEW, summary: { ...DEDICATED_PREVIEW.summary, unmatched: 9 } });
+      }
+      return HttpResponse.json({ ...DEDICATED_PREVIEW, summary: { ...DEDICATED_PREVIEW.summary, unmatched: 2 } });
+    }));
+    render(<EventSyncRuleEditor onSave={vi.fn()} onCancel={vi.fn()} />);
+    try {
+      await user.click(await screen.findByTestId('psg-master-1-any'));
+      await user.click(screen.getByTestId('psg-secondary-2-any'));
+      await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+      await waitFor(() => expect(requests).toHaveLength(1));
+      await user.click(screen.getByRole('radio', { name: 'Dedicated event group' }));
+      await user.click(screen.getByRole('button', { name: 'Remove Secondary Events' }));
+      await user.click(screen.getByRole('radio', { name: 'Existing master group' }));
+      expect(screen.getByTestId('psg-master-1-any')).toBeChecked();
+      await fillDedicatedDraft(user);
+      await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+      expect(await screen.findByTestId('event-sync-summary')).toHaveTextContent('2 unmatched');
+      expect(requests[1].event_sync_config).toEqual(expect.objectContaining({ mode: 'dedicated', master: null }));
+      await act(async () => { release(); });
+      await waitFor(() => expect(legacyReturned).toBe(true));
+      await goToStep(user, 2);
+      expect(screen.getByTestId('event-sync-summary')).toHaveTextContent('2 unmatched');
+      expect(screen.getByTestId('event-sync-summary')).not.toHaveTextContent('9 unmatched');
+    } finally {
+      await act(async () => { release(); });
+    }
+  });
+
+  it('discards a pending preview and reopens with a fresh legacy draft', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let returned = false;
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', async () => {
+      await pending;
+      returned = true;
+      return HttpResponse.json(DEDICATED_PREVIEW);
+    }));
+    const onCancel = vi.fn();
+    const first = render(<EventSyncRuleEditor onSave={vi.fn()} onCancel={onCancel} />);
+    try {
+      await fillDedicatedDraft(user);
+      await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      await user.click(screen.getByTestId('event-sync-discard-confirm'));
+      expect(onCancel).toHaveBeenCalledTimes(1);
+      first.unmount();
+      render(<EventSyncRuleEditor onSave={vi.fn()} onCancel={vi.fn()} />);
+      await screen.findByTestId('psg-master-1-any');
+      expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeChecked();
+      expect(screen.getByLabelText('Rule Name *')).toHaveValue('');
+      expect(screen.getByLabelText('Enabled')).toBeChecked();
+      await act(async () => { release(); });
+      await waitFor(() => expect(returned).toBe(true));
+      await goToStep(user, 4);
+      expect(screen.queryByTestId('event-sync-summary')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    } finally {
+      await act(async () => { release(); });
+    }
+  });
+});

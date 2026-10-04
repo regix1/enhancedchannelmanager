@@ -97,6 +97,39 @@ def live_master_channels() -> list[dict]:
     ]
 
 
+def dedicated_event_sync_config(**overrides) -> dict:
+    """Return a source-free rule with explicit ordered account scopes."""
+    config = event_sync_config(
+        mode="dedicated", master=None, master_group_id=None,
+        secondary=[{"group_id": SECONDARY_A, "m3u_account_id": 1}, {"group_id": SECONDARY_B, "m3u_account_id": 2}],
+        promote_unmatched=True, promote_target_group_id=40, dummy_epg_profile_id=7,
+        include_master_group_streams=False, parse_master_from_stream=False,
+        assume_current_date=False, skip_dead_streams=True, skip_past_events=True,
+        retire_finished_events=True,
+    )
+    config.update(overrides)
+    config["secondary_group_ids"] = [scope["group_id"] for scope in config["secondary"]]
+    return config
+
+
+def dedicated_event_profile(config: dict, *, enabled: bool = False):
+    """Return a real profile row with exact source-free persisted JSON."""
+    import json
+
+    from models import DummyEPGProfile
+
+    profile = DummyEPGProfile(id=config["dummy_epg_profile_id"], name="Dedicated events", enabled=enabled)
+    profile.set_channel_group_ids([config["promote_target_group_id"]])
+    profile.set_hide_empty_group_ids([config["promote_target_group_id"]])
+    profile.set_event_sync_config({
+        "secondary": copy.deepcopy(config["secondary"]), "slot_patterns": [],
+        "assume_current_date": False, "use_default_patterns": False,
+    })
+    profile.epg_source_ids = None
+    profile.channel_mappings = json.dumps([])
+    return profile
+
+
 class FakeDispatcharrState:
     """Mutable in-memory Dispatcharr channel/stream state (see module doc).
 
@@ -172,7 +205,8 @@ def make_stateful_client(state: FakeDispatcharrState,
     client.base_url = "http://dispatcharr.test"
 
     async def _get_channels(page=1, page_size=100, **kwargs):
-        results = [copy.deepcopy(c) for c in state.channels.values()]
+        results = [copy.deepcopy(c) for c in state.channels.values()
+                   if kwargs.get("channel_group") is None or c.get("channel_group_id") == kwargs["channel_group"]]
         return {"count": len(results), "next": None, "results": results}
 
     async def _get_channel(channel_id):
@@ -186,6 +220,7 @@ def make_stateful_client(state: FakeDispatcharrState,
         results = [
             copy.deepcopy(s)
             for s in state.secondary_streams.get(channel_group_name, [])
+            if kwargs.get("m3u_account") is None or s.get("m3u_account") == kwargs["m3u_account"]
         ]
         return {"count": len(results), "next": None, "results": results}
 

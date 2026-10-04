@@ -1530,3 +1530,69 @@ class TestPromotionPreview:
         assert created_names == {
             u["channel_name"] for u in promo_preview["units"]
         }
+
+
+class TestDedicatedPreview:
+    @pytest.fixture
+    def dedicated(self, test_session, monkeypatch):
+        import database
+        from sqlalchemy.orm import sessionmaker
+        from tests.event_sync_fixtures import dedicated_event_profile, dedicated_event_sync_config
+
+        config = dedicated_event_sync_config(enabled=False)
+        test_session.add(dedicated_event_profile(config))
+        test_session.commit()
+        monkeypatch.setattr(database, "_SessionLocal", sessionmaker(bind=test_session.bind))
+        return config
+
+    @pytest.mark.asyncio
+    async def test_inline_preview_reads_only_target_and_exact_scopes(self, async_client, dedicated):
+        client = _mock_client(master_channels=[], secondary_streams={})
+        client.get_channel_groups = AsyncMock(return_value=[{"id": 40, "name": "Target"}])
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, 20): {"auto_channel_sync": False}, (2, 30): {"auto_channel_sync": False}})
+        response = await _preview(async_client, client, {"event_sync_config": dedicated})
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["master"] is None
+        assert result["master_group_id"] is None
+        assert result["summary"]["master_channels"] == 0
+        assert result["summary"]["would_attach"] == 0
+        assert [call.kwargs["channel_group"] for call in client.get_channels.call_args_list] == [40]
+        assert [call.kwargs["m3u_account"] for call in client.get_streams.call_args_list] == [1, 2]
+        _assert_zero_writes(client)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fault", ["target_failed", "target_foreign", "accounts_failed"])
+    async def test_failed_target_or_account_inventory_is_unsafe(self, async_client, dedicated, fault):
+        client = _mock_client(master_channels=[], secondary_streams={})
+        client.get_channel_groups = AsyncMock(return_value=[{"id": 40}])
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, 20): {"auto_channel_sync": False}, (2, 30): {"auto_channel_sync": False}})
+        if fault == "target_failed":
+            client.get_channels.side_effect = RuntimeError("target read failed")
+        elif fault == "target_foreign":
+            client.get_channels.side_effect = None
+            client.get_channels.return_value = {"count": 1, "next": None, "results": [{"id": 900, "uuid": "manual", "channel_group_id": 40, "streams": []}]}
+        else:
+            client.get_m3u_accounts.side_effect = RuntimeError("account read failed")
+        response = await _preview(async_client, client, {"event_sync_config": dedicated})
+        assert response.status_code == 409
+        _assert_zero_writes(client)
+
+    @pytest.mark.asyncio
+    async def test_saved_debug_reports_null_master_without_writes(self, dedicated, test_session):
+        from routers.channel_pipeline import _build_event_sync_matching_section
+
+        rule = ChannelPipelineRule(name="Dedicated events", enabled=True, event_sync_config=json.dumps(dedicated), conditions=json.dumps([{"type": "always"}]), actions=json.dumps([{"type": "skip"}]))
+        test_session.add(rule)
+        test_session.commit()
+        client = _mock_client(master_channels=[], secondary_streams={})
+        client.get_channel_groups = AsyncMock(return_value=[{"id": 40}])
+        client.get_m3u_group_settings_by_provider = AsyncMock(return_value={(1, 20): {"auto_channel_sync": False}, (2, 30): {"auto_channel_sync": False}})
+        section = await _build_event_sync_matching_section(client)
+        row = next(row for row in section["rules"] if row["rule_id"] == rule.id)
+        assert "error" not in row
+        assert row["master_group_id"] is None
+        assert row["effective_master_group_id"] is None
+        assert row["summary"]["master_channels"] == 0
+        assert [call.kwargs["channel_group"] for call in client.get_channels.call_args_list] == [40]
+        _assert_zero_writes(client)

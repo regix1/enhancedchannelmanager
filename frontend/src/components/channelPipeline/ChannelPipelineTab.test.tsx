@@ -14,10 +14,14 @@ import {
   resetMockDataStore,
   createMockChannelPipelineRule,
   createMockChannelPipelineExecution,
+  createMockChannelGroup,
 } from '../../test/mocks/server';
 import { ChannelPipelineTab } from './ChannelPipelineTab';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import { AuthProvider } from '../../hooks/useAuth';
+import type { ChannelPipelineRule, CreateRuleData } from '../../types/channelPipeline';
+import type { ProviderGroupScopeRow } from '../../services/api';
+import type { DummyEPGProfile } from '../../types';
 
 const renderWithProviders = (ui: React.JSX.Element) =>
   render(
@@ -1825,6 +1829,500 @@ describe('ChannelPipelineTab', () => {
         expect(values).toContain('2');   // 2 enabled
         expect(values).toContain('100'); // 100 total matches
       });
+    });
+  });
+});
+
+describe('rule save failures', () => {
+  function prepareEventRules() {
+    mockDataStore.channelGroups.push(
+      createMockChannelGroup({ id: 1, name: 'Master Events' }),
+      createMockChannelGroup({ id: 2, name: 'Secondary Events' }),
+      createMockChannelGroup({ id: 40, name: 'Dedicated Events' }),
+    );
+    const scopes: ProviderGroupScopeRow[] = [
+      {
+        m3u_account_id: 1,
+        m3u_account_name: 'Provider A',
+        channel_group_id: 1,
+        auto_channel_sync: true,
+        enabled: true,
+        stream_count: 10,
+      },
+      {
+        m3u_account_id: 1,
+        m3u_account_name: 'Provider A',
+        channel_group_id: 2,
+        auto_channel_sync: false,
+        enabled: true,
+        stream_count: 10,
+      },
+    ];
+    const profile: DummyEPGProfile = {
+      id: 7,
+      name: 'Event Guide',
+      enabled: false,
+      name_source: 'channel',
+      stream_index: 0,
+      title_pattern: null,
+      time_pattern: null,
+      date_pattern: null,
+      substitution_pairs: [],
+      title_template: null,
+      description_template: null,
+      upcoming_title_template: null,
+      upcoming_description_template: null,
+      ended_title_template: null,
+      ended_description_template: null,
+      fallback_title_template: null,
+      fallback_description_template: null,
+      event_timezone: 'UTC',
+      output_timezone: null,
+      program_duration: 120,
+      categories: null,
+      channel_logo_url_template: null,
+      program_poster_url_template: null,
+      tvg_id_template: '{channel_id}',
+      include_date_tag: false,
+      include_live_tag: false,
+      include_new_tag: false,
+      pattern_builder_examples: null,
+      pattern_variants: [],
+      channel_group_ids: [40],
+      hide_empty_group_ids: [40],
+      epg_source_ids: [],
+      channel_mappings: [],
+      event_sync_config: {
+        secondary: [{ group_id: 2, m3u_account_id: 1 }],
+        time_window_minutes: 30,
+        enforce_time_window: true,
+        attach_threshold: 0.8,
+        assume_current_date: false,
+        demote_stale_dateless: true,
+        use_default_patterns: false,
+        slot_patterns: [],
+      },
+      last_generated_at: null,
+      created_at: null,
+      updated_at: null,
+    };
+    server.use(
+      http.get('/api/providers/group-settings/by-provider', () => HttpResponse.json(scopes)),
+      http.get('/api/dummy-epg/profiles', () => HttpResponse.json([profile])),
+    );
+  }
+
+  it('retains a new dedicated rule after a failed save and retries the same request', async () => {
+    const user = userEvent.setup();
+    prepareEventRules();
+    const savedRule = createMockChannelPipelineRule({ id: 3, name: 'Existing Rule', priority: 4 });
+    mockDataStore.channelPipelineRules.push(savedRule);
+    const bodies: CreateRuleData[] = [];
+    const routes: string[] = [];
+    const message = 'Target changed; reload its settings';
+    server.use(http.post('/api/channel-pipeline/rules', async ({ request }) => {
+      const body = await request.json() as CreateRuleData;
+      bodies.push(body);
+      routes.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (bodies.length === 1) {
+        return HttpResponse.json({ detail: message }, { status: 422 });
+      }
+      return HttpResponse.json({ ...createMockChannelPipelineRule({ id: 6 }), ...body, id: 6 });
+    }));
+    renderWithProviders(<ChannelPipelineTab />);
+    await screen.findByText('Existing Rule');
+    await user.click(screen.getByRole('button', { name: /create rule/i }));
+    await user.click(await screen.findByRole('button', { name: /event sync rule/i }));
+    await user.type(screen.getByLabelText('Rule Name *'), 'Dated Events');
+    await user.click(screen.getByRole('radio', { name: 'Dedicated event group' }));
+    await user.click(await screen.findByTestId('psg-secondary-2-1'));
+    await user.click(screen.getByTestId('event-sync-step-3'));
+    await user.click(screen.getByRole('button', { name: 'Target group for promoted channels' }));
+    await user.click(await screen.findByRole('option', { name: 'Dedicated Events' }));
+    await user.click(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' }));
+    await user.click(await screen.findByRole('option', { name: 'Event Guide (disabled)' }));
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => {
+      const toast = document.querySelector('.toast-error[role="alert"]');
+      expect(toast).toBeInTheDocument();
+      expect(toast!.querySelector('.toast-title')).toHaveTextContent('Channel Pipeline');
+      expect(toast!.querySelector('.toast-message')!.textContent).toBe(message);
+      expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    });
+    expect(within(screen.getByTestId('event-sync-editor')).getByRole('alert').textContent).toBe(message);
+    expect(routes).toEqual(['POST /api/channel-pipeline/rules']);
+    expect(bodies[0]).toMatchObject({ name: 'Dated Events', priority: 5, enabled: false, run_on_refresh: false });
+    expect(bodies[0].event_sync_config).toMatchObject({
+      mode: 'dedicated',
+      master: null,
+      master_group_id: null,
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      enabled: false,
+      auto_run: false,
+      promote_target_group_id: 40,
+      dummy_epg_profile_id: 7,
+      include_master_group_streams: false,
+      parse_master_from_stream: false,
+      assume_current_date: false,
+      promote_unmatched: true,
+      skip_dead_streams: true,
+      skip_past_events: true,
+      retire_finished_events: true,
+    });
+    expect(mockDataStore.channelPipelineRules).toEqual([savedRule]);
+    expect(screen.queryByRole('row', { name: /Dated Events/ })).not.toBeInTheDocument();
+    expect(screen.getByText('Existing Rule').closest('tr')).toBeInTheDocument();
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Dated Events');
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeChecked();
+    expect(screen.getByTestId('psg-secondary-2-1')).toBeChecked();
+    expect(screen.getByLabelText('Enabled')).not.toBeChecked();
+    expect(screen.getByLabelText('Enabled')).toBeDisabled();
+    await user.click(screen.getByTestId('event-sync-step-3'));
+    expect(screen.getByRole('button', { name: 'Target group for promoted channels' })).toHaveTextContent('Dedicated Events');
+    expect(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' })).toHaveTextContent('Event Guide (disabled)');
+    expect(screen.getByTestId('event-sync-auto-run')).not.toBeChecked();
+    expect(screen.getByTestId('event-sync-auto-run')).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    const discard = screen.getByRole('alertdialog', { name: 'Discard this rule?' });
+    expect(discard).toBeInTheDocument();
+    await user.click(within(discard).getByTestId('event-sync-discard-keep'));
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Dated Events');
+    expect(screen.getByTestId('psg-secondary-2-1')).toBeChecked();
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(routes).toEqual(['POST /api/channel-pipeline/rules', 'POST /api/channel-pipeline/rules']);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.getByText('Dated Events').closest('tr')).toBeInTheDocument();
+    });
+  });
+
+  it.each([
+    { enabled: true, runOnRefresh: false, nestedEnabled: false, autoRun: true },
+    { enabled: false, runOnRefresh: true, nestedEnabled: true, autoRun: false },
+  ])('retains saved dedicated gates after a failed update and retries the same request ($enabled/$runOnRefresh/$nestedEnabled/$autoRun)', async ({ enabled, runOnRefresh, nestedEnabled, autoRun }) => {
+    const user = userEvent.setup();
+    prepareEventRules();
+    const config: NonNullable<ChannelPipelineRule['event_sync_config']> = {
+      mode: 'dedicated',
+      master: null,
+      master_group_id: null,
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      time_window_minutes: 30,
+      attach_threshold: 0.8,
+      enabled: nestedEnabled,
+      auto_run: autoRun,
+      include_master_group_streams: false,
+      parse_master_from_stream: false,
+      assume_current_date: false,
+      promote_unmatched: true,
+      promote_target_group_id: 40,
+      dummy_epg_profile_id: 7,
+      skip_dead_streams: true,
+      skip_past_events: true,
+      retire_finished_events: true,
+    };
+    const savedRule = createMockChannelPipelineRule({
+      id: 5,
+      name: 'Dated Events',
+      enabled,
+      run_on_refresh: runOnRefresh,
+      conditions: [{ type: 'always' }],
+      actions: [{ type: 'skip' }],
+      event_sync_config: config,
+    });
+    mockDataStore.channelPipelineRules.push(savedRule);
+    const bodies: CreateRuleData[] = [];
+    const routes: string[] = [];
+    const message = 'Saved target changed; reload its settings';
+    server.use(http.put('/api/channel-pipeline/rules/5', async ({ request }) => {
+      const body = await request.json() as CreateRuleData;
+      bodies.push(body);
+      routes.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (bodies.length === 1) {
+        return HttpResponse.json({ detail: message }, { status: 422 });
+      }
+      return HttpResponse.json({ ...savedRule, ...body, id: savedRule.id });
+    }));
+    renderWithProviders(<ChannelPipelineTab />);
+    await screen.findByText('Dated Events');
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await screen.findByTestId('psg-secondary-2-1');
+    await user.clear(screen.getByLabelText('Rule Name *'));
+    await user.type(screen.getByLabelText('Rule Name *'), 'Edited Dated Events');
+    await user.click(screen.getByTestId('event-sync-step-3'));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' }))
+      .toHaveTextContent('Event Guide (disabled)'));
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => {
+      const toast = document.querySelector('.toast-error[role="alert"]');
+      expect(toast).toBeInTheDocument();
+      expect(toast!.querySelector('.toast-title')).toHaveTextContent('Channel Pipeline');
+      expect(toast!.querySelector('.toast-message')!.textContent).toBe(message);
+      expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    });
+    expect(within(screen.getByTestId('event-sync-editor')).getByRole('alert').textContent).toBe(message);
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5']);
+    expect(bodies[0].enabled).toBe(enabled);
+    expect(bodies[0].run_on_refresh).toBe(runOnRefresh);
+    expect(bodies[0].event_sync_config!.enabled).toBe(nestedEnabled);
+    expect(bodies[0].event_sync_config!.auto_run).toBe(autoRun);
+    expect(bodies[0].event_sync_config).toMatchObject({
+      mode: 'dedicated',
+      master: null,
+      master_group_id: null,
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      promote_target_group_id: 40,
+      dummy_epg_profile_id: 7,
+    });
+    expect(mockDataStore.channelPipelineRules).toEqual([savedRule]);
+    expect(screen.getByText('Dated Events').closest('tr')).toBeInTheDocument();
+    expect(screen.queryByRole('row', { name: /Edited Dated Events/ })).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Edited Dated Events');
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeDisabled();
+    expect(screen.getByTestId('psg-secondary-2-1')).toBeChecked();
+    expect(screen.getByLabelText('Enabled')).toHaveProperty('checked', enabled);
+    await user.click(screen.getByTestId('event-sync-step-3'));
+    expect(screen.getByRole('button', { name: 'Target group for promoted channels' })).toHaveTextContent('Dedicated Events');
+    expect(screen.getByRole('button', { name: 'Source-free dummy EPG profile (required)' })).toHaveTextContent('Event Guide (disabled)');
+    expect(screen.getByTestId('event-sync-auto-run')).toHaveProperty('checked', autoRun);
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    const discard = screen.getByRole('alertdialog', { name: 'Discard this rule?' });
+    expect(discard).toBeInTheDocument();
+    await user.click(within(discard).getByTestId('event-sync-discard-keep'));
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Edited Dated Events');
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5', 'PUT /api/channel-pipeline/rules/5']);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.getByText('Edited Dated Events').closest('tr')).toBeInTheDocument();
+      expect(screen.queryByText('Dated Events')).not.toBeInTheDocument();
+    });
+  });
+
+  it('retains a legacy event sync rule after a failed update and retries the same request', async () => {
+    const user = userEvent.setup();
+    prepareEventRules();
+    const config: NonNullable<ChannelPipelineRule['event_sync_config']> = {
+      master: { group_id: 1, m3u_account_id: 1 },
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      time_window_minutes: 30,
+      attach_threshold: 0.8,
+      enabled: false,
+      auto_run: true,
+    };
+    const savedRule = createMockChannelPipelineRule({
+      id: 5,
+      name: 'Legacy Events',
+      enabled: true,
+      run_on_refresh: true,
+      conditions: [{ type: 'always' }],
+      actions: [{ type: 'skip' }],
+      event_sync_config: config,
+    });
+    mockDataStore.channelPipelineRules.push(savedRule);
+    const bodies: CreateRuleData[] = [];
+    const routes: string[] = [];
+    const message = 'Master settings changed; reload its settings';
+    server.use(http.put('/api/channel-pipeline/rules/5', async ({ request }) => {
+      const body = await request.json() as CreateRuleData;
+      bodies.push(body);
+      routes.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (bodies.length === 1) {
+        return HttpResponse.json({ detail: message }, { status: 422 });
+      }
+      return HttpResponse.json({ ...savedRule, ...body, id: savedRule.id });
+    }));
+    renderWithProviders(<ChannelPipelineTab />);
+    await screen.findByText('Legacy Events');
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await screen.findByTestId('psg-secondary-2-any');
+    await user.clear(screen.getByLabelText('Rule Name *'));
+    await user.type(screen.getByLabelText('Rule Name *'), 'Edited Legacy Events');
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => {
+      const toast = document.querySelector('.toast-error[role="alert"]');
+      expect(toast).toBeInTheDocument();
+      expect(toast!.querySelector('.toast-title')).toHaveTextContent('Channel Pipeline');
+      expect(toast!.querySelector('.toast-message')!.textContent).toBe(message);
+      expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    });
+    expect(within(screen.getByTestId('event-sync-editor')).getByRole('alert').textContent).toBe(message);
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5']);
+    expect(bodies[0].name).toBe('Edited Legacy Events');
+    expect(bodies[0].enabled).toBe(true);
+    expect(bodies[0]).not.toHaveProperty('run_on_refresh');
+    expect(bodies[0].event_sync_config).not.toHaveProperty('mode');
+    expect(bodies[0].event_sync_config).not.toHaveProperty('master_group_id');
+    expect(bodies[0].event_sync_config).toMatchObject({
+      master: { group_id: 1, m3u_account_id: 1 },
+      secondary: [{ group_id: 2, m3u_account_id: 1 }],
+      enabled: false,
+      auto_run: true,
+    });
+    expect(mockDataStore.channelPipelineRules).toEqual([savedRule]);
+    expect(screen.getByText('Legacy Events').closest('tr')).toBeInTheDocument();
+    expect(screen.queryByRole('row', { name: /Edited Legacy Events/ })).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Edited Legacy Events');
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Existing master group' })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: 'Dedicated event group' })).toBeDisabled();
+    expect(screen.getByTestId('psg-secondary')).toHaveTextContent('Secondary Events · Provider A');
+    expect(screen.getByLabelText('Enabled')).toBeChecked();
+    await user.click(screen.getByTestId('event-sync-step-3'));
+    expect(screen.getByTestId('event-sync-auto-run')).toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    const discard = screen.getByRole('alertdialog', { name: 'Discard this rule?' });
+    expect(discard).toBeInTheDocument();
+    await user.click(within(discard).getByTestId('event-sync-discard-keep'));
+    await user.click(screen.getByTestId('event-sync-step-1'));
+    expect(screen.getByLabelText('Rule Name *')).toHaveValue('Edited Legacy Events');
+    await user.click(screen.getByTestId('event-sync-step-4'));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5', 'PUT /api/channel-pipeline/rules/5']);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.getByText('Edited Legacy Events').closest('tr')).toBeInTheDocument();
+      expect(screen.queryByText('Legacy Events')).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps standard rule creation open after a failed save and succeeds on retry', async () => {
+    const user = userEvent.setup();
+    const bodies: CreateRuleData[] = [];
+    const routes: string[] = [];
+    const message = 'Condition settings changed; reload its settings';
+    server.use(http.post('/api/channel-pipeline/rules', async ({ request }) => {
+      const body = await request.json() as CreateRuleData;
+      bodies.push(body);
+      routes.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (bodies.length === 1) {
+        return HttpResponse.json({ detail: message }, { status: 422 });
+      }
+      return HttpResponse.json({ ...createMockChannelPipelineRule({ id: 6 }), ...body, id: 6 });
+    }));
+    renderWithProviders(<ChannelPipelineTab />);
+    await screen.findByText(/no rules/i);
+    await user.click(screen.getByRole('button', { name: /create rule/i }));
+    await user.click(await screen.findByRole('button', { name: /standard rule/i }));
+    await user.type(screen.getByLabelText(/rule name/i), 'Standard Events');
+    await user.click(screen.getByRole('button', { name: /add condition/i }));
+    await user.type(screen.getByPlaceholderText(/enter text/i), 'test');
+    await user.click(screen.getByRole('button', { name: /add action/i }));
+    await user.click(screen.getByRole('combobox', { name: /action type/i }));
+    await user.click(screen.getByRole('option', { name: /skip/i }));
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => {
+      const toast = document.querySelector('.toast-error[role="alert"]');
+      expect(toast).toBeInTheDocument();
+      expect(toast!.querySelector('.toast-title')).toHaveTextContent('Channel Pipeline');
+      expect(toast!.querySelector('.toast-message')!.textContent).toBe(message);
+      expect(screen.getByRole('button', { name: /save/i })).toBeEnabled();
+    });
+    expect(routes).toEqual(['POST /api/channel-pipeline/rules']);
+    expect(bodies[0]).not.toHaveProperty('event_sync_config');
+    expect(bodies[0].name).toBe('Standard Events');
+    expect(bodies[0].conditions).toEqual([{ type: 'stream_name_contains', connector: 'and', value: 'test' }]);
+    expect(bodies[0].actions).toEqual([{ type: 'skip' }]);
+    expect(mockDataStore.channelPipelineRules).toEqual([]);
+    expect(screen.queryByRole('row', { name: /Standard Events/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Create Rule' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('rule-builder')).queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/rule name/i)).toHaveValue('Standard Events');
+    expect(screen.getByPlaceholderText(/enter text/i)).toHaveValue('test');
+    expect(screen.getByRole('combobox', { name: /action type/i })).toHaveTextContent(/skip/i);
+    await user.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(routes).toEqual(['POST /api/channel-pipeline/rules', 'POST /api/channel-pipeline/rules']);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.getByText('Standard Events').closest('tr')).toBeInTheDocument();
+    });
+  });
+
+  it('keeps standard rule editing open after a failed save and succeeds on retry', async () => {
+    const user = userEvent.setup();
+    const savedRule = createMockChannelPipelineRule({
+      id: 5,
+      name: 'Standard Events',
+      conditions: [{ type: 'stream_name_contains', value: 'test' }],
+      actions: [{ type: 'skip' }],
+    });
+    mockDataStore.channelPipelineRules.push(savedRule);
+    const bodies: CreateRuleData[] = [];
+    const routes: string[] = [];
+    const message = 'Action settings changed; reload its settings';
+    server.use(http.put('/api/channel-pipeline/rules/5', async ({ request }) => {
+      const body = await request.json() as CreateRuleData;
+      bodies.push(body);
+      routes.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (bodies.length === 1) {
+        return HttpResponse.json({ detail: message }, { status: 422 });
+      }
+      return HttpResponse.json({ ...savedRule, ...body, id: savedRule.id });
+    }));
+    renderWithProviders(<ChannelPipelineTab />);
+    await screen.findByText('Standard Events');
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.clear(screen.getByLabelText(/rule name/i));
+    await user.type(screen.getByLabelText(/rule name/i), 'Edited Standard Events');
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => {
+      const toast = document.querySelector('.toast-error[role="alert"]');
+      expect(toast).toBeInTheDocument();
+      expect(toast!.querySelector('.toast-title')).toHaveTextContent('Channel Pipeline');
+      expect(toast!.querySelector('.toast-message')!.textContent).toBe(message);
+      expect(screen.getByRole('button', { name: /save/i })).toBeEnabled();
+    });
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5']);
+    expect(bodies[0]).not.toHaveProperty('event_sync_config');
+    expect(bodies[0].name).toBe('Edited Standard Events');
+    expect(bodies[0].conditions).toEqual([{ type: 'stream_name_contains', value: 'test' }]);
+    expect(bodies[0].actions).toEqual([{ type: 'skip' }]);
+    expect(mockDataStore.channelPipelineRules).toEqual([savedRule]);
+    expect(screen.getByText('Standard Events').closest('tr')).toBeInTheDocument();
+    expect(screen.queryByRole('row', { name: /Edited Standard Events/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Edit Rule' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('rule-builder')).queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/rule name/i)).toHaveValue('Edited Standard Events');
+    expect(screen.getByPlaceholderText(/enter text/i)).toHaveValue('test');
+    expect(screen.getByRole('combobox', { name: /action type/i })).toHaveTextContent(/skip/i);
+    await user.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(routes).toEqual(['PUT /api/channel-pipeline/rules/5', 'PUT /api/channel-pipeline/rules/5']);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.getByText('Edited Standard Events').closest('tr')).toBeInTheDocument();
+      expect(screen.queryByText('Standard Events')).not.toBeInTheDocument();
     });
   });
 });

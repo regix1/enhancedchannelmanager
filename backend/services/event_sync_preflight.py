@@ -296,6 +296,7 @@ async def check_event_sync_group_settings(
     """
     # bead jiscc: read the provider-scoped nested shape (P1 keeps it in sync
     # with the flat keys; fall back to whole-group scopes for a bare config).
+    dedicated = config.get("mode") == "dedicated"
     master_scope = config.get("master") or {
         "group_id": config.get("master_group_id"), "m3u_account_id": None,
     }
@@ -345,7 +346,7 @@ async def check_event_sync_group_settings(
 
     # --- Master ---------------------------------------------------------
     master_settings = _scope_setting(master_scope)
-    if master_settings is None:
+    if master_settings is None and not dedicated:
         failures.append(_failure(
             group_id=master_scope.get("group_id"),
             role="master",
@@ -358,7 +359,7 @@ async def check_event_sync_group_settings(
                 f"removed or renamed, or that provider does not carry it."
             ),
         ))
-    elif not master_settings.get("auto_channel_sync"):
+    elif not dedicated and not master_settings.get("auto_channel_sync"):
         failures.append(_failure(
             group_id=master_scope.get("group_id"),
             role="master",
@@ -373,6 +374,22 @@ async def check_event_sync_group_settings(
                 f"it for you)."
             ),
         ))
+
+    if dedicated:
+        target_id = config["promote_target_group_id"]
+        target_settings = target_to_source.get(target_id)
+        direct_settings = all_settings.get(target_id)
+        if (
+            target_settings is not None and target_settings.get("auto_channel_sync")
+            or direct_settings is not None and direct_settings.get("auto_channel_sync")
+            or any(setting.get("auto_channel_sync") and isinstance(setting.get("custom_properties"), dict) and setting["custom_properties"].get("group_override") == target_id for setting in by_provider.values())
+        ):
+            failures.append(_failure(
+                group_id=target_id, role="target", check=CHECK_SECONDARY_AUTO_SYNC_OFF,
+                expected="no automatic channel source for the dedicated target",
+                got="auto_channel_sync ON",
+                message=f"Dedicated target group {target_id} is populated by automatic channel sync.",
+            ))
 
     # --- Secondaries ----------------------------------------------------
     for scope in secondary_scopes:
