@@ -1624,11 +1624,15 @@ class ChannelPipelineEngine:
                         if group_id and "channel_group_name" not in stream:
                             stream["channel_group_name"] = group_name_map.get(group_id)
                         stats = self._stream_stats_cache.get(stream.get("id"))
+                        successful_stats = (
+                            stats if stats and stats.get("probe_status") == "success"
+                            else None
+                        )
                         ctx = StreamContext.from_dispatcharr_stream(
                             stream,
                             m3u_account_id=account_id,
                             m3u_account_name=account.get("name"),
-                            stream_stats=stats
+                            stream_stats=successful_stats
                         )
                         all_streams.append(ctx)
                     fetched_for_account += len(streams)
@@ -1741,9 +1745,7 @@ class ChannelPipelineEngine:
         """Load stream stats from database for quality info."""
         session = get_session()
         try:
-            stats = session.query(StreamStats).filter(
-                StreamStats.probe_status == "success"
-            ).all()
+            stats = session.query(StreamStats).all()
 
             self._stream_stats_cache = {
                 s.stream_id: s.to_dict() for s in stats
@@ -1791,8 +1793,10 @@ class ChannelPipelineEngine:
             needs_quality = rule.sort_field == "quality" or getattr(rule, 'stream_sort_field', None) == "quality"
             if not needs_quality or not getattr(rule, 'probe_on_sort', False):
                 continue
-            # Only probe streams without existing stats
-            if stream.stream_id in self._stream_stats_cache:
+            # A failed, timed-out, or pending observation is not a usable
+            # quality measurement. Re-probe it before sorting.
+            stats = self._stream_stats_cache.get(stream.stream_id)
+            if stats and stats.get("probe_status") == "success":
                 continue
             if not stream.stream_url:
                 continue
@@ -1823,19 +1827,23 @@ class ChannelPipelineEngine:
             })
             return
 
-        # Probe with concurrency limit
-        semaphore = asyncio.Semaphore(3)
+        await prober.refresh_account_probe_limits()
 
-        async def probe_one(stream_id, url, name):
+        # Keep this caller bounded while sharing each account's connection
+        # ceiling with scheduled, bulk, and event probes.
+        semaphore = asyncio.Semaphore(max(1, min(3, prober.max_concurrent_probes)))
+
+        async def probe_one(stream_id, url, name, stream):
             async with semaphore:
-                try:
-                    await prober.probe_stream(stream_id, url, name)
-                except Exception as e:
-                    logger.warning("[AUTO-CREATE-ENGINE] Failed to probe stream %s (%s): %s", stream_id, name, e)
+                async with prober.semaphore_for_account(stream.m3u_account_id):
+                    try:
+                        await prober.probe_stream(stream_id, url, name)
+                    except Exception as e:
+                        logger.warning("[AUTO-CREATE-ENGINE] Failed to probe stream %s (%s): %s", stream_id, name, e)
 
         tasks = [
-            probe_one(sid, url, name)
-            for sid, (url, name, _ctx) in streams_to_probe.items()
+            probe_one(sid, url, name, stream)
+            for sid, (url, name, stream) in streams_to_probe.items()
         ]
         await asyncio.gather(*tasks)
 
@@ -1845,7 +1853,11 @@ class ChannelPipelineEngine:
         # Update resolution_height on matched stream contexts
         for stream, _rule, _losing, _log in matched_entries:
             stats = self._stream_stats_cache.get(stream.stream_id)
-            if stats and stats.get("resolution"):
+            if (
+                stats
+                and stats.get("probe_status") == "success"
+                and stats.get("resolution")
+            ):
                 try:
                     parts = stats["resolution"].split("x")
                     if len(parts) == 2:

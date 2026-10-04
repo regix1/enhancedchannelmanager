@@ -257,6 +257,7 @@ class TestChannelPipelineEngineFetchStreams:
         """Fetch streams from all M3U accounts."""
         mock_session = MagicMock()
         mock_get_session.return_value = mock_session
+        mock_session.query.return_value.all.return_value = []
         mock_session.query.return_value.filter.return_value.all.return_value = []
 
         streams = asyncio.get_event_loop().run_until_complete(
@@ -272,6 +273,7 @@ class TestChannelPipelineEngineFetchStreams:
         """Fetch streams from specific M3U accounts."""
         mock_session = MagicMock()
         mock_get_session.return_value = mock_session
+        mock_session.query.return_value.all.return_value = []
         mock_session.query.return_value.filter.return_value.all.return_value = []
 
         streams = asyncio.get_event_loop().run_until_complete(
@@ -286,6 +288,7 @@ class TestChannelPipelineEngineFetchStreams:
         """Fetch streams handles API failure gracefully."""
         mock_session = MagicMock()
         mock_get_session.return_value = mock_session
+        mock_session.query.return_value.all.return_value = []
         mock_session.query.return_value.filter.return_value.all.return_value = []
 
         self.client.get_streams = AsyncMock(side_effect=Exception("API error"))
@@ -301,6 +304,7 @@ class TestChannelPipelineEngineFetchStreams:
         """Fetch streams from accounts specified in rules."""
         mock_session = MagicMock()
         mock_get_session.return_value = mock_session
+        mock_session.query.return_value.all.return_value = []
         mock_session.query.return_value.filter.return_value.all.return_value = []
 
         mock_rule = MagicMock()
@@ -2577,6 +2581,702 @@ def _success_stats_dict(stream_id, resolution="1920x1080", fps="25", stream_name
         "is_black_screen": False,
         "is_low_fps": False,
     }
+
+
+class TestOrdinaryStreamAdmission:
+    """Ordinary rules admit a failed stream only after a successful probe."""
+
+    @staticmethod
+    def _settings():
+        settings = _mk_smart_sort_settings(
+            stream_sort_priority=["resolution"],
+            stream_sort_enabled={"resolution": True},
+            deprioritize_failed_streams=True,
+            failed_stream_sort_order=["failed", "black_screen", "low_fps"],
+        )
+        settings.strike_threshold = 3
+        settings.timezone_preference = "both"
+        settings.include_channel_number_in_name = False
+        settings.channel_number_separator = "-"
+        settings.default_channel_profile_ids = []
+        settings.auto_rename_channel_number = False
+        settings.auto_creation_excluded_terms = []
+        settings.auto_creation_excluded_groups = []
+        settings.auto_creation_exclude_auto_sync_groups = False
+        settings.max_auto_creation_log_entries = 1000
+        settings.max_auto_created_channels_per_run = 0
+        return settings
+
+    @staticmethod
+    def _quality_rule(rule_id=1):
+        rule = MagicMock()
+        rule.id = rule_id
+        rule.sort_field = "quality"
+        rule.stream_sort_field = "quality"
+        rule.probe_on_sort = True
+        return rule
+
+    @staticmethod
+    def _matched(streams, rule):
+        return [(stream, rule, [], []) for stream in streams]
+
+    @staticmethod
+    def _empty_session():
+        session = MagicMock()
+        session.query.return_value.all.return_value = []
+        session.query.return_value.filter.return_value.all.return_value = []
+        return session
+
+    @pytest.mark.parametrize("run_trigger", ["api", "m3u_refresh"])
+    @pytest.mark.asyncio
+    async def test_cleanup_keeps_failed_stream_out_until_success(
+        self, test_session, run_trigger,
+    ):
+        from models import ChannelPipelineRule, StreamStats
+        from stream_prober import StreamProber
+        from tasks.struck_stream_cleanup import StruckStreamCleanupTask
+
+        failed_id = 10
+        healthy_id = 20
+        channels = [
+            {
+                "id": 50,
+                "name": "ESPN",
+                "streams": [failed_id, healthy_id],
+                "auto_created": False,
+            },
+            {
+                "id": 51,
+                "name": "News",
+                "streams": [30, 40],
+                "auto_created": False,
+            },
+        ]
+        source_streams = [
+            {"id": failed_id, "name": "ESPN", "url": "http://media/failed"},
+            {"id": healthy_id, "name": "ESPN", "url": "http://media/healthy"},
+            {"id": 30, "name": "News", "url": "http://media/news"},
+            {"id": 40, "name": "Foreign News", "url": "http://media/foreign"},
+        ]
+        test_session.add_all([
+            StreamStats(
+                stream_id=failed_id,
+                stream_name="ESPN",
+                probe_status="failed",
+                error_message="upstream unavailable",
+                consecutive_failures=3,
+                resolution="3840x2160",
+            ),
+            StreamStats(
+                stream_id=healthy_id,
+                stream_name="ESPN",
+                probe_status="success",
+                consecutive_failures=0,
+                resolution="1920x1080",
+            ),
+            StreamStats(
+                stream_id=30,
+                stream_name="News",
+                probe_status="success",
+                consecutive_failures=0,
+                resolution="1280x720",
+            ),
+        ])
+        test_session.commit()
+
+        async def get_channels(page=1, page_size=100):
+            return {
+                "count": len(channels),
+                "results": [
+                    {**channel, "streams": list(channel["streams"])}
+                    for channel in channels
+                ],
+            }
+
+        async def update_channel(channel_id, changes):
+            channel = next(item for item in channels if item["id"] == channel_id)
+            for key, value in changes.items():
+                channel[key] = list(value) if key == "streams" else value
+            return {**channel, "streams": list(channel["streams"])}
+
+        client = MagicMock()
+        client.get_channels = AsyncMock(side_effect=get_channels)
+        client.get_channel_groups = AsyncMock(return_value=[])
+        client.get_m3u_accounts = AsyncMock(return_value=[
+            {"id": 1, "name": "Provider A"},
+        ])
+        client.get_streams = AsyncMock(return_value={
+            "count": len(source_streams),
+            "results": source_streams,
+        })
+        client.update_channel = AsyncMock(side_effect=update_channel)
+        client.create_channel = AsyncMock(
+            side_effect=AssertionError("the existing ESPN channel must be reused")
+        )
+        client.assign_channel_numbers = AsyncMock(return_value={})
+
+        settings = self._settings()
+        cleanup = StruckStreamCleanupTask()
+        with patch("tasks.struck_stream_cleanup.get_settings", return_value=settings), \
+             patch("tasks.struck_stream_cleanup.get_session", return_value=test_session), \
+             patch("tasks.struck_stream_cleanup.get_client", return_value=client):
+            cleanup_result = await cleanup.execute()
+
+        assert cleanup_result.success is True
+        assert channels[0]["streams"] == [healthy_id]
+        assert channels[1]["streams"] == [30, 40]
+        failed = test_session.query(StreamStats).filter_by(stream_id=failed_id).one()
+        assert failed.probe_status == "failed"
+        assert failed.error_message == "upstream unavailable"
+        assert failed.consecutive_failures == 3
+        assert failed.resolution == "3840x2160"
+
+        rule = ChannelPipelineRule()
+        rule.id = 1
+        rule.name = "ESPN admission"
+        rule.priority = 0
+        rule.enabled = True
+        rule.m3u_account_id = None
+        rule.target_group_id = None
+        rule.stop_on_first_match = True
+        rule.match_scope_target_group = False
+        rule.match_scope_group_id = None
+        rule.allow_manual_channel_merge = True
+        rule.fold_match_key = False
+        rule.skip_struck_streams = True
+        rule.sort_field = "quality"
+        rule.sort_order = "desc"
+        rule.probe_on_sort = True
+        rule.stream_sort_field = "quality"
+        rule.stream_sort_order = "desc"
+        rule.quality_tie_break_order = "desc"
+        rule.quality_m3u_tie_break_enabled = True
+        rule.orphan_action = "none"
+        rule.set_conditions([{"type": "stream_name_contains", "value": "ESPN"}])
+        rule.set_actions([{
+            "type": "create_channel",
+            "name_template": "ESPN",
+            "if_exists": "merge",
+        }])
+
+        prober = StreamProber(client=client, max_concurrent_probes=1)
+        prober.account_probe_limits = {1: 1}
+        prober.refresh_account_probe_limits = AsyncMock()
+
+        async def save_failure(stream_id, _url, name):
+            return prober._save_probe_result(
+                stream_id, name, None, "failed", "still unavailable"
+            )
+
+        prober.probe_stream = AsyncMock(side_effect=save_failure)
+
+        async def run_once(engine):
+            await engine._load_existing_data()
+            streams = await engine._fetch_streams(rules=[rule])
+            execution = MagicMock(id=1)
+            return await engine._process_streams(
+                streams, [rule], execution, dry_run=False,
+                triggered_by=run_trigger,
+            )
+
+        with patch("channel_pipeline_engine.get_settings", return_value=settings), \
+             patch("channel_pipeline_engine.get_session", return_value=test_session), \
+             patch("stream_prober.get_session", return_value=test_session), \
+             patch("stream_prober.get_prober", return_value=prober), \
+             patch("channel_pipeline_executor.journal.log_entries"):
+            first_engine = ChannelPipelineEngine(client)
+            first = await run_once(first_engine)
+
+            failed = test_session.query(StreamStats).filter_by(
+                stream_id=failed_id
+            ).one()
+            assert failed.probe_status == "failed"
+            assert failed.consecutive_failures == 4
+            assert failed_id in first_engine._stream_stats_cache
+            assert failed_id in first_engine._struck_stream_ids
+            assert first["streams_skipped_struck"] == 1
+            assert channels[0]["streams"] == [healthy_id]
+            assert channels[1]["streams"] == [30, 40]
+
+            prober._save_probe_result(
+                failed_id,
+                "ESPN",
+                {
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "width": 1920,
+                            "height": 1080,
+                            "codec_name": "h264",
+                            "r_frame_rate": "30/1",
+                        },
+                        {
+                            "codec_type": "audio",
+                            "codec_name": "aac",
+                            "channels": 2,
+                        },
+                    ],
+                    "format": {"format_name": "hls", "bit_rate": "5000000"},
+                },
+                "success",
+                None,
+            )
+            failed = test_session.query(StreamStats).filter_by(
+                stream_id=failed_id
+            ).one()
+            assert failed.consecutive_failures == 0
+            assert failed.probe_status == "success"
+
+            prober.probe_stream.reset_mock()
+            second_engine = ChannelPipelineEngine(client)
+            second = await run_once(second_engine)
+            assert second["streams_merged"] == 1
+            assert channels[0]["streams"].count(failed_id) == 1
+            assert healthy_id in channels[0]["streams"]
+            assert channels[1]["streams"] == [30, 40]
+            prober.probe_stream.assert_not_awaited()
+
+            third_engine = ChannelPipelineEngine(client)
+            third = await run_once(third_engine)
+            assert third["streams_merged"] == 0
+            assert channels[0]["streams"].count(failed_id) == 1
+            assert channels[1]["streams"] == [30, 40]
+            prober.probe_stream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_quality_sort_keeps_failed_stream_below_success(
+        self, test_session,
+    ):
+        from models import StreamStats
+
+        test_session.add_all([
+            StreamStats(
+                stream_id=1,
+                stream_name="ESPN 4K",
+                probe_status="failed",
+                consecutive_failures=2,
+                resolution="3840x2160",
+            ),
+            StreamStats(
+                stream_id=2,
+                stream_name="ESPN FHD",
+                probe_status="success",
+                consecutive_failures=0,
+                resolution="1920x1080",
+            ),
+        ])
+        test_session.commit()
+
+        client = MagicMock()
+        client.update_channel = AsyncMock(return_value={})
+        engine = ChannelPipelineEngine(client)
+        engine._existing_channels = [{
+            "id": 7,
+            "name": "ESPN",
+            "streams": [1, 2, 3],
+        }]
+        settings = self._settings()
+        rule = self._quality_rule()
+        rule.stream_sort_order = "desc"
+        rule.quality_tie_break_order = "desc"
+        rule.quality_m3u_tie_break_enabled = False
+
+        with patch("channel_pipeline_engine.get_session", return_value=test_session), \
+             patch("channel_pipeline_engine.get_settings", return_value=settings):
+            await engine._load_stream_stats()
+
+        assert set(engine._stream_stats_cache) == {1, 2}
+        results = {"execution_log": [], "dry_run_results": []}
+        await engine._reorder_channel_streams(
+            [rule],
+            {rule.id: [7]},
+            results,
+            dry_run=False,
+            settings=settings,
+            stream_name_map={
+                1: "ESPN 4K",
+                2: "ESPN FHD",
+                3: "ESPN HD",
+            },
+        )
+
+        client.update_channel.assert_awaited_once_with(
+            7, {"streams": [2, 3, 1]}
+        )
+        assert engine._stream_stats_cache[1]["probe_status"] == "failed"
+        assert engine._stream_stats_cache[2]["probe_status"] == "success"
+        assert 3 not in engine._stream_stats_cache
+
+    @pytest.mark.asyncio
+    async def test_failed_stats_do_not_satisfy_quality_conditions(
+        self, test_session,
+    ):
+        from models import StreamStats
+        from stream_prober import StreamProber
+
+        test_session.add_all([
+            StreamStats(
+                stream_id=11,
+                stream_name="Failed 4K",
+                probe_status="failed",
+                consecutive_failures=2,
+                resolution="3840x2160",
+                video_codec="hevc",
+                audio_codec="ac3",
+                audio_channels=6,
+                bitrate=15_000_000,
+            ),
+            StreamStats(
+                stream_id=12,
+                stream_name="Healthy FHD",
+                probe_status="success",
+                consecutive_failures=0,
+                resolution="1920x1080",
+                video_codec="h264",
+                audio_codec="aac",
+                audio_channels=2,
+                bitrate=5_000_000,
+            ),
+        ])
+        test_session.commit()
+
+        client = MagicMock()
+        client.get_m3u_accounts = AsyncMock(return_value=[
+            {"id": 1, "name": "Provider A"},
+        ])
+        client.get_streams = AsyncMock(return_value={
+            "count": 2,
+            "results": [
+                {"id": 11, "name": "Failed 4K", "url": "http://media/11"},
+                {"id": 12, "name": "Healthy FHD", "url": "http://media/12"},
+            ],
+        })
+        engine = ChannelPipelineEngine(client)
+        engine._existing_groups = []
+        settings = self._settings()
+
+        with patch("channel_pipeline_engine.get_session", return_value=test_session), \
+             patch("channel_pipeline_engine.get_settings", return_value=settings):
+            streams = await engine._fetch_streams()
+
+        by_id = {stream.stream_id: stream for stream in streams}
+        failed = by_id[11]
+        healthy = by_id[12]
+        assert failed.resolution is None
+        assert failed.resolution_height is None
+        assert failed.video_codec is None
+        assert failed.audio_codec is None
+        assert failed.audio_tracks == 1
+        assert failed.bitrate is None
+        assert healthy.resolution == "1920x1080"
+        assert healthy.resolution_height == 1080
+        assert healthy.video_codec == "h264"
+        assert healthy.audio_codec == "aac"
+        assert healthy.audio_tracks == 2
+        assert healthy.bitrate == 5_000_000
+
+        prober = StreamProber(client=client, max_concurrent_probes=1)
+        prober.account_probe_limits = {1: 1}
+        prober.refresh_account_probe_limits = AsyncMock()
+
+        async def save_failure(stream_id, _url, name):
+            return prober._save_probe_result(
+                stream_id, name, None, "failed", "still unavailable"
+            )
+
+        prober.probe_stream = AsyncMock(side_effect=save_failure)
+        rule = self._quality_rule()
+        results = {"execution_log": [], "dry_run_results": []}
+        with patch("channel_pipeline_engine.get_session", return_value=test_session), \
+             patch("channel_pipeline_engine.get_settings", return_value=settings), \
+             patch("stream_prober.get_session", return_value=test_session), \
+             patch("stream_prober.get_prober", return_value=prober):
+            await engine._probe_unprobed_streams(
+                self._matched([failed], rule), [rule], results, dry_run=False
+            )
+
+        assert engine._stream_stats_cache[11]["probe_status"] == "failed"
+        assert engine._stream_stats_cache[11]["resolution"] == "3840x2160"
+        assert engine._stream_stats_cache[11]["consecutive_failures"] == 3
+        assert failed.resolution is None
+        assert failed.resolution_height is None
+        assert failed.video_codec is None
+        assert failed.audio_codec is None
+        assert failed.audio_tracks == 1
+        assert failed.bitrate is None
+        prober.refresh_account_probe_limits.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_sort_probe_respects_account_capacity(self):
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=3)
+        prober.account_probe_limits = {2: 1}
+        refreshed = asyncio.Event()
+        media_started = asyncio.Event()
+
+        async def refresh_limits():
+            refreshed.set()
+
+        async def probe_stream(*_args):
+            media_started.set()
+            return {"probe_status": "success"}
+
+        async def wait_for_waiter():
+            for _ in range(100):
+                if prober._probe_condition._waiters:
+                    return
+                await asyncio.sleep(0)
+            raise AssertionError("ordinary probe did not wait for account capacity")
+
+        prober.refresh_account_probe_limits = AsyncMock(
+            side_effect=refresh_limits
+        )
+        prober.probe_stream = AsyncMock(side_effect=probe_stream)
+        rule = self._quality_rule()
+        stream = StreamContext(
+            stream_id=70,
+            stream_name="ESPN",
+            stream_url="http://media/70",
+            m3u_account_id=2,
+        )
+        engine = ChannelPipelineEngine(MagicMock())
+        session = self._empty_session()
+        settings = self._settings()
+
+        event_claim = prober.semaphore_for_account(2, event=True)
+        await event_claim.__aenter__()
+        claim_released = False
+        ordinary = None
+        try:
+            with patch("stream_prober.get_prober", return_value=prober), \
+                 patch("channel_pipeline_engine.get_session", return_value=session), \
+                 patch("channel_pipeline_engine.get_settings", return_value=settings):
+                ordinary = asyncio.create_task(engine._probe_unprobed_streams(
+                    self._matched([stream], rule),
+                    [rule],
+                    {"execution_log": [], "dry_run_results": []},
+                    dry_run=False,
+                ))
+                for _ in range(100):
+                    if (
+                        refreshed.is_set()
+                        or media_started.is_set()
+                        or ordinary.done()
+                    ):
+                        break
+                    await asyncio.sleep(0)
+                assert (
+                    refreshed.is_set()
+                    or media_started.is_set()
+                    or ordinary.done()
+                )
+                assert not media_started.is_set()
+                await wait_for_waiter()
+                await event_claim.__aexit__(None, None, None)
+                claim_released = True
+                await asyncio.wait_for(ordinary, timeout=1)
+        finally:
+            if not claim_released:
+                await event_claim.__aexit__(None, None, None)
+            if ordinary is not None:
+                ordinary.cancel()
+                await asyncio.gather(ordinary, return_exceptions=True)
+
+        assert media_started.is_set()
+        assert prober._account_active == {}
+        assert prober._event_probes == 0
+        prober.refresh_account_probe_limits.assert_awaited_once_with()
+
+        refreshed.clear()
+        media_started.clear()
+        prober.refresh_account_probe_limits.reset_mock()
+        event_claim = prober.semaphore_for_account(2, event=True)
+        await event_claim.__aenter__()
+        ordinary = None
+        try:
+            with patch("stream_prober.get_prober", return_value=prober), \
+                 patch("channel_pipeline_engine.get_session", return_value=session), \
+                 patch("channel_pipeline_engine.get_settings", return_value=settings):
+                ordinary = asyncio.create_task(engine._probe_unprobed_streams(
+                    self._matched([stream], rule),
+                    [rule],
+                    {"execution_log": [], "dry_run_results": []},
+                    dry_run=False,
+                ))
+                for _ in range(100):
+                    if (
+                        refreshed.is_set()
+                        or media_started.is_set()
+                        or ordinary.done()
+                    ):
+                        break
+                    await asyncio.sleep(0)
+                assert (
+                    refreshed.is_set()
+                    or media_started.is_set()
+                    or ordinary.done()
+                )
+                assert not media_started.is_set()
+                await wait_for_waiter()
+                ordinary.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await ordinary
+                assert prober._account_active == {2: 1}
+                assert prober._event_probes == 1
+        finally:
+            await event_claim.__aexit__(None, None, None)
+            if ordinary is not None:
+                ordinary.cancel()
+                await asyncio.gather(ordinary, return_exceptions=True)
+
+        assert prober._account_active == {}
+        assert prober._event_probes == 0
+        prober.refresh_account_probe_limits.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_sort_probe_respects_global_limit(self):
+        from stream_prober import StreamProber
+
+        settings = self._settings()
+        rule = self._quality_rule()
+
+        async def measure(configured_limit, stream_count, expected_peak):
+            prober = StreamProber(
+                client=MagicMock(), max_concurrent_probes=configured_limit
+            )
+            prober.account_probe_limits = {
+                account_id: 1 for account_id in range(1, stream_count + 1)
+            }
+            prober.refresh_account_probe_limits = AsyncMock()
+            release = asyncio.Event()
+            started = {
+                stream_id: asyncio.Event()
+                for stream_id in range(1, stream_count + 1)
+            }
+            active = 0
+            peak = 0
+
+            async def probe_stream(stream_id, _url, _name):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                started[stream_id].set()
+                await release.wait()
+                active -= 1
+                return {"probe_status": "success"}
+
+            prober.probe_stream = AsyncMock(side_effect=probe_stream)
+            streams = [
+                StreamContext(
+                    stream_id=stream_id,
+                    stream_name=f"Stream {stream_id}",
+                    stream_url=f"http://media/{stream_id}",
+                    m3u_account_id=stream_id,
+                )
+                for stream_id in range(1, stream_count + 1)
+            ]
+            engine = ChannelPipelineEngine(MagicMock())
+            session = self._empty_session()
+            with patch("stream_prober.get_prober", return_value=prober), \
+                 patch("channel_pipeline_engine.get_session", return_value=session), \
+                 patch("channel_pipeline_engine.get_settings", return_value=settings):
+                ordinary = asyncio.create_task(engine._probe_unprobed_streams(
+                    self._matched(streams, rule),
+                    [rule],
+                    {"execution_log": [], "dry_run_results": []},
+                    dry_run=False,
+                ))
+                try:
+                    for _ in range(100):
+                        started_count = sum(
+                            event.is_set() for event in started.values()
+                        )
+                        if started_count >= expected_peak:
+                            break
+                        await asyncio.sleep(0)
+                    assert started_count == expected_peak
+                    release.set()
+                    await asyncio.wait_for(ordinary, timeout=1)
+                finally:
+                    release.set()
+                    ordinary.cancel()
+                    await asyncio.gather(ordinary, return_exceptions=True)
+
+            assert peak == expected_peak
+            assert prober._account_active == {}
+            prober.refresh_account_probe_limits.assert_awaited_once_with()
+
+        await measure(configured_limit=1, stream_count=2, expected_peak=1)
+        await measure(configured_limit=8, stream_count=4, expected_peak=3)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "disabled",
+            "nonquality",
+            "dryrun",
+            "cachedsuccess",
+            "missingurl",
+            "unavailable",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_sort_probe_controls_preserve_optional_behavior(self, case):
+        rule = self._quality_rule()
+        stream = StreamContext(
+            stream_id=90,
+            stream_name="ESPN",
+            stream_url="http://media/90",
+            m3u_account_id=4,
+        )
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._stream_stats_cache = {
+            91: {
+                "stream_id": 91,
+                "probe_status": "failed",
+                "consecutive_failures": 3,
+            },
+        }
+        engine._struck_stream_ids = {91}
+        dry_run = False
+        prober = MagicMock()
+        prober.refresh_account_probe_limits = AsyncMock()
+        prober.probe_stream = AsyncMock()
+        available_prober = prober
+
+        if case == "disabled":
+            rule.probe_on_sort = False
+        elif case == "nonquality":
+            rule.sort_field = "stream_name"
+            rule.stream_sort_field = "provider_order"
+        elif case == "dryrun":
+            dry_run = True
+        elif case == "cachedsuccess":
+            engine._stream_stats_cache[90] = {"probe_status": "success"}
+        elif case == "missingurl":
+            stream.stream_url = None
+        elif case == "unavailable":
+            available_prober = None
+
+        expected_cache = {
+            stream_id: dict(stats)
+            for stream_id, stats in engine._stream_stats_cache.items()
+        }
+        results = {"execution_log": [], "dry_run_results": []}
+        with patch("stream_prober.get_prober", return_value=available_prober):
+            await engine._probe_unprobed_streams(
+                self._matched([stream], rule), [rule], results, dry_run=dry_run
+            )
+
+        assert engine._stream_stats_cache == expected_cache
+        assert engine._struck_stream_ids == {91}
+        prober.refresh_account_probe_limits.assert_not_awaited()
+        prober.probe_stream.assert_not_awaited()
+        if case == "dryrun":
+            assert len(results["dry_run_results"]) == 1
+        else:
+            assert results["dry_run_results"] == []
 
 
 class TestSmartSortMeasuredBitrate:

@@ -50,6 +50,7 @@ TERMINAL_PENDING_STAGES = frozenset({"complete", "failed", "expired", "allocatio
 RECOVERABLE_REASONS = frozenset({
     "guide_failed", "guide_expired", "programme_missing", "health_unknown", "health_failed",
 })
+HEALTH_REASONS = frozenset({"health_unknown", "health_failed"})
 
 
 @dataclass(frozen=True)
@@ -298,14 +299,25 @@ def _pending_channel(event_key: str, value) -> dict:
     if history is None or len(history) > 2:
         raise ValueError("Pending channel history is invalid.")
     attempt_no = _positive(value["attempt_no"], "pending channel attempt number")
-    if attempt_no > 3 or len(history) != attempt_no - 1:
+    history_length = min(attempt_no - 1, 2)
+    if len(history) != history_length:
         raise ValueError("Pending channel attempt history is incomplete.")
     attempt_ids = [item["attempt_id"] for item in history]
     attempt_id = _attempt(value["attempt_id"], "pending channel attempt ID")
     if attempt_id in attempt_ids or len(attempt_ids) != len(set(attempt_ids)):
         raise ValueError("Pending channel attempt IDs are not unique.")
-    if [item["attempt_no"] for item in history] != list(range(1, attempt_no)):
+    if [item["attempt_no"] for item in history] != list(
+        range(attempt_no - history_length, attempt_no)
+    ):
         raise ValueError("Pending channel history order is invalid.")
+    if attempt_no > 3:
+        latest = history[-1]
+        if (
+            latest["stage"] != "failed"
+            or latest["reason"] not in HEALTH_REASONS
+            or latest["input_hash"] != value["input_hash"]
+        ):
+            raise ValueError("Extended pending channel history is invalid.")
     record = {
         "event_key": event_key,
         "rule_id": _positive(value["rule_id"], "pending channel rule ID"),
@@ -1452,16 +1464,42 @@ def _admit_pending(
         or candidate["start"] != existing["start"]
         or candidate["stop"] != existing["stop"]
         or (existing["channel_uuid"] is not None and candidate["channel_uuid"] != existing["channel_uuid"])
-        or existing["attempt_no"] >= 3
     ):
         return None
-    attempted = [item["input_hash"] for item in existing["history"]]
-    attempted.append(existing["input_hash"])
-    matches = attempted.count(candidate["input_hash"])
-    retry_at = _utc(existing["retry_at"], "pending channel retry time") if existing["retry_at"] else None
-    if matches >= 2 or (matches == 1 and (retry_at is None or now < retry_at)):
+    health_failure = (
+        existing["stage"] == "failed"
+        and existing["reason"] in HEALTH_REASONS
+    )
+    same_health_input = (
+        health_failure
+        and existing["input_hash"] == candidate["input_hash"]
+    )
+    health_recovery = (
+        same_health_input
+        and existing["title"] == candidate["title"]
+        and existing["channel_name"] == candidate["channel_name"]
+        and existing["execution_id"] == candidate["execution_id"]
+        and existing["channel_uuid"] is not None
+        and candidate["channel_uuid"] == existing["channel_uuid"]
+    )
+    if same_health_input and not health_recovery:
         return None
-    history = [*copy.deepcopy(existing["history"]), _terminal_snapshot(existing, revision, xmltv_hash)]
+    retry_at = _utc(existing["retry_at"], "pending channel retry time") if existing["retry_at"] else None
+    if health_recovery:
+        if retry_at is None or now < retry_at:
+            return None
+    else:
+        if existing["attempt_no"] >= 3:
+            return None
+        attempted = [item["input_hash"] for item in existing["history"]]
+        attempted.append(existing["input_hash"])
+        matches = attempted.count(candidate["input_hash"])
+        if matches >= 2 or (matches == 1 and (retry_at is None or now < retry_at)):
+            return None
+    history = [
+        *copy.deepcopy(existing["history"]),
+        _terminal_snapshot(existing, revision, xmltv_hash),
+    ][-2:]
     receipt = {
         **{key: copy.deepcopy(candidate[key]) for key in (
             "event_key", "rule_id", "rule_hash", "config_hash", "profile_id",

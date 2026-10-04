@@ -133,6 +133,29 @@ def pending_candidate(*, channel_id=1, stream_name="Falcons vs Wolves"):
     }
 
 
+def _fail_pending(publication, reason, terminal_at):
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    failed = {
+        **receipt,
+        "stage": "failed",
+        "reason": reason,
+        "terminal_at": terminal_at.isoformat(),
+        "retry_at": (terminal_at + timedelta(minutes=5)).isoformat(),
+    }
+    revision = update_delivery(
+        publication["scope"],
+        expected_revision=publication["revision"],
+        expected_hash=publication["state"]["xmltv_hash"],
+        expected_pending={event_key: receipt["attempt_id"]},
+        pending_channels={event_key: failed},
+    )
+    stored = read_publication(publication["scope"])
+    assert stored["revision"] == revision
+    return stored
+
+
 @pytest.mark.parametrize("hidden", [True, False, None], ids=["hidden", "visible", "omitted"])
 def test_reported_ended_assignment_keeps_header_without_unconfirmed_programme(hidden):
     now = datetime(2026, 10, 3, 18, 45, tzinfo=timezone.utc)
@@ -879,6 +902,535 @@ def test_delivery_attempt_reuses_expiry_and_bounds_successor_history():
             "arena:falcons-wolves": pending_candidate(stream_name="Falcons vs Wolves UHD"),
         },
     ) is None
+
+
+@pytest.mark.parametrize("reason", ["health_failed", "health_unknown"])
+def test_health_recovery_keeps_latest_attempts(reason):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    admitted = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={"arena:falcons-wolves": pending_candidate()},
+    )
+    receipt = admitted["state"]["delivery"]["pending_channels"][
+        "arena:falcons-wolves"
+    ]
+    allocation = (
+        receipt["channel_id"],
+        receipt["channel_uuid"],
+        receipt["execution_id"],
+        receipt["input_hash"],
+    )
+    attempt_ids = [receipt["attempt_id"]]
+    snapshots = []
+    snapshot_fields = (
+        "attempt_id", "attempt_no", "input_hash", "admitted_at", "expires_at",
+        "terminal_at", "retry_at", "stage", "reason", "execution_id",
+        "channel_id", "channel_uuid", "guide_attempt_id", "rule_hash",
+        "config_hash",
+    )
+
+    for attempt_no in range(2, 5):
+        terminal_at = NOW + timedelta(minutes=attempt_no * 10)
+        failed = _fail_pending(admitted, reason, terminal_at)
+        failed_receipt = failed["state"]["delivery"]["pending_channels"][
+            "arena:falcons-wolves"
+        ]
+        snapshot = {
+            key: copy.deepcopy(failed_receipt[key])
+            for key in snapshot_fields
+        }
+        snapshot["revision"] = failed["revision"]
+        snapshot["xmltv_hash"] = failed["state"]["xmltv_hash"]
+        snapshots.append(snapshot)
+
+        admitted = begin_delivery(
+            "profile:1",
+            expected_revision=failed["revision"],
+            expected_hash=failed["state"]["xmltv_hash"],
+            profile=profile(),
+            now=terminal_at + timedelta(minutes=5),
+            pending_channels={"arena:falcons-wolves": pending_candidate()},
+        )
+        assert admitted is not None
+        fresh = read_publication("profile:1")
+        assert fresh == admitted
+        receipt = fresh["state"]["delivery"]["pending_channels"][
+            "arena:falcons-wolves"
+        ]
+        attempt_ids.append(receipt["attempt_id"])
+        assert receipt["attempt_no"] == attempt_no
+        assert receipt["history"] == snapshots[-2:]
+        assert (
+            receipt["channel_id"],
+            receipt["channel_uuid"],
+            receipt["execution_id"],
+            receipt["input_hash"],
+        ) == allocation
+        assert len(attempt_ids) == len(set(attempt_ids))
+
+
+@pytest.mark.parametrize("boundary", ["before", "at", "ended"])
+def test_health_recovery_waits_for_retry(boundary):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+    admitted = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    first = admitted["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    terminal_at = NOW + timedelta(minutes=1)
+    failed = _fail_pending(admitted, "health_failed", terminal_at)
+    before = copy.deepcopy(failed)
+    retry_at = terminal_at + timedelta(minutes=5)
+    now = {
+        "before": retry_at - timedelta(microseconds=1),
+        "at": retry_at,
+        "ended": datetime.fromisoformat(candidate["stop"]),
+    }[boundary]
+
+    successor = begin_delivery(
+        "profile:1",
+        expected_revision=failed["revision"],
+        expected_hash=failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=now,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+
+    if boundary != "at":
+        assert successor is None
+        assert read_publication("profile:1") == before
+        return
+    receipt = successor["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    assert receipt["attempt_no"] == 2
+    assert receipt["admitted_at"] == retry_at.isoformat()
+    assert receipt["expires_at"] == candidate["stop"]
+    assert receipt["history"][0]["expires_at"] == first["expires_at"]
+    assert receipt["history"][0]["terminal_at"] == terminal_at.isoformat()
+
+
+def test_health_recovery_outlives_failed_attempt():
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+    candidate["stop"] = (NOW + timedelta(hours=30)).isoformat()
+    admitted = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    first_attempt = admitted["state"]["delivery"]["guide_attempt"]
+    first_receipt = admitted["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    failed = _fail_pending(admitted, "health_failed", NOW + timedelta(minutes=1))
+    failed_receipt = failed["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    late = datetime.fromisoformat(first_receipt["expires_at"]) + timedelta(minutes=1)
+
+    successor = begin_delivery(
+        "profile:1",
+        expected_revision=failed["revision"],
+        expected_hash=failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=late,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    assert successor is not None
+    next_attempt = successor["state"]["delivery"]["guide_attempt"]
+    next_receipt = successor["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    assert next_attempt["attempt_id"] != first_attempt["attempt_id"]
+    assert next_receipt["attempt_id"] != failed_receipt["attempt_id"]
+    assert next_receipt["guide_attempt_id"] == next_attempt["attempt_id"]
+    assert next_receipt["expires_at"] == candidate["stop"]
+    assert next_receipt["history"][-1]["expires_at"] == first_receipt["expires_at"]
+    assert next_receipt["history"][-1]["terminal_at"] == failed_receipt["terminal_at"]
+    before_stale_write = copy.deepcopy(successor)
+    assert update_delivery(
+        "profile:1",
+        expected_revision=successor["revision"],
+        expected_pending={candidate["event_key"]: failed_receipt["attempt_id"]},
+        pending_channels=successor["state"]["delivery"]["pending_channels"],
+    ) is None
+    assert read_publication("profile:1") == before_stale_write
+
+    expired_at = late + timedelta(minutes=1)
+    expired = {
+        **next_receipt,
+        "stage": "expired",
+        "reason": "guide_expired",
+        "terminal_at": expired_at.isoformat(),
+        "retry_at": (expired_at + timedelta(minutes=5)).isoformat(),
+    }
+    expired_revision = update_delivery(
+        "profile:1",
+        expected_revision=successor["revision"],
+        expected_pending={candidate["event_key"]: next_receipt["attempt_id"]},
+        pending_channels={candidate["event_key"]: expired},
+    )
+    expired_publication = read_publication("profile:1")
+    assert expired_publication["revision"] == expired_revision
+    assert begin_delivery(
+        "profile:1",
+        expected_revision=expired_revision,
+        expected_hash=expired_publication["state"]["xmltv_hash"],
+        profile=profile(),
+        now=expired_at + timedelta(minutes=5),
+        pending_channels={candidate["event_key"]: candidate},
+    ) is None
+    assert read_publication("profile:1") == expired_publication
+
+    second_profile = profile(2)
+    publish_profiles(
+        [second_profile], channel_map(2), coverage(2), observations={}, now=NOW,
+    )
+    second = read_publication("profile:2")
+    ended_candidate = pending_candidate(channel_id=2)
+    ended_candidate.update({
+        "event_key": "arena:ended-event",
+        "profile_id": 2,
+        "stop": (NOW + timedelta(minutes=10)).isoformat(),
+    })
+    ended_admission = begin_delivery(
+        "profile:2",
+        expected_revision=second["revision"],
+        expected_hash=second["state"]["xmltv_hash"],
+        profile=second_profile,
+        now=NOW,
+        pending_channels={ended_candidate["event_key"]: ended_candidate},
+    )
+    ended_failure = _fail_pending(
+        ended_admission, "health_unknown", NOW + timedelta(minutes=1),
+    )
+    assert begin_delivery(
+        "profile:2",
+        expected_revision=ended_failure["revision"],
+        expected_hash=ended_failure["state"]["xmltv_hash"],
+        profile=second_profile,
+        now=datetime.fromisoformat(ended_candidate["stop"]),
+        pending_channels={ended_candidate["event_key"]: ended_candidate},
+    ) is None
+    assert read_publication("profile:2") == ended_failure
+
+
+@pytest.mark.parametrize("reason", ["guide_failed", "programme_missing"])
+def test_health_recovery_keeps_nonhealth_limits(reason):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+    first = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    first_failed = _fail_pending(first, "health_failed", NOW + timedelta(minutes=1))
+    second = begin_delivery(
+        "profile:1",
+        expected_revision=first_failed["revision"],
+        expected_hash=first_failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW + timedelta(minutes=6),
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    second_failed = _fail_pending(second, reason, NOW + timedelta(minutes=7))
+    retry = NOW + timedelta(minutes=12)
+    assert begin_delivery(
+        "profile:1",
+        expected_revision=second_failed["revision"],
+        expected_hash=second_failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=retry,
+        pending_channels={candidate["event_key"]: candidate},
+    ) is None
+    assert read_publication("profile:1") == second_failed
+
+    changed = pending_candidate(stream_name="Falcons vs Wolves HD")
+    third = begin_delivery(
+        "profile:1",
+        expected_revision=second_failed["revision"],
+        expected_hash=second_failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=retry,
+        pending_channels={changed["event_key"]: changed},
+    )
+    third_receipt = third["state"]["delivery"]["pending_channels"][changed["event_key"]]
+    assert third_receipt["attempt_no"] == 3
+    assert third_receipt["input_hash"] != second["state"]["delivery"]["pending_channels"][
+        candidate["event_key"]
+    ]["input_hash"]
+    third_failed = _fail_pending(third, reason, NOW + timedelta(minutes=13))
+    changed_again = pending_candidate(stream_name="Falcons vs Wolves UHD")
+    assert begin_delivery(
+        "profile:1",
+        expected_revision=third_failed["revision"],
+        expected_hash=third_failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW + timedelta(minutes=18),
+        pending_channels={changed_again["event_key"]: changed_again},
+    ) is None
+    assert read_publication("profile:1") == third_failed
+
+
+@pytest.mark.parametrize("case", [
+    "missing_uuid", "changed_uuid", "absent_channel", "changed_rule",
+    "changed_profile", "changed_group", "changed_event_key", "changed_start",
+    "changed_stop", "changed_title", "changed_name", "changed_execution",
+    "stale_publication", "stale_attempt", "allocation_unknown",
+])
+def test_health_recovery_requires_same_owned_event(case):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+
+    if case == "allocation_unknown":
+        candidate["channel_id"] = None
+        candidate["channel_uuid"] = None
+        candidate["channel_exists"] = False
+        admitted = begin_delivery(
+            "profile:1",
+            expected_revision=current["revision"],
+            expected_hash=current["state"]["xmltv_hash"],
+            profile=profile(),
+            now=NOW,
+            pending_channels={candidate["event_key"]: candidate},
+        )
+        receipt = admitted["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+        assert receipt["stage"] == "intent"
+        allocating = {**receipt, "stage": "allocating"}
+        allocating_revision = update_delivery(
+            "profile:1",
+            expected_revision=admitted["revision"],
+            expected_pending={candidate["event_key"]: receipt["attempt_id"]},
+            pending_channels={candidate["event_key"]: allocating},
+        )
+        admitted = read_publication("profile:1")
+        assert admitted["revision"] == allocating_revision
+        receipt = admitted["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+        assert begin_delivery(
+            "profile:1",
+            expected_revision=admitted["revision"],
+            expected_hash=admitted["state"]["xmltv_hash"],
+            profile=profile(),
+            now=datetime.fromisoformat(receipt["expires_at"]),
+            pending_channels={candidate["event_key"]: candidate},
+        ) is None
+        closed = read_publication("profile:1")
+        assert closed["state"]["delivery"]["pending_channels"][
+            candidate["event_key"]
+        ]["stage"] == "allocation_unknown"
+        assert begin_delivery(
+            "profile:1",
+            expected_revision=closed["revision"],
+            expected_hash=closed["state"]["xmltv_hash"],
+            profile=profile(),
+            now=datetime.fromisoformat(receipt["expires_at"]) + timedelta(minutes=5),
+            pending_channels={candidate["event_key"]: pending_candidate()},
+        ) is None
+        assert read_publication("profile:1") == closed
+        return
+
+    admitted = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    failed = _fail_pending(admitted, "health_failed", NOW + timedelta(minutes=1))
+    before = copy.deepcopy(failed)
+    retry = NOW + timedelta(minutes=6)
+
+    if case == "stale_attempt":
+        assert update_delivery(
+            "profile:1",
+            expected_revision=failed["revision"],
+            expected_pending={candidate["event_key"]: "f" * 32},
+            pending_channels=failed["state"]["delivery"]["pending_channels"],
+        ) is None
+        assert read_publication("profile:1") == before
+        return
+
+    expected_revision = failed["revision"]
+    if case == "stale_publication":
+        expected_revision -= 1
+    elif case == "missing_uuid":
+        candidate["channel_uuid"] = None
+    elif case == "changed_uuid":
+        candidate["channel_uuid"] = "foreign-channel"
+    elif case == "absent_channel":
+        candidate["channel_exists"] = False
+    elif case == "changed_rule":
+        candidate["rule_id"] += 1
+    elif case == "changed_profile":
+        candidate["profile_id"] += 1
+    elif case == "changed_group":
+        candidate["target_group_id"] += 1
+    elif case == "changed_event_key":
+        candidate["event_key"] = "arena:other-event"
+    elif case == "changed_start":
+        candidate["start"] = (NOW - timedelta(minutes=29)).isoformat()
+    elif case == "changed_stop":
+        candidate["stop"] = (NOW + timedelta(hours=3)).isoformat()
+    elif case == "changed_title":
+        candidate["title"] = "Falcons vs Bears"
+    elif case == "changed_name":
+        candidate["channel_name"] = "Arena 2"
+    elif case == "changed_execution":
+        candidate["execution_id"] = "execution-2"
+
+    call = lambda: begin_delivery(
+        "profile:1",
+        expected_revision=expected_revision,
+        expected_hash=failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=retry,
+        pending_channels={"arena:falcons-wolves": candidate},
+    )
+    if case in {"changed_profile", "changed_event_key"}:
+        with pytest.raises(ValueError):
+            call()
+    else:
+        assert call() is None
+    assert read_publication("profile:1") == before
+
+
+def test_health_recovery_preserves_terminal_claims():
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+    admitted = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    failed = _fail_pending(admitted, "health_unknown", NOW + timedelta(minutes=1))
+    failed_receipt = failed["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    retry = NOW + timedelta(minutes=6)
+
+    planned = begin_delivery(
+        "profile:1",
+        expected_revision=failed["revision"],
+        expected_hash=failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=retry,
+        pending_channels={candidate["event_key"]: candidate},
+        plan_only=True,
+    )
+    assert planned["state"]["delivery"]["pending_channels"][candidate["event_key"]][
+        "attempt_no"
+    ] == 2
+    assert read_publication("profile:1") == failed
+
+    successor = begin_delivery(
+        "profile:1",
+        expected_revision=failed["revision"],
+        expected_hash=failed["state"]["xmltv_hash"],
+        profile=profile(),
+        now=retry,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    successor_receipt = successor["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    before_stale_write = copy.deepcopy(successor)
+    assert update_delivery(
+        "profile:1",
+        expected_revision=successor["revision"],
+        expected_pending={candidate["event_key"]: failed_receipt["attempt_id"]},
+        pending_channels=successor["state"]["delivery"]["pending_channels"],
+    ) is None
+    assert read_publication("profile:1") == before_stale_write
+
+    terminal = _fail_pending(successor, "health_failed", NOW + timedelta(minutes=7))
+    terminal_receipt = terminal["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    changed = copy.deepcopy(terminal_receipt)
+    changed["history"][0]["reason"] = "guide_failed"
+    with pytest.raises(ValueError, match="immutable"):
+        update_delivery(
+            "profile:1",
+            expected_revision=terminal["revision"],
+            expected_pending={candidate["event_key"]: terminal_receipt["attempt_id"]},
+            pending_channels={candidate["event_key"]: changed},
+        )
+    assert read_publication("profile:1") == terminal
+
+
+@pytest.mark.parametrize("case", [
+    "missing", "duplicate", "out_of_order", "oversized", "non_health",
+    "different_input",
+])
+def test_health_recovery_validates_recent_history(test_session, case):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    current = read_publication("profile:1")
+    candidate = pending_candidate()
+    publication = begin_delivery(
+        "profile:1",
+        expected_revision=current["revision"],
+        expected_hash=current["state"]["xmltv_hash"],
+        profile=profile(),
+        now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    assert publication["state"]["delivery"]["pending_channels"][candidate["event_key"]][
+        "attempt_no"
+    ] == 1
+    for attempt_no in range(2, 5):
+        terminal_at = NOW + timedelta(minutes=attempt_no * 10)
+        failed = _fail_pending(publication, "health_failed", terminal_at)
+        publication = begin_delivery(
+            "profile:1",
+            expected_revision=failed["revision"],
+            expected_hash=failed["state"]["xmltv_hash"],
+            profile=profile(),
+            now=terminal_at + timedelta(minutes=5),
+            pending_channels={candidate["event_key"]: candidate},
+        )
+        stored = read_publication("profile:1")
+        assert stored == publication
+        assert stored["state"]["delivery"]["pending_channels"][candidate["event_key"]][
+            "attempt_no"
+        ] == attempt_no
+
+    receipt = publication["state"]["delivery"]["pending_channels"][candidate["event_key"]]
+    assert [item["attempt_no"] for item in receipt["history"]] == [2, 3]
+    test_session.expire_all()
+    row = test_session.query(GuidePublication).filter_by(scope="profile:1").one()
+    state = json.loads(row.state)
+    history = state["delivery"]["pending_channels"][candidate["event_key"]]["history"]
+    if case == "missing":
+        history.pop(0)
+    elif case == "duplicate":
+        history[1]["attempt_id"] = history[0]["attempt_id"]
+    elif case == "out_of_order":
+        history.reverse()
+    elif case == "oversized":
+        older = copy.deepcopy(history[0])
+        older["attempt_id"] = "a" * 32
+        older["attempt_no"] = 1
+        history.insert(0, older)
+    elif case == "non_health":
+        history[-1]["reason"] = "guide_failed"
+    elif case == "different_input":
+        history[-1]["input_hash"] = "f" * 64
+    row.state = json.dumps(state)
+    test_session.commit()
+    with pytest.raises(ValueError):
+        read_publication("profile:1")
 
 
 def test_absent_profile_admission_is_unpublished_and_loses_without_mutation():

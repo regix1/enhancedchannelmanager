@@ -159,19 +159,6 @@ class StruckStreamCleanupTask(TaskScheduler):
             elapsed_ms = (time.time() - start) * 1000
             logger.info("[%s] Removed %d struck streams from channels in %.1fms", self.task_id, removed_count, elapsed_ms)
 
-            # Reset consecutive_failures for removed streams
-            if removed_count > 0:
-                session = get_session()
-                try:
-                    for sid in struck_ids:
-                        stats = session.query(StreamStats).filter_by(stream_id=sid).first()
-                        if stats:
-                            stats.consecutive_failures = 0
-                    session.commit()
-                    logger.info("[%s] Reset consecutive_failures for %d streams", self.task_id, len(struck_ids))
-                finally:
-                    session.close()
-
             self._set_progress(
                 success_count=removed_count,
                 failed_count=len(errors),

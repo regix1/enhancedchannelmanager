@@ -59,7 +59,11 @@ import database
 from channel_pipeline_engine import ChannelPipelineEngine
 from channel_pipeline_executor import ActionExecutor, ActionResult
 from models import ChannelPipelineRule, PendingMerge
-from services.event_sync_matcher import ParsedEvent, StreamMatchResult
+from services.event_sync_matcher import (
+    ParsedEvent,
+    StreamMatchResult,
+    parse_event_name,
+)
 from channel_number_prefix import (
     channel_name_to_id,
     strip_channel_number_prefix,
@@ -1657,6 +1661,7 @@ def _staged_event(db_session_factory, monkeypatch, *, dedicated=False):
         "client": client,
         "dummy_epg": dummy_epg,
         "flow_expires": flow_expires,
+        "health": health,
     }
 
 
@@ -5610,6 +5615,895 @@ async def test_event_preview_does_not_consume_health_progress(promotion_candidat
             assert result["promoted_created"] == 0
     assert setup["batches"] == [[], [], [7301]]
     setup["client"].create_channel.assert_not_awaited()
+
+
+def test_staged_event_recovers_after_health_failures(
+    db_session_factory,
+    monkeypatch,
+):
+    from services import event_sync_stream_health
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+    final_failures = ["failed", "unknown"]
+    active_stages = {"allocated", "importing", "linking", "ready"}
+    seen_attempts = set()
+
+    def set_health(kind):
+        observed_at = current[0].astimezone(timezone.utc)
+        if kind == "failed":
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "failed",
+                "measured_bitrate": 0,
+                "last_probed": observed_at.isoformat(),
+                "is_black_screen": None,
+                "black_screen_checked_at": None,
+            }
+        elif kind == "dark":
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "success",
+                "measured_bitrate": 5_000_000,
+                "last_probed": observed_at.isoformat(),
+                "is_black_screen": True,
+                "black_screen_checked_at": observed_at.isoformat(),
+            }
+        elif kind == "off_air":
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "success",
+                "measured_bitrate": 0,
+                "last_probed": observed_at.isoformat(),
+                "is_black_screen": False,
+                "black_screen_checked_at": observed_at.isoformat(),
+            }
+        elif kind == "stale":
+            stale_at = observed_at - timedelta(minutes=6)
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "success",
+                "measured_bitrate": 5_000_000,
+                "last_probed": stale_at.isoformat(),
+                "is_black_screen": False,
+                "black_screen_checked_at": stale_at.isoformat(),
+            }
+        elif kind == "incomplete":
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "success",
+                "measured_bitrate": 5_000_000,
+                "last_probed": observed_at.isoformat(),
+                "is_black_screen": None,
+                "black_screen_checked_at": None,
+            }
+        elif kind == "unknown":
+            health.clear()
+        else:
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "success",
+                "measured_bitrate": 5_000_000,
+                "last_probed": observed_at.isoformat(),
+                "is_black_screen": False,
+                "black_screen_checked_at": observed_at.isoformat(),
+            }
+
+    async def fail_after_admission(executor):
+        attempt_id = next((
+            receipt.get("attempt_id")
+            for event_key, work in executor._event_pending.items()
+            for receipt in [
+                executor._event_publications.get(
+                    work["profile_id"], {}
+                ).get("state", {}).get("delivery", {}).get(
+                    "pending_channels", {}
+                ).get(event_key)
+            ]
+            if receipt is not None
+            and receipt.get("stage") in active_stages
+        ), None)
+        if attempt_id is not None and attempt_id not in seen_attempts:
+            seen_attempts.add(attempt_id)
+            if final_failures:
+                set_health(final_failures.pop(0))
+        return await finish(executor)
+
+    def run_at(when, kind):
+        current[0] = when
+        set_health(kind)
+        session = db_session_factory()
+        try:
+            assert session.get(
+                ChannelPipelineRule,
+                setup["rule_id"],
+            ).get_event_sync_config()["retire_finished_events"] is True
+        finally:
+            session.close()
+        return dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=fail_after_admission,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        first_result = run_at(current[0], "positive")
+        first = _read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )
+        event_key, first_receipt = next(iter(
+            first["state"]["delivery"]["pending_channels"].items()
+        ))
+        assert first_receipt["stage"] == "failed"
+        assert first_receipt["reason"] == "health_failed"
+        identity = (
+            first_receipt["input_hash"],
+            first_receipt["channel_id"],
+            first_receipt["channel_uuid"],
+        )
+        assert state.channels[900]["hidden_from_output"] is True
+        assert state.channels[900]["streams"] == []
+
+        first_retry = datetime.fromisoformat(first_receipt["retry_at"])
+        negative_results = []
+        for offset, kind in enumerate((
+            "failed", "off_air", "dark", "stale", "incomplete", "unknown",
+        ), 1):
+            negative_results.append(run_at(
+                first_retry + timedelta(seconds=offset),
+                kind,
+            ))
+            unchanged = _read_event_publication(
+                db_session_factory,
+                setup["profile_id"],
+            )["state"]["delivery"]["pending_channels"][event_key]
+            assert unchanged["attempt_id"] == first_receipt["attempt_id"]
+            assert unchanged["stage"] == "failed"
+            assert unchanged["reason"] == "health_failed"
+            assert state.channels[900]["hidden_from_output"] is True
+            assert state.channels[900]["streams"] == []
+
+        second_result = run_at(first_retry + timedelta(seconds=10), "positive")
+        second = _read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )
+        second_receipt = second["state"]["delivery"]["pending_channels"][event_key]
+        assert second_receipt["attempt_no"] == 2
+        assert second_receipt["stage"] == "failed"
+        assert second_receipt["reason"] == "health_unknown"
+        assert (
+            second_receipt["input_hash"],
+            second_receipt["channel_id"],
+            second_receipt["channel_uuid"],
+        ) == identity
+
+        second_retry = datetime.fromisoformat(second_receipt["retry_at"])
+        for offset, kind in enumerate((
+            "failed", "off_air", "dark", "stale", "incomplete", "unknown",
+        ), 1):
+            negative_results.append(run_at(
+                second_retry + timedelta(seconds=offset),
+                kind,
+            ))
+            unchanged = _read_event_publication(
+                db_session_factory,
+                setup["profile_id"],
+            )["state"]["delivery"]["pending_channels"][event_key]
+            assert unchanged["attempt_id"] == second_receipt["attempt_id"]
+            assert unchanged["stage"] == "failed"
+            assert unchanged["reason"] == "health_unknown"
+            assert state.channels[900]["hidden_from_output"] is True
+            assert state.channels[900]["streams"] == []
+
+        third_result = run_at(second_retry + timedelta(seconds=10), "positive")
+
+    completed = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    completed_receipt = completed["state"]["delivery"]["pending_channels"][event_key]
+    assert completed_receipt["attempt_no"] == 3
+    assert completed_receipt["stage"] == "complete"
+    assert completed_receipt["reason"] is None
+    assert (
+        completed_receipt["input_hash"],
+        completed_receipt["channel_id"],
+        completed_receipt["channel_uuid"],
+    ) == identity
+    assert final_failures == []
+    assert len({
+        first_receipt["attempt_id"],
+        second_receipt["attempt_id"],
+        completed_receipt["attempt_id"],
+    }) == 3
+    assert client.create_channel.await_count == 1
+    assert len(state.channels) == 2
+    assert state.channels[900]["epg_data_id"] == 502
+    assert state.channels[900]["streams"] == [7301]
+    assert state.channels[900]["hidden_from_output"] is False
+    assert len([
+        payload
+        for channel_id, payload in state.update_channel_calls
+        if channel_id == 900 and "streams" in payload
+    ]) == 1
+    assert len([
+        payload
+        for channel_id, payload in state.update_channel_calls
+        if channel_id == 900 and payload.get("hidden_from_output") is False
+    ]) == 1
+    assert [
+        first_result["channels_created"],
+        second_result["channels_created"],
+        third_result["channels_created"],
+    ] == [1, 0, 0]
+    assert all(result["channels_created"] == 0 for result in negative_results)
+
+
+@pytest.mark.parametrize("guard", [
+    "expired", "nonhealth_failed", "allocation_unknown", "missing_uuid",
+    "foreign_uuid", "ownership", "changed_identity", "new_event",
+    "missing_stream", "changed_stream", "changed_config", "changed_source",
+    "reached_stop", "positive_idle",
+])
+def test_staged_health_recovery_keeps_retirement_guards(
+    db_session_factory,
+    monkeypatch,
+    guard,
+):
+    from services import event_sync_stream_health
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+
+    def set_positive():
+        observed_at = current[0].astimezone(timezone.utc).isoformat()
+        health[7301] = {
+            "stream_name": setup["event_name"],
+            "probe_status": "success",
+            "measured_bitrate": 5_000_000,
+            "last_probed": observed_at,
+            "is_black_screen": False,
+            "black_screen_checked_at": observed_at,
+        }
+
+    async def close_first(executor):
+        if not executor._event_pending:
+            return await finish(executor)
+        publication = _read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )
+        receipt = next(iter(
+            publication["state"]["delivery"]["pending_channels"].values()
+        ))
+        if guard == "expired":
+            current[0] = datetime.fromisoformat(receipt["expires_at"])
+        elif guard == "nonhealth_failed":
+            state.guide_programmes.clear()
+        else:
+            observed_at = current[0].astimezone(timezone.utc).isoformat()
+            health[7301] = {
+                "stream_name": setup["event_name"],
+                "probe_status": "failed",
+                "measured_bitrate": 0,
+                "last_probed": observed_at,
+                "is_black_screen": None,
+                "black_screen_checked_at": None,
+            }
+        return await finish(executor)
+
+    if guard == "allocation_unknown":
+        client.create_channel.side_effect = RuntimeError("allocation failed")
+    set_positive()
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=close_first,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    before = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    pending_before = before["state"]["delivery"]["pending_channels"]
+    pending_keys = set(pending_before)
+    event_key, receipt = next(iter(pending_before.items()))
+    if guard == "expired":
+        assert (receipt["stage"], receipt["reason"]) == (
+            "expired", "guide_expired",
+        )
+    elif guard == "nonhealth_failed":
+        assert (receipt["stage"], receipt["reason"]) == (
+            "failed", "programme_missing",
+        )
+    elif guard == "allocation_unknown":
+        assert (receipt["stage"], receipt["reason"]) == (
+            "allocation_unknown", "allocation_unknown",
+        )
+    else:
+        assert (receipt["stage"], receipt["reason"]) == (
+            "failed", "health_failed",
+        )
+
+    if receipt["retry_at"] is not None:
+        current[0] = datetime.fromisoformat(receipt["retry_at"]) + timedelta(seconds=1)
+    else:
+        current[0] += timedelta(minutes=6)
+    if guard == "reached_stop":
+        current[0] = datetime.fromisoformat(receipt["stop"])
+    if guard == "missing_uuid":
+        state.channels[900].pop("uuid", None)
+    elif guard == "foreign_uuid":
+        state.channels[900]["uuid"] = "foreign-channel"
+    elif guard == "ownership":
+        session = db_session_factory()
+        try:
+            session.get(ChannelPipelineRule, setup["rule_id"]).set_managed_channel_ids([])
+            session.commit()
+        finally:
+            session.close()
+    elif guard == "changed_identity":
+        state.secondary_streams[SECONDARY_B_NAME][0]["name"] = (
+            setup["event_name"].replace("Fury vs. Usyk", "FURY VS. USYK")
+        )
+    elif guard == "new_event":
+        state.secondary_streams[SECONDARY_B_NAME][0]["name"] = (
+            setup["event_name"].replace("Fury vs. Usyk", "Fury vs. Joshua")
+        )
+    elif guard == "missing_stream":
+        state.secondary_streams[SECONDARY_B_NAME] = []
+    elif guard == "changed_stream":
+        state.secondary_streams[SECONDARY_B_NAME][0]["id"] = 7302
+        health[7302] = copy.deepcopy(health[7301])
+    elif guard == "changed_config":
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            config = rule.get_event_sync_config()
+            config["max_promote_per_run"] = 2
+            rule.set_event_sync_config(config)
+            session.commit()
+        finally:
+            session.close()
+    elif guard == "changed_source":
+        state.guide_sources[0]["url"] = (
+            state.guide_sources[0]["url"].rstrip("/") + "/changed"
+        )
+
+    set_positive()
+    if guard in {"changed_identity", "new_event"}:
+        health[7301]["stream_name"] = state.secondary_streams[
+            SECONDARY_B_NAME
+        ][0]["name"]
+    if guard == "changed_stream":
+        health[7302] = {
+            **health.pop(7301),
+            "stream_name": state.secondary_streams[SECONDARY_B_NAME][0]["name"],
+        }
+    create_count = client.create_channel.await_count
+    write_count = len(state.update_channel_calls)
+    lifecycle = ActionExecutor._event_lifecycle
+
+    async def mark_idle(executor, *args, **kwargs):
+        eligible, states = await lifecycle(executor, *args, **kwargs)
+        if 900 in states:
+            states[900] = "idle"
+        return eligible, states
+
+    session = db_session_factory()
+    try:
+        rule_config = session.get(
+            ChannelPipelineRule,
+            setup["rule_id"],
+        ).get_event_sync_config()
+        assert rule_config["retire_finished_events"] is True
+    finally:
+        session.close()
+
+    parsed_current = None
+    current_event_key = None
+    current_channel_name = None
+    if guard in {"changed_identity", "new_event"}:
+        current_stream = state.secondary_streams[SECONDARY_B_NAME][0]
+        parsed_current = parse_event_name(
+            current_stream["name"],
+            rule_config.get("slot_patterns"),
+            now=current[0],
+            assume_current_date=rule_config.get("assume_current_date", False),
+        )
+        current_event_key = master_event_key(parsed_current)
+        current_channel_name = promoted_channel_name(parsed_current)
+        assert parsed_current.start == datetime.fromisoformat(receipt["start"])
+        assert current_stream["id"] == receipt["streams"][0]["id"]
+        assert current_event_key is not None
+        if guard == "changed_identity":
+            assert current_event_key == event_key
+            assert current_channel_name == receipt["channel_name"]
+            assert parsed_current.title != receipt["title"]
+            assert current_stream["name"] != receipt["streams"][0]["name"]
+        else:
+            assert current_event_key != event_key
+            assert current_channel_name != receipt["channel_name"]
+
+    clock_patches = (
+        patch("services.event_sync_resolver.datetime", _clock(lambda: current[0])),
+        patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])),
+        patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])),
+    )
+    with clock_patches[0], clock_patches[1], clock_patches[2]:
+        if guard == "positive_idle":
+            with patch.object(
+                ActionExecutor,
+                "_event_lifecycle",
+                new=mark_idle,
+            ):
+                dummy_epg._manual_run(
+                    client,
+                    db_session_factory,
+                    regenerate,
+                    wait_refresh,
+                )
+        else:
+            dummy_epg._manual_run(
+                client,
+                db_session_factory,
+                regenerate,
+                wait_refresh,
+            )
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    pending_after = after["state"]["delivery"]["pending_channels"]
+    after_receipt = pending_after[event_key]
+    if guard == "new_event":
+        assert parsed_current is not None
+        assert current_event_key is not None
+        assert current_channel_name is not None
+        assert after_receipt == receipt
+        assert set(pending_after) == pending_keys | {current_event_key}
+        new_receipt = pending_after[current_event_key]
+        assert new_receipt["attempt_no"] == 1
+        assert new_receipt["attempt_id"] != receipt["attempt_id"]
+        assert new_receipt["channel_id"] == 901
+        assert new_receipt["channel_uuid"] == "event-901"
+        assert new_receipt["channel_id"] != receipt["channel_id"]
+        assert new_receipt["channel_uuid"] != receipt["channel_uuid"]
+        assert (
+            new_receipt["rule_id"],
+            new_receipt["profile_id"],
+            new_receipt["target_group_id"],
+        ) == (
+            receipt["rule_id"],
+            receipt["profile_id"],
+            receipt["target_group_id"],
+        )
+        assert new_receipt["start"] == receipt["start"]
+        assert new_receipt["channel_name"] == current_channel_name
+        assert client.create_channel.await_count == create_count + 1
+        assert state.channels[901]["hidden_from_output"] is True
+        assert state.channels[901]["streams"] == []
+    else:
+        assert set(pending_after) == pending_keys
+        assert after_receipt["attempt_id"] == receipt["attempt_id"]
+        assert after_receipt["stage"] == receipt["stage"]
+        assert client.create_channel.await_count == create_count
+        assert len(state.update_channel_calls) == write_count
+    if 900 in state.channels:
+        assert state.channels[900].get("hidden_from_output") is True
+        assert state.channels[900].get("streams") == []
+
+
+def test_staged_health_recovery_outlives_failed_attempt(
+    db_session_factory,
+    monkeypatch,
+):
+    from models import DummyEPGProfile
+    from services import event_sync_stream_health
+    from services.epg_publication import begin_delivery
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    session = db_session_factory()
+    try:
+        profile = session.get(DummyEPGProfile, setup["profile_id"]).to_dict()
+    finally:
+        session.close()
+    early = setup["event_start"] - timedelta(hours=23)
+    with patch(
+        "services.epg_publication.get_session",
+        side_effect=db_session_factory,
+    ):
+        seeded = begin_delivery(
+            f"profile:{setup['profile_id']}",
+            expected_revision=0,
+            expected_hash=None,
+            profile=profile,
+            now=early,
+        )
+    first_guide = seeded["state"]["delivery"]["guide_attempt"]
+    assert datetime.fromisoformat(first_guide["expires_at"]) == (
+        early.astimezone(timezone.utc) + timedelta(hours=24)
+    )
+
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+    active_stages = {"allocated", "importing", "linking", "ready"}
+    seen_attempts = set()
+
+    def set_health(working):
+        observed_at = current[0].astimezone(timezone.utc).isoformat()
+        health[7301] = {
+            "stream_name": setup["event_name"],
+            "probe_status": "success" if working else "failed",
+            "measured_bitrate": 5_000_000 if working else 0,
+            "last_probed": observed_at,
+            "is_black_screen": False if working else None,
+            "black_screen_checked_at": observed_at if working else None,
+        }
+
+    async def fail_then_pause(executor):
+        attempt_id = next((
+            receipt.get("attempt_id")
+            for event_key, work in executor._event_pending.items()
+            for receipt in [
+                executor._event_publications.get(
+                    work["profile_id"], {}
+                ).get("state", {}).get("delivery", {}).get(
+                    "pending_channels", {}
+                ).get(event_key)
+            ]
+            if receipt is not None
+            and receipt.get("stage") in active_stages
+        ), None)
+        if attempt_id is None or attempt_id in seen_attempts:
+            return await finish(executor)
+        seen_attempts.add(attempt_id)
+        if len(seen_attempts) == 1:
+            set_health(False)
+            return await finish(executor)
+        raise asyncio.CancelledError
+
+    set_health(True)
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=fail_then_pause,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+        failed = _read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )
+        event_key, failed_receipt = next(iter(
+            failed["state"]["delivery"]["pending_channels"].items()
+        ))
+        assert (failed_receipt["stage"], failed_receipt["reason"]) == (
+            "failed", "health_failed",
+        )
+        assert failed_receipt["expires_at"] == first_guide["expires_at"]
+        assert datetime.fromisoformat(failed_receipt["expires_at"]) < (
+            datetime.fromisoformat(failed_receipt["stop"])
+        )
+        current[0] = datetime.fromisoformat(
+            failed_receipt["expires_at"]
+        ) + timedelta(seconds=1)
+        assert current[0] < datetime.fromisoformat(failed_receipt["stop"])
+        set_health(True)
+        with pytest.raises(asyncio.CancelledError):
+            dummy_epg._manual_run(
+                client,
+                db_session_factory,
+                regenerate,
+                wait_refresh,
+            )
+
+    successor = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    next_guide = successor["state"]["delivery"]["guide_attempt"]
+    next_receipt = successor["state"]["delivery"]["pending_channels"][event_key]
+    assert next_guide["attempt_id"] != first_guide["attempt_id"]
+    assert next_receipt["attempt_id"] != failed_receipt["attempt_id"]
+    assert next_receipt["attempt_no"] == 2
+    assert next_receipt["guide_attempt_id"] == next_guide["attempt_id"]
+    assert next_receipt["channel_id"] == failed_receipt["channel_id"] == 900
+    assert next_receipt["channel_uuid"] == failed_receipt["channel_uuid"] == "event-900"
+    assert next_receipt["history"][-1]["expires_at"] == first_guide["expires_at"]
+    assert next_receipt["expires_at"] == failed_receipt["stop"]
+    assert state.channels[900]["hidden_from_output"] is True
+    assert state.channels[900]["streams"] == []
+    assert client.create_channel.await_count == 1
+
+
+def test_staged_health_recovery_loses_recorded_attempt_race(
+    db_session_factory,
+    monkeypatch,
+):
+    from models import DummyEPGProfile
+    from services import event_sync_stream_health
+    from services.epg_publication import begin_delivery
+    from tasks.event_visibility import _source_refresh_key
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+
+    def set_health(working):
+        observed_at = current[0].astimezone(timezone.utc).isoformat()
+        health[7301] = {
+            "stream_name": setup["event_name"],
+            "probe_status": "success" if working else "failed",
+            "measured_bitrate": 5_000_000 if working else 0,
+            "last_probed": observed_at,
+            "is_black_screen": False if working else None,
+            "black_screen_checked_at": observed_at if working else None,
+        }
+
+    async def fail_first(executor):
+        set_health(False)
+        return await finish(executor)
+
+    set_health(True)
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=fail_first,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    failed = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, failed_receipt = next(iter(
+        failed["state"]["delivery"]["pending_channels"].items()
+    ))
+    assert (failed_receipt["stage"], failed_receipt["reason"]) == (
+        "failed", "health_failed",
+    )
+    current[0] = datetime.fromisoformat(
+        failed_receipt["retry_at"]
+    ) + timedelta(seconds=1)
+    set_health(True)
+    create_count = client.create_channel.await_count
+    write_count = len(state.update_channel_calls)
+    current_claim = ActionExecutor._event_receipt_current
+    winner = []
+
+    def advance_attempt(executor, publication, key, *args, **kwargs):
+        current_value = current_claim(
+            executor,
+            publication,
+            key,
+            *args,
+            **kwargs,
+        )
+        if current_value is None or winner:
+            return current_value
+        claimed_publication, receipt = current_value
+        if receipt["stage"] != "failed" or receipt["reason"] != "health_failed":
+            return current_value
+        session = db_session_factory()
+        try:
+            profile = session.get(
+                DummyEPGProfile,
+                setup["profile_id"],
+            ).to_dict()
+        finally:
+            session.close()
+        source = next(
+            row for row in executor._epg_sources
+            if row.get("id") == setup["source_id"]
+        )
+        _, endpoint_hash, source_url_hash = _source_refresh_key(
+            executor.client,
+            source,
+            claimed_publication["scope"],
+        )
+        candidate = {
+            key: copy.deepcopy(receipt[key])
+            for key in (
+                "event_key", "rule_id", "rule_hash", "profile_id",
+                "target_group_id", "title", "start", "stop", "streams",
+                "channel_name", "channel_id", "channel_uuid", "execution_id",
+            )
+        }
+        candidate.update({
+            "source_hashes": [{
+                "endpoint_hash": endpoint_hash,
+                "source_url_hash": source_url_hash,
+            }],
+            "owner_proven": True,
+            "channel_exists": True,
+            "health_playable": True,
+        })
+        admitted = begin_delivery(
+            claimed_publication["scope"],
+            expected_revision=claimed_publication["revision"],
+            expected_hash=claimed_publication["state"]["xmltv_hash"],
+            profile=profile,
+            now=current[0],
+            pending_channels={key: candidate},
+        )
+        assert admitted is not None
+        winner.append(admitted)
+        return current_value
+
+    with patch.object(
+        ActionExecutor,
+        "_event_receipt_current",
+        new=advance_attempt,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    assert len(winner) == 1
+    stored = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    receipt = stored["state"]["delivery"]["pending_channels"][event_key]
+    winning_receipt = winner[0]["state"]["delivery"]["pending_channels"][event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["attempt_id"] != failed_receipt["attempt_id"]
+    assert receipt["attempt_id"] == winning_receipt["attempt_id"]
+    assert receipt["stage"] == "allocated"
+    assert client.create_channel.await_count == create_count
+    assert len(state.update_channel_calls) == write_count
+    assert state.channels[900]["hidden_from_output"] is True
+    assert state.channels[900]["streams"] == []
 
 
 class TestDedicatedDelivery:

@@ -6749,6 +6749,7 @@ class ActionExecutor:
             }
 
         event_states = {}
+        health_recoveries: dict[str, tuple[str, str]] = {}
         if config.get("retire_finished_events"):
             now = datetime.now(timezone.utc)
             sampled_keys = {unit.event_key for unit in health_units}
@@ -6768,6 +6769,7 @@ class ActionExecutor:
                 expires_at=health_expires_at,
             )
             from services.epg_publication import (
+                HEALTH_REASONS,
                 TERMINAL_PENDING_STAGES,
                 read_publication,
             )
@@ -6792,6 +6794,92 @@ class ActionExecutor:
                     in self._pipeline_managed_channel_ids
                 ):
                     eligible.add(event_key)
+                    continue
+                if (
+                    receipt is None
+                    or receipt["stage"] != "failed"
+                    or receipt["reason"] not in HEALTH_REASONS
+                    or receipt["event_key"] != event_key
+                    or receipt["rule_id"] != rule_id
+                    or receipt["profile_id"] != profile_id
+                    or receipt["target_group_id"] != target_group_id
+                    or unit.existing_channel_id is None
+                    or receipt["channel_id"] != unit.existing_channel_id
+                    or unit.existing_channel_id
+                    not in self._pipeline_managed_channel_ids
+                ):
+                    continue
+                channel_id = unit.existing_channel_id
+                channel = self._channel_by_id.get(channel_id)
+                if (
+                    channel is None
+                    or channel.get("hidden_from_output") is not True
+                    or channel.get("streams") != []
+                    or receipt.get("channel_uuid") is None
+                    or channel.get("uuid") != receipt["channel_uuid"]
+                    or event_states.get(channel_id) == "idle"
+                ):
+                    continue
+                start = datetime.fromisoformat(receipt["start"])
+                stop = datetime.fromisoformat(receipt["stop"])
+                retry_at = (
+                    datetime.fromisoformat(receipt["retry_at"])
+                    if receipt["retry_at"] is not None else None
+                )
+                expires_at = datetime.fromisoformat(receipt["expires_at"])
+                parsed = unit.rows[0].result.parsed
+                if (
+                    not start <= now < stop
+                    or retry_at is None
+                    or now < retry_at
+                    or parsed.start != start
+                    or parsed.title != receipt["title"]
+                    or unit.channel_name != receipt["channel_name"]
+                ):
+                    continue
+                current_streams = {
+                    row.stream.stream_id: (
+                        row.stream.name.strip(),
+                        row.stream.provider_id,
+                        row.stream.group_id,
+                    )
+                    for row in unit.rows
+                    if row.stream.stream_id is not None
+                    and isinstance(row.stream.name, str)
+                }
+                captured_streams = {
+                    row["id"]: (
+                        row["name"].strip(),
+                        row["account_id"],
+                        row["group_id"],
+                    )
+                    for row in receipt["streams"]
+                }
+                if (
+                    len(unit.rows) != len(receipt["streams"])
+                    or len(current_streams) != len(unit.rows)
+                    or current_streams != captured_streams
+                    or any(
+                        flow.get(row["id"]) is not True
+                        for row in receipt["streams"]
+                    )
+                    or any(row.stream.is_stale is True for row in unit.rows)
+                ):
+                    continue
+                current_value = self._event_receipt_current(
+                    publication,
+                    event_key,
+                    channel=channel,
+                    expired=now >= expires_at,
+                )
+                if current_value is None:
+                    continue
+                _, current_receipt = current_value
+                eligible.add(event_key)
+                health_recoveries[event_key] = (
+                    current_receipt["attempt_id"],
+                    current_receipt["input_hash"],
+                )
             plan = build_promotion_plan(
                 config, resolution.resolved, existing_name_to_id, now=now,
                 dead_stream_ids=current_unplayable,
@@ -7042,6 +7130,7 @@ class ActionExecutor:
                     _resolve_variant_duration,
                 )
                 from services.epg_publication import (
+                    _candidate,
                     _config_hash,
                     begin_delivery,
                     publication_lock,
@@ -7127,6 +7216,31 @@ class ActionExecutor:
                     promo["guide_pending"] += 1
                     _keep_existing_channel(unit)
                     continue
+                recovery = health_recoveries.get(unit.event_key)
+                if recovery is not None:
+                    observed_attempt_id, observed_input_hash = recovery
+                    if (
+                        prior_receipt is None
+                        or prior_receipt["attempt_id"] != observed_attempt_id
+                    ):
+                        promo["guide_pending"] += 1
+                        _keep_existing_channel(unit)
+                        continue
+                    try:
+                        normalized_candidate = _candidate(
+                            unit.event_key,
+                            candidate,
+                            guide_profile_id,
+                            _config_hash(guide_profile),
+                        )
+                    except ValueError:
+                        promo["guide_pending"] += 1
+                        _keep_existing_channel(unit)
+                        continue
+                    if normalized_candidate["input_hash"] != observed_input_hash:
+                        promo["guide_pending"] += 1
+                        _keep_existing_channel(unit)
+                        continue
                 if self._plan_only:
                     async with publication_lock:
                         admitted = begin_delivery(

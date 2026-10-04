@@ -51,7 +51,7 @@ class TestStruckStreamCleanupTask:
 
     @pytest.mark.asyncio
     async def test_removes_struck_streams(self, test_session):
-        """Mock struck streams in channels — removes them, resets failures."""
+        """Removing an assignment preserves the probe failure evidence."""
         from models import StreamStats
 
         # Create struck streams
@@ -92,11 +92,13 @@ class TestStruckStreamCleanupTask:
         # CH2: removed 20, kept 40
         mock_client.update_channel.assert_any_call(2, {"streams": [40]})
 
-        # Verify consecutive_failures was reset
+        # Detachment is not a successful health observation.
         s10 = test_session.query(StreamStats).filter_by(stream_id=10).first()
         s20 = test_session.query(StreamStats).filter_by(stream_id=20).first()
-        assert s10.consecutive_failures == 0
-        assert s20.consecutive_failures == 0
+        assert s10.probe_status == "failed"
+        assert s10.consecutive_failures == 3
+        assert s20.probe_status == "timeout"
+        assert s20.consecutive_failures == 5
 
     @pytest.mark.asyncio
     async def test_keeps_a_channel_whose_streams_have_all_struck_out(self, test_session):
@@ -135,6 +137,10 @@ class TestStruckStreamCleanupTask:
         mock_client.update_channel.assert_called_once_with(2, {"streams": [99]})
         assert result.details["channels_kept_intact"] == [1]
         assert result.success_count == 1
+        s10 = test_session.query(StreamStats).filter_by(stream_id=10).first()
+        s20 = test_session.query(StreamStats).filter_by(stream_id=20).first()
+        assert s10.consecutive_failures == 3
+        assert s20.consecutive_failures == 4
 
     @pytest.mark.asyncio
     async def test_handles_api_error(self, test_session):
