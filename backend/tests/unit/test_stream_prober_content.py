@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import subprocess
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -459,3 +461,213 @@ async def test_real_finite_hls_segments_are_playable(
         f"detector={dark} playable={playable} exit={decoder_exit} "
         f"frames={frames} span={span:.3f}s measured_bps={measured}"
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_process_cleanup_is_bounded(monkeypatch):
+    from stream_prober import _stop_probe
+
+    class HungProcess:
+        returncode = None
+
+        def __init__(self):
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    process = HungProcess()
+    monkeypatch.setattr("stream_prober._PROBE_STOP_SECONDS", 0.01)
+    started = time.monotonic()
+
+    await _stop_probe(process)
+
+    assert process.killed is True
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.asyncio
+async def test_ffprobe_cancellation_stops_owned_process_and_preserves_cancellation(
+    monkeypatch,
+):
+    class WaitingProcess:
+        returncode = None
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.killed = False
+            self.waited = False
+
+        async def communicate(self):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            self.returncode = -9
+            self.waited = True
+            return self.returncode
+
+    process = WaitingProcess()
+    monkeypatch.setattr("stream_prober.validated_subprocess_input", _allow_subprocess)
+    monkeypatch.setattr(
+        "stream_prober.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    prober = _prober()
+    task = asyncio.create_task(prober._run_ffprobe("http://media/held"))
+    await process.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.killed is True
+    assert process.waited is True
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_real_child_cancellation_leaves_no_owned_process(monkeypatch):
+    processes = []
+
+    async def spawn(*_args, **_kwargs):
+        process = await _CREATE_PROCESS(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("stream_prober.validated_subprocess_input", _allow_subprocess)
+    monkeypatch.setattr("stream_prober.asyncio.create_subprocess_exec", spawn)
+    prober = _prober()
+    task = asyncio.create_task(prober._run_ffprobe("http://media/held"))
+    for _ in range(100):
+        if processes:
+            break
+        await asyncio.sleep(0)
+    assert processes
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert processes[0].returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_threads_expiry_and_keeps_saved_result_when_push_is_cancelled():
+    prober = _prober()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+    media = {
+        "streams": [{
+            "codec_type": "video",
+            "width": 1920,
+            "height": 1080,
+            "codec_name": "h264",
+            "r_frame_rate": "30/1",
+        }],
+        "format": {"format_name": "mpegts", "bit_rate": "4000000"},
+    }
+    prober._run_ffprobe = AsyncMock(return_value=media)
+    prober._measure_stream_bitrate = AsyncMock(return_value=3_000_000)
+    prober._detect_black_screen = AsyncMock(return_value=False)
+    saved = {"probe_status": "success", "stream_id": 7}
+    prober._save_probe_result = MagicMock(return_value=saved)
+    push_started = asyncio.Event()
+
+    async def push(*_args):
+        push_started.set()
+        await asyncio.Event().wait()
+
+    prober._push_stats_to_dispatcharr = AsyncMock(side_effect=push)
+    task = asyncio.create_task(prober.probe_stream(
+        7,
+        "http://media/7",
+        "Seven",
+        content=True,
+        expires_at=expires_at,
+    ))
+    await push_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    prober._run_ffprobe.assert_awaited_once_with(
+        "http://media/7", expires_at=expires_at,
+    )
+    prober._measure_stream_bitrate.assert_awaited_once_with(
+        "http://media/7", expires_at=expires_at,
+    )
+    prober._detect_black_screen.assert_awaited_once_with(
+        "http://media/7", expires_at=expires_at,
+    )
+    prober._save_probe_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_expiry_during_stats_push_keeps_local_result():
+    prober = _prober()
+    media = {
+        "streams": [{
+            "codec_type": "video",
+            "width": 1920,
+            "height": 1080,
+            "codec_name": "h264",
+            "r_frame_rate": "30/1",
+        }],
+        "format": {"format_name": "mpegts", "bit_rate": "4000000"},
+    }
+    prober._run_ffprobe = AsyncMock(return_value=media)
+    prober._measure_stream_bitrate = AsyncMock(return_value=3_000_000)
+    prober._detect_black_screen = AsyncMock(return_value=False)
+    saved = {"probe_status": "success", "stream_id": 9}
+    prober._save_probe_result = MagicMock(return_value=saved)
+
+    async def push(*_args):
+        await asyncio.Event().wait()
+
+    prober._push_stats_to_dispatcharr = AsyncMock(side_effect=push)
+
+    result = await prober.probe_stream(
+        9,
+        "http://media/9",
+        "Nine",
+        content=True,
+        expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=30),
+    )
+
+    assert result == saved
+    prober._save_probe_result.assert_called_once()
+    prober._push_stats_to_dispatcharr.assert_awaited_once_with(9, saved)
+
+
+@pytest.mark.asyncio
+async def test_probe_stream_saves_nothing_after_expiry():
+    prober = _prober()
+
+    async def held_media(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    prober._run_ffprobe = AsyncMock(side_effect=held_media)
+    prober._save_probe_result = MagicMock()
+
+    result = await prober.probe_stream(
+        8,
+        "http://media/8",
+        "Eight",
+        expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=20),
+    )
+
+    assert result == {}
+    prober._save_probe_result.assert_not_called()

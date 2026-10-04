@@ -97,3 +97,45 @@ async def test_unreadable_accounts_do_not_stop_a_probe_run():
     client = AsyncMock()
     client.get_m3u_accounts = AsyncMock(side_effect=RuntimeError("Dispatcharr down"))
     assert await account_probe_limits(client) == {}
+
+
+@pytest.mark.asyncio
+async def test_empty_account_scope_performs_no_catalog_read():
+    client = _client([XC])
+
+    assert await account_probe_limits(client, account_ids=set()) == {}
+    client.get_m3u_accounts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_account_scope_filters_before_provider_reads(monkeypatch):
+    unrelated = {**XC, "id": 19, "name": "Unrelated"}
+    published = AsyncMock(return_value=2)
+    monkeypatch.setattr(
+        "services.probe_limits._published_max_connections", published,
+    )
+
+    limits = await account_probe_limits(
+        _client([unrelated, XC]),
+        account_ids={18},
+    )
+
+    assert limits == {18: 2}
+    published.assert_awaited_once_with(XC)
+
+
+@pytest.mark.asyncio
+async def test_scoped_override_avoids_provider_read(monkeypatch):
+    published = AsyncMock(side_effect=AssertionError("provider read is unnecessary"))
+    monkeypatch.setattr(
+        "services.probe_limits._published_max_connections", published,
+    )
+
+    limits = await account_probe_limits(
+        _client([XC, STD]),
+        overrides={"18": 3},
+        account_ids={18},
+    )
+
+    assert limits == {18: 3}
+    published.assert_not_awaited()

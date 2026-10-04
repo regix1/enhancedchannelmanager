@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 _PLAYER_API_TIMEOUT = 8.0
 
 
-async def account_probe_limits(client, overrides: dict | None = None) -> dict[int, int]:
+async def account_probe_limits(
+    client,
+    overrides: dict | None = None,
+    *,
+    account_ids: set[int] | None = None,
+) -> dict[int, int]:
     """Map of m3u account id to the most probes that account will accept.
 
     ``overrides`` is the operator's own setting, keyed by account id as a
@@ -38,6 +43,8 @@ async def account_probe_limits(client, overrides: dict | None = None) -> dict[in
     """
     overrides = overrides or {}
     limits: dict[int, int] = {}
+    if account_ids == set():
+        return limits
 
     try:
         accounts = await client.get_m3u_accounts()
@@ -51,6 +58,8 @@ async def account_probe_limits(client, overrides: dict | None = None) -> dict[in
     for account in accounts or []:
         account_id = account.get("id")
         if account_id is None:
+            continue
+        if account_ids is not None and account_id not in account_ids:
             continue
 
         override = overrides.get(str(account_id), overrides.get(account_id))

@@ -3157,7 +3157,8 @@ class TestOrdinaryStreamAdmission:
              patch("stream_prober.get_session", return_value=test_session), \
              patch("stream_prober.get_prober", return_value=prober):
             await engine._probe_unprobed_streams(
-                self._matched([failed], rule), [rule], results, dry_run=False
+                self._matched([failed], rule), [rule], results, dry_run=False,
+                expires_at=None,
             )
 
         assert engine._stream_stats_cache[11]["probe_status"] == "failed"
@@ -3222,6 +3223,7 @@ class TestOrdinaryStreamAdmission:
                     [rule],
                     {"execution_log": [], "dry_run_results": []},
                     dry_run=False,
+                    expires_at=None,
                 ))
                 for _ in range(100):
                     if (
@@ -3268,6 +3270,7 @@ class TestOrdinaryStreamAdmission:
                     [rule],
                     {"execution_log": [], "dry_run_results": []},
                     dry_run=False,
+                    expires_at=None,
                 ))
                 for _ in range(100):
                     if (
@@ -3351,6 +3354,7 @@ class TestOrdinaryStreamAdmission:
                     [rule],
                     {"execution_log": [], "dry_run_results": []},
                     dry_run=False,
+                    expires_at=None,
                 ))
                 try:
                     for _ in range(100):
@@ -3374,6 +3378,346 @@ class TestOrdinaryStreamAdmission:
 
         await measure(configured_limit=1, stream_count=2, expected_peak=1)
         await measure(configured_limit=8, stream_count=4, expected_peak=3)
+
+    @pytest.mark.asyncio
+    async def test_bounded_sort_probe_scopes_limits_and_threads_one_expiry(self):
+        from datetime import datetime, timedelta, timezone
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=3)
+        prober.refresh_account_probe_limits = AsyncMock()
+        prober.probe_stream = AsyncMock(return_value={"probe_status": "success"})
+        rule = self._quality_rule()
+        streams = [
+            StreamContext(
+                stream_id=1,
+                stream_name="One",
+                stream_url="http://media/1",
+                m3u_account_id=2,
+            ),
+            StreamContext(
+                stream_id=2,
+                stream_name="Two",
+                stream_url="http://media/2",
+                m3u_account_id=18,
+            ),
+        ]
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._load_stream_stats = AsyncMock()
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)
+
+        with patch("stream_prober.get_prober", return_value=prober):
+            selected = await engine._probe_unprobed_streams(
+                self._matched(streams, rule),
+                [rule],
+                {"execution_log": [], "dry_run_results": []},
+                dry_run=False,
+                expires_at=expires_at,
+            )
+
+        assert selected == [(stream, rule) for stream in streams]
+        prober.refresh_account_probe_limits.assert_awaited_once_with(
+            account_ids={2, 18},
+        )
+        assert prober.probe_stream.await_count == 2
+        for call in prober.probe_stream.await_args_list:
+            assert call.kwargs == {"content": False, "expires_at": expires_at}
+        assert prober._account_active == {}
+
+    @pytest.mark.asyncio
+    async def test_bounded_sort_probe_expiry_drains_active_and_queued_children(self):
+        from datetime import datetime, timedelta, timezone
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=1)
+        prober.account_probe_limits = {2: 1}
+        prober.refresh_account_probe_limits = AsyncMock()
+        active_cancelled = asyncio.Event()
+        calls = []
+
+        async def probe_stream(stream_id, _url, _name, **_kwargs):
+            calls.append(stream_id)
+            if stream_id == 1:
+                return {"probe_status": "success"}
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                active_cancelled.set()
+                raise
+
+        prober.probe_stream = AsyncMock(side_effect=probe_stream)
+        rule = self._quality_rule()
+        streams = [
+            StreamContext(
+                stream_id=stream_id,
+                stream_name=f"Stream {stream_id}",
+                stream_url=f"http://media/{stream_id}",
+                m3u_account_id=2,
+            )
+            for stream_id in (1, 2, 3)
+        ]
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._load_stream_stats = AsyncMock()
+        results = {"execution_log": [], "dry_run_results": []}
+        expires_at = datetime.now(timezone.utc) + timedelta(milliseconds=50)
+
+        with patch("stream_prober.get_prober", return_value=prober):
+            with pytest.raises(asyncio.TimeoutError):
+                await engine._probe_unprobed_streams(
+                    self._matched(streams, rule),
+                    [rule],
+                    results,
+                    dry_run=False,
+                    expires_at=expires_at,
+                )
+
+        assert calls == [1, 2]
+        assert active_cancelled.is_set()
+        assert prober._account_active == {}
+        assert results["execution_log"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blocked_stage", ["limits", "stats"])
+    async def test_bounded_sort_probe_stages_use_caller_expiry(
+        self, blocked_stage,
+    ):
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=1)
+        prober.refresh_account_probe_limits = AsyncMock()
+        prober.probe_stream = AsyncMock(return_value={"probe_status": "success"})
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._load_stream_stats = AsyncMock()
+        blocked = asyncio.Event()
+
+        async def wait_forever(*_args, **_kwargs):
+            blocked.set()
+            await asyncio.Event().wait()
+
+        if blocked_stage == "limits":
+            prober.refresh_account_probe_limits.side_effect = wait_forever
+        else:
+            engine._load_stream_stats.side_effect = wait_forever
+        rule = self._quality_rule()
+        stream = StreamContext(
+            stream_id=1,
+            stream_name="One",
+            stream_url="http://media/1",
+            m3u_account_id=2,
+        )
+        results = {"execution_log": [], "dry_run_results": []}
+
+        with patch("stream_prober.get_prober", return_value=prober):
+            with pytest.raises(asyncio.TimeoutError):
+                await engine._probe_unprobed_streams(
+                    self._matched([stream], rule),
+                    [rule],
+                    results,
+                    dry_run=False,
+                    expires_at=datetime.now(timezone.utc) + timedelta(
+                        milliseconds=30
+                    ),
+                )
+
+        assert blocked.is_set()
+        assert results["execution_log"] == []
+        assert prober._account_active == {}
+        if blocked_stage == "limits":
+            prober.probe_stream.assert_not_awaited()
+        else:
+            prober.probe_stream.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bounded_sort_probe_expiry_preserves_unrelated_owner(self):
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=1)
+        prober.account_probe_limits = {2: 1}
+        prober.refresh_account_probe_limits = AsyncMock()
+        prober.probe_stream = AsyncMock(return_value={"probe_status": "success"})
+        owner = prober.semaphore_for_account(2, event=True)
+        await owner.__aenter__()
+        rule = self._quality_rule()
+        stream = StreamContext(
+            stream_id=1,
+            stream_name="One",
+            stream_url="http://media/1",
+            m3u_account_id=2,
+        )
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._load_stream_stats = AsyncMock()
+        try:
+            with patch("stream_prober.get_prober", return_value=prober):
+                with pytest.raises(asyncio.TimeoutError):
+                    await engine._probe_unprobed_streams(
+                        self._matched([stream], rule),
+                        [rule],
+                        {"execution_log": [], "dry_run_results": []},
+                        dry_run=False,
+                        expires_at=datetime.now(timezone.utc) + timedelta(
+                            milliseconds=30
+                        ),
+                    )
+            assert prober._account_active == {2: 1}
+            assert prober._event_probes == 1
+            prober.probe_stream.assert_not_awaited()
+        finally:
+            await owner.__aexit__(None, None, None)
+
+        assert prober._account_active == {}
+        assert prober._event_probes == 0
+
+    @pytest.mark.asyncio
+    async def test_bounded_sort_probe_retains_completed_observation_only(
+        self, test_session,
+    ):
+        from models import StreamStats
+        from stream_prober import StreamProber
+
+        observed_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        test_session.add_all([
+            StreamStats(
+                stream_id=2,
+                stream_name="Two",
+                probe_status="failed",
+                consecutive_failures=2,
+                last_probed=observed_at,
+            ),
+            StreamStats(
+                stream_id=3,
+                stream_name="Three",
+                probe_status="failed",
+                consecutive_failures=2,
+                last_probed=observed_at,
+            ),
+        ])
+        test_session.commit()
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=1)
+        prober.account_probe_limits = {2: 1}
+        prober.refresh_account_probe_limits = AsyncMock()
+        active_cancelled = asyncio.Event()
+        calls = []
+
+        async def probe_stream(stream_id, _url, name, **_kwargs):
+            calls.append(stream_id)
+            if stream_id == 1:
+                return prober._save_probe_result(
+                    stream_id,
+                    name,
+                    {
+                        "streams": [{
+                            "codec_type": "video",
+                            "width": 1920,
+                            "height": 1080,
+                            "codec_name": "h264",
+                            "r_frame_rate": "30/1",
+                        }],
+                        "format": {"format_name": "hls"},
+                    },
+                    "success",
+                    None,
+                )
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                active_cancelled.set()
+                raise
+
+        prober.probe_stream = AsyncMock(side_effect=probe_stream)
+        rule = self._quality_rule()
+        streams = [
+            StreamContext(
+                stream_id=stream_id,
+                stream_name=name,
+                stream_url=f"http://media/{stream_id}",
+                m3u_account_id=2,
+            )
+            for stream_id, name in ((1, "One"), (2, "Two"), (3, "Three"))
+        ]
+        engine = ChannelPipelineEngine(MagicMock())
+        results = {"execution_log": [], "dry_run_results": []}
+
+        with patch("stream_prober.get_prober", return_value=prober), patch(
+            "stream_prober.get_session", return_value=test_session,
+        ), patch(
+            "channel_pipeline_engine.get_session", return_value=test_session,
+        ), patch(
+            "channel_pipeline_engine.get_settings",
+            return_value=MagicMock(strike_threshold=3),
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await engine._probe_unprobed_streams(
+                    self._matched(streams, rule),
+                    [rule],
+                    results,
+                    dry_run=False,
+                    expires_at=datetime.now(timezone.utc) + timedelta(
+                        milliseconds=50
+                    ),
+                )
+
+        first = test_session.query(StreamStats).filter_by(stream_id=1).one()
+        second = test_session.query(StreamStats).filter_by(stream_id=2).one()
+        third = test_session.query(StreamStats).filter_by(stream_id=3).one()
+        assert first.probe_status == "success"
+        assert first.consecutive_failures == 0
+        assert second.probe_status == third.probe_status == "failed"
+        assert second.consecutive_failures == third.consecutive_failures == 2
+        assert second.last_probed == third.last_probed == observed_at.replace(
+            tzinfo=None
+        )
+        assert calls == [1, 2]
+        assert active_cancelled.is_set()
+        assert prober._account_active == {}
+        assert results["execution_log"] == []
+
+    @pytest.mark.asyncio
+    async def test_bounded_sort_probe_first_child_error_drains_siblings(self):
+        from datetime import datetime, timedelta, timezone
+        from stream_prober import StreamProber
+
+        prober = StreamProber(client=MagicMock(), max_concurrent_probes=3)
+        prober.refresh_account_probe_limits = AsyncMock()
+        sibling_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def probe_stream(stream_id, _url, _name, **_kwargs):
+            if stream_id == 1:
+                await sibling_started.wait()
+                raise RuntimeError("synthetic child failure")
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+
+        prober.probe_stream = AsyncMock(side_effect=probe_stream)
+        rule = self._quality_rule()
+        streams = [
+            StreamContext(
+                stream_id=stream_id,
+                stream_name=f"Stream {stream_id}",
+                stream_url=f"http://media/{stream_id}",
+                m3u_account_id=stream_id,
+            )
+            for stream_id in (1, 2)
+        ]
+        engine = ChannelPipelineEngine(MagicMock())
+        engine._load_stream_stats = AsyncMock()
+
+        with patch("stream_prober.get_prober", return_value=prober):
+            with pytest.raises(RuntimeError, match="synthetic child failure"):
+                await engine._probe_unprobed_streams(
+                    self._matched(streams, rule),
+                    [rule],
+                    {"execution_log": [], "dry_run_results": []},
+                    dry_run=False,
+                    expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                )
+
+        assert sibling_cancelled.is_set()
+        assert prober._account_active == {}
 
     @pytest.mark.parametrize(
         "case",
@@ -3431,7 +3775,8 @@ class TestOrdinaryStreamAdmission:
         results = {"execution_log": [], "dry_run_results": []}
         with patch("stream_prober.get_prober", return_value=available_prober):
             selected = await engine._probe_unprobed_streams(
-                self._matched([stream], rule), [rule], results, dry_run=dry_run
+                self._matched([stream], rule), [rule], results, dry_run=dry_run,
+                expires_at=None,
             )
 
         assert engine._stream_stats_cache == expected_cache

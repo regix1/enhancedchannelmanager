@@ -504,7 +504,10 @@ async def test_pipeline_prerefresh_requires_two_distinct_confirmations(tool_name
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ["run_channel_pipeline", "run_auto_creation"])
-async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmations(tool_name):
+@pytest.mark.parametrize("outcome", ["success", "expiry"])
+async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmations(
+    tool_name, outcome,
+):
     mcp = _registry()
     client = AsyncMock()
     repository = Path(__file__).parents[2]
@@ -536,7 +539,8 @@ async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmati
         await process.stdin.drain()
         line = await asyncio.wait_for(process.stdout.readline(), timeout=20)
         reply = json.loads(line)
-        assert reply["ok"] is True, reply
+        if reply["ok"] is not True:
+            raise RuntimeError(json.dumps(reply, sort_keys=True))
         return reply["response"]
 
     async def call_endpoint(endpoint, *, body=None, path_args=None, **_kwargs):
@@ -551,8 +555,10 @@ async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmati
             }
         else:
             raise AssertionError(f"unexpected endpoint {endpoint.name}")
+        call = {"endpoint": endpoint.name, "body": body, "response": None}
+        backend_calls.append(call)
         response = await request_backend(message)
-        backend_calls.append({"endpoint": endpoint.name, "body": body, "response": response})
+        call["response"] = response
         return response
 
     client.call_endpoint.side_effect = call_endpoint
@@ -581,30 +587,65 @@ async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmati
             assert state["media_calls"] == 0
             assert state["refresh_calls"] == 1
 
-            third = await mcp.call_tool(
-                tool_name, {"dry_run": False, "confirmation_token": probe_token}
-            )
-            execute_token = _token(_text(third))
-            assert execute_token not in {refresh_token, probe_token}
-            assert "stream quality probes completed" in _text(third).lower()
-            assert backend_calls[-1]["body"]["phase"] == "probe"
-            assert backend_calls[-1]["response"]["completed_phase"] == "probe"
-            assert backend_calls[-1]["response"]["phase"] == "execute"
-            state = await request_backend({"operation": "state"})
-            assert state["writes"] == []
-            assert state["media_calls"] == 3
+            if outcome == "expiry":
+                await request_backend({
+                    "operation": "hold_probe_lock",
+                    "seconds": 0.03,
+                })
+                before_expiry = len(backend_calls)
+                expired = await mcp.call_tool(
+                    tool_name,
+                    {"dry_run": False, "confirmation_token": probe_token},
+                )
+                expired_text = _text(expired)
+                assert "Prepared stream probes expired" in expired_text
+                assert '"phase": "probe"' in expired_text
+                assert '"status": "expired"' in expired_text
+                assert '"stage": "lock"' in expired_text
+                assert '"expires_at":' in expired_text
+                assert "confirmation_token:" not in expired_text
+                assert "completed_phase" not in expired_text
+                assert "stream quality probes completed" not in expired_text.lower()
+                assert not any(
+                    call["endpoint"] == "ac_get_execution"
+                    for call in backend_calls[before_expiry:]
+                )
+                state = await request_backend({"operation": "state"})
+                assert state["writes"] == []
+                assert state["media_calls"] == 0
+                backend_count = len(backend_calls)
+                replay = await mcp.call_tool(
+                    tool_name,
+                    {"dry_run": False, "confirmation_token": probe_token},
+                )
+                assert "used" in _text(replay).lower()
+                assert len(backend_calls) == backend_count
+                await request_backend({"operation": "release_probe_lock"})
+            else:
+                third = await mcp.call_tool(
+                    tool_name, {"dry_run": False, "confirmation_token": probe_token}
+                )
+                execute_token = _token(_text(third))
+                assert execute_token not in {refresh_token, probe_token}
+                assert "stream quality probes completed" in _text(third).lower()
+                assert backend_calls[-1]["body"]["phase"] == "probe"
+                assert backend_calls[-1]["response"]["completed_phase"] == "probe"
+                assert backend_calls[-1]["response"]["phase"] == "execute"
+                state = await request_backend({"operation": "state"})
+                assert state["writes"] == []
+                assert state["media_calls"] == 3
 
-            final = await mcp.call_tool(
-                tool_name, {"dry_run": False, "confirmation_token": execute_token}
-            )
-            assert "complete" in _text(final).lower()
-            assert backend_calls[-2]["body"]["phase"] == "execute"
-            state = await request_backend({"operation": "state"})
-            assert state["writes"] == [{
-                "args": [200, {"streams": [102, 101, 104]}],
-                "kwargs": {},
-            }]
-            assert state["channels"]["201"]["streams"] == [105]
+                final = await mcp.call_tool(
+                    tool_name, {"dry_run": False, "confirmation_token": execute_token}
+                )
+                assert "complete" in _text(final).lower()
+                assert backend_calls[-2]["body"]["phase"] == "execute"
+                state = await request_backend({"operation": "state"})
+                assert state["writes"] == [{
+                    "args": [200, {"streams": [102, 101, 104]}],
+                    "kwargs": {},
+                }]
+                assert state["channels"]["201"]["streams"] == [105]
     finally:
         if process.returncode is None:
             process.stdin.write(b'{"operation":"close"}\n')
@@ -615,11 +656,16 @@ async def test_pipeline_refresh_probe_execute_requires_three_distinct_confirmati
         stderr = (await process.stderr.read()).decode()
 
     assert process.returncode == 0, stderr
+    expected_phases = (
+        ["refresh", "probe", "execute"]
+        if outcome == "success"
+        else ["refresh", "probe"]
+    )
     assert [
         call["body"]["phase"]
         for call in backend_calls
         if call["endpoint"] == "ac_commit_run"
-    ] == ["refresh", "probe", "execute"]
+    ] == expected_phases
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,12 @@ from routers.channel_pipeline import (
 from services.mutation_plan_store import mutation_plan_store
 
 
+def test_prepared_probe_operation_window_is_240_seconds():
+    from routers.channel_pipeline import _PREPARED_PROBE_SECONDS
+
+    assert _PREPARED_PROBE_SECONDS == 240.0
+
+
 async def _serve_pipeline_pipe():
     """Serve real staged pipeline calls over a private test subprocess pipe."""
     import sys
@@ -32,6 +38,7 @@ async def _serve_pipeline_pipe():
 
     from channel_pipeline_engine import ChannelPipelineEngine
     from models import ChannelPipelineRule, StreamStats
+    import routers.channel_pipeline as pipeline_router
     from routers.channel_pipeline import (
         CommitPipelinePlanRequest,
         commit_auto_creation_pipeline,
@@ -232,7 +239,7 @@ async def _serve_pipeline_pipe():
     prober.account_probe_limits = {1: 1}
     prober.refresh_account_probe_limits = AsyncMock()
 
-    async def read_media(url):
+    async def read_media(url, *, expires_at=None):
         if url.endswith("/103"):
             raise RuntimeError("synthetic failed observation")
         height = 2160 if url.endswith("/102") else 1080
@@ -249,7 +256,7 @@ async def _serve_pipeline_pipe():
             "format": {"format_name": "hls", "bit_rate": "5000000"},
         }
 
-    async def measure_media(url):
+    async def measure_media(url, *, expires_at=None):
         return 8_000_000 if url.endswith("/102") else 5_000_000
 
     prober._run_ffprobe = AsyncMock(side_effect=read_media)
@@ -285,6 +292,8 @@ async def _serve_pipeline_pipe():
     ]
     for active in patches:
         active.start()
+    original_probe_seconds = pipeline_router._PREPARED_PROBE_SECONDS
+    probe_lock_held = False
 
     def response_body(response):
         if hasattr(response, "body"):
@@ -316,6 +325,17 @@ async def _serve_pipeline_pipe():
                     response = await get_auto_creation_execution(
                         request["execution_id"],
                     )
+                elif request["operation"] == "hold_probe_lock":
+                    pipeline_router._PREPARED_PROBE_SECONDS = request["seconds"]
+                    await pipeline_router._MCP_PLANNED_RUN_LOCK.acquire()
+                    probe_lock_held = True
+                    response = {"held": True}
+                elif request["operation"] == "release_probe_lock":
+                    if probe_lock_held:
+                        pipeline_router._MCP_PLANNED_RUN_LOCK.release()
+                        probe_lock_held = False
+                    pipeline_router._PREPARED_PROBE_SECONDS = original_probe_seconds
+                    response = {"released": True}
                 elif request["operation"] == "state":
                     response = {
                         "channels": channels,
@@ -333,9 +353,13 @@ async def _serve_pipeline_pipe():
                 print(json.dumps({
                     "ok": False,
                     "status": getattr(exc, "status_code", None),
+                    "detail": getattr(exc, "detail", None),
                     "error": str(getattr(exc, "detail", exc)),
                 }), flush=True)
     finally:
+        if probe_lock_held:
+            pipeline_router._MCP_PLANNED_RUN_LOCK.release()
+        pipeline_router._PREPARED_PROBE_SECONDS = original_probe_seconds
         for active in reversed(patches):
             active.stop()
         database.Base.metadata.drop_all(bind=engine)
@@ -511,6 +535,44 @@ async def test_probe_plan_enforces_distinct_target_hard_cap(probe_count, status_
     )
 
 
+@pytest.mark.asyncio
+async def test_late_final_plan_computation_stores_no_execute_plan():
+    from datetime import datetime, timedelta, timezone
+    from routers.channel_pipeline import _materialize_pipeline_plan
+
+    decision = {
+        "request": {"m3u_account_ids": None, "rule_ids": [7]},
+        "result": {"dry_run_results": []},
+        "write_plan": {
+            "writes": [],
+            "channel_preconditions": {},
+            "group_preconditions": {},
+            "profile_preconditions": {},
+        },
+        "snapshot": [],
+        "sort_probes": [],
+    }
+
+    async def compute(_request):
+        await asyncio.sleep(0.03)
+        return decision
+
+    with patch(
+        "routers.channel_pipeline._compute_pipeline_plan_payload",
+        side_effect=compute,
+    ), patch.object(
+        mutation_plan_store, "create", wraps=mutation_plan_store.create,
+    ) as create_plan:
+        with pytest.raises(asyncio.TimeoutError):
+            await _materialize_pipeline_plan(
+                RunPipelineRequest(dry_run=False),
+                probe_before_run=False,
+                expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=10),
+            )
+
+    create_plan.assert_not_called()
+
+
 @pytest.fixture
 def probe_plan(monkeypatch):
     from channel_pipeline_engine import ChannelPipelineEngine
@@ -626,8 +688,12 @@ async def test_probe_commit_uses_exact_identity_and_returns_new_execute_plan(pro
     assert response["phase"] == "execute"
     assert response["preview"]["dry_run_results"] == []
     setup["client"].get_streams_by_ids.assert_awaited_once_with([41])
-    setup["prober"].probe_stream.assert_awaited_once_with(
-        41, "http://media.example/41", "Sports"
+    call = setup["prober"].probe_stream.await_args
+    assert call.args == (41, "http://media.example/41", "Sports")
+    assert call.kwargs["content"] is False
+    assert call.kwargs["expires_at"].tzinfo is not None
+    setup["prober"].refresh_account_probe_limits.assert_awaited_once_with(
+        account_ids={3},
     )
     assert setup["prober"]._account_active == {}
     execute_plan = mutation_plan_store.consume(
@@ -653,7 +719,7 @@ async def test_probe_completion_starts_next_plan_review_window(probe_plan):
     setup = probe_plan
     clock = [100.0]
 
-    async def complete_probe(*_args):
+    async def complete_probe(*_args, **_kwargs):
         clock[0] = 350.0
         return {"probe_status": "failed"}
 
@@ -869,7 +935,7 @@ async def test_probe_route_persists_results_and_replays_fresh_exact_write(
     prober.account_probe_limits = {1: 1}
     prober.refresh_account_probe_limits = AsyncMock()
 
-    async def read_media(url):
+    async def read_media(url, *, expires_at=None):
         if url.endswith("/103"):
             raise RuntimeError("synthetic failed observation")
         height = 2160 if url.endswith("/102") else 1080
@@ -886,7 +952,7 @@ async def test_probe_route_persists_results_and_replays_fresh_exact_write(
             "format": {"format_name": "hls", "bit_rate": "5000000"},
         }
 
-    async def measure_media(url):
+    async def measure_media(url, *, expires_at=None):
         return 8_000_000 if url.endswith("/102") else 5_000_000
 
     prober._run_ffprobe = AsyncMock(side_effect=read_media)
@@ -1122,6 +1188,187 @@ async def test_probe_commit_cancellation_releases_account_permit_and_creates_no_
 
     assert setup["prober"]._account_active == {}
     assert setup["compute"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_commit_lock_expiry_returns_terminal_receipt_and_stays_consumed(
+    probe_plan, monkeypatch,
+):
+    from routers.channel_pipeline import (
+        CommitPipelinePlanRequest,
+        _MCP_PLANNED_RUN_LOCK,
+        commit_auto_creation_pipeline,
+    )
+
+    setup = probe_plan
+    monkeypatch.setattr(
+        "routers.channel_pipeline._PREPARED_PROBE_SECONDS", 0.03,
+        raising=False,
+    )
+    await _MCP_PLANNED_RUN_LOCK.acquire()
+    try:
+        with pytest.raises(Exception) as caught:
+            await asyncio.wait_for(
+                commit_auto_creation_pipeline(
+                    CommitPipelinePlanRequest(
+                        plan_id=setup["plan"].plan_id,
+                        plan_hash=setup["plan"].payload_hash,
+                        phase="probe",
+                    ),
+                    _admin=None,
+                ),
+                timeout=0.5,
+            )
+    finally:
+        _MCP_PLANNED_RUN_LOCK.release()
+
+    assert getattr(caught.value, "status_code", None) == 504
+    detail = caught.value.detail
+    assert set(detail) == {
+        "phase", "status", "plan_id", "stage", "expires_at", "message",
+    }
+    assert detail == {
+        "phase": "probe",
+        "status": "expired",
+        "plan_id": setup["plan"].plan_id,
+        "stage": "lock",
+        "expires_at": detail["expires_at"],
+        "message": (
+            "Prepared stream probes expired. Completed observations were retained. "
+            "Prepare a new plan; channel writes were not applied."
+        ),
+    }
+    assert detail["expires_at"].endswith("+00:00")
+    assert setup["compute"].await_count == 0
+    setup["prober"].probe_stream.assert_not_awaited()
+    await asyncio.sleep(0)
+    setup["prober"].probe_stream.assert_not_awaited()
+
+    with pytest.raises(Exception) as replay:
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=setup["plan"].plan_id,
+                plan_hash=setup["plan"].payload_hash,
+                phase="probe",
+            ),
+            _admin=None,
+        )
+    assert getattr(replay.value, "status_code", None) == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["preflight", "probe", "plan"])
+async def test_probe_commit_expiry_reports_coarse_stage_and_creates_no_next_plan(
+    probe_plan, monkeypatch, blocked_stage,
+):
+    from routers.channel_pipeline import (
+        CommitPipelinePlanRequest,
+        commit_auto_creation_pipeline,
+    )
+    from services.mutation_plan_store import mutation_plan_store
+
+    setup = probe_plan
+    monkeypatch.setattr(
+        "routers.channel_pipeline._PREPARED_PROBE_SECONDS", 0.03,
+    )
+    blocked = asyncio.Event()
+
+    async def wait_forever(*_args, **_kwargs):
+        blocked.set()
+        await asyncio.Event().wait()
+
+    if blocked_stage == "preflight":
+        setup["compute"].side_effect = wait_forever
+    elif blocked_stage == "probe":
+        setup["prober"].probe_stream.side_effect = wait_forever
+    else:
+        calls = 0
+
+        async def compute(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return deepcopy(setup["decision"])
+            return await wait_forever()
+
+        setup["compute"].side_effect = compute
+
+    with patch.object(
+        mutation_plan_store, "create", wraps=mutation_plan_store.create,
+    ) as create_plan:
+        with pytest.raises(Exception) as caught:
+            await commit_auto_creation_pipeline(
+                CommitPipelinePlanRequest(
+                    plan_id=setup["plan"].plan_id,
+                    plan_hash=setup["plan"].payload_hash,
+                    phase="probe",
+                ),
+                _admin=None,
+            )
+
+    assert blocked.is_set()
+    assert getattr(caught.value, "status_code", None) == 504
+    assert caught.value.detail["stage"] == blocked_stage
+    assert caught.value.detail["plan_id"] == setup["plan"].plan_id
+    assert setup["prober"]._account_active == {}
+    create_plan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_probe_commit_identity_read_uses_operation_expiry(
+    probe_plan, monkeypatch,
+):
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+
+    setup = probe_plan
+    monkeypatch.setattr(
+        "routers.channel_pipeline._PREPARED_PROBE_SECONDS", 0.03,
+    )
+    identity_started = asyncio.Event()
+
+    async def wait_for_identity(*_args, **_kwargs):
+        identity_started.set()
+        await asyncio.Event().wait()
+
+    setup["client"].get_streams_by_ids.side_effect = wait_for_identity
+
+    with pytest.raises(Exception) as caught:
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=setup["plan"].plan_id,
+                plan_hash=setup["plan"].payload_hash,
+                phase="probe",
+            ),
+            _admin=None,
+        )
+
+    assert identity_started.is_set()
+    assert getattr(caught.value, "status_code", None) == 504
+    assert caught.value.detail["stage"] == "preflight"
+    setup["prober"].probe_stream.assert_not_awaited()
+    assert setup["prober"]._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_probe_commit_dependency_timeout_before_expiry_keeps_dependency_meaning(
+    probe_plan,
+):
+    from routers.channel_pipeline import CommitPipelinePlanRequest, commit_auto_creation_pipeline
+
+    setup = probe_plan
+    setup["compute"].side_effect = asyncio.TimeoutError("dependency timeout")
+
+    with pytest.raises(asyncio.TimeoutError, match="dependency timeout"):
+        await commit_auto_creation_pipeline(
+            CommitPipelinePlanRequest(
+                plan_id=setup["plan"].plan_id,
+                plan_hash=setup["plan"].payload_hash,
+                phase="probe",
+            ),
+            _admin=None,
+        )
+
+    setup["prober"].probe_stream.assert_not_awaited()
 
 
 @pytest.mark.asyncio

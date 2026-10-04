@@ -293,6 +293,49 @@ async def test_account_limit_increase_wakes_waiters():
 
 
 @pytest.mark.asyncio
+async def test_scoped_account_limit_refresh_merges_without_resetting_claims():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=3)
+    prober.account_probe_limits = {2: 1, 18: 2}
+    unrelated = prober.semaphore_for_account(18)
+    await unrelated.__aenter__()
+    read_limits = AsyncMock(return_value={2: 3})
+
+    with patch(
+        "config.get_settings",
+        return_value=MagicMock(probe_concurrency_by_account={}),
+    ), patch(
+        "services.probe_limits.account_probe_limits",
+        read_limits,
+    ):
+        await prober.refresh_account_probe_limits(account_ids={2})
+
+    assert prober.account_probe_limits == {2: 3, 18: 2}
+    assert prober._account_active == {18: 1}
+    read_limits.assert_awaited_once_with(
+        prober.client, {}, account_ids={2},
+    )
+    await unrelated.__aexit__(None, None, None)
+    assert prober._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_scoped_account_limit_refresh_keeps_known_selected_ceiling_without_result():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=3)
+    prober.account_probe_limits = {2: 1, 18: 2}
+
+    with patch(
+        "config.get_settings",
+        return_value=MagicMock(probe_concurrency_by_account={}),
+    ), patch(
+        "services.probe_limits.account_probe_limits",
+        AsyncMock(return_value={}),
+    ):
+        await prober.refresh_account_probe_limits(account_ids={2})
+
+    assert prober.account_probe_limits == {2: 1, 18: 2}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_account_claims_leave_no_occupancy():
     prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
     prober.account_probe_limits = {2: 1}

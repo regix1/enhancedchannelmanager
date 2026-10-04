@@ -1772,7 +1772,9 @@ class ChannelPipelineEngine:
         matched_entries: list,
         rules: list[ChannelPipelineRule],
         results: dict,
-        dry_run: bool
+        dry_run: bool,
+        *,
+        expires_at: datetime | None,
     ) -> list[tuple[StreamContext, ChannelPipelineRule]]:
         """
         Probe streams that haven't been probed yet, for rules that have
@@ -1781,7 +1783,7 @@ class ChannelPipelineEngine:
         This runs after Pass 1 (match collection) and before sorting,
         so that quality data is available for the sort.
         """
-        from stream_prober import get_prober
+        from stream_prober import _probe_seconds, get_prober
 
         # Collect streams that need probing
         rule_map = {r.id: r for r in rules}
@@ -1835,28 +1837,101 @@ class ChannelPipelineEngine:
             logger.warning("[AUTO-CREATE-ENGINE] Prober not available, skipping probe step")
             return []
 
-        await prober.refresh_account_probe_limits()
+        account_ids = {
+            account_id
+            for _stream, _rule in selected
+            if (
+                account_id := prober._extract_m3u_account_id(
+                    _stream.m3u_account_id
+                )
+            ) is not None
+        }
+        if expires_at is None:
+            await prober.refresh_account_probe_limits()
+        else:
+            remaining = _probe_seconds(expires_at, float("inf"))
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(
+                prober.refresh_account_probe_limits(account_ids=account_ids),
+                timeout=remaining,
+            )
 
         # Keep this caller bounded while sharing each account's connection
         # ceiling with scheduled, bulk, and event probes.
         semaphore = asyncio.Semaphore(max(1, min(3, prober.max_concurrent_probes)))
 
         async def probe_one(stream_id, url, name, stream):
-            async with semaphore:
-                async with prober.semaphore_for_account(stream.m3u_account_id):
-                    try:
-                        await prober.probe_stream(stream_id, url, name)
-                    except Exception as e:
-                        logger.warning("[AUTO-CREATE-ENGINE] Failed to probe stream %s (%s): %s", stream_id, name, e)
+            try:
+                if expires_at is None:
+                    async with semaphore:
+                        async with prober.semaphore_for_account(
+                            stream.m3u_account_id
+                        ):
+                            saved = await prober.probe_stream(stream_id, url, name)
+                else:
+                    remaining = _probe_seconds(expires_at, float("inf"))
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    async with asyncio.timeout(remaining):
+                        async with semaphore:
+                            async with prober.semaphore_for_account(
+                                stream.m3u_account_id
+                            ):
+                                if _probe_seconds(expires_at, 1.0) <= 0:
+                                    raise asyncio.TimeoutError
+                                saved = await prober.probe_stream(
+                                    stream_id,
+                                    url,
+                                    name,
+                                    content=False,
+                                    expires_at=expires_at,
+                                )
+                if not saved:
+                    if expires_at is not None:
+                        raise asyncio.TimeoutError
+                    logger.warning(
+                        "[AUTO-CREATE-ENGINE] Probe did not complete for stream "
+                        "%s (%s)",
+                        stream_id,
+                        name,
+                    )
+                    return False
+                return True
+            except Exception as e:
+                if expires_at is not None:
+                    raise
+                logger.warning(
+                    "[AUTO-CREATE-ENGINE] Failed to probe stream %s (%s): %s",
+                    stream_id,
+                    name,
+                    e,
+                )
+                return False
 
         tasks = [
-            probe_one(sid, url, name, stream)
+            asyncio.create_task(probe_one(sid, url, name, stream))
             for sid, (url, name, stream, _rule) in streams_to_probe.items()
         ]
-        await asyncio.gather(*tasks)
+        try:
+            completed = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         # Reload stats cache
-        await self._load_stream_stats()
+        if expires_at is None:
+            await self._load_stream_stats()
+        else:
+            remaining = _probe_seconds(expires_at, float("inf"))
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(self._load_stream_stats(), timeout=remaining)
+            if _probe_seconds(expires_at, 1.0) <= 0:
+                raise asyncio.TimeoutError
 
         # Update resolution_height on matched stream contexts
         for stream, _rule, _losing, _log in matched_entries:
@@ -1873,19 +1948,20 @@ class ChannelPipelineEngine:
                 except (ValueError, IndexError) as e:
                     logger.debug("[AUTO-CREATE-ENGINE] Suppressed resolution parse error: %s", e)
 
-        results["execution_log"].append({
-            "stream_id": None,
-            "stream_name": f"[AUTO-CREATE-ENGINE]",
-            "m3u_account_id": None,
-            "rules_evaluated": [],
-            "actions_executed": [{
-                "type": "probe_streams",
-                "description": f"Probed {count} unprobed stream(s) for quality sorting",
-                "success": True,
-                "entity_id": None,
-                "error": None
-            }]
-        })
+        if all(completed):
+            results["execution_log"].append({
+                "stream_id": None,
+                "stream_name": f"[AUTO-CREATE-ENGINE]",
+                "m3u_account_id": None,
+                "rules_evaluated": [],
+                "actions_executed": [{
+                    "type": "probe_streams",
+                    "description": f"Probed {count} unprobed stream(s) for quality sorting",
+                    "success": True,
+                    "entity_id": None,
+                    "error": None
+                }]
+            })
         return selected
 
     async def _reorder_channel_streams(
@@ -2888,6 +2964,7 @@ class ChannelPipelineEngine:
         probe_candidates = await self._probe_unprobed_streams(
             matched_entries, rules, results,
             dry_run or not planning.allow_internal_side_effects,
+            expires_at=None,
         )
         if plan_only:
             results["planned_sort_probes"] = [

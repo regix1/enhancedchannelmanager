@@ -102,6 +102,7 @@ DEFAULT_PROBE_TIMEOUT = 30  # seconds
 BITRATE_SAMPLE_DURATION = 8  # seconds to sample stream for bitrate measurement
 PROBE_STAGE_MAX_SECONDS = 120.0
 PROBE_STATS_PUSH_TIMEOUT_SECONDS = 30.0
+_PROBE_STOP_SECONDS = 5.0
 _MAX_HLS_MANIFESTS = 5
 
 
@@ -115,6 +116,19 @@ def _probe_seconds(expires_at: datetime | None, cap: float) -> float:
         expires_at = expires_at.astimezone(timezone.utc)
     remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
     return max(0.0, min(cap, remaining))
+
+
+async def _stop_probe(process) -> None:
+    """Stop one owned media process without waiting on it indefinitely."""
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_PROBE_STOP_SECONDS)
+    except Exception:
+        logger.warning("[STREAM-PROBE] Probe process cleanup did not finish")
 
 
 @asynccontextmanager
@@ -681,7 +695,11 @@ class StreamProber:
             logger.error("[STREAM-PROBE] Failed to load probe history from %s: %s", PROBE_HISTORY_FILE, e)
             self._probe_history = []
 
-    async def refresh_account_probe_limits(self) -> None:
+    async def refresh_account_probe_limits(
+        self,
+        *,
+        account_ids: set[int] | None = None,
+    ) -> None:
         """Re-read each provider's connection ceiling before a probe run.
 
         Cheap: one call per account, and Xtream Codes answers in well under a
@@ -692,10 +710,19 @@ class StreamProber:
         from services.probe_limits import account_probe_limits
 
         overrides = getattr(get_settings(), "probe_concurrency_by_account", {}) or {}
-        limits = await account_probe_limits(self.client, overrides)
+        limits = await account_probe_limits(
+            self.client,
+            overrides,
+            account_ids=account_ids,
+        )
         async with self._probe_condition:
-            self.account_probe_limits = limits
-            self._probe_condition.notify_all()
+            if account_ids is None:
+                updated = limits
+            else:
+                updated = {**self.account_probe_limits, **limits}
+            if updated != self.account_probe_limits:
+                self.account_probe_limits = updated
+                self._probe_condition.notify_all()
 
     @asynccontextmanager
     async def semaphore_for_account(
@@ -1446,20 +1473,12 @@ class StreamProber:
                     expires_at, self.probe_timeout + 5,
                 )
                 if communicate_timeout <= 0:
-                    process.kill()
-                    await process.wait()
                     raise asyncio.TimeoutError
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), timeout=communicate_timeout,
                 )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                raise
-            except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await _stop_probe(process)
                 raise
 
         if process.returncode != 0:
@@ -1908,19 +1927,15 @@ class StreamProber:
                 _, stderr = await asyncio.wait_for(
                     process.communicate(), timeout=total_timeout
                 )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                await _stop_probe(process)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
                 logger.warning(
                     "[STREAM-PROBE] Black screen detection timed out after %ss",
                     total_timeout,
                 )
                 return None
-            except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
-                raise
         output = stderr.decode()
         if process.returncode != 0:
             logger.debug(
