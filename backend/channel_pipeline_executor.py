@@ -5386,6 +5386,17 @@ class ActionExecutor:
             if probe_missing and probe_first
             else (unit_ids or stream_ids)
         )
+        probe_ids = set(probe_ids) - stale_ids
+        event_streams = {}
+        for unit in units:
+            members = frozenset(row.stream.stream_id for row in unit.rows
+                                if row.stream.stream_id in probe_ids)
+            if members:
+                key = f"event:{unit.event_key}"
+                event_streams[key] = event_streams.get(key, frozenset()) | members
+        represented = set().union(*event_streams.values()) if event_streams else set()
+        event_streams.update({f"stream:{sid}": frozenset({sid})
+                              for sid in probe_ids - represented})
         flow = await collect_stream_flow(
             probe_ids,
             client=self.client,
@@ -5394,8 +5405,10 @@ class ActionExecutor:
             event_start_by_stream=event_start_by_stream,
             stream_names=stream_names,
             expires_at=expires_at,
+            stop_when_playable=bool(probe_missing and config.get("retire_finished_events")),
+            event_streams=event_streams if probe_missing and config.get("retire_finished_events") else None,
         )
-        read_only_ids = stream_ids - set(probe_ids)
+        read_only_ids = stream_ids - set(probe_ids) - stale_ids
         if read_only_ids:
             flow.update(await collect_stream_flow(
                 read_only_ids,
@@ -5426,6 +5439,7 @@ class ActionExecutor:
         *,
         flow,
         expires_at,
+        advance=False,
     ):
         """Read one bounded evidence batch for event creation and retirement."""
         import asyncio
@@ -5439,6 +5453,10 @@ class ActionExecutor:
         from services.event_sync_matcher import parse_event_name, _score_parsed_pair, EVENT_ATTACH_FLOOR, BAND_ATTACH
         from services.event_sync_resolver import effective_patterns
         from stream_prober import extract_m3u_account_id
+        from cache import get_cache
+        from channel_pipeline_schema import validate_event_sync_config
+        from services.epg_publication import _config_hash
+        from services.event_sync_stream_health import collect_stream_flow, _selection_lock
 
         states, eligible = {}, set()
         if not hasattr(self, "_event_states"):
@@ -5448,6 +5466,7 @@ class ActionExecutor:
         try:
             rule = db.get(ChannelPipelineRule, rule_id)
             owned = rule.get_managed_channel_ids() if rule else []
+            rule_value = copy.deepcopy(rule.get_event_sync_config()) if rule else None
             profile = db.get(DummyEPGProfile, config.get("dummy_epg_profile_id"))
             profile = profile.to_dict() if profile and profile.enabled else None
             ownership_disputed = any(
@@ -5475,43 +5494,113 @@ class ActionExecutor:
                 rule_id, config["promote_target_group_id"],
             )
             return eligible, states
-        if not profile or len(channels) > 256:
+        if not profile:
             return eligible, states
+        profile_hash = _config_hash(profile)
+        checked_config = copy.deepcopy(config)
+        if advance and (
+            not rule or not rule.enabled or not isinstance(rule_value, dict)
+            or validate_event_sync_config(rule_value)
+            or validate_event_sync_config(checked_config) or rule_value != checked_config
+        ):
+            return eligible, states
+        if advance and expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            return eligible, states
+        # Each pass retains unknown channels outside its evidence batch.
+        retained = channels
+        channels = {}
+        stream_ids = set()
         unit_ids = {}
         for index, unit in enumerate(units, 1):
             cid = unit.existing_channel_id
             if cid is None:
                 start = unit.rows[0].result.parsed.start
-                if start is None or not now - timedelta(hours=24) <= start <= now or len(channels) >= 256:
+                if (
+                    start is None or not now - timedelta(hours=24) <= start <= now
+                    or len(channels) >= 256
+                    or not any(flow.get(row.stream.stream_id) is True
+                               and row.stream.is_stale is not True for row in unit.rows)
+                ):
                     continue
                 cid = -index
+                ids = {row.stream.stream_id for row in unit.rows if row.stream.stream_id is not None}
+                if not ids or len(stream_ids | ids) > 1000:
+                    continue
+                stream_ids.update(ids)
                 channels[cid] = {
                     "id": cid, "name": unit.channel_name,
                     "channel_group_id": config["promote_target_group_id"],
                     "streams": [row.stream.stream_id for row in unit.rows if row.stream.stream_id is not None],
                 }
-            unit_ids[unit.event_key] = cid
+            if cid in retained or cid in channels:
+                unit_ids[unit.event_key] = cid
+
+        with _selection_lock:
+            cache = get_cache()
+            cached = cache.get("event_sync_lifecycle_positions", ttl=86400)
+            positions = dict(cached) if isinstance(cached, dict) else {}
+            monotonic_now = time.monotonic()
+            identity = (rule_id, config["promote_target_group_id"])
+            position = positions.get(identity)
+            if not isinstance(position, dict) or position.get("expires_at", 0) <= monotonic_now:
+                position = None
+            ordered = sorted(retained)
+            if position is not None and position.get("channel_id") in ordered:
+                start = ordered.index(position["channel_id"]) + 1
+                ordered = ordered[start:] + ordered[:start]
+            positive = {
+                unit.existing_channel_id for unit in units
+                if any(flow.get(row.stream.stream_id) is True
+                       and row.stream.is_stale is not True for row in unit.rows)
+            }
+            ordered = ([cid for cid in ordered if cid in positive]
+                       + [cid for cid in ordered if cid not in positive])
+            last_channel_id = None
+            for cid in ordered:
+                if len(channels) >= 256 or len(stream_ids) >= 1000:
+                    break
+                last_channel_id = cid
+                rows = retained[cid].get("streams")
+                if not isinstance(rows, list):
+                    continue
+                ids = [row.get("id") if isinstance(row, dict) else row for row in rows]
+                if not ids or any(type(sid) is not int or sid < 1 for sid in ids):
+                    continue
+                ids = set(ids)
+                if len(ids) > 1000 or len(stream_ids | ids) > 1000:
+                    continue
+                channels[cid] = retained[cid]
+                stream_ids.update(ids)
+            if advance and last_channel_id is not None:
+                if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+                    return eligible, states
+                positions = {key: value for key, value in positions.items()
+                             if isinstance(value, dict) and value.get("expires_at", 0) > monotonic_now}
+                positions.pop(identity, None)
+                positions[identity] = {
+                    "expires_at": position["expires_at"] if position else monotonic_now + 86400,
+                    "channel_id": last_channel_id,
+                }
+                while len(positions) > 256:
+                    positions.pop(next(iter(positions)))
+                cache.set("event_sync_lifecycle_positions", positions)
         stream_scopes = {}
         for unit in units:
             for row in unit.rows:
                 stream_scopes.setdefault(row.stream.stream_id, set()).add(
                     (row.stream.provider_id, row.stream.group_id)
                 )
-        stream_ids = {
-            stream.get("id") if isinstance(stream, dict) else stream
-            for channel in channels.values() for stream in channel.get("streams", [])
-        }
-        if not stream_ids or None in stream_ids or len(stream_ids) > 1000:
+        if not stream_ids:
             return eligible, states
         remaining = (
             expires_at - datetime.now(timezone.utc)
-        ).total_seconds()
-        if remaining <= 0:
+        ).total_seconds() if expires_at is not None else None
+        if remaining is not None and remaining <= 0:
             return eligible, states
         try:
-            async with asyncio.timeout(min(10.0, remaining)):
+            async with asyncio.timeout(remaining):
                 streams = await self.client.get_streams_by_ids(sorted(stream_ids))
-            if datetime.now(timezone.utc) >= expires_at:
+            if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
                 return eligible, states
             if not isinstance(streams, list) or any(not isinstance(row, dict) for row in streams):
                 return eligible, states
@@ -5542,7 +5631,7 @@ class ActionExecutor:
             channel["streams"] = [by_id[sid] for sid in ids if sid in by_id]
             channel["_event_streams_complete"] = bool(ids) and all(sid in by_id for sid in ids)
         profile["name_source"] = "channel"
-        if datetime.now(timezone.utc) >= expires_at:
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             return eligible, states
         try:
             _, coverage = await prepare_profiles(
@@ -5552,23 +5641,134 @@ class ActionExecutor:
                 expires_at=expires_at,
                 now=now,
                 wait_for_sources=False,
+                recover_sources=advance,
             )
         except Exception:
             return eligible, states
-        if datetime.now(timezone.utc) >= expires_at:
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             return eligible, states
+        try:
+            for phase in range(2 if advance else 1):
+                remaining = (
+                    max(0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+                    if expires_at is not None else None
+                )
+                async with asyncio.timeout(remaining):
+                    current = await self.client.get_streams_by_ids(sorted(stream_ids))
+                if not isinstance(current, list) or any(not isinstance(row, dict) for row in current):
+                    return eligible, states
+                current = {row.get("id"): row for row in current if row.get("id") in stream_ids}
+                unchanged = set()
+                for sid, stream in by_id.items():
+                    row = current.get(sid)
+                    if row is None:
+                        continue
+                    groups = []
+                    for value in (stream, row):
+                        group = value.get("channel_group_id")
+                        if group is None:
+                            group = value.get("channel_group")
+                        if group is None:
+                            group = value.get("stream_group") or value.get("stream_group_id") or value.get("group_id")
+                        groups.append(group.get("id") if isinstance(group, dict) else group)
+                    if (
+                        stream.get("url") == row.get("url")
+                        and stream.get("name") == row.get("name")
+                        and extract_m3u_account_id(stream.get("m3u_account"))
+                        == extract_m3u_account_id(row.get("m3u_account"))
+                        and groups[0] == groups[1]
+                    ):
+                        unchanged.add(sid)
+                checked_at = datetime.now(timezone.utc)
+                if expires_at is not None and checked_at >= expires_at:
+                    return eligible, states
+                probe_ids = [sid for sid in unchanged if current[sid].get("is_stale") is not True]
+                parsed_units = {unit_ids[unit.event_key]: unit.rows[0].result.parsed for unit in units
+                                if unit.event_key in unit_ids}
+                for cid, channel in channels.items():
+                    if cid not in parsed_units:
+                        parsed_units[cid] = parse_event_name(
+                            channel.get("name") or "", now=checked_at,
+                            event_timezone=profile.get("event_timezone") or "US/Eastern",
+                        )
+                event_streams = {}
+                for unit in units:
+                    cid = unit_ids.get(unit.event_key)
+                    if cid not in channels:
+                        continue
+                    members = frozenset(
+                        row["id"] for row in channels[cid]["streams"]
+                        if row["id"] in probe_ids and _score_parsed_pair(
+                            unit.rows[0].result.parsed, parsed_streams[row["id"]],
+                            window_minutes=30, threshold=EVENT_ATTACH_FLOOR,
+                        ).band == BAND_ATTACH
+                    )
+                    if members:
+                        key = f"event:{unit.event_key}"
+                        event_streams[key] = event_streams.get(key, frozenset()) | members
+                for cid, channel in channels.items():
+                    if cid in unit_ids.values():
+                        continue
+                    members = frozenset(
+                        row["id"] for row in channel["streams"]
+                        if row["id"] in probe_ids and _score_parsed_pair(
+                            parsed_units[cid], parsed_streams[row["id"]],
+                            window_minutes=30, threshold=EVENT_ATTACH_FLOOR,
+                        ).band == BAND_ATTACH
+                    )
+                    if members:
+                        event_streams[f"channel:{cid}"] = members
+                represented = set().union(*event_streams.values()) if event_streams else set()
+                event_streams.update({f"stream:{sid}": frozenset({sid})
+                                      for sid in set(probe_ids) - represented})
+                flow = await collect_stream_flow(
+                    probe_ids, client=self.client, checked_after=checked_at - timedelta(minutes=5),
+                    event_start_by_stream={sid: parsed_streams[sid].start for sid in probe_ids},
+                    stream_names={sid: current[sid].get("name") for sid in probe_ids},
+                    expires_at=expires_at, probe_missing=advance and phase == 0,
+                    stop_when_playable=advance and phase == 0,
+                    event_streams=event_streams if advance and phase == 0 else None,
+                )
+                now = datetime.now(timezone.utc)
+                if expires_at is not None and now >= expires_at:
+                    return eligible, states
+                for channel in channels.values():
+                    channel["_event_streams_complete"] &= all(
+                        row["id"] in unchanged for row in channel["streams"]
+                    )
+                    channel["streams"] = [current[row["id"]] for row in channel["streams"]
+                                          if row["id"] in unchanged]
+        except Exception:
+            return eligible, states
+        if advance:
+            db = get_session()
+            try:
+                rule = db.get(ChannelPipelineRule, rule_id)
+                current_config = copy.deepcopy(rule.get_event_sync_config()) if rule else None
+                current_profile = db.get(DummyEPGProfile, config["dummy_epg_profile_id"])
+                if (
+                    not rule or not rule.enabled or not isinstance(current_config, dict)
+                    or validate_event_sync_config(current_config) or current_config != rule_value
+                    or not current_profile or not current_profile.enabled
+                    or _config_hash(current_profile.to_dict()) != profile_hash
+                    or rule.get_managed_channel_ids() != owned
+                    or any(conflict["group_id"] == config["promote_target_group_id"]
+                           for conflict in validate_ownership(
+                               db.query(DummyEPGProfile).filter(DummyEPGProfile.enabled == True).all(),
+                               db.query(ChannelPipelineRule).filter(ChannelPipelineRule.enabled == True).all(),
+                           ))
+                ):
+                    return eligible, states
+            finally:
+                db.close()
         sources = {row["source_id"]: row for row in coverage["sources"]}
         observations = {row["channel_id"]: row for row in coverage["channels"]}
-        parsed_units = {unit_ids[unit.event_key]: unit.rows[0].result.parsed for unit in units
-                        if unit.event_key in unit_ids}
         for cid, channel in channels.items():
             status = "unknown"
             witness = observations.get(cid, {}).get("event")
             if not channel["_event_streams_complete"]:
                 continue
-            parsed_channel = parsed_units.get(cid) or parse_event_name(
-                channel.get("name") or "", now=now, event_timezone=profile.get("event_timezone") or "US/Eastern",
-            )
+            parsed_channel = parsed_units[cid]
             # Nothing lists ESPN+ or PPV, so those channels never get a witness and
             # nothing below can retire them. A channel whose every stream is dead is
             # not waiting on evidence though: the provider has dropped the stream, or
@@ -6663,7 +6863,7 @@ class ActionExecutor:
         # read it. Two wall-clock reads a few milliseconds apart disagree
         # about every event whose start falls between them. [53]
         now = datetime.now(timezone.utc)
-        health_expires_at = now + timedelta(seconds=60)
+        health_expires_at = None
 
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id, now=now,
@@ -6789,6 +6989,7 @@ class ActionExecutor:
                 retirement_confirmed,
                 flow=flow,
                 expires_at=health_expires_at,
+                advance=not exec_ctx.dry_run,
             )
             from services.epg_publication import (
                 HEALTH_REASONS,

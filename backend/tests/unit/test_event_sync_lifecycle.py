@@ -260,7 +260,7 @@ async def test_elapsed_lifecycle_keeps_managed_channels_unknown():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("remaining_seconds,timeout_seconds", [
     (0.25, 0.25),
-    (30, 10.0),
+    (30, 30.0),
 ])
 async def test_lifecycle_lookup_uses_the_smaller_remaining_budget(
     remaining_seconds,
@@ -346,6 +346,7 @@ async def test_fresh_lifecycle_evidence_can_mark_a_channel_active():
     with patch("database.get_session", return_value=session), \
          patch("services.event_slots.validate_ownership", return_value=[]), \
          patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(return_value={9001: True})), \
          patch("channel_pipeline_executor.datetime", wraps=datetime) as clock:
         clock.now.return_value = now
         eligible, states = await executor._event_lifecycle(

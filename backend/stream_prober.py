@@ -1273,8 +1273,6 @@ class StreamProber:
         """
         logger.debug("[STREAM-PROBE] probe_stream() called for stream_id=%s, name=%s, url=%s", stream_id, name, 'present' if url else 'missing')
 
-        if content and expires_at is None:
-            raise ValueError("expires_at is required when content is true")
         if _probe_seconds(expires_at, 1.0) <= 0:
             return {}
 
@@ -1304,7 +1302,7 @@ class StreamProber:
                 return {}
             ffprobe_call = (
                 self._run_ffprobe(url, expires_at=expires_at)
-                if expires_at is not None
+                if expires_at is not None or content
                 else self._run_ffprobe(url)
             )
             result = await asyncio.wait_for(ffprobe_call, timeout=ffprobe_timeout)
@@ -1354,7 +1352,7 @@ class StreamProber:
                 return {}
             bitrate_call = (
                 self._measure_stream_bitrate(url, expires_at=expires_at)
-                if expires_at is not None
+                if expires_at is not None or content
                 else self._measure_stream_bitrate(url)
             )
             measured_bitrate = await asyncio.wait_for(
@@ -1388,7 +1386,7 @@ class StreamProber:
                     return {}
                 content_call = (
                     self._detect_black_screen(url, expires_at=expires_at)
-                    if expires_at is not None
+                    if expires_at is not None or content
                     else self._detect_black_screen(url)
                 )
                 is_black = await asyncio.wait_for(

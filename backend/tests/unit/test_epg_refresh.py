@@ -14,7 +14,224 @@ from tasks.event_visibility import EventVisibilityTask
 EXPIRES_AT = datetime.now(timezone.utc) + timedelta(hours=1)
 
 
-def admitted_publication(profile, *, expires_at=EXPIRES_AT):
+@pytest.fixture
+def phase_source(monkeypatch):
+    import copy
+    from types import SimpleNamespace
+    from tests.tasks.test_event_visibility import _publication
+
+    source = {"id": 46, "name": "Guide", "url": "http://ecm/api/dummy-epg/xmltv/1",
+              "status": "ready", "updated_at": "initial"}
+    channels = {10: {"id": 10, "uuid": "channel-10", "channel_group_id": 7, "epg_data_id": None}}
+    stored = _publication("profile:1", pending=False, channels=[{"channel_id": 10, "events": []}])
+    client = MagicMock(base_url="http://dispatcharr.local")
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(source))
+    client.get_channel = AsyncMock(side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]))
+    imports = []
+
+    async def dispatch(source_id):
+        imports.append(channels[10]["epg_data_id"])
+        source["status"] = "processing"
+
+    client.refresh_epg_source = AsyncMock(side_effect=dispatch)
+
+    def update(scope, **claims):
+        if claims["expected_revision"] != stored["revision"]:
+            return None
+        for name in ("source_refreshes", "required_dispatcharr_hashes", "confirmed_dispatcharr_hashes"):
+            if name in claims:
+                stored["state"]["delivery"][name] = copy.deepcopy(claims[name])
+        stored["revision"] += 1
+        return stored["revision"]
+
+    monkeypatch.setattr("services.epg_publication.read_publication", lambda scope: copy.deepcopy(stored))
+    monkeypatch.setattr("services.epg_publication.update_delivery", update)
+    return SimpleNamespace(source=source, channels=channels, stored=stored,
+                           client=client, imports=imports)
+
+
+@pytest.mark.asyncio
+async def test_programme_phase_survives_reconstructed_callers(phase_source):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+
+    async def call(after_link=False):
+        return await refresh_source(
+            setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+            expires_at=None, after_link=after_link, channel_map=setup.channels, wait=False,
+        )
+
+    assert await call() is False
+    assert await call() is False
+    assert setup.imports == [None]
+    setup.source.update(status="success", updated_at="headers")
+    assert await call() is True
+    assert setup.stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}
+    setup.channels[10]["epg_data_id"] = 900
+    assert await call(True) is False
+    assert await call(True) is False
+    assert setup.imports == [None, 900]
+    setup.source.update(status="success", updated_at="programmes")
+    assert await call(True) is True
+    setup.source["status"] = "ready"
+    assert await call(True) is True
+    assert setup.imports == [None, 900]
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["links"] == {"10": 900}
+    assert progress["completed"] is True
+    assert progress["pending_links"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("predecessor", ["headers", "programmes"])
+async def test_successor_keeps_latest_bindings_and_its_own_proof(phase_source, predecessor):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+
+    async def call(after_link):
+        return await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                    expires_at=None, after_link=after_link,
+                                    channel_map=setup.channels, wait=False)
+
+    if predecessor == "programmes":
+        setup.channels[10]["epg_data_id"] = 800
+    assert await call(predecessor == "programmes") is False
+    for link in (900, 901, 902):
+        setup.channels[10]["epg_data_id"] = link
+        assert await call(True) is False
+        assert await call(True) is False
+    assert len(setup.imports) == 1
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["pending_links"] == {"10": 902}
+    setup.source.update(status="success", updated_at="predecessor")
+    assert await call(True) is False
+    assert setup.imports[-1] == 902
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["initial_updated"] == "predecessor"
+    assert progress["completed"] is False
+    assert setup.stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}
+    setup.source.update(status="success", updated_at="successor")
+    assert await call(True) is True
+    assert len(setup.imports) == 2
+
+
+@pytest.mark.asyncio
+async def test_unrelated_import_cannot_complete_an_untriggered_phase(phase_source):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+    setup.source["status"] = "processing"
+
+    async def call():
+        return await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                    expires_at=None, channel_map=setup.channels, wait=False)
+
+    assert await call() is False
+    assert setup.imports == []
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["triggered"] is False
+    assert progress["observed_running"] is False
+    setup.source.update(status="success", updated_at="unrelated")
+    assert await call() is False
+    assert setup.imports == [None]
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["initial_updated"] == "unrelated"
+    assert progress["completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_incomplete_bindings_remove_confirmation_without_retrigger(phase_source):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+    setup.channels[10]["epg_data_id"] = 900
+
+    async def call():
+        return await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                    expires_at=None, after_link=True,
+                                    channel_map=setup.channels, wait=False)
+
+    assert await call() is False
+    setup.source.update(status="success", updated_at="programmes")
+    assert await call() is True
+    setup.channels[10].pop("epg_data_id")
+    assert await call() is False
+    assert setup.stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}
+    setup.channels[10]["epg_data_id"] = 900
+    assert await call() is True
+    assert setup.imports == [900]
+    setup.channels[10]["epg_data_id"] = None
+    assert await call() is False
+    setup.source.update(status="success", updated_at="empty-programmes")
+    assert await call() is True
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["links"] == {}
+    assert setup.imports == [900, None]
+
+
+@pytest.mark.asyncio
+async def test_failed_predecessor_releases_only_a_distinct_successor(phase_source):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+
+    async def call(after_link):
+        return await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                    expires_at=None, after_link=after_link,
+                                    channel_map=setup.channels, wait=False)
+
+    assert await call(False) is False
+    setup.channels[10]["epg_data_id"] = 900
+    assert await call(True) is False
+    setup.source.update(status="failed", updated_at="failed-header")
+    assert await call(True) is False
+    assert setup.imports == [None, 900]
+    setup.source.update(status="failed", updated_at="failed-programmes")
+    for _ in range(2):
+        assert await call(True) is False
+    assert setup.imports == [None, 900]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_phase_resumes_accepted_work_without_retrigger(phase_source):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+    assert await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                expires_at=None, channel_map=setup.channels, wait=False) is False
+    cancelled = {"value": False}
+    observed = asyncio.Event()
+    read = setup.client.get_epg_source.side_effect
+
+    async def source(source_id):
+        observed.set()
+        return read(source_id)
+
+    setup.client.get_epg_source.side_effect = source
+    pending = asyncio.create_task(refresh_source(
+        setup.client, setup.source, {1: copy.deepcopy(setup.stored)}, expires_at=None,
+        channel_map=setup.channels, wait=True, cancelled=lambda: cancelled["value"],
+    ))
+    await asyncio.wait_for(observed.wait(), timeout=1)
+    cancelled["value"] = True
+    assert await asyncio.wait_for(pending, timeout=1) is False
+    assert setup.imports == [None]
+    assert setup.stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}
+    setup.source.update(status="success", updated_at="accepted")
+    assert await refresh_source(setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+                                expires_at=None, channel_map=setup.channels, wait=False) is True
+    assert setup.imports == [None]
+
+
+def admitted_publication(profile, *, expires_at=None):
     return {
         "scope": f"profile:{profile['id']}",
         "xmltv": '<?xml version="1.0"?><tv></tv>',
@@ -27,7 +244,7 @@ def admitted_publication(profile, *, expires_at=EXPIRES_AT):
                     "attempt_id": "1" * 32,
                     "config_hash": _config_hash(profile),
                     "admitted_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
-                    "expires_at": expires_at.isoformat(),
+                    "expires_at": expires_at.isoformat() if expires_at is not None else None,
                     "stage": "preparing",
                 },
                 "pending_channels": {},
@@ -175,6 +392,87 @@ async def test_expired_source_lifetime_never_triggers_refresh():
 
     assert completed is False
     client.get_epg_source.assert_not_awaited()
+    client.refresh_epg_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unbounded_import_retains_progress_across_restart():
+    import json
+
+    client = MagicMock(base_url="http://dispatcharr.local")
+    initial = {"id": 1, "url": "http://guide.local/events.xml", "status": "ready"}
+    client.get_epg_source = AsyncMock(return_value={**initial, "status": "processing"})
+    client.refresh_epg_source = AsyncMock()
+    progress = {}
+    assert await wait_for_epg_source_refresh(
+        client, 1, "Guide", expires_at=None, initial_source=initial,
+        progress=progress, wait=False,
+    ) is False
+    progress = json.loads(json.dumps(progress))
+    client.get_epg_source.return_value = {**initial, "status": "success"}
+    assert await wait_for_epg_source_refresh(
+        client, 1, "Guide", expires_at=None, initial_source=initial,
+        progress=progress, wait=False,
+    ) is True
+    client.refresh_epg_source.assert_awaited_once_with(1)
+    assert progress["observed_running"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["none", "endpoint", "url", "id"])
+async def test_unbounded_import_rechecks_identity_after_long_wait(change):
+    from tests.unit.test_event_sync_promotion import _clock
+
+    clock = {"now": datetime.now(timezone.utc)}
+    client = MagicMock(base_url="http://dispatcharr.local")
+    initial = {"id": 1, "url": "http://guide.local/events.xml", "status": "processing"}
+
+    async def read(source_id):
+        clock["now"] += timedelta(days=2)
+        current = {**initial, "status": "success"}
+        if change == "endpoint":
+            client.base_url = "http://other.local"
+        elif change == "url":
+            current["url"] = "http://guide.local/other.xml"
+        elif change == "id":
+            current["id"] = 2
+        return current
+
+    client.get_epg_source = AsyncMock(side_effect=read)
+    client.refresh_epg_source = AsyncMock()
+    with patch("tasks.dummy_epg_refresh.datetime", new=_clock(lambda: clock["now"])):
+        completed = await wait_for_epg_source_refresh(
+            client, 1, "Guide", expires_at=None, initial_source=initial,
+            trigger=False, poll_interval=0,
+        )
+    assert completed is (change == "none")
+    client.refresh_epg_source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unbounded_import_cancels_owned_observation():
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    cancel = {"requested": False}
+
+    async def read(source_id):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    client = MagicMock()
+    client.get_epg_source = AsyncMock(side_effect=read)
+    client.refresh_epg_source = AsyncMock()
+    waiting = asyncio.create_task(wait_for_epg_source_refresh(
+        client, 1, "Guide", expires_at=None, initial_source={"status": "processing"},
+        trigger=False, poll_interval=0, cancelled=lambda: cancel["requested"],
+    ))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    cancel["requested"] = True
+    assert await asyncio.wait_for(waiting, timeout=1) is False
+    assert stopped.is_set()
     client.refresh_epg_source.assert_not_awaited()
 
 
@@ -348,3 +646,37 @@ async def test_expired_profile_starts_no_preparation_while_eligible_profile_prog
     prepare.assert_awaited_once()
     assert prepare.await_args.args[0] == [saved[1]]
     assert prepare.await_args.kwargs["expires_at"] == eligible
+
+
+@pytest.mark.asyncio
+async def test_blocking_drain_keeps_requested_phase_separate(phase_source, monkeypatch):
+    import copy
+    from services.epg_publication import refresh_source
+
+    setup = phase_source
+    setup.source["status"] = "processing"
+    reads = 0
+
+    async def read(source_id):
+        nonlocal reads
+        reads += 1
+        if setup.imports:
+            setup.source.update(status="success", updated_at="requested")
+        elif reads >= 3:
+            setup.source.update(status="success", updated_at="unrelated")
+        return copy.deepcopy(setup.source)
+
+    async def observe(*args, **kwargs):
+        return await wait_for_epg_source_refresh(*args, **kwargs, poll_interval=0)
+
+    setup.client.get_epg_source.side_effect = read
+    monkeypatch.setattr("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", observe)
+    assert await refresh_source(
+        setup.client, setup.source, {1: copy.deepcopy(setup.stored)},
+        expires_at=None, channel_map=setup.channels, wait=True,
+    ) is True
+    assert setup.imports == [None]
+    progress = next(iter(setup.stored["state"]["delivery"]["source_refreshes"].values()))
+    assert progress["initial_updated"] == "unrelated"
+    assert progress["completed"] is True
+    assert setup.stored["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}

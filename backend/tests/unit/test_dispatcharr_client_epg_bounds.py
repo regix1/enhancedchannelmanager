@@ -652,9 +652,10 @@ async def test_exact_ids_validate_the_internal_call_contract(kwargs):
 
 
 @pytest.mark.asyncio
-async def test_exact_ids_pass_one_expiry_to_every_page():
+@pytest.mark.parametrize("finite", [False, True])
+async def test_exact_ids_pass_one_expiry_to_every_page(finite):
     pages = []
-    expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=30) if finite else None
 
     def handler(request):
         page = request.url.params["page"]
@@ -796,6 +797,51 @@ async def test_current_programmes_rejects_invalid_or_expired_expiry_before_authe
                     expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
                 )
         ensure.assert_not_awaited()
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact", [False, True])
+async def test_current_and_exact_reads_have_no_implicit_deadline(monkeypatch, exact):
+    deadlines = []
+    timeout_at = asyncio.timeout_at
+
+    def record(deadline):
+        deadlines.append(deadline)
+        return timeout_at(deadline)
+
+    monkeypatch.setattr(asyncio, "timeout_at", record)
+    row = ({"id": 8, "epg_source": 46, "tvg_id": "eight"} if exact
+           else {"epg_data_id": 8, "title": "Programme"})
+    client = _client(lambda request: httpx.Response(200, json=[row]), source_count=1)
+    try:
+        if exact:
+            result = await client.get_epg_data(max_results=1, ids=frozenset({8}), expires_at=None)
+        else:
+            result = await client.get_epg_programmes(frozenset({8}), expires_at=None)
+        assert result == [row]
+        assert deadlines == [None]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_nonexact_bounded_read_keeps_explicit_deadline(monkeypatch):
+    deadlines = []
+    timeout_at = asyncio.timeout_at
+
+    def record(deadline):
+        deadlines.append(deadline)
+        return timeout_at(deadline)
+
+    monkeypatch.setattr(asyncio, "timeout_at", record)
+    client = _client(lambda request: httpx.Response(200, json=[]))
+    before = asyncio.get_running_loop().time()
+    try:
+        assert await client.get_epg_data(max_results=1) == []
+        assert len(deadlines) == 1
+        assert before + 120 <= deadlines[0] <= asyncio.get_running_loop().time() + 120
     finally:
         await client._client.aclose()
 

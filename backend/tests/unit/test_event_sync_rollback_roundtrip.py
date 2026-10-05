@@ -789,12 +789,12 @@ class TestDedicatedRollback:
         from tests.unit.test_event_sync_promotion import _staged_event
 
         setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
-        foreign = deepcopy(setup["state"].channels[100])
         dummy_epg = setup["dummy_epg"]
         _, regenerate, wait_refresh = dummy_epg._wire_epg(
             setup["state"], setup["client"], db_session_factory,
             regenerated_entries=[dummy_epg._dummy_entry(502, 900, setup["event_channel_name"])],
         )
+        foreign = deepcopy(setup["state"].channels[100])
         setup["state"].guide_sources[0]["is_active"] = True
         with patch("services.event_sync_resolver.datetime") as clock:
             clock.now.return_value = setup["event_start"] + timedelta(minutes=1)

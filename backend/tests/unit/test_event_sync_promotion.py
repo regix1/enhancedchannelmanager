@@ -1878,9 +1878,8 @@ def test_pending_guide_preserves_channel_id(db_session_factory, monkeypatch):
     assert final_receipt["reason"] is None
     assert final_receipt["terminal_at"] is not None
     assert final_receipt["retry_at"] is None
-    guide_expires = datetime.fromisoformat(
-        final_publication["state"]["delivery"]["guide_attempt"]["expires_at"]
-    )
+    guide_expires = final_publication["state"]["delivery"]["guide_attempt"]["expires_at"]
+    assert guide_expires is None
     assert refresh_expires == [guide_expires, guide_expires, guide_expires]
     assert (
         final_publication["state"]["delivery"]["guide_attempt"]["config_hash"]
@@ -1930,9 +1929,11 @@ def test_failed_import_keeps_event_hidden(db_session_factory, monkeypatch):
             completed = await complete_refresh(*args, **kwargs)
             state.channels[900]["logo_id"] = 77
             return completed
-        raise RuntimeError("programme import unavailable")
+        # The source completes its import without the newly linked programme.
+        state.guide_sources[0].update(status="success", updated_at=str(imports["count"]))
+        return True
 
-    wait_refresh.side_effect = fail_after_link
+    client.refresh_epg_source.side_effect = fail_after_link
     with patch("services.event_sync_resolver.datetime") as resolver_clock:
         resolver_clock.now.return_value = event_start + timedelta(minutes=1)
         result = dummy_epg._manual_run(
@@ -4679,6 +4680,7 @@ def retirement(db_session_factory, monkeypatch):
     monkeypatch.setattr(epg_publication, "get_session", db_session_factory)
     monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
     monkeypatch.setattr("channel_pipeline_executor.datetime", _clock(now))
+    monkeypatch.setattr(event_sync_stream_health, "datetime", _clock(now))
     monkeypatch.setattr(event_sync_stream_health, "_load_stats", AsyncMock(side_effect=lambda ids: stats.copy()))
     executor = ActionExecutor(
         client,
@@ -4743,16 +4745,16 @@ async def test_health_that_consumes_the_lifetime_starts_no_lifecycle_read(
         "channel_pipeline_executor.datetime",
         _clock(lambda: current[0]),
     ):
-        result = await executor._execute_event_sync_promotion(
-            setup["rule"].id,
-            setup["rule"].name,
-            setup["config"],
-            SimpleNamespace(resolved=[row]),
-            ExecutionContext(),
+        flow, dead = await executor._event_health(
+            setup["rule"].id, setup["config"], (), [row], setup["now"],
+            probe_missing=True, expires_at=expires_at,
         )
-
-    assert result["event_states"] == [{"channel_id": 900, "status": "unknown"}]
-    assert result["channel_ids"] == [900]
+        eligible, states = await executor._event_lifecycle(
+            setup["rule"].id, setup["config"], (), current[0], dead,
+            flow=flow, expires_at=expires_at,
+        )
+    assert eligible == set()
+    assert states == {900: "unknown"}
     setup["client"].get_streams_by_ids.assert_not_awaited()
     epg_programmes.prepare_profiles.assert_not_awaited()
     setup["client"].create_channel.assert_not_awaited()
@@ -5127,10 +5129,14 @@ async def test_event_retirement_holds_unknown_or_conflicting_evidence(retirement
     elif case == "wrong_start":
         setup["witness"]["start"] = (setup["now"] - timedelta(hours=5)).isoformat()
     states, result = await _retire(setup)
-    assert states[900] != "idle"
-    assert result["channels_removed"] == 0
-    setup["client"].delete_channel.assert_not_awaited()
-    assert _managed_ids(setup["session_factory"], setup["rule"].id) == [900]
+    if case == "old_stream_active":
+        assert states[900] == "idle"
+        assert result["channels_removed"] == 1
+    else:
+        assert states[900] != "idle"
+        assert result["channels_removed"] == 0
+        setup["client"].delete_channel.assert_not_awaited()
+        assert _managed_ids(setup["session_factory"], setup["rule"].id) == [900]
 
 
 @pytest.mark.asyncio
@@ -5235,6 +5241,7 @@ async def test_later_valid_event_can_use_the_retained_stream(retirement, stale_m
             is_black_screen=False,
             black_screen_checked_at=after_probe.isoformat(),
         )
+        kwargs["confirmed"].update(ids)
         return set()
     with patch("channel_pipeline_executor.datetime") as clock, \
          patch("services.event_sync_stream_health.datetime", _clock(after_probe)), \
@@ -5273,12 +5280,12 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
 
     setup = retirement
     now = setup["now"]
-    old = _parsed("Alpha", now - timedelta(hours=age))
+    old = _parsed("Alpha vs. Beta", (now - timedelta(hours=age)).astimezone(EASTERN))
     current = _parsed("Fury vs. Usyk", now)
     old_ids = list(range(1, MAX_HEALTH_PROBES_PER_RUN + 1))
     setup["state"].channels[900].update(name=promoted_channel_name(old), streams=old_ids)
     setup["streams"][:] = [
-        {"id": sid, "name": "Alpha @ " + old.start.astimezone(EASTERN).strftime("%d %b %I:%M %p ET"), "url": "https://example.invalid/stream",
+        {"id": sid, "name": "Alpha vs. Beta @ " + old.start.astimezone(EASTERN).strftime("%d %b %I:%M %p ET"), "url": "https://example.invalid/stream",
          "m3u_account": 2, "is_stale": False, "updated_at": now.isoformat()}
         for sid in old_ids
     ] + [{"id": 7301, "name": "Fury vs. Usyk @ 12 Jul 12:00 AM ET", "url": "https://example.invalid/stream",
@@ -5358,11 +5365,10 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
             setup["db"].get(ChannelPipelineRule, setup["rule"].id).set_managed_channel_ids(managed)
             setup["db"].commit()
     assert [result["promoted_created"] for result in results] == [1, 0]
-    # The event still waiting for a channel is dialled alone; the attached
-    # streams get their turn on the run that has nothing new to measure,
-    # and only while their event is still inside the 24h window.
-    assert batches[0] == [7301]
-    assert batches[1] == ([7301] if age == 26 else old_ids)
+    # Independent retained events get evidence without probing every alternate.
+    assert batches[0] == [7301, old_ids[0]], batches
+    assert set(batches[1]) == {7301, old_ids[0] if age == 26 else old_ids[1]}, batches
+    assert len(batches[1]) == 2
     assert len(batches[1]) <= MAX_HEALTH_PROBES_PER_RUN
     assert 900 in result["channel_ids"]
     assert 901 in result["channel_ids"]
@@ -5565,8 +5571,10 @@ async def test_lifecycle_uses_scoped_iso_patterns(retirement, shape, with_witnes
     elif case == "invalid_date":
         fresh["name"] = name.replace(local.strftime("%Y-%m-%d"), "2026-02-30", 1)
     setup["stats"][7301] = {
-        "measured_bitrate": 5000000,
+        "stream_name": name, "probe_status": "success",
+        "measured_bitrate": 5000000, "is_black_screen": False,
         "last_probed": (now - timedelta(minutes=6) if case == "stale_sample" else now).isoformat(),
+        "black_screen_checked_at": (now - timedelta(minutes=6) if case == "stale_sample" else now).isoformat(),
     }
     if with_witness:
         setup["witness"].update(title=parsed.title, start=start.isoformat(),
@@ -6302,9 +6310,7 @@ def test_staged_health_recovery_outlives_failed_attempt(
             now=early,
         )
     first_guide = seeded["state"]["delivery"]["guide_attempt"]
-    assert datetime.fromisoformat(first_guide["expires_at"]) == (
-        early.astimezone(timezone.utc) + timedelta(hours=24)
-    )
+    assert first_guide["expires_at"] is None
 
     state = setup["state"]
     client = setup["client"]
@@ -6394,13 +6400,8 @@ def test_staged_health_recovery_outlives_failed_attempt(
         assert (failed_receipt["stage"], failed_receipt["reason"]) == (
             "failed", "health_failed",
         )
-        assert failed_receipt["expires_at"] == first_guide["expires_at"]
-        assert datetime.fromisoformat(failed_receipt["expires_at"]) < (
-            datetime.fromisoformat(failed_receipt["stop"])
-        )
-        current[0] = datetime.fromisoformat(
-            failed_receipt["expires_at"]
-        ) + timedelta(seconds=1)
+        assert failed_receipt["expires_at"] == failed_receipt["stop"]
+        current[0] = early + timedelta(hours=24, seconds=1)
         assert current[0] < datetime.fromisoformat(failed_receipt["stop"])
         set_health(True)
         with pytest.raises(asyncio.CancelledError):
@@ -6423,7 +6424,7 @@ def test_staged_health_recovery_outlives_failed_attempt(
     assert next_receipt["guide_attempt_id"] == next_guide["attempt_id"]
     assert next_receipt["channel_id"] == failed_receipt["channel_id"] == 900
     assert next_receipt["channel_uuid"] == failed_receipt["channel_uuid"] == "event-900"
-    assert next_receipt["history"][-1]["expires_at"] == first_guide["expires_at"]
+    assert next_receipt["history"][-1]["expires_at"] == failed_receipt["stop"]
     assert next_receipt["expires_at"] == failed_receipt["stop"]
     assert state.channels[900]["hidden_from_output"] is True
     assert state.channels[900]["streams"] == []
@@ -6862,3 +6863,465 @@ class TestDedicatedDelivery:
         assert plan.skipped_past == 1
         assert plan.skipped_early == 1
         assert plan.skipped_all_dead == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count,bad", [(255, None), (256, None), (714, None), (714, "oversized"), (714, "invalid")])
+async def test_lifecycle_batches_retained_channels(retirement, count, bad):
+    from cache import Cache
+    from services import epg_programmes
+
+    setup = retirement
+    now = setup["now"]
+    name = "DAZN 07: Fresh Match @ 11 Jul 11:30 PM ET"
+    row = _resolved(name, DISPOSITION_UNMATCHED, _parsed("Fresh Match", now - timedelta(minutes=30)),
+                    provider_id=2, stream_id=7301, group_id=SECONDARY_A)
+    plan = build_promotion_plan(setup["config"], [row], {}, now=now)
+    assert len(plan.units) == 1
+    channels = [{
+        "id": cid, "name": FURY_CHANNEL_NAME, "channel_group_id": PROMOTE_GROUP_ID,
+        "streams": [10000 + cid],
+    } for cid in range(1, count + 1)]
+    if bad == "oversized":
+        channels[0]["streams"] = list(range(20000, 21001))
+    elif bad == "invalid":
+        channels[0]["streams"] = [{}]
+    channels.append({"id": 9000, "name": "Foreign", "channel_group_id": 99, "streams": [50000]})
+    setup["rule"].set_managed_channel_ids(list(range(1, count + 1)))
+    setup["db"].commit()
+    setup["streams"][:] = [{
+        "id": 10000 + cid, "name": STREAM_FURY, "url": f"https://example.invalid/{cid}",
+        "m3u_account": 2, "channel_group_id": SECONDARY_A,
+    } for cid in range(1, count + 1)] + [{
+        "id": 7301, "name": name, "url": "https://example.invalid/new",
+        "m3u_account": 2, "channel_group_id": SECONDARY_A,
+    }]
+    setup["stats"][7301] = {
+        "stream_name": name, "probe_status": "success", "measured_bitrate": 5000000,
+        "last_probed": now.isoformat(), "is_black_screen": False,
+        "black_screen_checked_at": now.isoformat(),
+    }
+    setup["witness"].clear()
+    executor = ActionExecutor(setup["client"], channels)
+    cache = Cache()
+    with patch("cache.get_cache", return_value=cache), \
+         patch("stream_prober.ensure_prober", return_value=None):
+        eligible, states = await executor._event_lifecycle(
+            setup["rule"].id, setup["config"], plan.units, now, flow={7301: True},
+            expires_at=None, advance=True,
+        )
+        assert eligible == {plan.units[0].event_key}
+        assert states[-1] == "active"
+        assert all(states[cid] == "unknown" for cid in range(1, count + 1))
+        assert 9000 not in states
+        assert epg_programmes.prepare_profiles.await_args.kwargs["recover_sources"] is True
+        positions = copy.deepcopy(cache.get("event_sync_lifecycle_positions", ttl=86400))
+        await executor._event_lifecycle(
+            setup["rule"].id, setup["config"], (), now, flow={},
+            expires_at=None, advance=False,
+        )
+        assert cache.get("event_sync_lifecycle_positions", ttl=86400) == positions
+        for _ in range(2):
+            await executor._event_lifecycle(
+                setup["rule"].id, setup["config"], (), now, flow={},
+                expires_at=None, advance=True,
+            )
+        assert next(iter(cache.get("event_sync_lifecycle_positions", ttl=86400).values()))["expires_at"] == (
+            next(iter(positions.values()))["expires_at"]
+        )
+    examined = set()
+    for call in epg_programmes.prepare_profiles.await_args_list:
+        batch = call.args[1]
+        assert len(batch) <= 256
+        ids = {stream["id"] for channel in batch.values() for stream in channel["streams"]}
+        assert len(ids) <= 1000
+        examined.update(cid for cid in batch if cid > 0)
+    assert examined == (set(range(1, count + 1)) - ({1} if bad else set()))
+    setup["client"].create_channel.assert_not_awaited()
+    setup["client"].update_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "fresh", "missing", "ended", "name", "url", "account", "group",
+    "rule_disabled", "config", "profile", "ownership",
+])
+async def test_lifecycle_checks_current_evidence_after_wait(retirement, monkeypatch, case):
+    from models import DummyEPGProfile
+    from services import epg_programmes
+    from stream_prober import StreamProber
+
+    setup = retirement
+    current = [setup["now"]]
+    name = "DAZN 07: Fresh Match @ 11 Jul 11:30 PM ET"
+    start = current[0] - timedelta(minutes=30)
+    row = _resolved(name, DISPOSITION_UNMATCHED, _parsed("Fresh Match", start),
+                    provider_id=2, stream_id=7301, group_id=SECONDARY_A)
+    plan = build_promotion_plan(setup["config"], [row], {}, now=current[0])
+    setup["rule"].set_managed_channel_ids([])
+    setup["db"].commit()
+    setup["streams"][:] = [{
+        "id": 7301, "name": name, "url": "https://example.invalid/current",
+        "m3u_account": 2, "channel_group_id": SECONDARY_A, "is_stale": False,
+    }]
+    setup["stats"][7301] = {
+        "stream_name": name, "measured_bitrate": 5000000, "probe_status": "success",
+        "last_probed": current[0].isoformat(), "is_black_screen": False,
+        "black_screen_checked_at": current[0].isoformat(),
+    }
+    profile_id = setup["config"]["dummy_epg_profile_id"]
+
+    async def prepare(profiles, channels, client, **kwargs):
+        assert kwargs["expires_at"] is None
+        assert kwargs["recover_sources"] is True
+        assert kwargs["wait_for_sources"] is False
+        current[0] += timedelta(minutes=6)
+        stream = setup["streams"][0]
+        if case in {"name", "url"}:
+            stream[case] += " changed"
+        elif case == "account":
+            stream["m3u_account"] = 18
+        elif case == "group":
+            stream["channel_group_id"] += 1
+        elif case == "rule_disabled":
+            setup["rule"].enabled = False
+        elif case == "config":
+            setup["rule"].set_event_sync_config({**setup["config"], "max_promote_per_run": 1})
+        elif case == "profile":
+            setup["db"].get(DummyEPGProfile, profile_id).event_timezone = "UTC"
+        elif case == "ownership":
+            setup["rule"].set_managed_channel_ids([900])
+        setup["db"].commit()
+        witness = {
+            "source_id": 50, "source_tvg_id": "event", "title": "Fresh Match",
+            "start": start.isoformat(),
+            "stop": (current[0] - timedelta(seconds=1) if case == "ended"
+                     else current[0] + timedelta(hours=1)).isoformat(),
+        }
+        return [], {"sources": [{"source_id": 50, "status": "ready",
+                                  "last_success": current[0].isoformat()}],
+                    "channels": [{"channel_id": cid, "event": witness} for cid in channels]}
+
+    prober = StreamProber.__new__(StreamProber)
+    prober.max_concurrent_probes = 1
+    prober.account_probe_limits = {2: 1}
+    prober._probe_condition = asyncio.Condition()
+    prober._account_active = {}
+    prober._event_probes = 0
+    prober.refresh_account_probe_limits = AsyncMock()
+
+    async def probe(sid, url, stream_name, **kwargs):
+        assert kwargs["expires_at"] is None
+        if case != "missing":
+            setup["stats"][sid].update(
+                last_probed=current[0].isoformat(),
+                black_screen_checked_at=current[0].isoformat(),
+            )
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
+    monkeypatch.setattr("stream_prober.ensure_prober", lambda: prober)
+    monkeypatch.setattr("stream_prober.get_prober", lambda: prober)
+    with patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+        eligible, states = await setup["executor"]._event_lifecycle(
+            setup["rule"].id, setup["config"], plan.units, setup["now"],
+            flow={7301: True}, expires_at=None, advance=True,
+        )
+    assert eligible == ({plan.units[0].event_key} if case == "fresh" else set())
+    assert states.get(-1) == ("active" if case == "fresh" else None) or (
+        case != "fresh" and states.get(-1) == "unknown"
+    )
+    if case == "fresh":
+        prober.probe_stream.assert_awaited_once()
+    assert prober._account_active == {}
+    setup["client"].create_channel.assert_not_awaited()
+    setup["client"].update_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owned_positive_does_not_skip_new_health(retirement):
+    from services import event_sync_stream_health
+
+    setup = retirement
+    current = setup["now"] - timedelta(minutes=30)
+    owned = _resolved(STREAM_FURY, DISPOSITION_UNMATCHED, _parsed("Fury vs. Usyk", current),
+                      provider_id=2, stream_id=7301, group_id=SECONDARY_A)
+    fresh = _resolved("DAZN 07: Fresh Match @ 11 Jul 11:30 PM ET", DISPOSITION_UNMATCHED,
+                      _parsed("Fresh Match", current), provider_id=2, stream_id=7302,
+                      group_id=SECONDARY_A)
+    plan = build_promotion_plan(
+        setup["config"], [owned, fresh], {promoted_channel_name(owned.result.parsed).lower(): 900},
+        now=setup["now"],
+    )
+    collect = AsyncMock(side_effect=[{7302: None}, {7301: True}])
+    with patch.object(event_sync_stream_health, "collect_stream_flow", collect):
+        flow, _ = await setup["executor"]._event_health(
+            setup["rule"].id, setup["config"], plan.units, [owned, fresh], setup["now"],
+            probe_missing=True, expires_at=None,
+        )
+    assert collect.await_args_list[0].args[0] == {7302}
+    assert collect.await_args_list[0].kwargs["probe_missing"] is True
+    assert flow == {7302: None, 7301: True}
+
+
+@pytest.mark.asyncio
+async def test_complete_sample_stages_event_with_stalled_sibling(promotion_candidates):
+    from channel_pipeline_executor import ExecutionContext
+    from channel_pipeline_schema import validate_event_sync_config
+    from models import DummyEPGProfile
+    from services.epg_publication import read_publication
+    from tests.event_sync_fixtures import dedicated_event_sync_config
+    from types import SimpleNamespace
+
+    setup = promotion_candidates
+    config = dedicated_event_sync_config(
+        dummy_epg_profile_id=setup["config"]["dummy_epg_profile_id"],
+        secondary=[{"group_id": SECONDARY_A, "m3u_account_id": 2}],
+    )
+    profile = setup["db"].get(DummyEPGProfile, config["dummy_epg_profile_id"])
+    profile.set_hide_empty_group_ids([PROMOTE_GROUP_ID])
+    profile.set_epg_source_ids([])
+    profile.set_event_sync_config({
+        "secondary": config["secondary"], "assume_current_date": False,
+        "use_default_patterns": False, "slot_patterns": [],
+    })
+    setup["db"].commit()
+    assert validate_event_sync_config(config) == []
+    setup["rule"].set_event_sync_config(config)
+    setup["db"].commit()
+    first = setup["rows"][0]
+    setup["rows"][1] = _resolved(
+        first.stream.name, DISPOSITION_UNMATCHED, first.result.parsed,
+        provider_id=2, stream_id=7302, group_id=SECONDARY_A,
+    )
+    setup["streams"][1]["name"] = first.stream.name
+    setup["prober"].max_concurrent_probes = 2
+    setup["prober"].account_probe_limits = {2: 2}
+    stalled = asyncio.Event()
+    cancelled = asyncio.Event()
+    current = [setup["now"]]
+
+    async def probe(sid, url, name, *, content, expires_at):
+        assert content is True and expires_at is None
+        if sid == 7302:
+            stalled.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        else:
+            await stalled.wait()
+            current[0] += timedelta(seconds=65)
+            setup["stats"][sid] = {
+                "stream_name": name, "probe_status": "success", "measured_bitrate": 5000000,
+                "last_probed": current[0].isoformat(), "is_black_screen": False,
+                "black_screen_checked_at": current[0].isoformat(),
+            }
+
+    setup["prober"].probe_stream = AsyncMock(side_effect=probe)
+    setup["epg_sources"][0]["is_active"] = True
+    executor = ActionExecutor(
+        setup["client"], [], managed_channel_ids=[], epg_sources=setup["epg_sources"],
+        existing_groups=[{"id": PROMOTE_GROUP_ID, "name": "Events"}],
+    )
+    with patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])), \
+         patch("stream_prober.get_prober", return_value=setup["prober"]):
+        result = await asyncio.wait_for(executor._execute_event_sync_promotion(
+            setup["rule"].id, setup["rule"].name, config,
+            SimpleNamespace(resolved=setup["rows"]), ExecutionContext(),
+        ), 2)
+    assert result["promoted_created"] == 1, result
+    assert cancelled.is_set()
+    assert setup["prober"]._account_active == {}
+    channel = next(iter(setup["state"].channels.values()))
+    assert channel["hidden_from_output"] is True
+    assert channel["streams"] == []
+    publication = read_publication(f"profile:{profile.id}")
+    receipt = next(iter(publication["state"]["delivery"]["pending_channels"].values()))
+    assert receipt["expires_at"] == receipt["stop"]
+    assert [row["id"] for row in receipt["streams"]] == [7301]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_refreshes_each_event_after_wait(promotion_candidates, monkeypatch):
+    from services import epg_programmes
+
+    setup = promotion_candidates
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+    current = [setup["now"]]
+    plan = build_promotion_plan(setup["config"], setup["rows"], {}, now=current[0])
+    for row in setup["rows"]:
+        setup["stats"][row.stream.stream_id] = {
+            "stream_name": row.stream.name, "probe_status": "success", "measured_bitrate": 5000000,
+            "last_probed": current[0].isoformat(), "is_black_screen": False,
+            "black_screen_checked_at": current[0].isoformat(),
+        }
+
+    async def prepare(*args, **kwargs):
+        current[0] += timedelta(minutes=6)
+        return [], {"sources": [], "channels": []}
+
+    async def probe(sid, url, name, **kwargs):
+        setup["stats"][sid].update(
+            last_probed=current[0].isoformat(), black_screen_checked_at=current[0].isoformat(),
+        )
+
+    setup["prober"].probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
+    monkeypatch.setattr("stream_prober.get_prober", lambda: setup["prober"])
+    with patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+        eligible, states = await setup["executor"]._event_lifecycle(
+            setup["rule"].id, setup["config"], plan.units, setup["now"],
+            flow={7301: True, 7302: True}, expires_at=None, advance=True,
+        )
+    assert eligible == {unit.event_key for unit in plan.units}
+    assert states == {-1: "active", -2: "active"}
+    assert [call.args[0] for call in setup["prober"].probe_stream.await_args_list] == [7301, 7302]
+    assert setup["prober"]._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_new_cached_event_does_not_starve_other_event(promotion_candidates, monkeypatch):
+    from services import epg_programmes
+
+    setup = promotion_candidates
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+    plan = build_promotion_plan(setup["config"], setup["rows"], {}, now=setup["now"])
+    assert len(plan.units) == 2
+    assert all(unit.existing_channel_id is None for unit in plan.units)
+
+    async def probe(sid, url, name, **kwargs):
+        assert sid == 7302
+        setup["stats"][sid] = {
+            "stream_name": name, "probe_status": "success", "measured_bitrate": 5000000,
+            "last_probed": setup["now"].isoformat(), "is_black_screen": False,
+            "black_screen_checked_at": setup["now"].isoformat(),
+        }
+
+    async def prepare(profiles, channels, client, **kwargs):
+        witness = {
+            "source_id": 50, "source_tvg_id": "pending", "title": "Alpha Event",
+            "start": (setup["now"] - timedelta(minutes=30)).isoformat(),
+            "stop": (setup["now"] + timedelta(hours=1)).isoformat(),
+        }
+        return [], {
+            "sources": [{"source_id": 50, "status": "error", "last_success": setup["now"].isoformat()}],
+            "channels": [{"channel_id": cid, "event": witness if "Alpha" in row["name"] else None}
+                         for cid, row in channels.items()],
+        }
+
+    setup["prober"].probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr("stream_prober.get_prober", lambda: setup["prober"])
+    monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(side_effect=prepare))
+    for _ in range(2):
+        setup["stats"].clear()
+        setup["stats"][7301] = {
+            "stream_name": setup["rows"][0].stream.name, "probe_status": "success",
+            "measured_bitrate": 5000000, "last_probed": setup["now"].isoformat(),
+            "is_black_screen": False, "black_screen_checked_at": setup["now"].isoformat(),
+        }
+        flow, dead = await setup["executor"]._event_health(
+            setup["rule"].id, setup["config"], plan.units, setup["rows"], setup["now"],
+            probe_missing=True, expires_at=None,
+        )
+        eligible, _ = await setup["executor"]._event_lifecycle(
+            setup["rule"].id, setup["config"], plan.units, setup["now"], dead,
+            flow=flow, expires_at=None, advance=True,
+        )
+        assert flow == {7301: True, 7302: True}
+        assert eligible == {plan.units[1].event_key}
+    assert [call.args[0] for call in setup["prober"].probe_stream.await_args_list] == [7302, 7302]
+    assert setup["prober"]._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_each_new_event_stages_with_shared_capacity(promotion_candidates):
+    from channel_pipeline_executor import ExecutionContext
+    from types import SimpleNamespace
+
+    setup = promotion_candidates
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+
+    async def probe(sid, url, name, **kwargs):
+        setup["stats"][sid] = {
+            "stream_name": name, "probe_status": "success", "measured_bitrate": 5000000,
+            "last_probed": setup["now"].isoformat(), "is_black_screen": False,
+            "black_screen_checked_at": setup["now"].isoformat(),
+        }
+
+    setup["prober"].probe_stream = AsyncMock(side_effect=probe)
+    executor = ActionExecutor(
+        setup["client"], [], managed_channel_ids=[], epg_sources=setup["epg_sources"],
+    )
+    with patch("stream_prober.get_prober", return_value=setup["prober"]):
+        result = await executor._execute_event_sync_promotion(
+            setup["rule"].id, setup["rule"].name, setup["config"],
+            SimpleNamespace(resolved=setup["rows"]), ExecutionContext(),
+        )
+    assert result["promoted_created"] == 2
+    assert [call.args[0] for call in setup["prober"].probe_stream.await_args_list] == [7301, 7302]
+    assert len(executor._event_pending) == 2
+    assert all(channel["streams"] == [] and channel["hidden_from_output"] is True
+               for channel in setup["state"].channels.values())
+    assert setup["prober"]._account_active == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["age", "name", "url", "account", "group"])
+async def test_lifecycle_rechecks_after_other_event_probe(promotion_candidates, monkeypatch, case):
+    from services import epg_programmes
+
+    setup = promotion_candidates
+    setup["config"]["max_promote_per_run"] = 2
+    setup["rule"].set_event_sync_config(setup["config"])
+    setup["db"].commit()
+    current = [setup["now"]]
+    plan = build_promotion_plan(setup["config"], setup["rows"], {}, now=current[0])
+    observed = current[0] - timedelta(minutes=4)
+    setup["stats"][7301] = {
+        "stream_name": setup["rows"][0].stream.name, "probe_status": "success",
+        "measured_bitrate": 5000000, "last_probed": observed.isoformat(),
+        "is_black_screen": False, "black_screen_checked_at": observed.isoformat(),
+    }
+
+    async def probe(sid, url, name, **kwargs):
+        assert sid == 7302
+        current[0] += timedelta(minutes=2) if case == "age" else timedelta(seconds=1)
+        stream = setup["streams"][0]
+        if case in {"name", "url"}:
+            stream[case] += " changed"
+        elif case == "account":
+            stream["m3u_account"] = 18
+        elif case == "group":
+            stream["channel_group_id"] += 1
+        setup["stats"][sid] = {
+            "stream_name": name, "probe_status": "success", "measured_bitrate": 5000000,
+            "last_probed": current[0].isoformat(), "is_black_screen": False,
+            "black_screen_checked_at": current[0].isoformat(),
+        }
+
+    setup["prober"].probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr("stream_prober.get_prober", lambda: setup["prober"])
+    monkeypatch.setattr(epg_programmes, "prepare_profiles", AsyncMock(return_value=(
+        [], {"sources": [], "channels": []},
+    )))
+    with patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+        eligible, states = await setup["executor"]._event_lifecycle(
+            setup["rule"].id, setup["config"], plan.units, setup["now"],
+            flow={7301: True, 7302: True}, expires_at=None, advance=True,
+        )
+    assert eligible == {plan.units[1].event_key}
+    assert states.get(-1, "unknown") == "unknown"
+    assert states[-2] == "active"
+    setup["prober"].probe_stream.assert_awaited_once()
+    assert setup["prober"]._account_active == {}

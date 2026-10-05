@@ -30,7 +30,6 @@ HTTP_WAIT = 5.0
 # Large programme feeds are parsed incrementally; selected rows keep their own smaller limit.
 MAX_DOWNLOAD = 4 * 1024 * 1024 * 1024
 MAX_DECODED = 4 * 1024 * 1024 * 1024
-SOURCE_TIMEOUT = 24 * 60 * 60.0
 SOURCE_READ_TIMEOUT = 300.0
 CATALOGUE_TIMEOUT = 120.0
 # Keep guide freshness independent of the time allowed for a replacement scan.
@@ -56,13 +55,17 @@ _SOURCE_EXPIRIES: dict = {}
 _SOURCE_SLOTS = asyncio.Semaphore(2)
 
 
-def _expiry(value: datetime, field_name: str = "expires_at") -> datetime:
+def _expiry(value: datetime | None, field_name: str = "expires_at") -> datetime | None:
+    if value is None:
+        return None
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be a datetime with an offset.")
     return value.astimezone(timezone.utc)
 
 
-def _remaining(expires_at: datetime) -> float:
+def _remaining(expires_at: datetime | None) -> float | None:
+    if expires_at is None:
+        return None
     return (_expiry(expires_at) - datetime.now(timezone.utc)).total_seconds()
 
 
@@ -436,7 +439,7 @@ async def _read_source(
     stop: datetime,
     now: datetime,
     *,
-    expires_at: datetime,
+    expires_at: datetime | None,
 ) -> dict:
     """Keep only useful identities and strictly matched events from a complete XMLTV."""
     import tempfile
@@ -637,10 +640,10 @@ async def _read_source(
 
     expires_at = _expiry(expires_at)
     remaining = _remaining(expires_at)
-    if remaining <= 0:
+    if remaining is not None and remaining <= 0:
         raise TimeoutError("XMLTV source lifetime expired before transport.")
     try:
-        async with asyncio.timeout(min(SOURCE_TIMEOUT, remaining)):
+        async with asyncio.timeout(remaining):
             # Selection must not slow delivery of a time-limited upstream response.
             with tempfile.TemporaryFile(mode="w+b", dir=CONFIG_DIR) as spool:
                 download_started = time.monotonic()
@@ -665,11 +668,11 @@ async def _read_source(
 
                 try:
                     transport_time = _remaining(expires_at)
-                    if transport_time <= 0:
+                    if transport_time is not None and transport_time <= 0:
                         raise TimeoutError("XMLTV source lifetime expired before transport.")
                     async with aclosing(stream_xmltv(
                         source, max_download=MAX_DOWNLOAD, max_decoded=MAX_DECODED,
-                        timeout=min(SOURCE_TIMEOUT, transport_time),
+                        timeout=transport_time,
                         read_timeout=SOURCE_READ_TIMEOUT,
                         diagnostics=diagnostics,
                     )) as chunks:
@@ -807,20 +810,24 @@ async def _load_source(
     stop: datetime,
     now: datetime,
     *,
-    expires_at: datetime,
+    expires_at: datetime | None,
 ) -> None:
+    expires_at = _expiry(expires_at)
+    owner = asyncio.current_task()
+    _SOURCE_LOADS.setdefault(key, owner)
+    if _SOURCE_LOADS.get(key) is owner:
+        _SOURCE_EXPIRIES[key] = expires_at
     previous = _SOURCE_CACHE.get(key, {})
     attempt = 0
     diagnostics = {}
     totals = {}
-    expires_at = _expiry(expires_at)
     try:
         remaining = _remaining(expires_at)
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             raise TimeoutError("XMLTV source lifetime expired before queue admission.")
         async with asyncio.timeout(remaining):
             async with _SOURCE_SLOTS:
-                if _remaining(expires_at) <= 0:
+                if expires_at is not None and _remaining(expires_at) <= 0:
                     raise TimeoutError("XMLTV source lifetime expired before transport.")
                 for attempt in range(1, 3):
                     diagnostics = {}
@@ -856,31 +863,41 @@ async def _load_source(
                           "start": start, "stop": stop},
             "demand": _SOURCE_CACHE.get(key, {}).get("demand", {}),
         })
-        _SOURCE_CACHE[key] = loaded
+        if _SOURCE_LOADS.get(key) is owner:
+            _SOURCE_CACHE[key] = loaded
     except asyncio.CancelledError as exc:
         diagnostics = getattr(exc, "diagnostics", diagnostics)
-        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled.",
-                              "diagnostics": {**diagnostics, **totals, "attempts": attempt}}
+        if _SOURCE_LOADS.get(key) is owner:
+            _SOURCE_CACHE[key] = {
+                **previous, "checked": time.monotonic(), "error": "XMLTV source loading was cancelled.",
+                "demand": _SOURCE_CACHE.get(key, {}).get("demand", {}),
+                "diagnostics": {**diagnostics, **totals, "attempts": attempt},
+            }
         raise
     except Exception as exc:
         diagnostics = getattr(exc, "diagnostics", getattr(exc.__cause__, "diagnostics", diagnostics))
-        _SOURCE_CACHE[key] = {**previous, "checked": time.monotonic(), "error": _error_reason(exc),
-                              "diagnostics": {**diagnostics, **totals, "attempts": attempt}}
+        if _SOURCE_LOADS.get(key) is owner:
+            _SOURCE_CACHE[key] = {
+                **previous, "checked": time.monotonic(), "error": _error_reason(exc),
+                "demand": _SOURCE_CACHE.get(key, {}).get("demand", {}),
+                "diagnostics": {**diagnostics, **totals, "attempts": attempt},
+            }
     finally:
-        _SOURCE_LOADS.pop(key, None)
-        _SOURCE_EXPIRIES.pop(key, None)
-        total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
-        for oldest in sorted(_SOURCE_CACHE, key=lambda item: _SOURCE_CACHE[item].get("checked", 0)):
-            if total <= MAX_CACHE and len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
-                break
-            if oldest in _SOURCE_LOADS:
-                continue
-            total -= _SOURCE_CACHE[oldest].get("size", 0)
-            del _SOURCE_CACHE[oldest]
-        # A read that failed carries no schedules to recompose from, so dropping the
-        # published guide for it trades a working guide for an emptier one.
-        if not _SOURCE_CACHE.get(key, {}).get("error"):
-            get_cache().invalidate_prefix("dummy_epg_xmltv")
+        if _SOURCE_LOADS.get(key) is owner:
+            _SOURCE_LOADS.pop(key, None)
+            _SOURCE_EXPIRIES.pop(key, None)
+            total = sum(entry.get("size", 0) for entry in _SOURCE_CACHE.values())
+            for oldest in sorted(_SOURCE_CACHE, key=lambda item: _SOURCE_CACHE[item].get("checked", 0)):
+                if total <= MAX_CACHE and len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
+                    break
+                if oldest in _SOURCE_LOADS:
+                    continue
+                total -= _SOURCE_CACHE[oldest].get("size", 0)
+                del _SOURCE_CACHE[oldest]
+            # A read that failed carries no schedules to recompose from, so dropping the
+            # published guide for it trades a working guide for an emptier one.
+            if not _SOURCE_CACHE.get(key, {}).get("error"):
+                get_cache().invalidate_prefix("dummy_epg_xmltv")
 
 
 async def _probe_artwork(unknown: dict) -> None:
@@ -930,78 +947,77 @@ async def _load_catalogue(
     key: tuple,
     client,
     *,
-    expires_at: datetime,
+    expires_at: datetime | None,
 ) -> dict:
+    expires_at = _expiry(expires_at)
     owner = asyncio.current_task()
     claimed = [key] if key[1] is None else [(client, link) for link in key[1]]
+    for item in claimed:
+        _CATALOGUE_LOADS.setdefault(item, owner)
+        if _CATALOGUE_LOADS.get(item) is owner:
+            _CATALOGUE_EXPIRIES[item] = expires_at
     previous = {item: _CATALOGUE_CACHE.get(item, {}) for item in claimed}
     completed = {}
     failed = False
-    expires_at = _expiry(expires_at)
     try:
         remaining = _remaining(expires_at)
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             raise TimeoutError("EPG catalogue lifetime expired before queue admission.")
         async with asyncio.timeout(remaining):
             async with _CATALOGUE_SLOTS:
-                if _remaining(expires_at) <= 0:
+                if expires_at is not None and _remaining(expires_at) <= 0:
                     raise TimeoutError("EPG catalogue lifetime expired before transport.")
-                read_expires_at = min(
-                    expires_at,
-                    type(expires_at).fromtimestamp(
-                        (datetime.now(timezone.utc) + timedelta(seconds=CATALOGUE_TIMEOUT)).timestamp(),
-                        timezone.utc,
-                    ),
-                )
-                for item in claimed:
-                    if _CATALOGUE_LOADS.get(item) is owner:
-                        _CATALOGUE_EXPIRIES[item] = read_expires_at
-                async with asyncio.timeout(max(0, _remaining(read_expires_at))):
-                    if key[1] is None:
-                        value = await client.get_epg_sources()
-                        completed[key] = {
-                            "value": value,
-                            "checked": time.monotonic(),
-                            "error": False,
-                        }
-                    else:
-                        ids = frozenset(key[1])
-                        rows = await client.get_epg_data(
-                            max_results=len(ids), ids=ids, expires_at=read_expires_at,
+                if key[1] is None:
+                    value = await client.get_epg_sources()
+                    if (not isinstance(value, list)
+                            or any(not isinstance(source, dict)
+                                   or type(source.get("id")) is not int or source["id"] <= 0
+                                   for source in value)
+                            or len({source["id"] for source in value}) != len(value)):
+                        raise ValueError("Dispatcharr EPG source selection is unavailable")
+                    completed[key] = {
+                        "value": value,
+                        "checked": time.monotonic(),
+                        "error": False,
+                    }
+                else:
+                    ids = frozenset(key[1])
+                    rows = await client.get_epg_data(
+                        max_results=len(ids), ids=ids, expires_at=expires_at,
+                    )
+                    if not isinstance(rows, list):
+                        raise ValueError("Dispatcharr EPG row selection is unavailable")
+                    selected = {}
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        link = row.get("id")
+                        source_id = _epg_source_id(
+                            row.get("epg_source") or row.get("epg_source_id")
                         )
-                        if not isinstance(rows, list):
-                            raise ValueError("Dispatcharr EPG row selection is unavailable")
-                        selected = {}
-                        for row in rows:
-                            if not isinstance(row, dict):
-                                continue
-                            link = row.get("id")
-                            source_id = _epg_source_id(
-                                row.get("epg_source") or row.get("epg_source_id")
-                            )
-                            tvg_id = row.get("tvg_id")
-                            if (type(link) is int and link in ids
-                                    and type(source_id) is int and source_id > 0
-                                    and isinstance(tvg_id, str) and tvg_id.strip()):
-                                selected[link] = {
-                                    name: row.get(name)
-                                    for name in ("id", "epg_source", "epg_source_id", "tvg_id")
-                                }
-                        checked = time.monotonic()
-                        for item in claimed:
-                            link = item[1]
-                            if link in selected:
-                                completed[item] = {
-                                    "value": selected[link],
-                                    "checked": checked,
-                                    "error": False,
-                                }
-                            else:
-                                completed[item] = {
-                                    **previous[item],
-                                    "checked": checked,
-                                    "error": True,
-                                }
+                        tvg_id = row.get("tvg_id")
+                        if (type(link) is int and link in ids
+                                and type(source_id) is int and source_id > 0
+                                and isinstance(tvg_id, str) and tvg_id.strip()):
+                            selected[link] = {
+                                name: row.get(name)
+                                for name in ("id", "epg_source", "epg_source_id", "tvg_id")
+                            }
+                    checked = time.monotonic()
+                    for item in claimed:
+                        link = item[1]
+                        if link in selected:
+                            completed[item] = {
+                                "value": selected[link],
+                                "checked": checked,
+                                "error": False,
+                            }
+                        else:
+                            completed[item] = {
+                                **previous[item],
+                                "checked": checked,
+                                "error": True,
+                            }
     except asyncio.CancelledError:
         failed = True
         raise
@@ -1014,17 +1030,22 @@ async def _load_catalogue(
                 item: {**previous[item], "checked": checked, "error": True}
                 for item in claimed
             }
+        completed = {item: entry for item, entry in completed.items()
+                     if _CATALOGUE_LOADS.get(item) is owner}
         for item, entry in completed.items():
             _CATALOGUE_CACHE[item] = entry
         for item in claimed:
             if _CATALOGUE_LOADS.get(item) is owner:
                 _CATALOGUE_LOADS.pop(item, None)
                 _CATALOGUE_EXPIRIES.pop(item, None)
-        for oldest in sorted(_CATALOGUE_CACHE, key=lambda item: _CATALOGUE_CACHE[item].get("checked", 0)):
+        for oldest in sorted(_CATALOGUE_CACHE if completed else {},
+                             key=lambda item: _CATALOGUE_CACHE[item].get("checked", 0)):
             if len(_CATALOGUE_CACHE) <= 2048:
                 break
+            if oldest in _CATALOGUE_LOADS:
+                continue
             del _CATALOGUE_CACHE[oldest]
-        if any(previous[item].get("value") != completed[item].get("value") for item in claimed):
+        if any(previous[item].get("value") != completed[item].get("value") for item in completed):
             get_cache().invalidate_prefix("dummy_epg_xmltv")
     return completed
 
@@ -1270,7 +1291,7 @@ def _compose(query: dict, sources: list[dict], entries: dict, start: datetime, s
     return programmes, result
 
 
-async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, expires_at: datetime,
+async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, expires_at: datetime | None,
                            now: datetime | None = None,
                            wait_for_sources: bool = False,
                            recover_sources: bool = False) -> tuple[list[dict], dict]:
@@ -1281,7 +1302,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     realtime = now is None
     now = now or datetime.now(timezone.utc)
     expires_at = _expiry(expires_at)
-    if _remaining(expires_at) <= 0:
+    if expires_at is not None and _remaining(expires_at) <= 0:
         raise TimeoutError("Guide preparation lifetime has expired.")
     enriched, coverage = [], {"generated_at": now.isoformat(), "window_start": None, "window_stop": None,
                               "sources": [], "channels": [], "profiles": {}}
@@ -1298,7 +1319,6 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     catalogue_tasks = {}
     source_key = None
     catalogue_sources_pending = False
-    wait_expires_at = None
     if selected_ids:
         channel_ids = set()
         for profile in profiles:
@@ -1318,8 +1338,9 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         source_entry = _CATALOGUE_CACHE.get(source_key, {})
         if (time.monotonic() - source_entry.get("checked", float("-inf")) >= SOURCE_RETRY
                 and source_key not in _CATALOGUE_LOADS):
-            task = asyncio.create_task(_load_catalogue(source_key, client, expires_at=expires_at))
+            task = asyncio.create_task(_load_catalogue(source_key, client, expires_at=None))
             _CATALOGUE_LOADS[source_key] = task
+            _CATALOGUE_EXPIRIES[source_key] = None
         due = [
             key for key in keys if key[1] is not None
             and time.monotonic() - _CATALOGUE_CACHE.get(key, {}).get(
@@ -1329,25 +1350,21 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         ]
         if due:
             batch = (client, tuple(key[1] for key in due))
-            task = asyncio.create_task(_load_catalogue(batch, client, expires_at=expires_at))
+            task = asyncio.create_task(_load_catalogue(batch, client, expires_at=None))
             for key in due:
                 _CATALOGUE_LOADS[key] = task
-        if wait_for_sources or recover_sources:
-            wait_expires_at = min(
-                expires_at,
-                type(expires_at).fromtimestamp(
-                    (datetime.now(timezone.utc) + timedelta(seconds=CATALOGUE_TIMEOUT)).timestamp(),
-                    timezone.utc,
-                ),
-            )
-        if wait_expires_at is None and any(key in _CATALOGUE_LOADS for key in keys):
+                _CATALOGUE_EXPIRIES[key] = None
+        if not wait_for_sources and not recover_sources and any(key in _CATALOGUE_LOADS for key in keys):
             await asyncio.sleep(0)
         catalogue = {key: _CATALOGUE_CACHE.get(key, {}) for key in keys}
         loading = {key: _CATALOGUE_LOADS[key] for key in keys if key in _CATALOGUE_LOADS}
         catalogue_tasks = dict(loading)
-        if loading and wait_expires_at is not None:
+        if loading and (wait_for_sources or recover_sources):
+            remaining = _remaining(expires_at)
+            if not wait_for_sources:
+                remaining = CATALOGUE_TIMEOUT if remaining is None else min(CATALOGUE_TIMEOUT, remaining)
             await asyncio.wait(
-                set(loading.values()), timeout=max(0, _remaining(wait_expires_at))
+                set(loading.values()), timeout=None if remaining is None else max(0, remaining)
             )
         for key, task in loading.items():
             if task.done() and not task.cancelled():
@@ -1529,13 +1546,13 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         if ((wait_for_sources or (recover_sources and recovery_needed))
                 and age >= (SOURCE_RETRY if recovery_needed else SOURCE_TTL)
                 and key not in _SOURCE_LOADS
-                and _remaining(expires_at) > 0):
-            _SOURCE_EXPIRIES[key] = expires_at
+                and (expires_at is None or _remaining(expires_at) > 0)):
+            _SOURCE_EXPIRIES[key] = None
             _SOURCE_LOADS[key] = asyncio.create_task(_load_source(
                 key, job["source"], [request["query"] for request in demand.values()],
                 min(request["start"] for request in demand.values()),
                 max(request["stop"] for request in demand.values()), now,
-                expires_at=expires_at,
+                expires_at=None,
             ))
     if not wait_for_sources and any(job["key"] in _SOURCE_LOADS for job in jobs.values()):
         await asyncio.sleep(0)
@@ -1543,7 +1560,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
     if pending and wait_for_sources:
         await asyncio.wait(
             pending,
-            timeout=max(0, _remaining(wait_expires_at)),
+            timeout=None if expires_at is None else max(0, _remaining(expires_at)),
         )
     for key in list(_SOURCE_CACHE):
         if len(_SOURCE_CACHE) <= MAX_CACHE_ENTRIES:
@@ -1670,6 +1687,29 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
                 if real and all(row.find("icon") is not None for row in real):
                     result["warnings"] = [warning for warning in result["warnings"] if warning != "missing_artwork"]
             coverage["channels"].append(result)
+    due = [key for key, entry in catalogue.items()
+           if time.monotonic() - _CATALOGUE_CACHE.get(key, entry).get("checked", float("-inf")) >= SOURCE_RETRY
+           and key not in _CATALOGUE_LOADS]
+    if expires_at is None or _remaining(expires_at) > 0:
+        if source_key in due:
+            task = asyncio.create_task(_load_catalogue(source_key, client, expires_at=None))
+            _CATALOGUE_LOADS[source_key] = task
+            _CATALOGUE_EXPIRIES[source_key] = None
+        rows_due = [key for key in due if key[1] is not None]
+        if rows_due:
+            batch = (client, tuple(key[1] for key in rows_due))
+            task = asyncio.create_task(_load_catalogue(batch, client, expires_at=None))
+            for key in rows_due:
+                _CATALOGUE_LOADS[key] = task
+                _CATALOGUE_EXPIRIES[key] = None
+    catalogue_tasks = {key: _CATALOGUE_LOADS[key] for key in catalogue if key in _CATALOGUE_LOADS}
+    if catalogue_tasks and (wait_for_sources or recover_sources):
+        remaining = _remaining(expires_at)
+        if not wait_for_sources:
+            remaining = CATALOGUE_TIMEOUT if remaining is None else min(CATALOGUE_TIMEOUT, remaining)
+        await asyncio.wait(
+            set(catalogue_tasks.values()), timeout=None if remaining is None else max(0, remaining)
+        )
     final_captured_at = datetime.now(timezone.utc).isoformat()
     final_catalogue = {}
     for key in catalogue:
@@ -1723,6 +1763,12 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
                 set(profile_coverage["reason_codes"]) | {"GUIDE_SOURCES_PENDING"}
             )
             profile_coverage["can_publish"] = False
+    if expires_at is not None and _remaining(expires_at) <= 0:
+        for profile_coverage in coverage["profiles"].values():
+            profile_coverage["can_publish"] = False
+            profile_coverage["reason_codes"] = sorted(
+                set(profile_coverage["reason_codes"]) | {"GUIDE_SOURCES_PENDING"}
+            )
     coverage["artwork_pending"] = bool(artwork)
     if artwork and _ARTWORK_LOAD is None and time.monotonic() - _ARTWORK_CHECKED >= SOURCE_RETRY:
         _ARTWORK_LOAD = asyncio.create_task(_probe_artwork(artwork))

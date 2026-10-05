@@ -5366,208 +5366,16 @@ class ChannelPipelineEngine:
     # =========================================================================
 
     async def _refresh_epg_source(
-        self,
-        source: dict,
-        publications: dict[int, dict],
-        *,
-        expires_at: datetime,
-        after_link: bool = False,
+        self, source: dict, publications: dict[int, dict], *,
+        expires_at: datetime | None, after_link: bool = False, channel_map=None,
     ) -> bool:
-        """Refresh one generated source under its stored publication claims."""
-        import copy
+        """Refresh through the durable source phase owner."""
+        from services.epg_publication import refresh_source
 
-        from services.epg_publication import (
-            publication_lock,
-            read_publication,
-            update_delivery,
+        return await refresh_source(
+            self.client, source, publications, expires_at=expires_at,
+            after_link=after_link, channel_map=channel_map,
         )
-        from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
-        from tasks.event_visibility import _generated_scope, _source_refresh_key
-
-        source_id = source.get("id")
-        if source_id is None:
-            return False
-        source_name = source.get("name", f"Source {source_id}")
-        if not publications:
-            return await wait_for_epg_source_refresh(
-                self.client,
-                source_id,
-                source_name,
-                poll_interval=3,
-                expires_at=expires_at,
-            )
-        initial = await self.client.get_epg_source(source_id)
-        scope_kind = _generated_scope(source)
-        claimed = {}
-        trigger = False
-        for profile_id, expected in sorted(publications.items()):
-            scope = f"profile:{profile_id}"
-            if scope_kind not in {scope, "all"}:
-                continue
-            if scope_kind == "all":
-                aggregate = read_publication("all")
-                if (
-                    aggregate is None
-                    or aggregate["state"].get("published", True) is not True
-                    or aggregate["state"]["members"].get(str(profile_id))
-                    != expected["state"]["xmltv_hash"]
-                ):
-                    return False
-            async with publication_lock:
-                current = read_publication(scope)
-                if current is None:
-                    return False
-                expected_attempt = expected["state"]["delivery"].get(
-                    "guide_attempt"
-                )
-                attempt = current["state"]["delivery"].get("guide_attempt")
-                if (
-                    expected_attempt is None
-                    or attempt is None
-                    or current["revision"] != expected["revision"]
-                    or current["state"]["xmltv_hash"]
-                    != expected["state"]["xmltv_hash"]
-                    or current["state"]["config_hash"]
-                    != expected["state"]["config_hash"]
-                    or attempt["attempt_id"] != expected_attempt["attempt_id"]
-                    or datetime.now(timezone.utc)
-                    >= datetime.fromisoformat(attempt["expires_at"])
-                ):
-                    return False
-                source_key, endpoint_hash, source_url_hash = _source_refresh_key(
-                    self.client,
-                    source,
-                    scope,
-                )
-                delivery = current["state"]["delivery"]
-                refreshes = copy.deepcopy(delivery["source_refreshes"])
-                if any(
-                    key != source_key
-                    and value["source_id"] == source_id
-                    and value["expected_hash"] == current["state"]["xmltv_hash"]
-                    for key, value in refreshes.items()
-                ):
-                    return False
-                progress = refreshes.get(source_key)
-                if after_link or progress is None:
-                    status = str(initial.get("status") or "").strip().lower()
-                    progress = {
-                        "source_id": source_id,
-                        "endpoint_hash": endpoint_hash,
-                        "source_url_hash": source_url_hash,
-                        "expected_hash": current["state"]["xmltv_hash"],
-                        "initial_updated": (
-                            initial.get("updated_at")
-                            or initial.get("last_updated")
-                        ),
-                        "observed_running": status in {
-                            "fetching", "processing", "parsing", "loading",
-                            "pending", "running", "queued", "refreshing",
-                        },
-                        "triggered": False,
-                        "expires_at": attempt["expires_at"],
-                        "attempt_id": attempt["attempt_id"],
-                    }
-                if progress["triggered"] is False:
-                    progress["triggered"] = True
-                    trigger = True
-                refreshes[source_key] = progress
-                required = dict(delivery["required_dispatcharr_hashes"])
-                required[str(source_id)] = current["state"]["xmltv_hash"]
-                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
-                if after_link:
-                    confirmed.pop(str(source_id), None)
-                next_revision = update_delivery(
-                    scope,
-                    expected_revision=current["revision"],
-                    expected_hash=current["state"]["xmltv_hash"],
-                    expected_config_hash=current["state"]["config_hash"],
-                    expected_attempt_id=attempt["attempt_id"],
-                    required_dispatcharr_hashes=required,
-                    confirmed_dispatcharr_hashes=confirmed,
-                    source_refreshes=refreshes,
-                )
-                if next_revision is None:
-                    return False
-                updated = read_publication(scope)
-                if updated is None or updated["revision"] != next_revision:
-                    return False
-                publications[profile_id] = updated
-                claimed[profile_id] = (
-                    source_key,
-                    copy.deepcopy(progress),
-                    datetime.fromisoformat(attempt["expires_at"]),
-                )
-        if not claimed:
-            return False
-        if trigger:
-            await self.client.refresh_epg_source(source_id)
-        source_expires = min(item[2] for item in claimed.values())
-        progress = next(iter(claimed.values()))[1]
-        completed = await wait_for_epg_source_refresh(
-            self.client,
-            source_id,
-            source_name,
-            poll_interval=3,
-            expires_at=source_expires,
-            initial_source=initial,
-            trigger=False,
-            progress=progress,
-        )
-        if not completed:
-            return False
-        for profile_id, (source_key, stored_progress, _) in claimed.items():
-            scope = f"profile:{profile_id}"
-            if scope_kind == "all":
-                aggregate = read_publication("all")
-                current_profile = read_publication(scope)
-                if (
-                    aggregate is None
-                    or current_profile is None
-                    or aggregate["state"].get("published", True) is not True
-                    or aggregate["state"]["members"].get(str(profile_id))
-                    != current_profile["state"]["xmltv_hash"]
-                ):
-                    return False
-            async with publication_lock:
-                current = read_publication(scope)
-                if current is None:
-                    return False
-                delivery = current["state"]["delivery"]
-                attempt = delivery.get("guide_attempt")
-                current_progress = delivery["source_refreshes"].get(source_key)
-                if (
-                    attempt is None
-                    or current_progress is None
-                    or current_progress["attempt_id"]
-                    != stored_progress["attempt_id"]
-                    or datetime.now(timezone.utc)
-                    >= datetime.fromisoformat(current_progress["expires_at"])
-                ):
-                    return False
-                refreshes = copy.deepcopy(delivery["source_refreshes"])
-                refreshes[source_key]["observed_running"] = stored_progress[
-                    "observed_running"
-                ]
-                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
-                if after_link:
-                    confirmed[str(source_id)] = current["state"]["xmltv_hash"]
-                next_revision = update_delivery(
-                    scope,
-                    expected_revision=current["revision"],
-                    expected_hash=current["state"]["xmltv_hash"],
-                    expected_config_hash=current["state"]["config_hash"],
-                    expected_attempt_id=attempt["attempt_id"],
-                    confirmed_dispatcharr_hashes=confirmed,
-                    source_refreshes=refreshes,
-                )
-                if next_revision is None:
-                    return False
-                updated = read_publication(scope)
-                if updated is None or updated["revision"] != next_revision:
-                    return False
-                publications[profile_id] = updated
-        return True
 
     async def _refresh_dummy_epg_and_retry(
         self, executor, results: dict, epg_sources: list, dry_run: bool
@@ -5955,13 +5763,17 @@ class ChannelPipelineEngine:
                     if dedicated_ids:
                         if len(served) != 1 or scope_kind != f"profile:{next(iter(dedicated_ids))}":
                             raise ValueError("Dedicated guide import requires one exact publication")
-                        refresh_expires_at = datetime.fromisoformat(next(iter(served.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
+                        refresh_expires_at = (
+                            datetime.fromisoformat(next(iter(served.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
+                            if next(iter(served.values()))["state"]["delivery"]["guide_attempt"]["expires_at"] is not None else None
+                        )
                     elif any(source_id == src_id for profile_id, (rule_id, config) in dedicated_profiles.items() for source_id in [executor._dummy_source_by_profile.get(profile_id)]):
                         raise ValueError("Dedicated guide import has no publication admission")
                     completed = await self._refresh_epg_source(
                         src or {"id": src_id, "name": source_name},
                         served,
                         expires_at=refresh_expires_at,
+                        channel_map=executor._channel_by_id,
                     )
                     if not completed:
                         raise RuntimeError("EPG source refresh did not complete successfully")
@@ -6313,21 +6125,26 @@ class ChannelPipelineEngine:
                         for row in publications.values()
                     })),
                 )
-                if attempt_key in attempted:
-                    continue
-                attempted.add(attempt_key)
+                if not publications:
+                    if attempt_key in attempted:
+                        continue
+                    attempted.add(attempt_key)
                 dedicated_works = [work for work in executor._event_pending.values() if work["source_id"] == source_id and work["config"].get("mode") == "dedicated"]
                 refresh_expires_at = expires_at
                 if dedicated_works or set(publications) & dedicated_profiles:
                     profile_ids = {work["profile_id"] for work in dedicated_works}
                     if len(profile_ids) != 1 or set(publications) != profile_ids or scope_kind != f"profile:{next(iter(profile_ids))}" or source.get("is_active") is not True:
                         raise ValueError("Dedicated linked guide import scope changed")
-                    refresh_expires_at = datetime.fromisoformat(next(iter(publications.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
+                    refresh_expires_at = (
+                            datetime.fromisoformat(next(iter(publications.values()))["state"]["delivery"]["guide_attempt"]["expires_at"])
+                            if next(iter(publications.values()))["state"]["delivery"]["guide_attempt"]["expires_at"] is not None else None
+                        )
                 completed = await self._refresh_epg_source(
                     source or {"id": source_id, "name": f"Source {source_id}"},
                     publications,
                     expires_at=refresh_expires_at,
                     after_link=bool(publications),
+                    channel_map=executor._channel_by_id,
                 )
                 if not completed:
                     raise RuntimeError("EPG programme import did not complete successfully")

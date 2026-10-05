@@ -135,8 +135,8 @@ def _guide_attempt(value) -> dict | None:
     if set(value) != required:
         raise ValueError("Stored guide attempt fields are invalid.")
     admitted_at = _utc(value["admitted_at"], "guide attempt admission")
-    expires_at = _utc(value["expires_at"], "guide attempt expiry")
-    if not admitted_at < expires_at <= admitted_at + timedelta(hours=24):
+    expires_at = _optional_time(value["expires_at"], "guide attempt expiry")
+    if expires_at is not None and _utc(expires_at, "guide attempt expiry") <= admitted_at:
         raise ValueError("Stored guide attempt lifetime is invalid.")
     stage = value["stage"]
     if stage not in GUIDE_STAGES:
@@ -145,7 +145,7 @@ def _guide_attempt(value) -> dict | None:
         "attempt_id": _attempt(value["attempt_id"], "guide attempt ID"),
         "config_hash": _sha(value["config_hash"], "guide attempt config hash"),
         "admitted_at": admitted_at.isoformat(),
-        "expires_at": expires_at.isoformat(),
+        "expires_at": expires_at,
         "stage": stage,
     }
 
@@ -204,7 +204,7 @@ def _history_entry(value) -> dict:
     expires_at = _utc(value["expires_at"], "pending history expiry")
     terminal_at = _utc(value["terminal_at"], "pending history terminal time")
     retry_at = _utc(value["retry_at"], "pending history retry time") if value["retry_at"] is not None else None
-    if not admitted_at < expires_at <= admitted_at + timedelta(hours=24):
+    if expires_at <= admitted_at:
         raise ValueError("Pending channel history lifetime is invalid.")
     recoverable = (
         stage in {"failed", "expired"}
@@ -267,7 +267,7 @@ def _pending_channel(event_key: str, value) -> dict:
     stop = _utc(value["stop"], "pending channel stop")
     terminal_at = _utc(value["terminal_at"], "pending channel terminal time") if value["terminal_at"] is not None else None
     retry_at = _utc(value["retry_at"], "pending channel retry time") if value["retry_at"] is not None else None
-    if stop <= start or not admitted_at < expires_at <= admitted_at + timedelta(hours=24) or expires_at > stop:
+    if stop <= start or not admitted_at < expires_at <= stop:
         raise ValueError("Pending channel interval or lifetime is invalid.")
     failure_reasons = {
         "guide_failed", "channel_missing", "ownership_changed",
@@ -350,6 +350,19 @@ def _pending_channel(event_key: str, value) -> dict:
     return record
 
 
+def _links(value) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or len(value) > MAX_CHANNELS:
+        raise ValueError("Stored source links are invalid.")
+    result = {}
+    for key, link in value.items():
+        if not isinstance(key, str) or re.fullmatch(r"[1-9]\d*", key) is None:
+            raise ValueError("Stored source channel ID is invalid.")
+        result[key] = _positive(link, "source programme link")
+    return dict(sorted(result.items()))
+
+
 def _source_refreshes(values, guide_attempt: dict | None, xmltv_hash: str) -> dict:
     if not isinstance(values, Mapping) or len(values) > MAX_CHANNELS:
         raise ValueError("Stored source refreshes are invalid.")
@@ -361,19 +374,26 @@ def _source_refreshes(values, guide_attempt: dict | None, xmltv_hash: str) -> di
             "source_id", "endpoint_hash", "source_url_hash", "expected_hash",
             "initial_updated", "observed_running", "triggered", "expires_at", "attempt_id",
         }
-        if set(value) != required:
+        extended = {"links", "pending_links", "completed"}
+        if set(value) not in (required, required | extended):
             raise ValueError("Stored source refresh fields are invalid.")
-        expires_at = _utc(value["expires_at"], "source refresh expiry")
+        completed = value.get("completed", False)
+        if not isinstance(completed, bool) or (completed and value["triggered"] is not True):
+            raise ValueError("Stored source refresh completion is invalid.")
+        expires_at = _optional_time(value["expires_at"], "source refresh expiry")
         attempt_id = _attempt(value["attempt_id"], "source refresh attempt ID")
         if guide_attempt is None or attempt_id != guide_attempt["attempt_id"]:
             raise ValueError("Stored source refresh has the wrong guide attempt.")
-        if expires_at != _utc(guide_attempt["expires_at"], "guide attempt expiry"):
+        if expires_at != guide_attempt["expires_at"]:
             raise ValueError("Stored source refresh has the wrong expiry.")
         if value["expected_hash"] != xmltv_hash:
             raise ValueError("Stored source refresh has the wrong XMLTV hash.")
         if not isinstance(value["observed_running"], bool) or not isinstance(value["triggered"], bool):
             raise ValueError("Stored source refresh progress is invalid.")
         result[key] = {
+            "links": _links(value.get("links")),
+            "pending_links": _links(value.get("pending_links")),
+            "completed": completed,
             "source_id": _positive(value["source_id"], "source refresh source ID"),
             "endpoint_hash": _sha(value["endpoint_hash"], "source refresh endpoint hash"),
             "source_url_hash": _sha(value["source_url_hash"], "source refresh URL hash"),
@@ -381,7 +401,7 @@ def _source_refreshes(values, guide_attempt: dict | None, xmltv_hash: str) -> di
             "initial_updated": _text(value["initial_updated"], "source refresh initial timestamp", optional=True, limit=512),
             "observed_running": value["observed_running"],
             "triggered": value["triggered"],
-            "expires_at": expires_at.isoformat(),
+            "expires_at": expires_at,
             "attempt_id": attempt_id,
         }
     return dict(sorted(result.items()))
@@ -510,9 +530,28 @@ def _parse_state(raw: str, *, document: str | None) -> dict:
     else:
         guide_attempt = _guide_attempt(delivery["guide_attempt"])
         delivery["guide_attempt"] = guide_attempt
+        legacy_sources = {
+            str(value["source_id"])
+            for value in delivery["source_refreshes"].values()
+            if isinstance(value, Mapping) and "links" not in value
+        } if isinstance(delivery["source_refreshes"], Mapping) else set()
         delivery["source_refreshes"] = _source_refreshes(
             delivery["source_refreshes"], guide_attempt, xmltv_hash,
         )
+        for source_id in list(delivery["confirmed_dispatcharr_hashes"]):
+            phases = [
+                value for value in delivery["source_refreshes"].values()
+                if str(value["source_id"]) == source_id
+            ]
+            if source_id in legacy_sources or (guide_attempt is not None and not phases):
+                delivery["confirmed_dispatcharr_hashes"].pop(source_id)
+            elif phases and not any(
+                value["links"] is not None and value["completed"]
+                and value["pending_links"] is None
+                and value["expected_hash"] == delivery["confirmed_dispatcharr_hashes"][source_id]
+                for value in phases
+            ):
+                raise ValueError("Confirmed source has no completed programme phase.")
         pending = delivery["pending_channels"]
         if not isinstance(pending, Mapping) or len(pending) > MAX_CHANNELS:
             raise ValueError("Stored pending channels are invalid.")
@@ -1360,7 +1399,10 @@ def _close_expired(delivery: dict, now: datetime, revision: int, xmltv_hash: str
     guide_attempt = delivery.get("guide_attempt")
     if guide_attempt is None or guide_attempt["stage"] in TERMINAL_GUIDE_STAGES:
         return
-    guide_expired = _utc(guide_attempt["expires_at"], "guide attempt expiry") <= now
+    guide_expired = (
+        guide_attempt["expires_at"] is not None
+        and _utc(guide_attempt["expires_at"], "guide attempt expiry") <= now
+    )
     if guide_expired:
         guide_attempt["stage"] = "expired"
     for event_key, receipt in list(delivery["pending_channels"].items()):
@@ -1401,7 +1443,7 @@ def _admit_pending(
     stop = _utc(candidate["stop"], "candidate event stop")
     if not start <= now < stop:
         return None
-    expires_at = min(_utc(guide_attempt["expires_at"], "guide attempt expiry"), stop)
+    expires_at = stop
     if expires_at <= now:
         return None
     if existing is None:
@@ -1534,7 +1576,7 @@ def begin_delivery(
     pending_channels: Mapping[str, Mapping] | None = None,
     plan_only: bool = False,
 ) -> dict | None:
-    """Admit or resume one bounded guide attempt under revision protection."""
+    """Admit or resume one guide attempt under revision protection."""
     if re.fullmatch(r"profile:[1-9]\d*", scope) is None:
         raise ValueError("Guide delivery requires a profile scope.")
     now = _utc(now, "delivery admission time")
@@ -1582,6 +1624,35 @@ def begin_delivery(
             revision = expected_revision
         delivery = copy.deepcopy(state["delivery"])
         original_delivery = copy.deepcopy(delivery)
+        guide_attempt = delivery.get("guide_attempt")
+        if (
+            guide_attempt is not None
+            and guide_attempt["stage"] not in TERMINAL_GUIDE_STAGES
+            and guide_attempt["config_hash"] == config_hash
+            and state["config_hash"] == config_hash
+        ):
+            guide_attempt["expires_at"] = None
+            for progress in delivery["source_refreshes"].values():
+                if progress["attempt_id"] == guide_attempt["attempt_id"]:
+                    progress["expires_at"] = None
+            for event_key, receipt in delivery["pending_channels"].items():
+                if (
+                    receipt["stage"] in TERMINAL_PENDING_STAGES
+                    or receipt["guide_attempt_id"] != guide_attempt["attempt_id"]
+                    or receipt["config_hash"] != config_hash
+                    or receipt["channel_id"] is None
+                    or receipt["channel_uuid"] is None
+                    or _utc(receipt["stop"], "pending channel stop") <= now
+                ):
+                    continue
+                if event_key in candidates:
+                    candidate = _candidate(event_key, candidates[event_key], profile_id, config_hash)
+                    if _admit_pending(
+                        event_key, candidate, receipt, guide_attempt,
+                        now, revision, state["xmltv_hash"],
+                    ) is None:
+                        continue
+                receipt["expires_at"] = receipt["stop"]
         _close_expired(delivery, now, revision, state["xmltv_hash"])
         closed_delivery = copy.deepcopy(delivery)
         closed_state = copy.deepcopy(state)
@@ -1610,14 +1681,17 @@ def begin_delivery(
                 "attempt_id": uuid4().hex,
                 "config_hash": config_hash,
                 "admitted_at": now.isoformat(),
-                "expires_at": (now + timedelta(hours=24)).isoformat(),
+                "expires_at": None,
                 "stage": "preparing",
             }
             delivery["guide_attempt"] = _guide_attempt(guide_attempt)
             delivery["source_refreshes"] = {}
         elif guide_attempt["config_hash"] != config_hash:
             return None
-        elif _utc(guide_attempt["expires_at"], "guide attempt expiry") <= now:
+        elif (
+            guide_attempt["expires_at"] is not None
+            and _utc(guide_attempt["expires_at"], "guide attempt expiry") <= now
+        ):
             return None
 
         for event_key, value in sorted(candidates.items()):
@@ -1803,7 +1877,10 @@ def add_groups(
             or attempt["attempt_id"] != expected_attempt_id
             or attempt["config_hash"] != expected_config_hash
             or attempt["stage"] in TERMINAL_GUIDE_STAGES
-            or _utc(attempt["expires_at"], "guide attempt expiry") <= now
+            or (
+                attempt["expires_at"] is not None
+                and _utc(attempt["expires_at"], "guide attempt expiry") <= now
+            )
             or current_pending != normalized_pending
         ):
             return None
@@ -1886,6 +1963,357 @@ def add_groups(
         session.close()
 
 
+async def refresh_source(
+    client, source, publications, *, expires_at,
+    after_link=False, channel_map=None, wait=True, cancelled=None,
+) -> bool:
+    """Retain each source import phase until its own observed completion."""
+    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+    from tasks.event_visibility import (
+        _await_preparation, _generated_scope, _source_refresh_key,
+        _stream_group_id,
+    )
+
+    def stopped():
+        return cancelled is not None and cancelled()
+
+    source_id = _positive(source.get("id"), "refresh source ID")
+    source_name = source.get("name", f"Source {source_id}")
+    if not publications:
+        return bool(await _await_preparation(wait_for_epg_source_refresh(
+            client, source_id, source_name, expires_at=expires_at,
+            wait=wait, cancelled=cancelled,
+        ), stopped))
+    scope_kind = _generated_scope(source)
+    selected = {
+        profile_id: copy.deepcopy(record)
+        for profile_id, record in publications.items()
+        if scope_kind in {"all", f"profile:{profile_id}"}
+    }
+    if not selected:
+        return False
+    keys = {
+        profile_id: _source_refresh_key(client, source, f"profile:{profile_id}")
+        for profile_id in selected
+    }
+    running = {"fetching", "processing", "parsing", "loading", "pending", "running", "queued", "refreshing"}
+    failed = {"error", "failed", "failure", "cancelled", "canceled"}
+
+    async def read_source():
+        current = await _await_preparation(client.get_epg_source(source_id), stopped)
+        if stopped() or not isinstance(current, Mapping):
+            return None
+        if (
+            current.get("id") != source_id
+            or not isinstance(current.get("url"), str) or not current["url"]
+            or current["url"] != source.get("url")
+            or any(
+                _source_refresh_key(client, source, f"profile:{profile_id}") != key
+                for profile_id, key in keys.items()
+            )
+        ):
+            return None
+        return current
+
+    def current_claims():
+        if stopped():
+            return None
+        current = {}
+        for profile_id, expected in selected.items():
+            scope = f"profile:{profile_id}"
+            record = read_publication(scope)
+            if record is None:
+                return None
+            state = record["state"]
+            attempt = state["delivery"].get("guide_attempt")
+            expected_attempt = expected["state"]["delivery"].get("guide_attempt")
+            if (
+                attempt is None or expected_attempt is None
+                or record["revision"] != expected["revision"]
+                or state["xmltv_hash"] != expected["state"]["xmltv_hash"]
+                or state["config_hash"] != expected["state"]["config_hash"]
+                or attempt != expected_attempt
+                or state["delivery"]["source_refreshes"] != expected["state"]["delivery"]["source_refreshes"]
+                or (attempt["expires_at"] is not None and _utc(attempt["expires_at"], "source expiry") <= datetime.now(timezone.utc))
+                or _source_refresh_key(client, source, scope) != keys[profile_id]
+            ):
+                return None
+            if scope_kind == "all":
+                aggregate = read_publication("all")
+                if (
+                    aggregate is None or aggregate["state"].get("published", True) is not True
+                    or aggregate["state"]["members"].get(str(profile_id)) != state["xmltv_hash"]
+                ):
+                    return None
+            current[profile_id] = record
+        return current
+
+    def bindings(record, channels):
+        members = record["state"]["channels"]
+        if len(members) > MAX_CHANNELS:
+            return None
+        result = {}
+        for member in members:
+            channel_id = member["channel_id"]
+            channel = channels.get(channel_id) if channels is not None else None
+            if not isinstance(channel, Mapping) or channel.get("id") != channel_id:
+                return None
+            if "epg_data_id" in channel:
+                link = channel["epg_data_id"]
+            elif "epg_data" in channel:
+                link = channel["epg_data"]
+                if isinstance(link, Mapping):
+                    link = link.get("id")
+                    if link is None:
+                        return None
+            else:
+                return None
+            if link is not None:
+                try:
+                    result[str(channel_id)] = _positive(link, "source programme link")
+                except ValueError:
+                    return None
+        return _links(result)
+
+    async def read_bindings(record):
+        fresh = {}
+        for member in record["state"]["channels"]:
+            channel_id = member["channel_id"]
+            admitted = channel_map.get(channel_id) if channel_map is not None else None
+            if not isinstance(admitted, Mapping):
+                return None
+            channel = await _await_preparation(client.get_channel(channel_id), stopped)
+            if (
+                stopped() or not isinstance(channel, Mapping)
+                or channel.get("id") != channel_id
+                or channel.get("uuid") != admitted.get("uuid")
+                or _stream_group_id(channel) != _stream_group_id(admitted)
+            ):
+                return None
+            fresh[channel_id] = channel
+        return bindings(record, fresh)
+
+    async def save(changes):
+        if not changes:
+            return current_claims() is not None
+        async with publication_lock:
+            if current_claims() is None:
+                return False
+            session = get_session() if len(changes) > 1 else None
+            revisions = {}
+            try:
+                for profile_id, (progress, confirmed) in changes.items():
+                    record = selected[profile_id]
+                    state = record["state"]
+                    refreshes = copy.deepcopy(state["delivery"]["source_refreshes"])
+                    refreshes[keys[profile_id][0]] = progress
+                    required = dict(state["delivery"]["required_dispatcharr_hashes"])
+                    required[str(source_id)] = state["xmltv_hash"]
+                    claims = {
+                        "expected_revision": record["revision"],
+                        "expected_hash": state["xmltv_hash"],
+                        "expected_config_hash": state["config_hash"],
+                        "expected_attempt_id": state["delivery"]["guide_attempt"]["attempt_id"],
+                        "required_dispatcharr_hashes": required,
+                        "confirmed_dispatcharr_hashes": confirmed,
+                        "source_refreshes": refreshes,
+                    }
+                    if session is not None:
+                        claims["session"] = session
+                    revision = update_delivery(f"profile:{profile_id}", **claims)
+                    if revision is None:
+                        if session is not None:
+                            session.rollback()
+                        return False
+                    revisions[profile_id] = revision
+                if session is not None:
+                    session.commit()
+            except BaseException:
+                if session is not None:
+                    session.rollback()
+                raise
+            finally:
+                if session is not None:
+                    session.close()
+            for profile_id, revision in revisions.items():
+                record = read_publication(f"profile:{profile_id}")
+                if record is None or record["revision"] != revision:
+                    return False
+                selected[profile_id] = copy.deepcopy(record)
+                publications[profile_id] = record
+            return True
+
+    actual = await read_source()
+    if actual is None or current_claims() is None:
+        return False
+    changes = {}
+    for profile_id, record in selected.items():
+        state = record["state"]
+        delivery = state["delivery"]
+        attempt = delivery["guide_attempt"]
+        source_key, endpoint_hash, source_url_hash = keys[profile_id]
+        if any(
+            key != source_key and value["source_id"] == source_id
+            for key, value in delivery["source_refreshes"].items()
+        ):
+            return False
+        requested = bindings(record, channel_map) if after_link else None
+        if after_link and requested is None:
+            progress = delivery["source_refreshes"].get(source_key)
+            if progress is not None:
+                confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
+                confirmed.pop(str(source_id), None)
+                await save({profile_id: (copy.deepcopy(progress), confirmed)})
+            return False
+        progress = copy.deepcopy(delivery["source_refreshes"].get(source_key))
+        confirmed = dict(delivery["confirmed_dispatcharr_hashes"])
+        if progress is None:
+            progress = {
+                "source_id": source_id, "endpoint_hash": endpoint_hash,
+                "source_url_hash": source_url_hash, "expected_hash": state["xmltv_hash"],
+                "attempt_id": attempt["attempt_id"], "expires_at": attempt["expires_at"],
+                "initial_updated": actual.get("updated_at") or actual.get("last_updated"),
+                "triggered": False, "observed_running": False,
+                "links": requested, "pending_links": None, "completed": False,
+            }
+        elif after_link:
+            progress["pending_links"] = requested if requested != progress["links"] else None
+        if not progress["completed"] or progress["links"] is None or progress["pending_links"] is not None:
+            confirmed.pop(str(source_id), None)
+        if progress != delivery["source_refreshes"].get(source_key) or confirmed != delivery["confirmed_dispatcharr_hashes"]:
+            changes[profile_id] = (progress, confirmed)
+    if not await save(changes):
+        return False
+
+    while not stopped():
+        if current_claims() is None:
+            return False
+        phases = {
+            profile_id: copy.deepcopy(record["state"]["delivery"]["source_refreshes"][keys[profile_id][0]])
+            for profile_id, record in selected.items()
+        }
+        changes = {}
+        for profile_id, progress in phases.items():
+            confirmed = dict(selected[profile_id]["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+            if progress["completed"] and progress["pending_links"] is not None:
+                progress.update(links=progress["pending_links"], pending_links=None,
+                                completed=False, triggered=False, observed_running=False)
+                confirmed.pop(str(source_id), None)
+                changes[profile_id] = (progress, confirmed)
+        if changes:
+            if not await save(changes):
+                return False
+            continue
+
+        active = {key: phase for key, phase in phases.items() if phase["triggered"] and not phase["completed"]}
+        if active:
+            for profile_id, progress in active.items():
+                lifetime = min((
+                    _utc(phase["expires_at"], "source expiry")
+                    for phase in phases.values() if phase["expires_at"] is not None
+                ), default=None)
+                actual = await read_source()
+                if actual is None or current_claims() is None:
+                    return False
+                observed = copy.deepcopy(progress)
+                completed = await _await_preparation(wait_for_epg_source_refresh(
+                    client, source_id, source_name, expires_at=lifetime,
+                    initial_source=actual, trigger=False, progress=observed,
+                    wait=wait, cancelled=cancelled,
+                ), stopped)
+                if stopped() or current_claims() is None:
+                    return False
+                actual = await read_source()
+                if actual is None or current_claims() is None:
+                    return False
+                record = selected[profile_id]
+                observed["completed"] = bool(completed)
+                confirmed = dict(record["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                if completed and observed["links"] is not None:
+                    latest = await read_bindings(record)
+                    if latest is None or current_claims() is None:
+                        return False
+                    if latest != observed["links"]:
+                        observed["pending_links"] = latest
+                terminal = str(actual.get("status") or "").strip().lower() in failed
+                if not completed and terminal and observed["pending_links"] is not None:
+                    observed.update(links=observed["pending_links"], pending_links=None,
+                                    completed=False, triggered=False, observed_running=False)
+                if observed["completed"] and observed["links"] is not None and observed["pending_links"] is None:
+                    confirmed[str(source_id)] = record["state"]["xmltv_hash"]
+                else:
+                    confirmed.pop(str(source_id), None)
+                if not await save({profile_id: (observed, confirmed)}):
+                    return False
+                if not completed and not (terminal and not observed["triggered"]):
+                    return False
+            continue
+
+        untriggered = {key: phase for key, phase in phases.items() if not phase["triggered"]}
+        if untriggered:
+            actual = await read_source()
+            if actual is None or current_claims() is None:
+                return False
+            if str(actual.get("status") or "").strip().lower() in running:
+                finite = [
+                    _utc(phase["expires_at"], "source expiry")
+                    for phase in phases.values() if phase["expires_at"] is not None
+                ]
+                await _await_preparation(wait_for_epg_source_refresh(
+                    client, source_id, source_name, expires_at=min(finite, default=None),
+                    initial_source=actual, trigger=False, progress={}, wait=wait,
+                    cancelled=cancelled,
+                ), stopped)
+                if not wait or stopped() or current_claims() is None:
+                    return False
+                actual = await read_source()
+                if actual is None or str(actual.get("status") or "").strip().lower() in running:
+                    return False
+            changes = {}
+            for profile_id, progress in untriggered.items():
+                progress.update(
+                    initial_updated=actual.get("updated_at") or actual.get("last_updated"),
+                    observed_running=False, triggered=True,
+                )
+                confirmed = dict(selected[profile_id]["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                confirmed.pop(str(source_id), None)
+                changes[profile_id] = (progress, confirmed)
+            if not await save(changes) or stopped():
+                return False
+            await _await_preparation(client.refresh_epg_source(source_id), stopped)
+            if stopped():
+                return False
+            continue
+
+        confirmations = {}
+        for profile_id, progress in phases.items():
+            if progress["links"] is not None:
+                latest = await read_bindings(selected[profile_id])
+                if current_claims() is None:
+                    return False
+                if latest is None:
+                    confirmed = dict(selected[profile_id]["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                    confirmed.pop(str(source_id), None)
+                    await save({profile_id: (progress, confirmed)})
+                    return False
+                if latest != progress["links"]:
+                    progress["pending_links"] = latest
+                    confirmed = dict(selected[profile_id]["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                    confirmed.pop(str(source_id), None)
+                    if not await save({profile_id: (progress, confirmed)}):
+                        return False
+                    break
+                confirmed = dict(selected[profile_id]["state"]["delivery"]["confirmed_dispatcharr_hashes"])
+                if confirmed.get(str(source_id)) != progress["expected_hash"]:
+                    confirmed[str(source_id)] = progress["expected_hash"]
+                    confirmations[profile_id] = (progress, confirmed)
+            elif after_link:
+                return False
+        else:
+            return await save(confirmations)
+    return False
+
+
 def update_delivery(
     scope: str,
     *,
@@ -1900,9 +2328,12 @@ def update_delivery(
     guide_attempt: Mapping | None = None,
     source_refreshes: Mapping | None = None,
     pending_channels: Mapping | None = None,
+    session=None,
 ) -> int | None:
     """Update bounded delivery progress only when the publication still wins."""
-    session = get_session()
+    owned_session = session is None
+    if owned_session:
+        session = get_session()
     try:
         row = session.query(GuidePublication).filter(GuidePublication.scope == scope).one_or_none()
         if row is None or row.revision != expected_revision:
@@ -2037,7 +2468,7 @@ def update_delivery(
         if delivery == state["delivery"]:
             return expected_revision
         state["delivery"] = delivery
-        _parse_state(_state_text(state), document=row.xmltv)
+        state = _parse_state(_state_text(state), document=row.xmltv)
         next_revision = expected_revision + 1
         updated = (
             session.query(GuidePublication)
@@ -2051,12 +2482,16 @@ def update_delivery(
             }, synchronize_session=False)
         )
         if updated != 1:
-            session.rollback()
+            if owned_session:
+                session.rollback()
             return None
-        session.commit()
+        if owned_session:
+            session.commit()
         return next_revision
     except Exception:
-        session.rollback()
+        if owned_session:
+            session.rollback()
         raise
     finally:
-        session.close()
+        if owned_session:
+            session.close()

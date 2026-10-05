@@ -671,3 +671,27 @@ async def test_probe_stream_saves_nothing_after_expiry():
 
     assert result == {}
     prober._save_probe_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_content_sample_without_loading_expiry(timeout):
+    prober = _prober()
+    media = {"streams": [], "format": {"format_name": "mpegts"}}
+    prober._run_ffprobe = AsyncMock(
+        return_value=media, side_effect=asyncio.TimeoutError if timeout else None,
+    )
+    prober._measure_stream_bitrate = AsyncMock(return_value=None if timeout else 3000000)
+    prober._detect_black_screen = AsyncMock(return_value=False)
+    prober._save_probe_result = MagicMock(return_value={"stream_id": 7})
+    prober._push_stats_to_dispatcharr = AsyncMock()
+    result = await prober.probe_stream(7, "http://media/7", "Seven", content=True, expires_at=None)
+    assert result == {"stream_id": 7}
+    prober._run_ffprobe.assert_awaited_once_with("http://media/7", expires_at=None)
+    prober._measure_stream_bitrate.assert_awaited_once_with("http://media/7", expires_at=None)
+    if timeout:
+        prober._detect_black_screen.assert_not_awaited()
+        assert prober._save_probe_result.call_args.args[3] == "timeout"
+    else:
+        prober._detect_black_screen.assert_awaited_once_with("http://media/7", expires_at=None)
+        assert prober._save_probe_result.call_args.args[3] == "success"

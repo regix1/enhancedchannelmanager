@@ -24,7 +24,7 @@ _PREVIEW_INSTANCE_DOMAIN = b"ecm:guide-migration:instance:v1"
 
 async def stream_xmltv(
     source: dict, *, max_download: int, max_decoded: int,
-    timeout: float = 120.0, transport=None, read_timeout: float = 30.0,
+    timeout: float | None = 120.0, transport=None, read_timeout: float = 30.0,
     diagnostics: dict | None = None,
 ):
     """Yield bounded, validated XML chunks without retaining the document."""

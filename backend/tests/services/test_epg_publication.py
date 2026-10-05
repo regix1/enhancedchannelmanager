@@ -753,7 +753,7 @@ def test_delivery_attempt_reuses_expiry_and_bounds_successor_history():
     assert admitted is not None
     guide_attempt = admitted["state"]["delivery"]["guide_attempt"]
     receipt = admitted["state"]["delivery"]["pending_channels"]["arena:falcons-wolves"]
-    assert guide_attempt["expires_at"] == (NOW + timedelta(hours=24)).isoformat()
+    assert guide_attempt["expires_at"] is None
     assert receipt["expires_at"] == (NOW + timedelta(hours=2)).isoformat()
     assert receipt["attempt_no"] == 1
     assert receipt["stage"] == "allocated"
@@ -1036,7 +1036,7 @@ def test_health_recovery_outlives_failed_attempt():
     first_receipt = admitted["state"]["delivery"]["pending_channels"][candidate["event_key"]]
     failed = _fail_pending(admitted, "health_failed", NOW + timedelta(minutes=1))
     failed_receipt = failed["state"]["delivery"]["pending_channels"][candidate["event_key"]]
-    late = datetime.fromisoformat(first_receipt["expires_at"]) + timedelta(minutes=1)
+    late = NOW + timedelta(hours=24, minutes=1)
 
     successor = begin_delivery(
         "profile:1",
@@ -1049,7 +1049,7 @@ def test_health_recovery_outlives_failed_attempt():
     assert successor is not None
     next_attempt = successor["state"]["delivery"]["guide_attempt"]
     next_receipt = successor["state"]["delivery"]["pending_channels"][candidate["event_key"]]
-    assert next_attempt["attempt_id"] != first_attempt["attempt_id"]
+    assert next_attempt["attempt_id"] == first_attempt["attempt_id"]
     assert next_receipt["attempt_id"] != failed_receipt["attempt_id"]
     assert next_receipt["guide_attempt_id"] == next_attempt["attempt_id"]
     assert next_receipt["expires_at"] == candidate["stop"]
@@ -1857,3 +1857,232 @@ def test_receipt_expiry_closes_once_before_the_guide_expiry():
         pending_channels={"arena:falcons-wolves": pending_candidate()},
     ) is None
     assert read_publication("profile:1")["revision"] == closed["revision"]
+
+
+@pytest.mark.parametrize("condition", ["active", "ended", "terminal", "foreign", "allocating"])
+def test_legacy_delivery_resumes_only_eligible_receipts(condition):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    stored = read_publication("profile:1")
+    candidate = pending_candidate()
+    candidate["stop"] = (NOW + timedelta(hours=48)).isoformat()
+    admitted = begin_delivery(
+        "profile:1", expected_revision=stored["revision"],
+        expected_hash=stored["state"]["xmltv_hash"], profile=profile(), now=NOW,
+        pending_channels={candidate["event_key"]: candidate},
+    )
+    legacy = copy.deepcopy(admitted["state"])
+    delivery = legacy["delivery"]
+    attempt = delivery["guide_attempt"]
+    attempt["expires_at"] = (NOW + timedelta(hours=24)).isoformat()
+    receipt = delivery["pending_channels"][candidate["event_key"]]
+    receipt["expires_at"] = attempt["expires_at"]
+    if condition == "ended":
+        receipt["stop"] = receipt["expires_at"]
+    elif condition == "terminal":
+        receipt.update(stage="failed", reason="health_failed",
+                       terminal_at=(NOW + timedelta(minutes=1)).isoformat(),
+                       retry_at=(NOW + timedelta(minutes=6)).isoformat())
+    elif condition == "foreign":
+        receipt["config_hash"] = "f" * 64
+    elif condition == "allocating":
+        receipt.update(stage="allocating", channel_id=None, channel_uuid=None)
+    progress = {
+        "source_id": 7, "endpoint_hash": "1" * 64, "source_url_hash": "2" * 64,
+        "expected_hash": legacy["xmltv_hash"], "initial_updated": "initial",
+        "observed_running": True, "triggered": True,
+        "expires_at": attempt["expires_at"], "attempt_id": attempt["attempt_id"],
+    }
+    delivery["source_refreshes"] = {"source": progress}
+    with database.get_session() as session:
+        row = session.query(GuidePublication).filter_by(scope="profile:1").one()
+        row.state = json.dumps(legacy)
+        session.commit()
+    normalized = copy.deepcopy(legacy)
+    normalized["delivery"]["source_refreshes"]["source"].update(
+        links=None, pending_links=None, completed=False,
+    )
+    assert read_publication("profile:1")["state"] == normalized
+
+    resumed = begin_delivery(
+        "profile:1", expected_revision=admitted["revision"],
+        expected_hash=legacy["xmltv_hash"], profile=profile(),
+        now=NOW + timedelta(hours=25),
+    )
+    assert read_publication("profile:1") == resumed
+    result = resumed["state"]["delivery"]
+    assert result["guide_attempt"] == {**attempt, "expires_at": None}
+    assert result["source_refreshes"]["source"] == {
+        **progress, "expires_at": None, "links": None,
+        "pending_links": None, "completed": False,
+    }
+    current = result["pending_channels"][candidate["event_key"]]
+    assert current["attempt_id"] == receipt["attempt_id"]
+    assert current["channel_id"] == receipt["channel_id"]
+    assert current["history"] == receipt["history"]
+    if condition == "active":
+        assert current == {**receipt, "expires_at": receipt["stop"]}
+    elif condition == "terminal":
+        assert current == receipt
+    else:
+        assert current["expires_at"] == receipt["expires_at"]
+        assert current["stage"] == ("allocation_unknown" if condition == "allocating" else "expired")
+
+
+def test_legacy_loading_normalization_requires_current_revision_and_config():
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    stored = read_publication("profile:1")
+    admitted = begin_delivery(
+        "profile:1", expected_revision=stored["revision"],
+        expected_hash=stored["state"]["xmltv_hash"], profile=profile(), now=NOW,
+        pending_channels={"arena:falcons-wolves": pending_candidate()},
+    )
+    with database.get_session() as session:
+        row = session.query(GuidePublication).filter_by(scope="profile:1").one()
+        state = json.loads(row.state)
+        state["delivery"]["guide_attempt"]["expires_at"] = (NOW + timedelta(hours=24)).isoformat()
+        row.state = json.dumps(state)
+        session.commit()
+    before = read_publication("profile:1")
+    for revision, selected in (
+        (admitted["revision"] - 1, profile()),
+        (admitted["revision"], {**profile(), "name": "Changed"}),
+    ):
+        assert begin_delivery(
+            "profile:1", expected_revision=revision,
+            expected_hash=before["state"]["xmltv_hash"], profile=selected,
+            now=NOW + timedelta(minutes=1),
+        ) is None
+        assert read_publication("profile:1") == before
+
+
+@pytest.mark.parametrize("case", ["legacy", "headers", "programmes", "successor", "empty", "finite"])
+def test_source_phase_round_trips(case):
+    from services.epg_publication import _source_refreshes
+
+    attempt = {"attempt_id": "1" * 32, "expires_at": None}
+    progress = {
+        "source_id": 46, "endpoint_hash": "a" * 64, "source_url_hash": "b" * 64,
+        "expected_hash": "c" * 64, "initial_updated": "initial",
+        "observed_running": True, "triggered": True,
+        "expires_at": None, "attempt_id": attempt["attempt_id"],
+    }
+    if case != "legacy":
+        progress.update(links=None, pending_links=None, completed=True)
+    if case in {"programmes", "successor"}:
+        progress["links"] = {"10": 900}
+    if case == "successor":
+        progress["pending_links"] = {"10": 901}
+    elif case == "empty":
+        progress["links"] = {}
+    elif case == "finite":
+        attempt["expires_at"] = progress["expires_at"] = NOW.isoformat()
+    result = _source_refreshes({"source": progress}, attempt, "c" * 64)
+    assert result == {"source": {
+        "links": None, "pending_links": None, "completed": False, **progress,
+    }}
+    assert _source_refreshes(json.loads(json.dumps(result)), attempt, "c" * 64) == result
+
+
+@pytest.mark.parametrize("change", [
+    {"links": {}},
+    {"links": {str(number): 900 for number in range(1, 10002)}, "pending_links": None, "completed": False},
+    {"links": {"01": 900}, "pending_links": None, "completed": False},
+    {"links": {"10": True}, "pending_links": None, "completed": False},
+    {"links": {"10": 0}, "pending_links": None, "completed": False},
+    {"links": {True: 900}, "pending_links": None, "completed": False},
+    {"links": None, "pending_links": None, "completed": "yes"},
+    {"links": None, "pending_links": None, "completed": True, "triggered": False},
+    {"links": None, "pending_links": None, "completed": False, "unknown": True},
+])
+def test_source_phase_rejects_incomplete_or_invalid_fields(change):
+    from services.epg_publication import _source_refreshes
+
+    progress = {
+        "source_id": 46, "endpoint_hash": "a" * 64, "source_url_hash": "b" * 64,
+        "expected_hash": "c" * 64, "initial_updated": "initial",
+        "observed_running": False, "triggered": True,
+        "expires_at": None, "attempt_id": "1" * 32, **change,
+    }
+    with pytest.raises(ValueError):
+        _source_refreshes({"source": progress}, {"attempt_id": "1" * 32, "expires_at": None}, "c" * 64)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lose_second", [False, True])
+async def test_aggregate_refresh_admission_commits_all_claims_or_none(monkeypatch, lose_second):
+    from unittest.mock import AsyncMock, MagicMock
+    from services import epg_publication
+
+    publish_profiles([profile(1), profile(2)], channel_map(1, 2), coverage(1, 2), observations={}, now=NOW)
+    publications = {}
+    for profile_id in (1, 2):
+        row = read_publication(f"profile:{profile_id}")
+        publications[profile_id] = begin_delivery(
+            row["scope"], expected_revision=row["revision"], expected_hash=row["state"]["xmltv_hash"],
+            profile=profile(profile_id), now=NOW,
+        )
+    before = copy.deepcopy(publications)
+    source = {"id": 46, "name": "All", "url": "http://ecm/api/dummy-epg/xmltv", "status": "ready", "updated_at": "old"}
+    client = MagicMock(base_url="http://dispatcharr.local")
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(source))
+
+    async def refresh(source_id):
+        source.update(status="success", updated_at="new")
+
+    client.refresh_epg_source = AsyncMock(side_effect=refresh)
+    original = epg_publication.update_delivery
+
+    def update(scope, **claims):
+        assert claims["session"] is not None
+        if lose_second and scope == "profile:2":
+            return None
+        return original(scope, **claims)
+
+    if lose_second:
+        monkeypatch.setattr(epg_publication, "update_delivery", update)
+    result = await epg_publication.refresh_source(client, source, publications, expires_at=None, wait=False)
+    assert result is (not lose_second)
+    if lose_second:
+        client.refresh_epg_source.assert_not_awaited()
+        assert {key: read_publication(f"profile:{key}") for key in (1, 2)} == before
+    else:
+        client.refresh_epg_source.assert_awaited_once_with(46)
+        for row in publications.values():
+            progress = next(iter(row["state"]["delivery"]["source_refreshes"].values()))
+            assert progress["completed"] is True
+            assert progress["links"] is None
+            assert row["state"]["delivery"]["confirmed_dispatcharr_hashes"] == {}
+
+
+@pytest.mark.parametrize("phase", ["missing", "legacy", "headers", "programmes", "successor"])
+def test_confirmations_require_current_programme_phase(phase):
+    publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
+    row = read_publication("profile:1")
+    admitted = begin_delivery(row["scope"], expected_revision=row["revision"],
+                              expected_hash=row["state"]["xmltv_hash"], profile=profile(), now=NOW)
+    state = copy.deepcopy(admitted["state"])
+    delivery = state["delivery"]
+    delivery["required_dispatcharr_hashes"] = {"46": state["xmltv_hash"]}
+    delivery["confirmed_dispatcharr_hashes"] = dict(delivery["required_dispatcharr_hashes"])
+    progress = {
+        "source_id": 46, "endpoint_hash": "a" * 64, "source_url_hash": "b" * 64,
+        "expected_hash": state["xmltv_hash"], "initial_updated": "initial",
+        "observed_running": True, "triggered": True, "expires_at": None,
+        "attempt_id": delivery["guide_attempt"]["attempt_id"],
+    }
+    if phase != "missing":
+        if phase != "legacy":
+            progress.update(links=None if phase == "headers" else {"1": 900},
+                            pending_links={"1": 901} if phase == "successor" else None,
+                            completed=True)
+        delivery["source_refreshes"] = {"source": progress}
+    with database.get_session() as session:
+        stored = session.query(GuidePublication).filter_by(scope="profile:1").one()
+        stored.state = json.dumps(state)
+        session.commit()
+    if phase in {"headers", "successor"}:
+        with pytest.raises(ValueError, match="programme phase"):
+            read_publication("profile:1")
+    else:
+        confirmed = read_publication("profile:1")["state"]["delivery"]["confirmed_dispatcharr_hashes"]
+        assert confirmed == ({"46": state["xmltv_hash"]} if phase == "programmes" else {})

@@ -20,7 +20,7 @@ async def wait_for_epg_source_refresh(
     source_name: str,
     poll_interval: int = POLL_INTERVAL_SECONDS,
     *,
-    expires_at: datetime,
+    expires_at: datetime | None,
     initial_source: dict | None = None,
     trigger: bool = True,
     cancelled: Callable[[], bool] | None = None,
@@ -28,28 +28,36 @@ async def wait_for_epg_source_refresh(
     wait: bool = True,
 ) -> bool:
     """Trigger or observe a source refresh, returning only confirmed completion."""
-    if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        raise ValueError("expires_at must be a datetime with an offset.")
-    expires_at = expires_at.astimezone(timezone.utc)
+    from tasks.event_visibility import _await_preparation
+
+    if expires_at is not None:
+        if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("expires_at must be a datetime with an offset.")
+        expires_at = expires_at.astimezone(timezone.utc)
+    endpoint = getattr(client, "base_url", None)
     progress = progress if progress is not None else {}
     if cancelled is not None and cancelled():
         return False
-    if datetime.now(timezone.utc) >= expires_at:
+    if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
         return False
     if initial_source is None:
-        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-        if remaining <= 0:
+        remaining = (
+            (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if expires_at is not None else None
+        )
+        if remaining is not None and remaining <= 0:
             return False
         try:
-            initial_source = await asyncio.wait_for(
-                client.get_epg_source(source_id), timeout=remaining,
+            initial_source = await _await_preparation(
+                asyncio.wait_for(client.get_epg_source(source_id), timeout=remaining),
+                lambda: cancelled is not None and cancelled(),
             )
         except asyncio.TimeoutError:
             logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
             return False
     if cancelled is not None and cancelled():
         return False
-    if datetime.now(timezone.utc) >= expires_at:
+    if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
         return False
     if "initial_updated" not in progress:
         progress["initial_updated"] = (
@@ -58,13 +66,13 @@ async def wait_for_epg_source_refresh(
     if cancelled is not None and cancelled():
         return False
     if trigger and progress.get("triggered") is not True:
-        if datetime.now(timezone.utc) >= expires_at:
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             return False
         await client.refresh_epg_source(source_id)
         progress["triggered"] = True
     if cancelled is not None and cancelled():
         return False
-    if datetime.now(timezone.utc) >= expires_at:
+    if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
         return False
 
     running_states = {
@@ -76,27 +84,47 @@ async def wait_for_epg_source_refresh(
     while True:
         if cancelled is not None and cancelled():
             return False
-        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-        if remaining <= 0:
+        remaining = (
+            (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if expires_at is not None else None
+        )
+        if remaining is not None and remaining <= 0:
             logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
             return False
         if wait:
-            await asyncio.sleep(min(max(0, poll_interval), remaining))
+            await _await_preparation(
+                asyncio.sleep(
+                    max(0, poll_interval) if remaining is None
+                    else min(max(0, poll_interval), remaining)
+                ),
+                lambda: cancelled is not None and cancelled(),
+            )
         if cancelled is not None and cancelled():
             return False
-        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-        if remaining <= 0:
+        remaining = (
+            (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if expires_at is not None else None
+        )
+        if remaining is not None and remaining <= 0:
             return False
         try:
-            current_source = await asyncio.wait_for(
-                client.get_epg_source(source_id), timeout=remaining,
+            current_source = await _await_preparation(
+                asyncio.wait_for(client.get_epg_source(source_id), timeout=remaining),
+                lambda: cancelled is not None and cancelled(),
             )
         except asyncio.TimeoutError:
             logger.warning("[EPG-REFRESH] Timeout waiting for source %s", source_id)
             return False
         if cancelled is not None and cancelled():
             return False
-        if datetime.now(timezone.utc) >= expires_at:
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            return False
+        if (
+            getattr(client, "base_url", None) != endpoint
+            or current_source.get("url") != initial_source.get("url")
+            or ("id" in current_source and current_source["id"] != source_id)
+            or ("id" in initial_source and initial_source["id"] != source_id)
+        ):
             return False
         status = str(current_source.get("status") or "").strip().lower()
         current_updated = current_source.get("updated_at") or current_source.get("last_updated")
@@ -198,11 +226,15 @@ class DummyEPGRefreshTask(TaskScheduler):
                 or attempt.get("config_hash") != state.get("config_hash")
             ):
                 raise ValueError("Guide regeneration publication does not match its profile.")
-            expires_at = datetime.fromisoformat(attempt["expires_at"])
-            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-                raise ValueError("Guide regeneration expiry requires an offset.")
-            expires_at = expires_at.astimezone(timezone.utc)
-            if expires_at <= now:
+            expires_at = (
+                datetime.fromisoformat(attempt["expires_at"])
+                if attempt["expires_at"] is not None else None
+            )
+            if expires_at is not None:
+                if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                    raise ValueError("Guide regeneration expiry requires an offset.")
+                expires_at = expires_at.astimezone(timezone.utc)
+            if expires_at is not None and expires_at <= now:
                 unavailable.add(profile_id)
                 continue
             admitted[profile_id] = (copy.deepcopy(profile), publication, expires_at)
@@ -256,15 +288,23 @@ class DummyEPGRefreshTask(TaskScheduler):
                     })
                 if intervals:
                     profile["event_intervals"] = intervals
-            prepared, coverage = await prepare_profiles(
-                [profile],
-                channel_map,
-                client,
-                expires_at=expires_at,
-                now=now,
-                wait_for_sources=wait_for_sources,
-                recover_sources=True,
+            from tasks.event_visibility import _await_preparation
+
+            preparation = await _await_preparation(
+                prepare_profiles(
+                    [profile],
+                    channel_map,
+                    client,
+                    expires_at=expires_at,
+                    now=now,
+                    wait_for_sources=wait_for_sources,
+                    recover_sources=True,
+                ),
+                lambda: self._cancel_requested,
             )
+            if preparation is None:
+                raise asyncio.CancelledError
+            prepared, coverage = preparation
             if prepared:
                 prepared_profile = next(
                     (item for item in prepared if item.get("id") == profile_id),
@@ -309,7 +349,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             complete_profiles.append(prepared)
         _profile_owners(complete_profiles, channel_map, coverage)
         for profile_id, (_, _, expires_at) in admitted.items():
-            if datetime.now(timezone.utc) >= expires_at:
+            if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
                 record = coverage["profiles"][str(profile_id)]
                 record["can_publish"] = False
                 record["reason_codes"] = sorted(

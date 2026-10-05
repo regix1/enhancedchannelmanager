@@ -840,7 +840,7 @@ async def test_cold_budget_deduplicates_load_and_invalidates_output_on_completio
     started, release = asyncio.Event(), asyncio.Event()
     calls = 0
     async def read(*_, expires_at):
-        assert expires_at == EXPIRES_AT
+        assert expires_at is None
         nonlocal calls
         calls += 1
         started.set()
@@ -936,7 +936,7 @@ async def test_active_cached_mapping_reports_the_frozen_retry_state(monkeypatch)
         "cached_source_id": 50,
         "cached_source_kind": "external",
         "checked_age_seconds": observation["links"][0]["checked_age_seconds"],
-        "load_expires_at": upstream.get_epg_data.await_args.kwargs["expires_at"].isoformat(),
+        "load_expires_at": None,
     }]
     assert observation["links"][0]["checked_age_seconds"] >= guides.SOURCE_RETRY
     assert coverage["profiles"]["1"]["can_publish"] is False
@@ -1107,7 +1107,7 @@ async def test_mapping_capture_stays_fixed_while_later_preparation_waits(monkeyp
     assert observation["captured_at"] != NOW.isoformat()
     assert observation["links"][0]["active"] is True
     assert observation["links"][0]["checked_age_seconds"] == 100.0
-    assert observation["links"][0]["load_expires_at"] == upstream.get_epg_data.await_args.kwargs["expires_at"].isoformat()
+    assert observation["links"][0]["load_expires_at"] is None
 
 
 @pytest.mark.asyncio
@@ -1370,7 +1370,7 @@ async def test_catalogue_eviction_does_not_drop_the_current_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_catalogue_read_expiry_starts_after_queue_admission(monkeypatch):
+async def test_catalogue_read_expiry(monkeypatch):
     monkeypatch.setattr(guides, "_CATALOGUE_SLOTS", asyncio.Semaphore(0))
     upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}])
     key = (upstream, 90)
@@ -1378,16 +1378,13 @@ async def test_catalogue_read_expiry_starts_after_queue_admission(monkeypatch):
     task = asyncio.create_task(guides._load_catalogue(batch, upstream))
     guides._CATALOGUE_LOADS[key] = task
     await asyncio.sleep(0)
-    assert key not in guides._CATALOGUE_EXPIRIES
+    assert guides._CATALOGUE_EXPIRIES[key] == EXPIRES_AT
 
-    admitted_at = datetime.now(timezone.utc)
     guides._CATALOGUE_SLOTS.release()
     result = await task
 
     read_expiry = upstream.get_epg_data.await_args.kwargs["expires_at"]
-    assert admitted_at < read_expiry <= admitted_at + timedelta(
-        seconds=guides.CATALOGUE_TIMEOUT + 1,
-    )
+    assert read_expiry == EXPIRES_AT
     assert result[key]["value"]["id"] == 90
     assert key not in guides._CATALOGUE_LOADS
     assert key not in guides._CATALOGUE_EXPIRIES
@@ -1446,7 +1443,7 @@ async def test_cancelled_catalogue_joiner_leaves_shared_owner_running(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_final_mapping_check_blocks_identity_aged_during_source_wait(monkeypatch):
+async def test_final_mapping_check_during_source_wait(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(guides.time, "monotonic", lambda: clock[0])
     row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
@@ -1470,15 +1467,326 @@ async def test_final_mapping_check_blocks_identity_aged_during_source_wait(monke
     _, aged = await guides.prepare_profiles(
         [profile()], channels, upstream, now=NOW, wait_for_sources=True,
     )
-    assert aged["profiles"]["1"]["can_publish"] is False
-    assert aged["profiles"]["1"]["mapping_checks"]["counts"]["pending"] == 1
-    assert upstream.get_epg_data.await_count == 1
+    assert aged["profiles"]["1"]["can_publish"] is True
+    assert upstream.get_epg_data.await_count == 2
 
     _, refreshed = await guides.prepare_profiles(
         [profile()], channels, upstream, now=NOW, wait_for_sources=True,
     )
     assert refreshed["profiles"]["1"]["can_publish"] is True
     assert upstream.get_epg_data.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_generated_links_refresh_after_source_or_composition_wait(monkeypatch, recover):
+    from types import SimpleNamespace
+    clock = [1000.0]
+    monkeypatch.setattr(guides, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    sources = [source(), {"id": 100, "source_type": "xmltv", "is_active": True,
+                          "url": "http://ecm/api/dummy-epg/xmltv/1"}]
+    rows = [{"id": 90 + number, "epg_source": 100, "tvg_id": f"sports-{number}"}
+            for number in range(1, 56)]
+    channels = {number: channel(id=number, epg_data_id=90 + number, tvg_id=f"sports-{number}")
+                for number in range(1, 56)}
+    selected = profile(tvg_id_template="sports-{channel_id}", channel_mappings=[
+        {"channel_id": number, "source_id": 50, "tvg_id": "111"} for number in channels
+    ])
+    upstream = client(sources=sources, rows=rows)
+    install_feed(monkeypatch, feed(programme(tvg="111")))
+    if recover:
+        await guides.prepare_profiles([selected], channels, upstream, now=NOW, expires_at=None,
+                                      wait_for_sources=True)
+    read_source = guides._read_source
+    compose = guides._compose
+    downloads = []
+    aged = False
+
+    async def read(*args, **kwargs):
+        assert kwargs["expires_at"] is None
+        downloads.append(args[0]["id"])
+        result = await read_source(*args, **kwargs)
+        clock[0] += 68.573949
+        return result
+
+    def render(*args):
+        nonlocal aged
+        result = compose(*args)
+        if not aged:
+            clock[0] += 68.573949
+            aged = True
+        return result
+
+    if recover:
+        monkeypatch.setattr(guides, "_compose", render)
+    else:
+        monkeypatch.setattr(guides, "_read_source", read)
+    _, coverage = await guides.prepare_profiles(
+        [selected], channels, upstream, now=NOW, expires_at=None,
+        wait_for_sources=not recover, recover_sources=recover,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is True
+    assert len(coverage["channels"]) == 55
+    assert upstream.get_epg_data.await_count == 2
+    assert upstream.get_epg_sources.await_count == 2
+    assert all(call.kwargs == {"max_results": 55,
+                              "ids": frozenset(range(91, 146)), "expires_at": None}
+               for call in upstream.get_epg_data.await_args_list)
+    assert downloads == ([] if recover else [50])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["missing", "wrong_id", "malformed", "source", "tvg", "definition",
+                                    "failure", "invalid_sources", "duplicate_sources"])
+async def test_final_catalogue_refresh_rejects_changed_proof(monkeypatch, change):
+    from types import SimpleNamespace
+    clock = [1000.0]
+    monkeypatch.setattr(guides, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    install_feed(monkeypatch, feed(programme()))
+    compose = guides._compose
+
+    def render(*args):
+        result = compose(*args)
+        clock[0] += 68.573949
+        changed = dict(row)
+        if change == "wrong_id":
+            changed["id"] = 91
+        elif change == "malformed":
+            changed.pop("tvg_id")
+        elif change == "source":
+            changed["epg_source"] = 51
+        elif change == "tvg":
+            changed["tvg_id"] = "TNT.us"
+        upstream.get_epg_data.side_effect = None
+        upstream.get_epg_data.return_value = [] if change == "missing" else [changed]
+        if change == "definition":
+            upstream.get_epg_sources.return_value = [source(url="https://example.com/changed.xml")]
+        if change == "failure":
+            upstream.get_epg_sources.side_effect = ValueError("unavailable")
+        if change == "invalid_sources":
+            upstream.get_epg_sources.return_value = [None]
+        if change == "duplicate_sources":
+            upstream.get_epg_sources.return_value = [source(), source()]
+        return result
+
+    monkeypatch.setattr(guides, "_compose", render)
+    _, coverage = await guides.prepare_profiles(
+        [profile()], {1: channel(epg_data_id=90)}, upstream, now=NOW,
+        expires_at=None, wait_for_sources=True,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is False
+    assert "GUIDE_SOURCES_PENDING" in coverage["profiles"]["1"]["reason_codes"]
+    assert upstream.get_epg_data.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_catalogue_and_source_outlive_reader_waits(monkeypatch):
+    catalogue_started, source_started = asyncio.Event(), asyncio.Event()
+    release_catalogue, release_source = asyncio.Event(), asyncio.Event()
+    upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}])
+    rows = upstream.get_epg_data.side_effect
+    waits = []
+    wait = asyncio.wait
+    read_source = guides._read_source
+    install_feed(monkeypatch, feed(programme()))
+
+    async def held_rows(**kwargs):
+        assert kwargs["expires_at"] is None
+        catalogue_started.set()
+        await release_catalogue.wait()
+        return await rows(**kwargs)
+
+    async def held_source(*args, **kwargs):
+        assert kwargs["expires_at"] is None
+        source_started.set()
+        await release_source.wait()
+        return await read_source(*args, **kwargs)
+
+    async def yield_wait(tasks, *, timeout):
+        waits.append(timeout)
+        if timeout is not None:
+            await asyncio.sleep(0)
+            return set(), set(tasks)
+        return await wait(tasks, timeout=timeout)
+
+    upstream.get_epg_data.side_effect = held_rows
+    monkeypatch.setattr(guides, "_read_source", held_source)
+    monkeypatch.setattr(guides.asyncio, "wait", yield_wait)
+    channels = {1: channel(epg_data_id=90)}
+    _, pending = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, expires_at=None, recover_sources=True,
+    )
+    await catalogue_started.wait()
+    owner = guides._CATALOGUE_LOADS[(upstream, 90)]
+    assert not owner.done()
+    assert pending["profiles"]["1"]["can_publish"] is False
+    assert waits and all(value == guides.CATALOGUE_TIMEOUT for value in waits)
+    blocking = asyncio.create_task(guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, expires_at=None, wait_for_sources=True,
+    ))
+    release_catalogue.set()
+    await source_started.wait()
+    assert not blocking.done()
+    source_owner = next(iter(guides._SOURCE_LOADS.values()))
+    assert not source_owner.done()
+    release_source.set()
+    _, ready = await blocking
+    assert ready["profiles"]["1"]["can_publish"] is True
+    assert upstream.get_epg_data.await_count == 1
+    assert waits[-2:] == [None, None]
+    _, retained = await guides.prepare_profiles(
+        [profile()], channels, upstream, now=NOW, expires_at=None, recover_sources=True,
+    )
+    assert retained["profiles"]["1"]["can_publish"] is True
+    assert upstream.get_epg_data.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_source_owner_survives_finite_or_cancelled_reader(monkeypatch, cancel):
+    current = [datetime.now(timezone.utc)]
+    expiry = current[0] + timedelta(seconds=10)
+    started, release = asyncio.Event(), asyncio.Event()
+    read_source = guides._read_source
+    install_feed(monkeypatch, feed(programme()))
+    upstream = client()
+
+    async def read(*args, **kwargs):
+        assert kwargs["expires_at"] is None
+        started.set()
+        await release.wait()
+        return await read_source(*args, **kwargs)
+
+    async def expire(tasks, *, timeout):
+        await started.wait()
+        current[0] = expiry + timedelta(seconds=1)
+        return set(), set(tasks)
+
+    monkeypatch.setattr(guides, "_read_source", read)
+    await guides.prepare_profiles([profile()], {1: channel()}, upstream, now=NOW, expires_at=None)
+    if not cancel:
+        monkeypatch.setattr(guides, "_remaining", lambda value: (
+            None if value is None else (value - current[0]).total_seconds()
+        ))
+        monkeypatch.setattr(guides.asyncio, "wait", expire)
+    reader = asyncio.create_task(guides.prepare_profiles(
+        [profile()], {1: channel()}, upstream, now=NOW,
+        expires_at=expiry, wait_for_sources=True,
+    ))
+    await started.wait()
+    owner = next(iter(guides._SOURCE_LOADS.values()))
+    if cancel:
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+    else:
+        _, pending = await reader
+        assert pending["profiles"]["1"]["can_publish"] is False
+    assert not owner.done()
+    assert next(iter(guides._SOURCE_EXPIRIES.values())) is None
+    release.set()
+    await owner
+    assert next(iter(guides._SOURCE_CACHE.values()))["success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expire_before", [False, True])
+async def test_final_refresh_does_not_renew_finite_reader(monkeypatch, expire_before):
+    from types import SimpleNamespace
+
+    current = [datetime.now(timezone.utc)]
+    expiry = current[0] + timedelta(seconds=10)
+    clock = [1000.0]
+    monkeypatch.setattr(guides, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(guides, "_remaining", lambda value: (
+        None if value is None else (value - current[0]).total_seconds()
+    ))
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    install_feed(monkeypatch, feed(programme()))
+    compose = guides._compose
+    wait = asyncio.wait
+    release = asyncio.Event()
+    observed = []
+
+    async def held(**kwargs):
+        assert kwargs["expires_at"] is None
+        await release.wait()
+        return [row]
+
+    async def waiting(tasks, *, timeout):
+        observed.append(timeout)
+        if clock[0] > 1000:
+            await asyncio.sleep(0)
+            current[0] = expiry + timedelta(seconds=1)
+            return set(), set(tasks)
+        return await wait(tasks, timeout=timeout)
+
+    def render(*args):
+        result = compose(*args)
+        clock[0] += 68.573949
+        current[0] += timedelta(seconds=11 if expire_before else 8)
+        upstream.get_epg_data.side_effect = held
+        return result
+
+    monkeypatch.setattr(guides.asyncio, "wait", waiting)
+    monkeypatch.setattr(guides, "_compose", render)
+    _, coverage = await guides.prepare_profiles(
+        [profile()], {1: channel(epg_data_id=90)}, upstream, now=NOW,
+        expires_at=expiry, wait_for_sources=True,
+    )
+    assert coverage["profiles"]["1"]["can_publish"] is False
+    assert upstream.get_epg_data.await_count == (1 if expire_before else 2)
+    if not expire_before:
+        assert observed[-1] == 2
+        owner = guides._CATALOGUE_LOADS[(upstream, 90)]
+        assert not owner.done()
+        release.set()
+        await owner
+
+
+@pytest.mark.asyncio
+async def test_catalogue_owner_survives_expired_reader(monkeypatch):
+    remaining = [10.0]
+    release = asyncio.Event()
+    row = {"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}
+    upstream = client(rows=[row])
+    wait = asyncio.wait
+    install_feed(monkeypatch, feed(programme()))
+
+    async def held(**kwargs):
+        assert kwargs["expires_at"] is None
+        await release.wait()
+        return [row]
+
+    async def waiting(tasks, *, timeout):
+        if timeout is None:
+            return await wait(tasks, timeout=timeout)
+        await asyncio.sleep(0)
+        remaining[0] = 0
+        return set(), set(tasks)
+
+    monkeypatch.setattr(guides, "_remaining", lambda value: None if value is None else remaining[0])
+    monkeypatch.setattr(guides.asyncio, "wait", waiting)
+    upstream.get_epg_data.side_effect = held
+    _, pending = await guides.prepare_profiles(
+        [profile()], {1: channel(epg_data_id=90)}, upstream, now=NOW,
+        expires_at=EXPIRES_AT, wait_for_sources=True,
+    )
+    owner = guides._CATALOGUE_LOADS[(upstream, 90)]
+    assert not owner.done()
+    assert guides._CATALOGUE_EXPIRIES[(upstream, 90)] is None
+    assert pending["profiles"]["1"]["can_publish"] is False
+    release.set()
+    await owner
+    _, ready = await guides.prepare_profiles(
+        [profile()], {1: channel(epg_data_id=90)}, upstream, now=NOW,
+        expires_at=None, wait_for_sources=True,
+    )
+    assert ready["profiles"]["1"]["can_publish"] is True
+    assert upstream.get_epg_data.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1594,7 +1902,7 @@ async def test_transport_gzip_bounds_and_truncation():
 @pytest.mark.asyncio
 async def test_multiple_sources_share_one_cold_wait_budget(monkeypatch):
     async def read(*_, expires_at):
-        assert expires_at == EXPIRES_AT
+        assert expires_at is None
         await asyncio.sleep(0.2)
         return {"headers": {}, "rows": {}, "warnings": [], "size": 0}
     monkeypatch.setattr(guides, "_read_source", read)
@@ -1939,7 +2247,7 @@ async def test_open_xml_element_is_bounded_before_its_closing_tag(monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_cache_entries_have_a_count_limit(monkeypatch):
     async def fail(*_, expires_at):
-        assert expires_at == EXPIRES_AT
+        assert expires_at is None
         raise ValueError("unavailable")
     monkeypatch.setattr(guides, "_read_source", fail)
     monkeypatch.setattr(guides, "MAX_CACHE_ENTRIES", 1)
@@ -2272,7 +2580,7 @@ async def test_recovery_backoff_coalesces_and_carries_late_public_demand(monkeyp
     entry["checked"] = time.monotonic()
 
     async def read(_source, queries, _start, _stop, _now, *, expires_at):
-        assert expires_at == EXPIRES_AT
+        assert expires_at is None
         calls.append({query["key"] for query in queries})
         if len(calls) == 1:
             started.set()
@@ -2341,6 +2649,91 @@ async def test_failed_recovery_keeps_completed_snapshot_and_demand(monkeypatch, 
     assert entry["size"] == previous_size
     assert set(entry["demand"]) == previous_demand
     assert entry["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, ValueError("unavailable"), asyncio.CancelledError()])
+async def test_late_demand_converges_after_owner_finishes(monkeypatch, failure):
+    started, release = asyncio.Event(), asyncio.Event()
+    first = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}])
+    second = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 2}])
+    channels = {1: channel(), 2: channel(id=2, name="TNT", tvg_id="TNT.us")}
+    upstream = client()
+    read_source = guides._read_source
+    install_feed(monkeypatch, feed(programme(), programme(tvg="TNT.us")))
+    calls = []
+
+    async def read(*args, **kwargs):
+        calls.append({query["key"] for query in args[1]})
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+            if failure is not None:
+                raise failure
+        return await read_source(*args, **kwargs)
+
+    monkeypatch.setattr(guides, "_read_source", read)
+    await guides.prepare_profiles([first], channels, upstream, now=NOW,
+                                  expires_at=None, recover_sources=True)
+    await started.wait()
+    owner = next(iter(guides._SOURCE_LOADS.values()))
+    _, pending = await guides.prepare_profiles([second], channels, upstream, now=NOW,
+                                               expires_at=None, recover_sources=True)
+    assert pending["profiles"]["1"]["can_publish"] is False
+    key = next(iter(guides._SOURCE_CACHE))
+    guides._SOURCE_CACHE[key] = dict(guides._SOURCE_CACHE[key])
+    release.set()
+    await asyncio.gather(owner, return_exceptions=True)
+    entry = guides._SOURCE_CACHE[key]
+    assert len(entry["demand"]) == 2
+    _, pending = await guides.prepare_profiles([second], channels, upstream, now=NOW,
+                                               expires_at=None, recover_sources=True)
+    assert pending["profiles"]["1"]["can_publish"] is False
+    assert len(calls) == 1
+    entry["checked"] -= guides.SOURCE_RETRY + 1
+    await guides.prepare_profiles([second], channels, upstream, now=NOW,
+                                  expires_at=None, recover_sources=True)
+    await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+    _, ready = await guides.prepare_profiles([second], channels, upstream, now=NOW,
+                                             expires_at=None, recover_sources=True)
+    assert ready["profiles"]["1"]["can_publish"] is True
+    assert len(calls) == 2 and len(calls[1]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catalogue", [False, True])
+async def test_replaced_owner_cannot_write_or_remove_replacement(monkeypatch, catalogue):
+    started, release = asyncio.Event(), asyncio.Event()
+    upstream = client(rows=[{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}])
+
+    async def held(*args, **kwargs):
+        started.set()
+        await release.wait()
+        if catalogue:
+            return [{"id": 90, "epg_source": 50, "tvg_id": "ESPN.us"}]
+        return {"headers": {}, "rows": {}, "size": 0}
+
+    if catalogue:
+        upstream.get_epg_data.side_effect = held
+        key = (upstream, 90)
+        loads, cache = guides._CATALOGUE_LOADS, guides._CATALOGUE_CACHE
+        loading = guides._load_catalogue((upstream, (90,)), upstream, expires_at=None)
+    else:
+        monkeypatch.setattr(guides, "_read_source", held)
+        key = "selected"
+        loads, cache = guides._SOURCE_LOADS, guides._SOURCE_CACHE
+        loading = guides._load_source(key, source(), [], START, STOP, NOW, expires_at=None)
+    owner = asyncio.create_task(loading)
+    loads[key] = owner
+    await started.wait()
+    replacement = asyncio.create_task(asyncio.Event().wait())
+    loads[key] = replacement
+    saved = {"checked": time.monotonic(), "value": "replacement"}
+    cache[key] = saved
+    release.set()
+    await owner
+    assert loads[key] is replacement
+    assert cache[key] is saved
 
 
 @pytest.mark.asyncio
@@ -2728,8 +3121,8 @@ async def test_expired_source_queue_opens_no_transport(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_programme_budget_remains_finite_and_transport_defaults_are_unchanged(monkeypatch):
-    assert guides.SOURCE_TIMEOUT == 24 * 60 * 60
+async def test_transport_defaults_are_unchanged(monkeypatch):
+    assert guides._remaining(None) is None
     assert guides.SOURCE_MAX_AGE == 80 * 60
     observed = []
     def respond(request):
@@ -2754,11 +3147,89 @@ async def test_programme_total_timeout_never_publishes_partial_rows(monkeypatch)
         yield GOOD[:-5]
         await asyncio.Event().wait()
     monkeypatch.setattr(guides, "stream_xmltv", stalled)
-    monkeypatch.setattr(guides, "SOURCE_TIMEOUT", 0.02)
-    await guides._load_source("timed", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW)
+    await guides._load_source(
+        "timed", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=0.02),
+    )
     entry = guides._SOURCE_CACHE["timed"]
     assert entry["error"] == "Request timed out."
     assert "success" not in entry and not entry.get("rows")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle", [False, True])
+async def test_source_without_expiry_keeps_transport_limits_and_cleanup(monkeypatch, tmp_path, idle):
+    import tempfile
+
+    started, release = asyncio.Event(), asyncio.Event()
+    closed = []
+    temporary = tempfile.TemporaryFile
+
+    def create(*args, **kwargs):
+        result = temporary(*args, **kwargs)
+        closed.append(result)
+        return result
+
+    async def chunks(selected, **options):
+        assert options["timeout"] is None
+        assert options["read_timeout"] == guides.SOURCE_READ_TIMEOUT
+        yield GOOD[:-5]
+        started.set()
+        await release.wait()
+        if idle:
+            raise httpx.ReadTimeout("idle read")
+        yield GOOD[-5:]
+
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(tempfile, "TemporaryFile", create)
+    monkeypatch.setattr(guides, "stream_xmltv", chunks)
+    owner = asyncio.create_task(guides._load_source(
+        "held", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW,
+        expires_at=None,
+    ))
+    await started.wait()
+    assert not owner.done()
+    assert not guides._SOURCE_CACHE.get("held", {}).get("success")
+    release.set()
+    await owner
+    entry = guides._SOURCE_CACHE["held"]
+    assert bool(entry.get("error")) is idle
+    assert bool(entry.get("success")) is not idle
+    assert entry["diagnostics"]["attempts"] == 1
+    assert len(closed) == 1 and closed[0].closed and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_source_selection_has_no_aggregate_deadline(monkeypatch):
+    timeout = asyncio.timeout
+    observed = []
+    run = asyncio.to_thread
+    selecting, release = asyncio.Event(), asyncio.Event()
+    install_feed(monkeypatch, feed(programme()))
+
+    def record(delay):
+        observed.append(delay)
+        assert delay is None
+        return timeout(delay)
+
+    async def held(function, *args, **kwargs):
+        if getattr(function, "__name__", None) == "consume" and args[-1] is True:
+            selecting.set()
+            await release.wait()
+        return await run(function, *args, **kwargs)
+
+    monkeypatch.setattr(guides.asyncio, "timeout", record)
+    monkeypatch.setattr(guides.asyncio, "to_thread", held)
+    owner = asyncio.create_task(guides._load_source(
+        "selection", source(), [guides._query(profile(), channel(), None, NOW)], START, STOP, NOW,
+        expires_at=None,
+    ))
+    await selecting.wait()
+    assert not owner.done()
+    release.set()
+    await owner
+    assert observed == [None, None]
+    assert guides._SOURCE_CACHE["selection"]["success"]
 
 
 @pytest.mark.asyncio
@@ -3042,12 +3513,14 @@ async def test_validation_uses_source_deadline_and_keeps_previous_snapshot(monke
     monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
     monkeypatch.setattr(tempfile, "TemporaryFile", create)
     monkeypatch.setattr(asyncio, "to_thread", run)
-    monkeypatch.setattr(guides, "SOURCE_TIMEOUT", 0.05)
     install_transport(monkeypatch, lambda request: reply(GOOD))
     previous = {"success": NOW, "rows": {"ESPN.us": [programme()]}, "checked": 0, "size": 0}
     guides._SOURCE_CACHE["previous"] = previous
     with patch.object(guides, "programme_times", wraps=guides.programme_times) as times:
-        await guides._load_source("previous", source(), [], START, STOP, NOW)
+        await guides._load_source(
+            "previous", source(), [], START, STOP, NOW,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=0.05),
+        )
     entry = guides._SOURCE_CACHE["previous"]
     assert times.call_count == 0
     assert entry["success"] == NOW and entry["rows"] is previous["rows"]

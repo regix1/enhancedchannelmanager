@@ -20,7 +20,7 @@ import {
 import { EventSyncRuleEditor } from './EventSyncRuleEditor';
 import type { ChannelPipelineRule } from '../../types/channelPipeline';
 import type { ProviderGroupScopeRow } from '../../services/api';
-import type { EventSyncPreviewResponse } from '../../types/eventSync';
+import type { EventSyncConfig, EventSyncPreviewResponse } from '../../types/eventSync';
 
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
 afterEach(() => {
@@ -3216,6 +3216,82 @@ describe('dedicated event group ownership', () => {
 });
 
 describe('dedicated draft validation and request ownership', () => {
+  it.each<{ name: string; groupPatterns: EventSyncConfig['group_patterns'] }>([
+    { name: 'absent', groupPatterns: undefined },
+    { name: 'empty', groupPatterns: {} },
+    { name: 'populated', groupPatterns: { '2': [
+      { name: 'first', title_pattern: 'x(?P<title>.+)' },
+      { name: 'extra', title_pattern: 'y(?P<title>.+)' },
+    ] } },
+  ])('preserves $name group overrides in dedicated Preview and Save', async ({ groupPatterns }) => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    let previewConfig: EventSyncConfig | undefined;
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', async ({ request }) => {
+      const body = await request.json() as { event_sync_config: EventSyncConfig };
+      previewConfig = body.event_sync_config;
+      return HttpResponse.json(DEDICATED_PREVIEW);
+    }));
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: {
+        ...DEDICATED_RULE.event_sync_config!,
+        ...(groupPatterns === undefined ? {} : { group_patterns: groupPatterns }),
+      },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+    await screen.findByTestId('event-sync-summary');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const saved = onSave.mock.calls[0][0].event_sync_config;
+    expect(previewConfig).toEqual(saved);
+    if (groupPatterns === undefined) {
+      expect(previewConfig).not.toHaveProperty('group_patterns');
+      expect(saved).not.toHaveProperty('group_patterns');
+    } else {
+      expect(previewConfig).toHaveProperty('group_patterns', groupPatterns);
+      expect(saved).toHaveProperty('group_patterns', groupPatterns);
+      for (const [key, patterns] of Object.entries(groupPatterns)) {
+        expect(saved.group_patterns[key]).toBe(patterns);
+      }
+    }
+    expect(screen.queryByTestId('event-sync-preview-stale')).not.toBeInTheDocument();
+    await goToStep(user, 2);
+    await user.click(screen.getByTestId('event-sync-ignore-time-window'));
+    expect(screen.getByTestId('event-sync-preview-stale')).toBeInTheDocument();
+  });
+
+  it('emits an empty map after removing the last dedicated group override', async () => {
+    const user = userEvent.setup();
+    seedDedicated();
+    const onSave = vi.fn();
+    let previewConfig: EventSyncConfig | undefined;
+    server.use(http.post('/api/channel-pipeline/event-sync-preview', async ({ request }) => {
+      const body = await request.json() as { event_sync_config: EventSyncConfig };
+      previewConfig = body.event_sync_config;
+      return HttpResponse.json(DEDICATED_PREVIEW);
+    }));
+    render(<EventSyncRuleEditor rule={{ ...DEDICATED_RULE,
+      event_sync_config: { ...DEDICATED_RULE.event_sync_config!, group_patterns: {
+        '2': [{ title_pattern: 'x(?P<title>.+)' }],
+      } },
+    }} onSave={onSave} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Preview matches/ })).toBeEnabled());
+    await goToStep(user, 2);
+    await user.click(screen.getByText('Per-group pattern overrides'));
+    await user.click(screen.getByText(/Secondary Events/, { selector: 'summary' }));
+    const overrideTitle = screen.getAllByLabelText('Title pattern')
+      .find(el => el.id.includes('-ov-2-'))!;
+    await user.clear(overrideTitle);
+    await user.click(screen.getByRole('button', { name: /Preview matches/ }));
+    await screen.findByTestId('event-sync-summary');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(previewConfig).toHaveProperty('group_patterns', {});
+    expect(onSave.mock.calls[0][0].event_sync_config).toHaveProperty('group_patterns', {});
+  });
+
   it('preserves the exact order of two account scopes on save', async () => {
     const user = userEvent.setup();
     seedDedicated();

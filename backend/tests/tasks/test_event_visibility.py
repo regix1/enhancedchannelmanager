@@ -36,6 +36,40 @@ ATTEMPT_ADMITTED_AT = datetime.now(timezone.utc)
 ATTEMPT_EXPIRES_AT = ATTEMPT_ADMITTED_AT + timedelta(hours=24)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outer_cancel", [False, True])
+async def test_cancelled_preparation_preserves_shared_loading(outer_cancel):
+    release = asyncio.Event()
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    cancel = {"requested": False}
+    shared = asyncio.create_task(release.wait())
+
+    async def prepare():
+        started.set()
+        try:
+            await asyncio.wait({shared})
+            return shared.result()
+        finally:
+            stopped.set()
+
+    caller = asyncio.create_task(_await_preparation(prepare(), lambda: cancel["requested"]))
+    other = asyncio.create_task(_await_preparation(prepare(), lambda: False))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    if outer_cancel:
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+    else:
+        cancel["requested"] = True
+        assert await asyncio.wait_for(caller, timeout=1) is None
+    assert stopped.is_set()
+    assert not shared.done()
+    assert not other.done()
+    release.set()
+    assert await asyncio.wait_for(other, timeout=1) is True
+
+
 def _config(scopes=None):
     return {
         "secondary": list(scopes or []),
@@ -87,7 +121,7 @@ def _publication(scope, *, revision=1, pending=True, confirmed=None, channels=No
             "attempt_id": "1" * 32,
             "config_hash": "b" * 64,
             "admitted_at": ATTEMPT_ADMITTED_AT.isoformat(),
-            "expires_at": ATTEMPT_EXPIRES_AT.isoformat(),
+            "expires_at": None,
             "stage": "preparing",
         }
     return {
@@ -105,7 +139,12 @@ def _publication(scope, *, revision=1, pending=True, confirmed=None, channels=No
                 "confirmed_dispatcharr_hashes": dict(confirmed or {}),
                 "pending_emby": pending,
                 "guide_attempt": guide_attempt,
-                "source_refreshes": {},
+                "source_refreshes": {
+                    str(source_id): {
+                        "source_id": int(source_id), "expected_hash": document_hash,
+                        "links": {}, "pending_links": None, "completed": True,
+                    } for source_id, document_hash in (confirmed or {}).items()
+                },
                 "pending_channels": {},
             },
         },
@@ -352,7 +391,7 @@ async def test_reconciliation_waits_for_due_identity_and_publishes_fresh_program
     with patch("tasks.event_visibility._load_profiles", return_value=([selected], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
          patch("cache.get_cache"), \
          patch("emby_client.request_guide_refresh", new=AsyncMock()):
@@ -377,9 +416,8 @@ async def test_reconciliation_waits_for_due_identity_and_publishes_fresh_program
     }
     assert request_shapes[-1][0] == frozenset({90})
     assert set(request_shapes[-1][2]) == {"max_results"}
-    assert request_shapes[-1][1] < datetime.fromisoformat(
-        after["state"]["delivery"]["guide_attempt"]["expires_at"]
-    )
+    assert request_shapes[-1][1] is None
+    assert after["state"]["delivery"]["guide_attempt"]["expires_at"] is None
 
 
 @pytest.mark.asyncio
@@ -508,7 +546,7 @@ async def test_bulk_identity_read_publishes_824_owned_channels(monkeypatch, test
     with patch("tasks.event_visibility._load_profiles", return_value=([selected], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
          patch("cache.get_cache"), \
          patch("emby_client.request_guide_refresh", new=AsyncMock()):
@@ -578,7 +616,7 @@ async def test_reconciliation_allows_runtime_updates(change):
     client.update_channel = AsyncMock()
 
     async def prepare(*args, **kwargs):
-        assert kwargs["expires_at"] == ATTEMPT_EXPIRES_AT
+        assert kwargs["expires_at"] is None
         if change == "rule":
             rule.last_run_at = ATTEMPT_ADMITTED_AT
             rule.match_count = 0
@@ -600,7 +638,7 @@ async def test_reconciliation_allows_runtime_updates(change):
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
          patch("services.epg_programmes.prepare_profiles", new=preparation), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=publishing), \
          patch("services.epg_publication.read_publication", side_effect=publications.get), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -681,7 +719,7 @@ async def test_reconciliation_copies_only_present_profile_mapping_checks():
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(side_effect=prepare)), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=AsyncMock(side_effect=publish)), \
          patch("services.epg_publication.read_publication", side_effect=publications.get), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -718,7 +756,7 @@ async def test_reconciliation_rejects_changed_config(change):
     client.refresh_epg_source = AsyncMock()
 
     async def prepare(*args, **kwargs):
-        assert kwargs["expires_at"] == ATTEMPT_EXPIRES_AT
+        assert kwargs["expires_at"] is None
         if change == "pattern":
             profile["title_pattern"] = rf"^(?P<title>Event {preparation.await_count})$"
         elif change == "timezone":
@@ -738,7 +776,7 @@ async def test_reconciliation_rejects_changed_config(change):
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
          patch("services.epg_programmes.prepare_profiles", new=preparation), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=publishing), \
          patch("services.epg_publication.read_publication", side_effect=publications.get), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -829,7 +867,7 @@ async def test_fetch_match_streams_honors_account_scope_and_pagination():
             "results": [{
                 "id": 11,
                 "name": "LIVE 1 Main Event",
-                "m3u_account": {"id": 4},
+                "m3u_account": {"id": 4}, "channel_group_id": 9, "url": "https://media.test/11",
             }],
             "next": "page-2",
         },
@@ -837,13 +875,13 @@ async def test_fetch_match_streams_honors_account_scope_and_pagination():
             "results": [{
                 "id": 12,
                 "name": "Backup 1",
-                "m3u_account": 4,
+                "m3u_account": 4, "channel_group_id": 9, "url": "https://media.test/12",
             }],
             "next": None,
         },
     ])
 
-    streams, complete, failures = await _fetch_match_streams(
+    streams, complete, failures, identities = await _fetch_match_streams(
         client, [{"group_id": 9, "m3u_account_id": 4}],
     )
 
@@ -861,10 +899,10 @@ async def test_fetch_match_streams_isolates_a_failed_scope():
     client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
     client.get_streams = AsyncMock(side_effect=[
         RuntimeError("first unavailable"),
-        {"results": [{"id": 22, "name": "Backup 2"}], "next": None},
+        {"results": [{"id": 22, "name": "Backup 2", "channel_group_id": 2, "url": "https://media.test/22"}], "next": None},
     ])
 
-    streams, complete, failures = await _fetch_match_streams(
+    streams, complete, failures, identities = await _fetch_match_streams(
         client,
         [
             {"group_id": 1, "m3u_account_id": None},
@@ -885,21 +923,21 @@ async def test_fetch_match_streams_applies_the_limit_to_each_scope(monkeypatch):
     client.get_streams = AsyncMock(side_effect=[
         {
             "results": [
-                {"id": 11, "name": "One A"},
-                {"id": 12, "name": "One B"},
+                {"id": 11, "name": "One A", "channel_group_id": 1, "url": "https://media.test/11"},
+                {"id": 12, "name": "One B", "channel_group_id": 1, "url": "https://media.test/12"},
             ],
             "next": None,
         },
         {
             "results": [
-                {"id": 21, "name": "Two A"},
-                {"id": 22, "name": "Two B"},
+                {"id": 21, "name": "Two A", "channel_group_id": 2, "url": "https://media.test/21"},
+                {"id": 22, "name": "Two B", "channel_group_id": 2, "url": "https://media.test/22"},
             ],
             "next": None,
         },
     ])
 
-    streams, complete, failures = await _fetch_match_streams(
+    streams, complete, failures, identities = await _fetch_match_streams(
         client,
         [
             {"group_id": 1, "m3u_account_id": None},
@@ -917,12 +955,12 @@ async def test_fetch_match_streams_discards_a_scope_after_a_later_page_fails():
     client = MagicMock()
     client._channel_group_name_for_id = AsyncMock(side_effect=["One", "Two"])
     client.get_streams = AsyncMock(side_effect=[
-        {"results": [{"id": 11, "name": "One A"}], "next": "page-2"},
+        {"results": [{"id": 11, "name": "One A", "channel_group_id": 1, "url": "https://media.test/11"}], "next": "page-2"},
         RuntimeError("later page unavailable"),
-        {"results": [{"id": 22, "name": "Two A"}], "next": None},
+        {"results": [{"id": 22, "name": "Two A", "channel_group_id": 2, "url": "https://media.test/22"}], "next": None},
     ])
 
-    streams, complete, failures = await _fetch_match_streams(
+    streams, complete, failures, identities = await _fetch_match_streams(
         client,
         [
             {"group_id": 1, "m3u_account_id": None},
@@ -943,16 +981,16 @@ async def test_fetch_match_streams_discards_an_oversized_scope_and_continues(mon
     client.get_streams = AsyncMock(side_effect=[
         {
             "results": [
-                {"id": 11, "name": "One A"},
-                {"id": 12, "name": "One B"},
-                {"id": 13, "name": "One C"},
+                {"id": 11, "name": "One A", "channel_group_id": 1, "url": "https://media.test/11"},
+                {"id": 12, "name": "One B", "channel_group_id": 1, "url": "https://media.test/12"},
+                {"id": 13, "name": "One C", "channel_group_id": 1, "url": "https://media.test/13"},
             ],
             "next": None,
         },
-        {"results": [{"id": 22, "name": "Two A"}], "next": None},
+        {"results": [{"id": 22, "name": "Two A", "channel_group_id": 2, "url": "https://media.test/22"}], "next": None},
     ])
 
-    streams, complete, failures = await _fetch_match_streams(
+    streams, complete, failures, identities = await _fetch_match_streams(
         client,
         [
             {"group_id": 1, "m3u_account_id": None},
@@ -1432,6 +1470,8 @@ def test_conflicting_event_slots_are_unknown_and_stale_fallbacks_are_not_attache
 async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
     flow_case,
     programme_fault,
+    identity_change=None,
+    change_at="import",
 ):
     master_url = "https://media.example/master.m3u8"
     media_url = "https://media.example/media.m3u8"
@@ -1602,10 +1642,13 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
         return [{"id": 900, "tvg_id": "custom-10", "epg_source": 46}]
 
     async def get_epg_programmes(epg_ids, *, expires_at):
+        if change_at == "programme":
+            change_stream()
         assert epg_ids == frozenset({900})
         assert channels[10]["hidden_from_output"] is True
         attempt = publications["profile:1"]["state"]["delivery"]["guide_attempt"]
-        assert expires_at == datetime.fromisoformat(attempt["expires_at"])
+        assert expires_at is None
+        assert attempt["expires_at"] is None
         row = {
             "epg_data_id": 900,
             "tvg_id": "custom-10",
@@ -1640,23 +1683,96 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
     client.get_epg_data = AsyncMock(side_effect=guide_rows)
     client.get_epg_grid = AsyncMock(return_value=[])
     client.get_epg_programmes = AsyncMock(side_effect=get_epg_programmes)
+    current_streams = {
+        501: {"id": 501, "name": matched_stream.name, "url": master_url,
+              "channel_group_id": 5, "m3u_account": None},
+        502: {"id": 502, "name": "Ended event", "url": "https://media.example/ended",
+              "channel_group_id": 5, "m3u_account": None},
+    }
+    reads = 0
+    from services.epg_publication import publication_lock
+    acquire = publication_lock.acquire
+    lock_waiting = asyncio.Event()
+    release_task = None
+
+    async def acquire_lock():
+        if publication_lock.locked():
+            lock_waiting.set()
+        return await acquire()
+
+    def change_stream():
+        if identity_change == "name":
+            current_streams[501]["name"] = "Different event"
+        elif identity_change == "account":
+            current_streams[501]["m3u_account"] = 99
+        elif identity_change == "group":
+            current_streams[501]["channel_group_id"] = 99
+        elif identity_change == "url":
+            current_streams[501]["url"] = "https://media.example/replaced"
+        elif identity_change == "query":
+            current_streams[501]["url"] += "?stream=other"
+        elif identity_change == "wrong":
+            current_streams[501]["id"] = 999
+        elif identity_change == "stale":
+            current_streams[501]["is_stale"] = True
+        elif identity_change == "aged":
+            stat["last_probed"] = (checked - timedelta(minutes=10)).isoformat()
+            stat["black_screen_checked_at"] = stat["last_probed"]
+        elif identity_change == "ended":
+            publications["profile:1"]["state"]["channels"][0]["events"][0]["stop"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+
+    async def read_streams(ids):
+        nonlocal reads, release_task
+        if 501 in ids:
+            reads += 1
+            if change_at == "lock" and reads == 4:
+                change_stream()
+            elif change_at == "blocked_lock" and reads == 3:
+                await publication_lock.acquire()
+
+                async def release():
+                    await lock_waiting.wait()
+                    change_stream()
+                    publication_lock.release()
+
+                release_task = asyncio.create_task(release())
+        rows = [copy.deepcopy(current_streams[sid]) for sid in ids]
+        changed = (change_at == "lock" and reads >= 4) or (
+            change_at != "lock" and channels[10]["epg_data_id"] == 900
+        )
+        if identity_change == "missing" and changed:
+            rows = [row for row in rows if row["id"] != 501]
+        elif identity_change == "duplicate" and changed and 501 in ids:
+            rows.append(copy.deepcopy(current_streams[501]))
+        return rows
+
+    client.get_streams_by_ids = AsyncMock(side_effect=read_streams)
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(client.get_epg_sources.return_value[0]))
     client.refresh_epg_source = AsyncMock()
     task = EventVisibilityTask()
 
     async def import_source(*args, **kwargs):
         order.append(("import", args[1]))
+        if change_at == "import" and channels[10]["epg_data_id"] == 900:
+            change_stream()
         return True
 
     async def emby():
         order.append(("emby",))
         return None
 
-    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+    with patch.object(publication_lock, "acquire", side_effect=acquire_lock), \
+         patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([prepared], coverage))), \
          patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
-             [matched_stream], {(5, None)}, {},
+             [matched_stream], {(5, None)}, {}, {
+                 501: (matched_stream.name, None, 5, master_url),
+                 502: ("Ended event", None, 5, "https://media.example/ended"),
+             },
          ))), \
          patch("services.event_sync_stream_health._load_stats", new=load_stats), \
          patch("services.event_sync_stream_health._probe_and_collect_failures", new=AsyncMock()), \
@@ -1669,6 +1785,16 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
          patch("emby_client.request_guide_refresh", side_effect=emby):
         outcome = await reconcile_profiles(task, wait_for_sources=True)
 
+    if change_at == "blocked_lock":
+        assert lock_waiting.is_set()
+        assert release_task is not None and release_task.done()
+        await release_task
+    if identity_change is not None:
+        assert outcome.details["revealed_channel_ids"] == []
+        assert channels[10]["streams"] == []
+        assert channels[20]["hidden_from_output"] is True
+        assert all(len(call.args[0]) <= 1000 for call in client.get_streams_by_ids.await_args_list)
+        return
     assert outcome.success is (programme_fault is None)
     assert outcome.completed_degraded is (programme_fault is not None)
     assert load_stats.await_count >= 1
@@ -1699,6 +1825,7 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
             ("import", 46),
             ("rows", 46),
             ("channel", 10, ("epg_data_id",)),
+            ("import", 46),
             ("channel", 10, ("hidden_from_output", "streams")),
             ("channel", 20, ("streams",)),
             ("emby",),
@@ -1713,6 +1840,23 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
         assert (
             "channel", 10, ("hidden_from_output",)
         ) not in order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_change", ["name", "account", "group", "url", "query", "missing", "wrong", "duplicate", "stale"])
+@pytest.mark.parametrize("change_at", ["import", "programme", "lock"])
+async def test_remote_stream_changes_block_delivery(identity_change, change_at):
+    await test_reconciliation_orders_hide_import_link_reveal_and_emby(
+        "positive", None, identity_change=identity_change, change_at=change_at,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_change", ["aged", "ended"])
+async def test_final_stream_read_rechecks_time(identity_change):
+    await test_reconciliation_orders_hide_import_link_reveal_and_emby(
+        "positive", None, identity_change=identity_change, change_at="lock",
+    )
 
 
 @pytest.mark.asyncio
@@ -1808,7 +1952,7 @@ async def test_current_programme_batches_keep_profile_expiry_and_isolate_failure
         "profile:1": _publication("profile:1", channels=publication_channels[1]),
         "profile:2": _publication("profile:2", channels=publication_channels[2]),
     }
-    first_expiry = ATTEMPT_EXPIRES_AT
+    first_expiry = None
     second_expiry = ATTEMPT_EXPIRES_AT + timedelta(hours=1)
     publications["profile:2"]["state"]["delivery"]["guide_attempt"][
         "expires_at"
@@ -1856,6 +2000,22 @@ async def test_current_programme_batches_keep_profile_expiry_and_isolate_failure
             "is_active": True,
         },
     ])
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(next(
+        row for row in client.get_epg_sources.return_value if row["id"] == source_id
+    )))
+    stream_rows = {
+        stream_id: {"id": stream_id, "name": f"Stream {stream_id}", "url": f"https://media.test/{stream_id}",
+                    "channel_group_id": 5, "m3u_account": None}
+        for plan in plans.values() for values in plan["primary_ids"].values() for stream_id in values
+    }
+    original = {key: (row["name"], None, 5, row["url"]) for key, row in stream_rows.items()}
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [copy.deepcopy(stream_rows[key]) for key in ids])
+    stats = {
+        key: {"stream_name": row["name"], "probe_status": "success", "measured_bitrate": 5000000,
+              "last_probed": datetime.now(timezone.utc).isoformat(),
+              "black_screen_checked_at": datetime.now(timezone.utc).isoformat(), "is_black_screen": False}
+        for key, row in stream_rows.items()
+    }
     client.get_epg_data = AsyncMock(
         side_effect=lambda **kwargs: copy.deepcopy(guide_rows[kwargs["epg_source"]])
     )
@@ -1899,8 +2059,9 @@ async def test_current_programme_batches_keep_profile_expiry_and_isolate_failure
          patch("tasks.event_visibility._plan_profile", side_effect=lambda profile, *args: plans[profile["id"]]), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(profiles, coverage))), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], {(5, None)}, {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], {(5, None)}, {}, original))), \
          patch("services.event_sync_stream_health.collect_stream_flow", side_effect=collect), \
+         patch("services.event_sync_stream_health._load_stats", new=AsyncMock(return_value=stats)), \
          patch("concurrency.run_cpu_bound", new=_publication_run(result)), \
          patch("services.epg_publication.read_publication", side_effect=read), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -1970,11 +2131,12 @@ async def test_reconciliation_keeps_unconfirmed_import_pending():
         "is_active": True,
     }])
     client.refresh_epg_source = AsyncMock()
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(client.get_epg_sources.return_value[0]))
 
     async def observe(*args, **kwargs):
         assert args[1] == 46
         assert kwargs["wait"] is False
-        assert kwargs["expires_at"].isoformat() == ATTEMPT_EXPIRES_AT.isoformat()
+        assert kwargs["expires_at"] is None
         assert kwargs["progress"]["attempt_id"] == "1" * 32
         return False
 
@@ -1983,7 +2145,7 @@ async def test_reconciliation_keeps_unconfirmed_import_pending():
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([copy.deepcopy(profile)], coverage))), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=_publication_run(publication)), \
          patch("services.epg_publication.read_publication", side_effect=lambda scope: stored), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -2019,7 +2181,7 @@ async def test_reconciliation_cancellation_prevents_publication_and_mutation():
              "channels": [],
          }))), patch("services.epg_publication.read_publication", return_value=None), \
          patch("services.epg_publication.begin_delivery", side_effect=_admit({})), \
-         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
          patch("concurrency.run_cpu_bound", new=AsyncMock()) as publish:
         outcome = await reconcile_profiles(task, wait_for_sources=False)
 
@@ -2141,7 +2303,7 @@ async def test_cancellation_after_publication_preserves_commit_and_stops_externa
          patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(
              [copy.deepcopy(profile)], coverage,
          ))), patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(
-             return_value=([], set(), {}),
+             return_value=([], set(), {}, {}),
              )), patch("concurrency.run_cpu_bound", side_effect=publish), \
              patch("services.epg_publication.read_publication", side_effect=[None, stored]), \
              patch("services.epg_publication.begin_delivery", side_effect=_admit({})), \
@@ -2235,9 +2397,14 @@ async def test_channel_change_persists_emby_retry_across_stop_and_restart():
     client.update_channel = AsyncMock(side_effect=update_channel)
     client.get_channel = AsyncMock(side_effect=[
         copy.deepcopy(first_channels[10]),
+        copy.deepcopy(first_channels[10]),
         copy.deepcopy(restarted_channels[10]),
         copy.deepcopy(restarted_channels[10]),
     ])
+    client.get_streams_by_ids = AsyncMock(return_value=[{
+        "id": 501, "name": "Prior event", "channel_group_id": 9,
+        "url": "https://media.test/501", "m3u_account": None,
+    }])
     emby = AsyncMock(return_value=True)
 
     with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
@@ -2251,7 +2418,7 @@ async def test_channel_change_persists_emby_retry_across_stop_and_restart():
              ],
              ([copy.deepcopy(profile)], copy.deepcopy(coverage)),
          ])), patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(
-             return_value=([], {(9, None)}, {}),
+             return_value=([], {(9, None)}, {}, {501: ("Prior event", None, 9, "https://media.test/501")}),
              )), patch("concurrency.run_cpu_bound", new=_publication_run(publication)), \
              patch("services.epg_publication.read_publication", side_effect=lambda name: stored), \
              patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
@@ -2275,8 +2442,14 @@ async def test_channel_change_persists_emby_retry_across_stop_and_restart():
     assert restarted.details["emby_request_outcome"] == "accepted"
     assert restarted.details["pending_emby"] is False
     assert stored["state"]["delivery"]["pending_emby"] is False
-    assert channel_updates == [
-        (10, {"streams": []}),
-        (10, {"hidden_from_output": True}),
-    ]
+    assert channel_updates == [(10, {"streams": []})]
+    assert restarted.details["hidden_channel_ids"] == []
     emby.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_change", ["name", "url", "aged", "ended"])
+async def test_mutation_rechecks_after_publication_lock_wait(identity_change):
+    await test_reconciliation_orders_hide_import_link_reveal_and_emby(
+        "positive", None, identity_change=identity_change, change_at="blocked_lock",
+    )

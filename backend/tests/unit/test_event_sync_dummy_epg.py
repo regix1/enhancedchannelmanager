@@ -338,7 +338,14 @@ def _wire_epg(state, client, session_factory,
                     }},
                 )
 
+    for channel in state.channels.values():
+        channel.setdefault("epg_data_id", None)
+
+    dispatch_refresh = client.refresh_epg_source.side_effect
+
     async def complete_refresh(*args, **kwargs):
+        if args and isinstance(args[0], int):
+            await dispatch_refresh(args[0])
         served_headers = available_headers()
         known_tvg_ids = {row["tvg_id"] for row in state.guide_rows}
         missing_headers = [
@@ -377,10 +384,19 @@ def _wire_epg(state, client, session_factory,
                 }
                 for row in served_headers
             ]
+        state.guide_sources[0]["status"] = "success"
+        state.guide_sources[0]["updated_at"] = str(client.refresh_epg_source.await_count)
         return True
 
+    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
+    client.refresh_epg_source.side_effect = complete_refresh
+
+    async def observe(*args, **kwargs):
+        kwargs["wait"] = False
+        return await wait_for_epg_source_refresh(*args, **kwargs)
+
     regenerate = AsyncMock(side_effect=publish)
-    wait_refresh = AsyncMock(side_effect=complete_refresh)
+    wait_refresh = AsyncMock(side_effect=observe)
     wait_refresh.complete_refresh = complete_refresh
     return headers, regenerate, wait_refresh
 
@@ -416,6 +432,11 @@ def _refresh_executor(source_ids=(), publications=None):
     return SimpleNamespace(
         _epg_import_sources=set(source_ids),
         _epg_import_attempts=set(),
+        _channel_by_id={
+            channel_id: {"id": channel_id, "uuid": f"channel-{channel_id}",
+                         "channel_group_id": MASTER_GROUP_ID, "epg_data_id": channel_id + 1000}
+            for channel_id in (901, 902)
+        },
         _event_pending={},
         _event_publications=dict(publications or {}),
         _finish_event_promotions=AsyncMock(return_value=set()),
@@ -627,7 +648,7 @@ class TestPass5RetryPath:
                 programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
             return True
 
-        wait_refresh.side_effect = import_linked
+        client.refresh_epg_source.side_effect = import_linked
         result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
         assert result["success"] is True
         assert programmes == [{"channel_id": 100, "title": MASTER_MERCURY}]
@@ -650,7 +671,7 @@ class TestPass5RetryPath:
                 programmes.append({"channel_id": 100, "title": MASTER_MERCURY})
             return True
 
-        wait_refresh.side_effect = import_linked
+        client.refresh_epg_source.side_effect = import_linked
         result = _manual_run(client, db_session_factory, regenerate, wait_refresh)
         assert result["success"] is True
         assert programmes == [{"channel_id": 100, "title": MASTER_MERCURY}]
@@ -683,8 +704,8 @@ class TestPass5RetryPath:
             regenerated_entries=[_dummy_entry(501, 100, MASTER_MERCURY)],
         )
         async def fail_programme(*args, **kwargs):
-            if not state.guide_rows:
-                return await wait_refresh.complete_refresh(*args, **kwargs)
+            if state.channels[100].get("epg_data_id") is None:
+                return True
             return False
 
         wait_refresh.side_effect = fail_programme
@@ -747,7 +768,7 @@ class TestPass5RetryPath:
             },
         ]
         publications = _seed_publications(db_session_factory, sources)
-        state = FakeDispatcharrState(guide_sources=sources)
+        state = FakeDispatcharrState(guide_sources=sources, channels=copy.deepcopy(list(_refresh_executor()._channel_by_id.values())))
         client = make_stateful_client(state)
         engine = ChannelPipelineEngine(client)
         with patch(
@@ -759,10 +780,8 @@ class TestPass5RetryPath:
         ) as wait:
             wait.return_value = True
             for profile_id, source in zip((1, 2), sources):
-                expires_at = datetime.fromisoformat(
-                    publications[profile_id]["state"]["delivery"]
-                    ["guide_attempt"]["expires_at"]
-                )
+                expires_at = None
+                assert publications[profile_id]["state"]["delivery"]["guide_attempt"]["expires_at"] is None
                 assert _run(engine._refresh_epg_source(
                     source,
                     {profile_id: publications[profile_id]},
@@ -797,7 +816,7 @@ class TestPass5RetryPath:
             "updated_at": "2026-07-11T15:00:00+00:00",
         }
         _seed_publications(db_session_factory, [source])
-        state = FakeDispatcharrState(guide_sources=[source])
+        state = FakeDispatcharrState(guide_sources=[source], channels=copy.deepcopy(list(_refresh_executor()._channel_by_id.values())))
         client = make_stateful_client(state)
         engine = ChannelPipelineEngine(client)
         executor = _refresh_executor({100})
@@ -864,7 +883,7 @@ class TestPass5RetryPath:
             },
         ]
         _seed_publications(db_session_factory, sources)
-        state = FakeDispatcharrState(guide_sources=sources)
+        state = FakeDispatcharrState(guide_sources=sources, channels=copy.deepcopy(list(_refresh_executor()._channel_by_id.values())))
         first_engine = ChannelPipelineEngine(make_stateful_client(state))
         second_engine = ChannelPipelineEngine(make_stateful_client(state))
 
@@ -1100,7 +1119,7 @@ class TestGracefulDegradation:
         ]
         assert len(warnings) == 1
         assert f"/api/dummy-epg/xmltv/{PROFILE_ID}" in warnings[0]["message"]
-        assert "epg_data_id" not in state.channels[100]
+        assert state.channels[100].get("epg_data_id") is None
 
     def test_disabled_profile_warns_skips_epg_step_and_still_attaches(
         self, db_session_factory
@@ -1128,7 +1147,7 @@ class TestGracefulDegradation:
             if w["type"] == "event_sync_dummy_epg_profile_disabled"
         ]
         assert len(warnings) == 1
-        assert "epg_data_id" not in state.channels[100]
+        assert state.channels[100].get("epg_data_id") is None
 
     def test_dry_run_defers_reports_and_writes_nothing(
         self, db_session_factory
@@ -1171,7 +1190,7 @@ class TestDedicatedGuide:
         assert executor._combined_dummy_source_ids == []
         assert executor._dummy_source_by_profile[setup["profile_id"]] == setup["source_id"]
         assert setup["state"].channels[900]["epg_data_id"] == 502
-        assert "epg_data_id" not in setup["state"].channels[100]
+        assert setup["state"].channels[100].get("epg_data_id") is None
         assert setup["state"].source_refresh_ids
         assert set(setup["state"].source_refresh_ids) == {setup["source_id"]}
 

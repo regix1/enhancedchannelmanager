@@ -10,8 +10,8 @@ Retirement is stronger. Only a scoped delisting or repeated current hard
 probe failures can retire a stream. A lone dark frame result or zero-flow
 sample can hide a channel reversibly, but cannot destroy event state.
 
-Preview calls are read-only. Live callers supply one absolute expiry for URL
-lookup, account permits, subprocesses, sampling, cleanup, and result reload.
+Preview calls are read-only. Callers pass a loading expiry explicitly; None
+leaves loading unbounded while each media sample retains its finite limits.
 Expired or cancelled work cannot save or consume a late verdict.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -277,6 +278,8 @@ async def collect_stream_flow(
     expires_at: datetime | None,
     probe_missing: bool = False,
     probe_while_busy: bool = False,
+    stop_when_playable: bool = False,
+    event_streams: Mapping[str, frozenset[int]] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[int, bool | None]:
     """Return fresh measured-flow verdicts for a bounded stream set.
@@ -289,9 +292,14 @@ async def collect_stream_flow(
     ids = sorted({sid for sid in stream_ids if sid is not None})
     if not ids:
         return {}
-    if probe_missing and expires_at is None:
-        raise ValueError("expires_at is required when probe_missing is true")
-
+    if stop_when_playable and (
+        not isinstance(event_streams, Mapping) or not event_streams
+        or any(not isinstance(key, str) or not key
+               or not isinstance(members, frozenset) or not members
+               for key, members in event_streams.items())
+        or set().union(*event_streams.values()) != set(ids)
+    ):
+        raise ValueError("event_streams must cover the requested streams")
     now = datetime.now(timezone.utc)
     caller_cutoff = _utc_time(checked_after)
     if caller_cutoff is None:
@@ -324,6 +332,7 @@ async def collect_stream_flow(
             now=at,
         )
 
+    now = datetime.now(timezone.utc)
     states = {sid: classify(sid, stats, now) for sid in ids}
     missing = [sid for sid, state in states.items() if state is None]
     missing = [
@@ -333,6 +342,15 @@ async def collect_stream_flow(
         and isinstance(stream_names.get(sid), str)
         and bool(stream_names[sid])
     ]
+    if stop_when_playable:
+        positive = {key for key, members in event_streams.items()
+                    if any(states[sid] is True for sid in members)}
+        missing = [sid for sid in missing
+                   if any(sid in members and key not in positive
+                          for key, members in event_streams.items())]
+        event_streams = {key: frozenset(members.intersection(missing))
+                         for key, members in event_streams.items()
+                         if key not in positive and members.intersection(missing)}
     missing.sort(key=lambda sid: (
         _utc_time((stats.get(sid) or {}).get("last_probed")) is not None,
         _utc_time((stats.get(sid) or {}).get("last_probed"))
@@ -355,6 +373,7 @@ async def collect_stream_flow(
                 len(missing),
             )
             return states
+        confirmed: set[int] = set()
         await _probe_and_collect_failures(
             client,
             missing,
@@ -364,21 +383,30 @@ async def collect_stream_flow(
             },
             stream_names={sid: stream_names[sid] for sid in missing},
             cancelled=cancelled,
+            stop_when_playable=stop_when_playable,
+            confirmed=confirmed,
+            event_streams=event_streams,
+            checked_after=caller_cutoff,
         )
         if _expired(expires_at) or (cancelled is not None and cancelled()):
-            return states
+            return {sid: None for sid in ids}
+        refreshed = {}
         try:
-            refreshed = await _load_stats(missing)
+            refreshed = await _load_stats(sorted(confirmed))
         except Exception as e:
             logger.warning(
                 "[STREAM-HEALTH] refreshed stream flow lookup failed (%s) — "
                 "visibility falls back to the current guide",
                 e,
             )
-        else:
-            now = datetime.now(timezone.utc)
-            for sid in missing:
+        if _expired(expires_at) or (cancelled is not None and cancelled()):
+            return {sid: None for sid in ids}
+        now = datetime.now(timezone.utc)
+        for sid in ids:
+            if sid in confirmed:
                 states[sid] = classify(sid, refreshed, now)
+            elif states[sid] is not None:
+                states[sid] = classify(sid, stats, now)
     return states
 
 
@@ -579,51 +607,58 @@ async def _probe_and_collect_failures(
     client,
     stream_ids: list[int],
     *,
-    expires_at: datetime,
+    expires_at: datetime | None,
     event_start_by_stream: Mapping[int, datetime],
     stream_names: Mapping[int, str],
     cancelled: Callable[[], bool] | None = None,
+    stop_when_playable: bool = False,
+    confirmed: set[int] | None = None,
+    event_streams: Mapping[str, frozenset[int]] | None = None,
+    checked_after: datetime | None = None,
 ) -> set[int]:
-    """Probe bounded candidates and return current conclusive failures.
-
-    A fresh probe answers through the shared three-state classifier. This is
-    the path a live run takes for candidates without complete current
-    evidence.
-
-    Bounded twice over: at most ``MAX_HEALTH_PROBES_PER_RUN`` streams, and
-    no more at a time than the prober's own ``max_concurrent_probes``. The
-    prober's timeout and retry settings apply because this calls the
-    prober's own single-stream probe rather than reimplementing one.
-    """
+    """Probe bounded candidates and return current conclusive failures."""
     from stream_prober import ensure_prober
 
     expiry = _utc_time(expires_at)
-    if expiry is None:
+    if expires_at is not None and expiry is None:
         raise ValueError("expires_at must be a valid datetime")
     if _expired(expiry) or (cancelled is not None and cancelled()):
         return set()
     if not stream_ids or MAX_HEALTH_PROBES_PER_RUN <= 0:
         return set()
-
     try:
         prober = ensure_prober()
     except Exception as e:
-        logger.warning(
-            "[EVENT-SYNC] stream prober unavailable (%s) — promotion "
-            "candidates keep their current health verdict", e,
-        )
+        logger.warning("[EVENT-SYNC] Stream prober unavailable (%s)", e)
         return set()
     if prober is None:
-        logger.info(
-            "[EVENT-SYNC] no stream prober configured — %d promotion "
-            "candidate(s) keep an unknown health verdict",
-            len(stream_ids),
-        )
         return set()
 
-    held_back = 0
-    if len(stream_ids) > MAX_HEALTH_PROBES_PER_RUN:
-        held_back = len(stream_ids) - MAX_HEALTH_PROBES_PER_RUN
+    positive = set()
+    memberships = {}
+    if stop_when_playable:
+        if event_streams is None:
+            raise ValueError("event_streams is required for early completion")
+        ordered = []
+        seen = set()
+        groups = {
+            key: [sid for sid in stream_ids if sid in members]
+            for key, members in sorted(event_streams.items())
+        }
+        for index in range(max((len(ids) for ids in groups.values()), default=0)):
+            for ids in groups.values():
+                if index < len(ids) and ids[index] not in seen:
+                    ordered.append(ids[index])
+                    seen.add(ids[index])
+        stream_ids = ordered
+        memberships = {
+            sid: {key for key, members in event_streams.items() if sid in members}
+            for sid in stream_ids
+        }
+    identity = None
+    selection_id = uuid.uuid4().hex
+    held_back = max(0, len(stream_ids) - MAX_HEALTH_PROBES_PER_RUN)
+    if held_back or (stop_when_playable and len(stream_ids) > 1):
         parsed = urlparse(str(getattr(client, "base_url", "")))
         identity = canonical_hash({
             "endpoint": [
@@ -640,6 +675,9 @@ async def _probe_and_collect_failures(
                 ]
                 for stream_id in sorted(stream_ids)
             ],
+            **({"event_streams": [[key, sorted(members)]
+                                 for key, members in sorted(event_streams.items())]}
+               if stop_when_playable else {}),
         })
         with _selection_lock:
             if _expired(expiry) or (cancelled is not None and cancelled()):
@@ -656,7 +694,6 @@ async def _probe_and_collect_failures(
                     or not isinstance(position.get("stream_id"), int)
                 ):
                     positions.pop(key, None)
-
             position = positions.get(identity)
             ordered = list(stream_ids)
             if position is None:
@@ -667,155 +704,134 @@ async def _probe_and_collect_failures(
                 if last_stream_id in ordered:
                     start = ordered.index(last_stream_id) + 1
                     ordered = ordered[start:] + ordered[:start]
-
             stream_ids = ordered[:MAX_HEALTH_PROBES_PER_RUN]
             positions.pop(identity, None)
             positions[identity] = {
                 "expires_at": retention_expiry,
-                "stream_id": stream_ids[-1],
+                "stream_id": stream_ids[0] if stop_when_playable else stream_ids[-1],
+                **({"selection_id": selection_id} if stop_when_playable else {}),
             }
             while len(positions) > 256:
                 positions.pop(next(iter(positions)))
             cache.set("event_sync_health_positions", positions)
-        logger.warning(
-            "[EVENT-SYNC] promotion health check capped at %d probe(s) this "
-            "run — %d candidate stream(s) keep no health verdict and will "
-            "be probed by a later run",
-            MAX_HEALTH_PROBES_PER_RUN, held_back,
+
+    def remaining() -> float | None:
+        return (
+            max(0, (expiry - datetime.now(timezone.utc)).total_seconds())
+            if expiry is not None else None
         )
 
-    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
-    if remaining <= 0:
-        return set()
     try:
         urls = await asyncio.wait_for(
             _probe_urls(client, stream_ids, stream_names=stream_names),
-            timeout=remaining,
+            timeout=remaining(),
         )
-    except asyncio.TimeoutError:
-        return set()
-    if not urls:
-        return set()
-
-    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
-    if remaining <= 0:
-        return set()
-    try:
+        if not urls or _expired(expiry) or (cancelled is not None and cancelled()):
+            return set()
         await asyncio.wait_for(
-            prober.refresh_account_probe_limits(), timeout=remaining,
+            prober.refresh_account_probe_limits(), timeout=remaining(),
         )
     except asyncio.TimeoutError:
         return set()
 
     async def _probe_one(stream_id: int, url: str, name: str, m3u_account) -> None:
-        if _expired(expiry) or (cancelled is not None and cancelled()):
-            return
-        remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
-        if remaining <= 0:
+        if _expired(expiry) or (stop_when_playable and memberships[stream_id] <= positive) or (cancelled is not None and cancelled()):
             return
         try:
-            async with asyncio.timeout(remaining):
-                # Account and event capacity share the caller's supplied
-                # lifetime with the media work that follows.
+            async with asyncio.timeout(remaining()):
                 async with prober.semaphore_for_account(m3u_account, event=True):
-                    if cancelled is not None and cancelled():
+                    # A queued task cannot start media after another task supplies proof.
+                    if _expired(expiry) or (stop_when_playable and memberships[stream_id] <= positive) or (cancelled is not None and cancelled()):
                         return
-                    probe_task = asyncio.create_task(prober.probe_stream(
-                        stream_id,
-                        url,
-                        name,
-                        content=True,
-                        expires_at=expiry,
-                    ))
-                    try:
-                        while not probe_task.done():
-                            if cancelled is not None and cancelled():
-                                probe_task.cancel()
-                                break
-                            await asyncio.wait(
-                                {probe_task}, timeout=min(0.05, remaining),
-                            )
-                            remaining = (
-                                expiry - datetime.now(timezone.utc)
-                            ).total_seconds()
-                            if remaining <= 0:
-                                probe_task.cancel()
-                                break
-                        await probe_task
-                    except asyncio.CancelledError:
+                    if stop_when_playable and identity is not None:
+                        with _selection_lock:
+                            cache = get_cache()
+                            positions = cache.get("event_sync_health_positions", ttl=86400)
+                            position = positions.get(identity) if isinstance(positions, dict) else None
+                            if (
+                                isinstance(position, dict)
+                                and position.get("selection_id") == selection_id
+                                and not _expired(expiry)
+                                and not (stop_when_playable and memberships[stream_id] <= positive)
+                                and (cancelled is None or not cancelled())
+                            ):
+                                position["stream_id"] = stream_id
+                                cache.set("event_sync_health_positions", positions)
+                    await prober.probe_stream(
+                        stream_id, url, name, content=True, expires_at=expiry,
+                    )
+                    if stop_when_playable and not _expired(expiry):
+                        stats = await _load_stats([stream_id])
+                        classified_at = datetime.now(timezone.utc)
+                        event_start = _utc_time(event_start_by_stream.get(stream_id))
                         if (
-                            (cancelled is None or not cancelled())
-                            and not _expired(expiry)
+                            event_start is not None
+                            and event_start <= classified_at
+                            and _fresh_flow_state(
+                                stats.get(stream_id),
+                                max(event_start, _utc_time(checked_after) or event_start,
+                                    classified_at - timedelta(minutes=5)),
+                                stream_name=stream_names[stream_id],
+                                now=classified_at,
+                            ) is True
                         ):
-                            raise
-                    except Exception as e:
-                        logger.warning(
-                            "[EVENT-SYNC] health probe of stream %s raised "
-                            "(%s) — no new verdict is used", stream_id, e,
-                        )
-                    finally:
-                        if not probe_task.done():
-                            probe_task.cancel()
-                            try:
-                                await probe_task
-                            except asyncio.CancelledError:
-                                pass
+                            positive.update(memberships[stream_id])
         except asyncio.TimeoutError:
             return
+        except Exception as e:
+            logger.warning(
+                "[EVENT-SYNC] Health probe of stream %s raised (%s)",
+                stream_id, e,
+            )
 
+    tasks = {
+        asyncio.create_task(_probe_one(sid, url, name, account)): sid
+        for sid, (url, name, account, _group) in urls.items()
+    }
+    pending = set(tasks)
     try:
-        async with asyncio.timeout(
-            max(0, (expiry - datetime.now(timezone.utc)).total_seconds())
-        ):
-            await asyncio.gather(*[
-                _probe_one(sid, url, name, account)
-                for sid, (url, name, account, _group) in urls.items()
-            ])
-    except asyncio.TimeoutError:
-        return set()
+        while pending:
+            if _expired(expiry) or (cancelled is not None and cancelled()):
+                break
+            if stop_when_playable:
+                for task in pending:
+                    if memberships[tasks[task]] <= positive and not task.done():
+                        task.cancel()
+            _, pending = await asyncio.wait(
+                pending, timeout=0.05, return_when=asyncio.FIRST_COMPLETED,
+            )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     if _expired(expiry) or (cancelled is not None and cancelled()):
-        return set()
-
-    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
-    if remaining <= 0:
         return set()
     try:
         current = await asyncio.wait_for(
             _probe_urls(client, list(urls), stream_names=stream_names),
-            timeout=remaining,
+            timeout=remaining(),
         )
-    except asyncio.TimeoutError:
-        return set()
-
-    unchanged = [
-        sid for sid, original in urls.items()
-        if sid in current and current[sid][1:] == original[1:]
-    ]
-    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
-    if remaining <= 0:
-        return set()
-    try:
-        stats = await asyncio.wait_for(
-            _load_stats(unchanged), timeout=remaining,
-        )
+        unchanged = [
+            sid for sid, original in urls.items()
+            if sid in current and current[sid] == original
+        ]
+        stats = await asyncio.wait_for(_load_stats(unchanged), timeout=remaining())
     except asyncio.TimeoutError:
         return set()
     except Exception as e:
-        logger.warning(
-            "[EVENT-SYNC] probed stream health reload failed (%s) — no new "
-            "failure verdict is used", e,
-        )
+        logger.warning("[EVENT-SYNC] Probed stream health reload failed (%s)", e)
         return set()
-
     classified_at = datetime.now(timezone.utc)
-    if classified_at >= expiry:
+    if _expired(expiry) or (cancelled is not None and cancelled()):
         return set()
-    dead = {
+    if confirmed is not None:
+        confirmed.update(unchanged)
+    return {
         sid for sid in unchanged
         if (
-            (event_start := _utc_time(event_start_by_stream.get(sid)))
-            is not None
+            (event_start := _utc_time(event_start_by_stream.get(sid))) is not None
             and event_start <= classified_at
             and _fresh_flow_state(
                 stats.get(sid),
@@ -825,11 +841,6 @@ async def _probe_and_collect_failures(
             ) is False
         )
     }
-    logger.info(
-        "[EVENT-SYNC] promotion health check probed %d candidate stream(s), "
-        "%d had nothing behind them", len(urls), len(dead),
-    )
-    return dead
 
 
 async def _probe_urls(
@@ -844,6 +855,8 @@ async def _probe_urls(
     left out rather than reported dead: it was never probed, so there is no
     verdict to report.
     """
+    from stream_prober import extract_m3u_account_id
+
     urls: dict[int, tuple] = {}
     for start in range(0, len(stream_ids), _URL_LOOKUP_BATCH):
         batch = stream_ids[start:start + _URL_LOOKUP_BATCH]
@@ -865,14 +878,22 @@ async def _probe_urls(
                 or not url
                 or not isinstance(name, str)
                 or name != stream_names.get(stream_id)
+                or stream.get("is_stale") is True
             ):
                 continue
+            group = stream.get("channel_group_id")
+            if group is None:
+                group = stream.get("channel_group")
+            if group is None:
+                group = (stream.get("stream_group")
+                         or stream.get("stream_group_id")
+                         or stream.get("group_id"))
+            if isinstance(group, dict):
+                group = group.get("id")
             urls[stream_id] = (
                 url,
                 name,
-                stream.get("m3u_account"),
-                stream.get("stream_group")
-                or stream.get("stream_group_id")
-                or stream.get("group_id"),
+                extract_m3u_account_id(stream.get("m3u_account")),
+                group,
             )
     return urls

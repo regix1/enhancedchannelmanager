@@ -1042,7 +1042,7 @@ export function EventSyncRuleEditor({
         } satisfies EventSyncPattern,
       ];
     }
-    if (Object.keys(groupPatternsOut).length > 0) {
+    if (Object.keys(groupPatternsOut).length > 0 || config?.group_patterns !== undefined) {
       built.group_patterns = groupPatternsOut;
     }
 

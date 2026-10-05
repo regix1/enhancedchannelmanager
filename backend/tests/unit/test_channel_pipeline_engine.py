@@ -37,6 +37,68 @@ def _enable_guide_lifecycle(executor):
     executor._finish_event_promotions = AsyncMock(return_value=set())
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["none", "revision", "hash", "config", "attempt", "endpoint", "url", "phase", "expiry"])
+async def test_source_completion_keeps_its_original_claim(change):
+    import copy
+    from tests.tasks.test_event_visibility import _publication
+
+    source = {"id": 46, "name": "Guide", "url": "http://ecm/api/dummy-epg/xmltv/1"}
+    client = MagicMock(base_url="http://dispatcharr.local")
+    client.get_epg_source = AsyncMock(return_value=dict(source))
+    client.refresh_epg_source = AsyncMock()
+    current = _publication("profile:1", pending=False)
+    publications = {1: copy.deepcopy(current)}
+    writes = []
+
+    def update(scope, **claims):
+        assert scope == "profile:1"
+        assert claims["expected_revision"] == current["revision"]
+        writes.append(copy.deepcopy(claims))
+        for name in ("source_refreshes", "required_dispatcharr_hashes", "confirmed_dispatcharr_hashes"):
+            if name in claims:
+                current["state"]["delivery"][name] = copy.deepcopy(claims[name])
+        current["revision"] += 1
+        return current["revision"]
+
+    async def observe(*args, **kwargs):
+        assert kwargs["expires_at"] is None
+        if change == "revision":
+            current["revision"] += 1
+        elif change == "hash":
+            current["state"]["xmltv_hash"] = "c" * 64
+        elif change == "config":
+            current["state"]["config_hash"] = "c" * 64
+        elif change == "attempt":
+            current["state"]["delivery"]["guide_attempt"]["attempt_id"] = "2" * 32
+        elif change == "phase":
+            progress = next(iter(current["state"]["delivery"]["source_refreshes"].values()))
+            progress["pending_links"] = {"10": 900}
+        elif change == "expiry":
+            current["state"]["delivery"]["guide_attempt"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        elif change == "endpoint":
+            client.base_url = "http://other.local"
+        elif change == "url":
+            source["url"] = "http://other/api/dummy-epg/xmltv/1"
+        return True
+
+    with patch("services.epg_publication.read_publication", side_effect=lambda scope: copy.deepcopy(current)), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=observe):
+        completed = await ChannelPipelineEngine(client)._refresh_epg_source(
+            source, publications, expires_at=None, after_link=True,
+        )
+    assert completed is (change == "none")
+    assert all(
+        not claims["confirmed_dispatcharr_hashes"]
+        for claims in (writes[:-1] if change == "none" else writes)
+    )
+    assert current["state"]["delivery"]["confirmed_dispatcharr_hashes"] == (
+        {"46": current["state"]["xmltv_hash"]} if change == "none" else {}
+    )
+    client.refresh_epg_source.assert_awaited_once_with(46)
+
+
 class TestChannelPipelineEngineInit:
     """Tests for ChannelPipelineEngine initialization."""
 
@@ -5124,6 +5186,7 @@ class TestPass5DeferredEpgRetryFailureAggregation:
         client.get_epg_source = AsyncMock(return_value={
             "id": 5,
             "name": "Dummy",
+            "url": "/api/dummy-epg/xmltv/1",
             "status": "idle",
             "updated_at": "2026-01-01T00:00:00Z",
         })
@@ -6303,3 +6366,46 @@ class TestCompleteChannelInventory:
         asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
         assert engine._channels_complete is (case == "valid")
         client.update_channel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_link_requires_new_programme_import():
+    source = {"id": 46, "name": "Guide", "url": "http://ecm/api/dummy-epg/xmltv/1", "status": "ready", "updated_at": "initial"}
+    client = MagicMock(base_url="http://dispatcharr.local")
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(source))
+    imports = []
+    linked = False
+
+    async def refresh(source_id):
+        imports.append(linked)
+        source["updated_at"] = str(len(imports))
+        source["status"] = "success"
+
+    client.refresh_epg_source = AsyncMock(side_effect=refresh)
+    import copy
+    from tests.tasks.test_event_visibility import _publication
+
+    current = _publication("profile:1", pending=False)
+    publications = {1: copy.deepcopy(current)}
+
+    def update(scope, **claims):
+        assert claims["expected_revision"] == current["revision"]
+        for name in ("source_refreshes", "required_dispatcharr_hashes", "confirmed_dispatcharr_hashes"):
+            if name in claims:
+                current["state"]["delivery"][name] = copy.deepcopy(claims[name])
+        current["revision"] += 1
+        return current["revision"]
+
+    import copy
+    from tests.tasks.test_event_visibility import _publication
+
+    with patch("services.epg_publication.read_publication", side_effect=lambda scope: copy.deepcopy(current)), patch("services.epg_publication.update_delivery", side_effect=update):
+        engine = ChannelPipelineEngine(client)
+        assert await asyncio.wait_for(engine._refresh_epg_source(source, publications, expires_at=None), 10)
+        assert imports == [False]
+        linked = True
+        assert await asyncio.wait_for(engine._refresh_epg_source(source, publications, expires_at=None, after_link=True), 10)
+
+        assert await asyncio.wait_for(engine._refresh_epg_source(source, publications, expires_at=None, after_link=True), 10)
+
+    assert imports == [False, True]

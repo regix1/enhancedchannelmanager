@@ -26,6 +26,7 @@ async def isolated_guide_state(monkeypatch, test_engine, tmp_path):
         autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False,
     )
     monkeypatch.setattr(database, "_SessionLocal", sessions)
+    monkeypatch.setattr("services.epg_publication.get_session", sessions)
     monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
     guides._SOURCE_CACHE.clear()
     guides._SOURCE_LOADS.clear()
@@ -320,7 +321,7 @@ async def test_retained_placeholder_continues_safe_profile_work():
                 return_value=(copy.deepcopy(profiles), []),
             ))
             stack.enter_context(patch("tasks.event_visibility.get_client", return_value=client))
-            stack.enter_context(patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}))))
+            stack.enter_context(patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))))
             stack.enter_context(patch("concurrency.run_cpu_bound", side_effect=commit))
             stack.enter_context(patch("services.epg_publication.read_publication", side_effect=read))
             stack.enter_context(patch(
@@ -348,6 +349,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     from services import epg_programmes as guides
     from services.epg_publication import publish_profiles, read_publication
     from tasks import event_visibility
+    from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
 
     now = datetime.now(timezone.utc).replace(
         hour=0, minute=5, second=0, microsecond=0,
@@ -387,6 +389,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         201: {"id": 201, "name": "Other A", "channel_group_id": 10},
         202: {"id": 202, "name": "Other B", "channel_group_id": 10},
     }
+    for stream_id, row in stream_rows.items():
+        row.update(url=f"https://streams.example/{stream_id}", m3u_account=None)
     channels = {
         10: {
             "id": 10, "name": "Arena 0", "channel_number": 100,
@@ -431,7 +435,34 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     source_release = asyncio.Event()
     source_calls = []
     link_ready = True
+    import_ready = False
     oversized = False
+    imports = {46: 0, 47: 0}
+
+    async def get_epg_source(source_id):
+        source = next(row for row in sources if row["id"] == source_id)
+        if source.get("status") == "running" and import_ready:
+            source.update(status="success", updated_at=str(imports[source_id]))
+        return copy.deepcopy(source)
+
+    async def refresh_source(source_id):
+        imports[source_id] += 1
+        source = next(row for row in sources if row["id"] == source_id)
+        if source_id == 46 and imports[source_id] > 1 and not import_ready:
+            source["status"] = "running"
+        else:
+            source.update(status="success", updated_at=str(imports[source_id]))
+
+    async def load_stats(ids):
+        return {
+            stream_id: {
+                "stream_name": stream_rows[stream_id]["name"],
+                "probe_status": "success", "measured_bitrate": 1000,
+                "last_probed": now.isoformat(), "is_black_screen": False,
+                "black_screen_checked_at": now.isoformat(),
+            }
+            for stream_id in ids
+        }
 
     async def stream_xmltv(source, **options):
         source_calls.append(source["id"])
@@ -474,7 +505,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
             assert all(type(value) is int and value > 0 for value in ids)
             assert kwargs["max_results"] == len(ids)
             expires_at = kwargs["expires_at"]
-            assert expires_at.tzinfo is not None and expires_at.utcoffset() is not None
+            assert expires_at is None
             assert kwargs.get("epg_source") is None
             assert not kwargs.get("search")
             return [await get_link(link) for link in sorted(ids)]
@@ -494,9 +525,15 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
 
     async def get_epg_programmes(epg_ids, *, expires_at):
         assert epg_ids == frozenset({501})
+        assert (await get_epg_source(46))["status"] == "success"
         publication = read_publication("profile:1")
+        phase = next(iter(publication["state"]["delivery"]["source_refreshes"].values()))
+        assert phase["links"] == {"10": 500, "11": 501}
+        assert phase["completed"] is True
+        assert phase["pending_links"] is None
         attempt = publication["state"]["delivery"]["guide_attempt"]
-        assert expires_at == datetime.fromisoformat(attempt["expires_at"])
+        assert expires_at is None
+        assert attempt["expires_at"] is None
         evidence = next(
             item for item in publication["state"]["channels"]
             if item["channel_id"] == 11
@@ -517,6 +554,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         return [row]
 
     client = MagicMock()
+    client.base_url = "http://dispatcharr.test"
     client.get_channels = AsyncMock(side_effect=get_channels)
     client.get_streams_by_ids = AsyncMock(side_effect=get_streams_by_ids)
     client._channel_group_name_for_id = AsyncMock(
@@ -532,7 +570,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     )
     client.get_epg_grid = AsyncMock(return_value=[])
     client.get_epg_programmes = AsyncMock(side_effect=get_epg_programmes)
-    client.refresh_epg_source = AsyncMock()
+    client.get_epg_source = AsyncMock(side_effect=get_epg_source)
+    client.refresh_epg_source = AsyncMock(side_effect=refresh_source)
 
     seed_one = copy.deepcopy(profile_one)
     seed_one["channel_group_ids"] = []
@@ -556,8 +595,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
 
     async def imported(*args, **kwargs):
         assert kwargs["wait"] is False
-        assert kwargs["expires_at"].tzinfo is not None
-        return True
+        assert kwargs["expires_at"] is None
+        return await wait_for_epg_source_refresh(*args, **kwargs)
 
     async def emby_refresh():
         return None
@@ -565,6 +604,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     with patch("tasks.event_visibility.datetime", wraps=datetime) as visibility_clock, \
          patch("tasks.event_visibility._load_profiles", return_value=(copy.deepcopy(profiles), [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.event_sync_stream_health._load_stats", side_effect=load_stats), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(
              return_value={101: True},
@@ -580,8 +620,18 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         assert first.details["retained_profile_ids"] == [1]
         assert first.details["hidden_channel_ids"] == [20]
         assert read_publication("profile:1")["xmltv"] == before_profile
+        now += timedelta(minutes=2)
+        visibility_clock.now.return_value = now
         source_release.set()
         await asyncio.gather(*list(guides._SOURCE_LOADS.values()))
+        pending = await event_visibility.EventVisibilityTask().execute()
+        assert pending.details["revealed_channel_ids"] == []
+        assert pending.details["hidden_channel_ids"] == [10]
+        assert channels[11]["hidden_from_output"] is True
+        assert channels[11]["streams"] == [50, 102]
+        now += timedelta(minutes=31)
+        visibility_clock.now.return_value = now
+        import_ready = True
         converged = await event_visibility.EventVisibilityTask().execute()
 
         first_profile = read_publication("profile:1")["xmltv"]
@@ -593,7 +643,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     assert converged.details["published_profile_ids"] == [1, 2]
     assert converged.details["retained_profile_ids"] == []
     assert converged.details["revealed_channel_ids"] == [11]
-    assert converged.details["hidden_channel_ids"] == [10]
+    assert converged.details["hidden_channel_ids"] == []
     assert channels[11]["hidden_from_output"] is False
     assert channels[11]["epg_data_id"] == 501
     assert channels[11]["streams"] == [101, 50, 102]
@@ -637,7 +687,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
 async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_inputs(monkeypatch):
     from services import epg_programmes as guides
     from services.epg_publication import read_publication
-    from tasks.dummy_epg_refresh import DummyEPGRefreshTask
+    from tasks.dummy_epg_refresh import DummyEPGRefreshTask, wait_for_epg_source_refresh
     from tasks.event_visibility import _guide_name
 
     now = datetime.now(timezone.utc).replace(
@@ -706,7 +756,8 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         assert epg_ids == frozenset({901})
         publication = read_publication("profile:1")
         attempt = publication["state"]["delivery"]["guide_attempt"]
-        assert expires_at == datetime.fromisoformat(attempt["expires_at"])
+        assert expires_at is None
+        assert attempt["expires_at"] is None
         if mode != "active":
             return []
         evidence = next(
@@ -729,6 +780,7 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         return [row]
 
     client = MagicMock()
+    client.base_url = "http://dispatcharr.test"
     client.get_channels = AsyncMock(side_effect=get_channels)
     client.get_streams_by_ids = AsyncMock(return_value=[])
     client.get_epg_sources = AsyncMock(return_value=copy.deepcopy(sources))
@@ -756,11 +808,36 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         name_seen_before_today=None,
         is_stale=False,
     )
+    stream_row = {
+        "id": 101, "name": matched_stream.name, "channel_group_id": 9,
+        "m3u_account": None, "url": "https://streams.example/101",
+    }
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        copy.deepcopy(stream_row) for stream_id in ids if stream_id == 101
+    ])
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(
+        next(source for source in sources if source["id"] == source_id)
+    ))
+
+    async def refresh_source(source_id):
+        source = next(row for row in sources if row["id"] == source_id)
+        source.update(status="success", updated_at=str(client.refresh_epg_source.await_count))
+
+    client.refresh_epg_source.side_effect = refresh_source
+
+    async def load_stats(ids):
+        return {stream_id: {
+            "stream_name": matched_stream.name,
+            "probe_status": "success", "measured_bitrate": 1000,
+            "last_probed": now.isoformat(), "is_black_screen": False,
+            "black_screen_checked_at": now.isoformat(),
+        } for stream_id in ids}
 
     async def imported(*args, **kwargs):
         assert kwargs["wait"] is True
-        assert kwargs["expires_at"].tzinfo is not None
-        return True
+        assert kwargs["expires_at"] is None
+        kwargs["poll_interval"] = 0
+        return await wait_for_epg_source_refresh(*args, **kwargs)
 
     async def emby_refresh():
         return None
@@ -772,7 +849,9 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
          patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
          patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
              [matched_stream], {(9, None)}, {},
+             {101: (matched_stream.name, None, 9, stream_row["url"])},
          ))), \
+         patch("services.event_sync_stream_health._load_stats", side_effect=load_stats), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(
              return_value={101: True},
          )), \
@@ -822,7 +901,7 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         await DummyEPGRefreshTask().execute()
         assert read_publication("profile:1")["xmltv"] == before_xml
         assert next(iter(guides._SOURCE_CACHE.values()))["success"] == before_success
-        assert client.update_channel.await_count == update_count
+        assert client.update_channel.await_count == update_count, client.update_channel.await_args_list
 
         mode = "cancel"
         next(iter(guides._SOURCE_CACHE.values()))["checked"] -= guides.SOURCE_RETRY + 1

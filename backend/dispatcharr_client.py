@@ -1630,8 +1630,8 @@ class DispatcharrClient:
                 raise ValueError("EPG row ID reads require one result slot per requested ID")
             if search or epg_source is not None:
                 raise ValueError("EPG row ID reads cannot use search or source restrictions")
-            if (not isinstance(expires_at, datetime) or expires_at.tzinfo is None
-                    or expires_at.utcoffset() is None):
+            if expires_at is not None and (not isinstance(expires_at, datetime) or expires_at.tzinfo is None
+                                           or expires_at.utcoffset() is None):
                 raise ValueError("EPG row ID reads require an aware expiry")
         params = {"page": page, "page_size": page_size}
         if search:
@@ -1640,12 +1640,13 @@ class DispatcharrClient:
             params["epg_source"] = epg_source
 
         limits = None
-        deadline = asyncio.get_running_loop().time() + 120
+        deadline = asyncio.get_running_loop().time() + 120 if ids is None else None
         if max_results is not None:
             max_bytes = max(_EPG_DATA_MIN_RESPONSE_BYTES, max_results * _EPG_DATA_BYTES_PER_RESULT)
             if ids is not None or search or epg_source is not None:
                 if ids is not None:
-                    remaining = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+                    remaining = (None if expires_at is None else
+                                 max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds()))
                     timeout = asyncio.timeout(remaining)
                 else:
                     timeout = asyncio.timeout_at(deadline)
@@ -1708,7 +1709,6 @@ class DispatcharrClient:
             remaining = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
             timeout = asyncio.timeout(remaining)
         else:
-            deadline = deadline if deadline is not None else asyncio.get_running_loop().time() + 120
             timeout = asyncio.timeout_at(deadline)
         async with timeout:
             await self._ensure_authenticated()
@@ -1889,7 +1889,7 @@ class DispatcharrClient:
                 await response.aclose()
 
     async def get_epg_programmes(
-        self, epg_ids: frozenset[int], *, expires_at: datetime,
+        self, epg_ids: frozenset[int], *, expires_at: datetime | None,
     ) -> list[dict]:
         """Get current programmes for explicit EPG data rows."""
         if (
@@ -1897,12 +1897,14 @@ class DispatcharrClient:
             or not epg_ids
             or len(epg_ids) > 50
             or any(type(value) is not int or value <= 0 for value in epg_ids)
-            or not isinstance(expires_at, datetime)
-            or expires_at.tzinfo is None
-            or expires_at.utcoffset() is None
+            or (expires_at is not None and (
+                not isinstance(expires_at, datetime)
+                or expires_at.tzinfo is None
+                or expires_at.utcoffset() is None
+            ))
         ):
             raise ValueError("Current programme IDs and expiry are invalid")
-        if expires_at <= datetime.now(timezone.utc):
+        if expires_at is not None and expires_at <= datetime.now(timezone.utc):
             raise TimeoutError("Current programme request expired")
 
         rows = await self._get_json_bounded(
