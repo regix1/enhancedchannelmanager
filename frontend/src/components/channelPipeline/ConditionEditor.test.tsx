@@ -150,6 +150,31 @@ describe('ConditionEditor', () => {
       expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
       expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
     });
+
+    it.each([
+      [{ type: 'stream_is_stale' } as const, 'Is Stale'],
+      [{ type: 'stream_is_stale', value: true } as const, 'Is Stale'],
+      [{ type: 'stream_is_stale', value: false } as const, 'Is Not Stale'],
+      [{ type: 'stream_is_stale', value: true, negate: true } as const, 'Is Not Stale'],
+      [{ type: 'stream_is_stale', value: false, negate: true } as const, 'Is Stale'],
+    ])('renders stale truth-table case %# as Stream Status with no value input', (condition, operator) => {
+      const onChange = vi.fn();
+      render(
+        <ConditionEditor
+          condition={condition}
+          onChange={onChange}
+          onRemove={vi.fn()}
+          showValidation={true}
+        />
+      );
+
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText(operator)).toBeInTheDocument();
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+      expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
+      expect(screen.queryByText(/value is required/i)).not.toBeInTheDocument();
+      expect(onChange).not.toHaveBeenCalled();
+    });
   });
 
   describe('stream_group_is (provider group dropdown)', () => {
@@ -259,6 +284,53 @@ describe('ConditionEditor', () => {
   });
 
   describe('onChange handling', () => {
+    it('builds the stale default when Stream Status is selected and preserves the connector', async () => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+
+      render(
+        <ConditionEditor
+          condition={{ type: 'stream_name_contains', value: 'test', connector: 'or' }}
+          onChange={onChange}
+          onRemove={vi.fn()}
+        />
+      );
+
+      await user.click(screen.getByText('Stream Name').closest('button')!);
+      await user.click(screen.getByText('Stream Status'));
+
+      expect(onChange).toHaveBeenCalledWith({
+        type: 'stream_is_stale',
+        value: true,
+        connector: 'or',
+      });
+    });
+
+    it.each([
+      [true, 'Is Stale', 'Is Not Stale', false],
+      [false, 'Is Not Stale', 'Is Stale', true],
+    ])('builds the canonical stale boolean for operator case %#', async (value, currentLabel, nextLabel, expectedValue) => {
+      const user = userEvent.setup();
+      const onChange = vi.fn();
+
+      render(
+        <ConditionEditor
+          condition={{ type: 'stream_is_stale', value, connector: 'or' }}
+          onChange={onChange}
+          onRemove={vi.fn()}
+        />
+      );
+
+      await user.click(screen.getByText(currentLabel).closest('button')!);
+      await user.click(screen.getByText(nextLabel));
+
+      expect(onChange).toHaveBeenCalledWith({
+        type: 'stream_is_stale',
+        value: expectedValue,
+        connector: 'or',
+      });
+    });
+
     it('calls onChange when operator is changed', async () => {
       const user = userEvent.setup();
       const onChange = vi.fn();
@@ -459,6 +531,25 @@ describe('ConditionEditor', () => {
   });
 
   describe('readonly mode', () => {
+    it('shows stale state without allowing edits when readonly', () => {
+      const onChange = vi.fn();
+      const { container } = render(
+        <ConditionEditor
+          condition={{ type: 'stream_is_stale', value: false, negate: true }}
+          onChange={onChange}
+          onRemove={vi.fn()}
+          readonly={true}
+        />
+      );
+
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText('Is Stale')).toBeInTheDocument();
+      const selectTriggers = container.querySelectorAll('.custom-select-trigger');
+      expect(selectTriggers).toHaveLength(2);
+      selectTriggers.forEach(trigger => expect(trigger).toBeDisabled());
+      expect(onChange).not.toHaveBeenCalled();
+    });
+
     it('disables all inputs when readonly', () => {
       const { container } = render(
         <ConditionEditor

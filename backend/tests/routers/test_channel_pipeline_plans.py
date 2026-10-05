@@ -2187,7 +2187,7 @@ async def test_cancelled_publication_resumes_same_channel_and_expiry(event_plan)
         f"regenerations={setup['regenerate'].await_count} "
         f"refresh_waits={setup['wait_refresh'].await_count} "
         f"source_refreshes={setup['client'].refresh_epg_source.await_count} "
-        f"programme_reads={setup['client'].get_epg_grid.await_count} "
+        f"programme_reads={setup['client'].get_epg_programmes.await_count} "
         f"guide_rows={len(setup['state'].guide_rows)} "
         f"programmes={len(setup['state'].guide_programmes)} "
         f"updates={setup['state'].update_channel_calls} "

@@ -1770,10 +1770,11 @@ def test_pending_guide_preserves_channel_id(db_session_factory, monkeypatch):
                 current["state"]["delivery"]["pending_channels"].values()
             ))
             state.guide_programmes[:] = [{
+                "epg_data_id": 502,
                 "tvg_id": "ecm-900",
                 "title": receipt["title"],
-                "start": receipt["start"],
-                "stop": receipt["stop"],
+                "start_time": receipt["start"],
+                "end_time": receipt["stop"],
             }]
         return completed
 
@@ -2231,7 +2232,7 @@ def test_expiry_during_the_completion_grid_closes_only_its_receipt(
     ))
     expires_at = datetime.fromisoformat(before_receipt["expires_at"])
     current = [datetime.fromisoformat(before_receipt["admitted_at"])]
-    grid = client.get_epg_grid.side_effect
+    grid = client.get_epg_programmes.side_effect
     observed = []
 
     async def expire_during_grid(*args, **kwargs):
@@ -2242,7 +2243,7 @@ def test_expiry_during_the_completion_grid_closes_only_its_receipt(
         current[0] = expires_at
         return await grid(*args, **kwargs)
 
-    client.get_epg_grid.side_effect = expire_during_grid
+    client.get_epg_programmes.side_effect = expire_during_grid
     with patch("database.get_session", side_effect=db_session_factory), \
          patch(
              "services.epg_publication.get_session",
@@ -2322,6 +2323,112 @@ def test_fresh_completion_keeps_the_existing_success_path(
     assert setup["state"].channels[900]["streams"] == [7301]
 
 
+@pytest.mark.parametrize("fault", [
+    "row_id", "tvg_id", "title", "start", "stop", "missing", "parsing",
+])
+def test_current_programme_mismatch_keeps_staged_channel_unpublished(
+    fault,
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    row = next(
+        item for item in setup["state"].guide_programmes
+        if item["epg_data_id"] == 502
+    )
+    if fault == "row_id":
+        row["epg_data_id"] = 999
+    elif fault == "tvg_id":
+        row["tvg_id"] = "foreign"
+    elif fault == "title":
+        row["title"] = "Different event"
+    elif fault == "start":
+        row["start_time"] = (
+            datetime.fromisoformat(row["start_time"]) + timedelta(minutes=1)
+        ).isoformat()
+    elif fault == "stop":
+        row["end_time"] = (
+            datetime.fromisoformat(row["end_time"]) + timedelta(minutes=1)
+        ).isoformat()
+    elif fault == "missing":
+        row.pop("title")
+    else:
+        row["parsing"] = True
+    before = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].items()
+    ))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        _run(finish(executor))
+
+    after = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    closed = after["state"]["delivery"]["pending_channels"][event_key]
+    assert (closed["stage"], closed["reason"]) == (
+        "failed", "programme_missing",
+    )
+    assert setup["state"].channels[900]["hidden_from_output"] is True
+    assert setup["state"].channels[900]["streams"] == []
+
+
+def test_foreign_link_after_programme_read_loses_authority_without_mutation(
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    before = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    receipt = next(iter(
+        before["state"]["delivery"]["pending_channels"].values()
+    ))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    read_programmes = setup["client"].get_epg_programmes.side_effect
+    write_count = len(setup["state"].update_channel_calls)
+
+    async def remap_after_read(*args, **kwargs):
+        rows = await read_programmes(*args, **kwargs)
+        setup["state"].channels[900]["epg_data_id"] = 999
+        return rows
+
+    setup["client"].get_epg_programmes.side_effect = remap_after_read
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        _run(finish(executor))
+
+    assert _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    ) == before
+    assert len(setup["state"].update_channel_calls) == write_count
+    assert setup["state"].channels[900]["epg_data_id"] == 999
+    assert setup["state"].channels[900]["hidden_from_output"] is True
+    assert setup["state"].channels[900]["streams"] == []
+
+
 def test_expiry_after_flow_stops_before_link_or_channel_mutation(
     db_session_factory,
     monkeypatch,
@@ -2369,7 +2476,7 @@ def test_expiry_after_flow_stops_before_link_or_channel_mutation(
     assert after["state"]["delivery"]["pending_channels"][event_key][
         "stage"
     ] == "expired"
-    assert setup["client"].get_channel.await_count == 1
+    assert setup["client"].get_channel.await_count == 3
     assert setup["state"].channels[900]["streams"] == []
     assert setup["state"].channels[900]["hidden_from_output"] is True
 
@@ -2516,7 +2623,7 @@ def test_an_admitted_mutation_that_outlives_expiry_starts_no_followup(
         "stage"
     ] == "expired"
     assert setup["state"].channels[900]["streams"] == [7301]
-    assert client.get_channel.await_count == (2 if mutation == "attach" else 3)
+    assert client.get_channel.await_count == (4 if mutation == "attach" else 5)
     assert setup["state"].channels[900]["hidden_from_output"] is (
         mutation == "attach"
     )
@@ -2525,6 +2632,8 @@ def test_an_admitted_mutation_that_outlives_expiry_starts_no_followup(
 @pytest.mark.parametrize("read_number,expire,expected_stage", [
     (1, False, "failed"),
     (1, True, "expired"),
+    (2, False, "failed"),
+    (2, True, "expired"),
     (3, False, "failed"),
     (3, True, "expired"),
     (4, False, "failed"),
@@ -2972,7 +3081,7 @@ def test_completion_cancellation_never_writes_expiry(
     ))
     current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
     if phase == "guide":
-        setup["client"].get_epg_grid.side_effect = asyncio.CancelledError()
+        setup["client"].get_epg_programmes.side_effect = asyncio.CancelledError()
     elif phase == "flow":
         monkeypatch.setattr(
             event_sync_stream_health,
@@ -6652,6 +6761,8 @@ class TestDedicatedDelivery:
         ("test_an_admitted_mutation_that_outlives_expiry_starts_no_followup", ("reveal",)),
         ("test_channel_read_failure_uses_live_failure_or_expiry", (1, False, "failed")),
         ("test_channel_read_failure_uses_live_failure_or_expiry", (1, True, "expired")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (2, False, "failed")),
+        ("test_channel_read_failure_uses_live_failure_or_expiry", (2, True, "expired")),
         ("test_channel_read_failure_uses_live_failure_or_expiry", (3, False, "failed")),
         ("test_channel_read_failure_uses_live_failure_or_expiry", (3, True, "expired")),
         ("test_channel_read_failure_uses_live_failure_or_expiry", (4, False, "failed")),

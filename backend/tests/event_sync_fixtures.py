@@ -259,7 +259,28 @@ def make_stateful_client(state: FakeDispatcharrState,
         return rows[:max_results] if max_results is not None else rows
 
     async def _get_epg_grid(**kwargs):
-        return copy.deepcopy(state.guide_programmes)
+        visible_ids = {
+            channel.get("epg_data_id")
+            for channel in state.channels.values()
+            if channel.get("hidden_from_output") is not True
+        }
+        return [
+            copy.deepcopy(row)
+            for row in state.guide_programmes
+            if row.get("epg_data_id") in visible_ids
+        ]
+
+    async def _get_epg_programmes(epg_ids, *, expires_at):
+        assert isinstance(epg_ids, frozenset) and epg_ids
+        assert len(epg_ids) <= 50
+        assert all(type(value) is int and value > 0 for value in epg_ids)
+        assert expires_at.tzinfo is not None and expires_at.utcoffset() is not None
+        return [
+            copy.deepcopy(row)
+            for row in state.guide_programmes
+            if row.get("epg_data_id") in epg_ids
+            and row.get("parsing") is not True
+        ]
 
     async def _get_channel_stats():
         return {"channels": copy.deepcopy(list(state.stream_health.values()))}
@@ -295,6 +316,7 @@ def make_stateful_client(state: FakeDispatcharrState,
     client.refresh_epg_source = AsyncMock(side_effect=_refresh_epg_source)
     client.get_epg_data = AsyncMock(side_effect=_get_epg_rows)
     client.get_epg_grid = AsyncMock(side_effect=_get_epg_grid)
+    client.get_epg_programmes = AsyncMock(side_effect=_get_epg_programmes)
     client.get_channel_stats = AsyncMock(side_effect=_get_channel_stats)
     client.update_channel = AsyncMock(side_effect=_update_channel)
     client.delete_channel = AsyncMock(side_effect=_delete_channel)

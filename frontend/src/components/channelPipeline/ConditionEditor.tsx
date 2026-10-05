@@ -67,6 +67,13 @@ const EXISTS_OPS: OperatorDef[] = [
 
 const FIELDS: FieldDef[] = [
   { id: 'stream_name', label: 'Stream Name', category: 'stream', operators: TEXT_OPS },
+  {
+    id: 'stream_is_stale', label: 'Stream Status', category: 'stream',
+    operators: [
+      { id: 'is', label: 'Is Stale', valueType: 'none' },
+      { id: 'is_not', label: 'Is Not Stale', valueType: 'none' },
+    ],
+  },
   { id: 'stream_group', label: 'Stream Group', category: 'stream', operators: TEXT_OPS },
   {
     id: 'stream_group_is', label: 'Stream Group Is', category: 'stream',
@@ -175,6 +182,9 @@ function buildCondition(
       type = 'stream_group_is'; value = userValue;
       if (operator === 'is_not') negate = true;
       break;
+    case 'stream_is_stale':
+      type = 'stream_is_stale'; value = operator !== 'is_not';
+      break;
     case 'tvg_id':
       switch (operator) {
         case 'exists': type = 'tvg_id_exists'; value = true; break;
@@ -270,6 +280,12 @@ function parseCondition(condition: Condition): { field: string; operator: string
       return detectRegexOp('stream_group', String(value ?? ''), true, negate);
     case 'stream_group_is':
       return { field: 'stream_group_is', operator: negate ? 'is_not' : 'is', displayValue: String(value ?? '') };
+    case 'stream_is_stale':
+      return {
+        field: 'stream_is_stale',
+        operator: (typeof value === 'boolean' ? value : true) !== Boolean(negate) ? 'is' : 'is_not',
+        displayValue: '',
+      };
 
     case 'tvg_id_exists':
       return { field: 'tvg_id', operator: value === false ? 'does_not_exist' : 'exists', displayValue: '' };

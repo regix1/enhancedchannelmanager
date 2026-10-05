@@ -604,6 +604,9 @@ async def _read_source(
                                     delta = abs((parsed.start - begin).total_seconds())
                                     window = query["time_window_minutes"] if query["enforce_time_window"] else None
                                     if window is not None and delta > window * 60:
+                                        reason = "event_date_conflict" if delta >= 43200 else "event_start_conflict"
+                                        if reason in channel_warnings.get(query["key"], ()):
+                                            continue
                                         if event_terms is None:
                                             event_terms = set(normalize_alias_term(event_title.title or ""))
                                         common = query_terms[id(query)] & event_terms
@@ -611,7 +614,6 @@ async def _read_source(
                                             parsed, event_title, window_minutes=None,
                                             threshold=query["attach_threshold"], alias_index=alias_index,
                                         ).band == BAND_ATTACH:
-                                            reason = "event_date_conflict" if delta >= 43200 else "event_start_conflict"
                                             channel_warnings.setdefault(query["key"], set()).add(reason)
                                         continue
                                     if _score_parsed_pair(parsed, event_title, window_minutes=window,

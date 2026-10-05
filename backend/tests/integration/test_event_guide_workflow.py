@@ -349,7 +349,9 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     from services.epg_publication import publish_profiles, read_publication
     from tasks import event_visibility
 
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(
+        hour=0, minute=5, second=0, microsecond=0,
+    )
     active_start = now - timedelta(minutes=10)
     active_stop = now + timedelta(minutes=80)
     profile_one = _profile(1, 7, [100])
@@ -484,10 +486,35 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
         return [{"id": 920, "epg_source": 47, "tvg_id": "event-20"}]
 
     updates = []
+    programme_reads = []
 
     async def update_channel(channel_id, values):
         updates.append((channel_id, copy.deepcopy(values)))
         channels[channel_id].update(copy.deepcopy(values))
+
+    async def get_epg_programmes(epg_ids, *, expires_at):
+        assert epg_ids == frozenset({501})
+        publication = read_publication("profile:1")
+        attempt = publication["state"]["delivery"]["guide_attempt"]
+        assert expires_at == datetime.fromisoformat(attempt["expires_at"])
+        evidence = next(
+            item for item in publication["state"]["channels"]
+            if item["channel_id"] == 11
+        )
+        current = next(
+            item for item in evidence["events"]
+            if datetime.fromisoformat(item["start"]) <= now
+            < datetime.fromisoformat(item["stop"])
+        )
+        row = {
+            "epg_data_id": 501,
+            "tvg_id": "event-11",
+            "title": current["title"],
+            "start_time": current["start"],
+            "end_time": current["stop"],
+        }
+        programme_reads.append(copy.deepcopy(row))
+        return [row]
 
     client = MagicMock()
     client.get_channels = AsyncMock(side_effect=get_channels)
@@ -503,12 +530,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     client.get_channel = AsyncMock(
         side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]),
     )
-    client.get_epg_grid = AsyncMock(return_value=[{
-        "tvg_id": "event-11",
-        "title": "Main Event",
-        "start": active_start.isoformat(),
-        "stop": active_stop.isoformat(),
-    }])
+    client.get_epg_grid = AsyncMock(return_value=[])
+    client.get_epg_programmes = AsyncMock(side_effect=get_epg_programmes)
     client.refresh_epg_source = AsyncMock()
 
     seed_one = copy.deepcopy(profile_one)
@@ -539,7 +562,8 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     async def emby_refresh():
         return None
 
-    with patch("tasks.event_visibility._load_profiles", return_value=(copy.deepcopy(profiles), [])), \
+    with patch("tasks.event_visibility.datetime", wraps=datetime) as visibility_clock, \
+         patch("tasks.event_visibility._load_profiles", return_value=(copy.deepcopy(profiles), [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
          patch("services.event_sync_stream_health.collect_stream_flow", new=AsyncMock(
@@ -547,6 +571,7 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
          )), \
          patch("emby_client.request_guide_refresh", side_effect=emby_refresh), \
          patch("tasks.event_visibility.MAX_MATCH_STREAMS", 2):
+        visibility_clock.now.return_value = now
         run = asyncio.create_task(event_visibility.EventVisibilityTask().execute())
         await asyncio.wait_for(source_started.wait(), timeout=1)
         first = await asyncio.wait_for(run, timeout=2)
@@ -578,6 +603,22 @@ async def test_visibility_task_waits_for_source_and_reveals_channel(monkeypatch)
     assert [row.findtext("title") for row in first_document.findall(
         "programme[@channel='event-11']"
     )] == ["Main Event"]
+    published_programme = first_document.find("programme[@channel='event-11']")
+    assert published_programme is not None
+    assert programme_reads == [{
+        "epg_data_id": 501,
+        "tvg_id": "event-11",
+        "title": published_programme.findtext("title"),
+        "start_time": datetime.strptime(
+            published_programme.get("start"), "%Y%m%d%H%M%S %z",
+        ).isoformat(),
+        "end_time": datetime.strptime(
+            published_programme.get("stop"), "%Y%m%d%H%M%S %z",
+        ).isoformat(),
+    }]
+    published_start = datetime.fromisoformat(programme_reads[0]["start_time"])
+    assert published_start == now.replace(hour=0, minute=0)
+    assert active_start < published_start
     assert all(
         row.findtext("title") != "Programming unavailable"
         for row in first_document.findall("programme")
@@ -599,7 +640,9 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     from tasks.dummy_epg_refresh import DummyEPGRefreshTask
     from tasks.event_visibility import _guide_name
 
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(
+        hour=0, minute=5, second=0, microsecond=0,
+    )
     active_start = now - timedelta(minutes=10)
     active_stop = now + timedelta(minutes=80)
     selected = _profile(1, 7, [100])
@@ -657,6 +700,34 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     async def update_channel(channel_id, values):
         channels[channel_id].update(copy.deepcopy(values))
 
+    programme_reads = []
+
+    async def get_epg_programmes(epg_ids, *, expires_at):
+        assert epg_ids == frozenset({901})
+        publication = read_publication("profile:1")
+        attempt = publication["state"]["delivery"]["guide_attempt"]
+        assert expires_at == datetime.fromisoformat(attempt["expires_at"])
+        if mode != "active":
+            return []
+        evidence = next(
+            item for item in publication["state"]["channels"]
+            if item["channel_id"] == 10
+        )
+        current = next(
+            item for item in evidence["events"]
+            if datetime.fromisoformat(item["start"]) <= now
+            < datetime.fromisoformat(item["stop"])
+        )
+        row = {
+            "epg_data_id": 901,
+            "tvg_id": "event-10",
+            "title": current["title"],
+            "start_time": current["start"],
+            "end_time": current["stop"],
+        }
+        programme_reads.append(copy.deepcopy(row))
+        return [row]
+
     client = MagicMock()
     client.get_channels = AsyncMock(side_effect=get_channels)
     client.get_streams_by_ids = AsyncMock(return_value=[])
@@ -671,12 +742,8 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     client.get_channel = AsyncMock(
         side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]),
     )
-    client.get_epg_grid = AsyncMock(return_value=[{
-        "tvg_id": "event-10",
-        "title": "Main Event",
-        "start": active_start.isoformat(),
-        "stop": active_stop.isoformat(),
-    }])
+    client.get_epg_grid = AsyncMock(return_value=[])
+    client.get_epg_programmes = AsyncMock(side_effect=get_epg_programmes)
     client.refresh_epg_source = AsyncMock()
     monkeypatch.setattr(guides, "stream_xmltv", stream_xmltv)
 
@@ -698,7 +765,9 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
     async def emby_refresh():
         return None
 
-    with patch("tasks.event_visibility._load_profiles", return_value=([copy.deepcopy(selected)], [])), \
+    with patch("tasks.event_visibility.datetime", wraps=datetime) as visibility_clock, \
+         patch("tasks.dummy_epg_refresh.datetime", wraps=datetime) as refresh_clock, \
+         patch("tasks.event_visibility._load_profiles", return_value=([copy.deepcopy(selected)], [])), \
          patch("tasks.event_visibility.get_client", return_value=client), \
          patch("tasks.dummy_epg_refresh.get_client", return_value=client), \
          patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=(
@@ -709,6 +778,8 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
          )), \
          patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=imported), \
          patch("emby_client.request_guide_refresh", side_effect=emby_refresh):
+        visibility_clock.now.return_value = now
+        refresh_clock.now.return_value = now
         first = await DummyEPGRefreshTask().execute()
         assert first.details["hidden_channel_ids"] == [10], {
             key: first.details[key]
@@ -725,6 +796,23 @@ async def test_ordinary_refresh_moves_idle_to_active_and_retains_after_bad_input
         second = await DummyEPGRefreshTask().execute()
         assert second.details["revealed_channel_ids"] == [10]
         assert channels[10]["hidden_from_output"] is False
+        published = ET.fromstring(read_publication("profile:1")["xmltv"])
+        published_programme = published.find("programme[@channel='event-10']")
+        assert published_programme is not None
+        assert programme_reads == [{
+            "epg_data_id": 901,
+            "tvg_id": "event-10",
+            "title": published_programme.findtext("title"),
+            "start_time": datetime.strptime(
+                published_programme.get("start"), "%Y%m%d%H%M%S %z",
+            ).isoformat(),
+            "end_time": datetime.strptime(
+                published_programme.get("stop"), "%Y%m%d%H%M%S %z",
+            ).isoformat(),
+        }]
+        published_start = datetime.fromisoformat(programme_reads[0]["start_time"])
+        assert published_start == now.replace(hour=0, minute=0)
+        assert active_start < published_start
 
         before_xml = read_publication("profile:1")["xmltv"]
         before_success = next(iter(guides._SOURCE_CACHE.values()))["success"]

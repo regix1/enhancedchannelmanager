@@ -360,16 +360,17 @@ def _wire_epg(state, client, session_factory,
             }
             state.guide_programmes[:] = [
                 {
+                    "epg_data_id": row["id"],
                     "tvg_id": row["tvg_id"],
                     "title": (
                         receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
                         .get("title", row["name"])
                     ),
-                    "start": (
+                    "start_time": (
                         receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
                         .get("start", (now - timedelta(minutes=15)).isoformat())
                     ),
-                    "stop": (
+                    "end_time": (
                         receipts.get(int(row["tvg_id"].split("-", 1)[1]), {})
                         .get("stop", (now + timedelta(hours=2)).isoformat())
                     ),

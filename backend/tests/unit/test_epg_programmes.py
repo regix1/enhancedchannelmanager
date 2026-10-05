@@ -3407,7 +3407,7 @@ async def test_reused_event_terms_preserve_edition_date_and_ambiguity_checks(mon
             patch.object(guides, "normalize_alias_term", wraps=guides.normalize_alias_term) as normalize, \
             patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
         loaded = await guides._read_source(source(), queries, START, STOP, NOW)
-    assert event.call_count == 4 and normalize.call_count == 4 and score.call_count == 8
+    assert event.call_count == 4 and normalize.call_count == 4 and score.call_count == 7
     assert set(loaded["ended"]) == {queries[0]["key"]}
     assert loaded["ended"][queries[0]["key"]][3].findtext("title") == "ONE Fight Night 47"
     assert set(loaded["channel_warnings"][queries[0]["key"]]) == {"ambiguous_event", "event_date_conflict"}
@@ -3415,3 +3415,224 @@ async def test_reused_event_terms_preserve_edition_date_and_ambiguity_checks(mon
     for query in queries:
         rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
         assert rows == [] and result["event"] is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_known_event_conflicts_score_once_per_query(monkeypatch):
+    guide = profile()
+    queries = [
+        guides._query(
+            guide,
+            channel(id=index, name=f"ONE Fight Night 47 @ Sep 04 09:{minute} PM", tvg_id=""),
+            None,
+            NOW,
+        )
+        for index, minute in enumerate(("00", "05", "10", "15"), start=1)
+    ]
+    conflicts = [
+        programme(
+            f"PPV({index})-05.v",
+            "ONE Fight Night 47",
+            start="20260906013000 +0000",
+            stop="20260906023000 +0000",
+        )
+        for index in range(8)
+    ]
+    document = feed(*conflicts)
+    install_transport(monkeypatch, lambda request: reply(document))
+
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+
+    assert len({query["key"] for query in queries}) == 4
+    assert score.call_count == len(queries)
+    assert loaded["rows"] == {}
+    assert loaded["ended"] == {}
+    assert loaded["warnings"] == []
+    assert loaded["diagnostics"]["transport_complete"] is True
+    assert loaded["diagnostics"]["xml_complete"] is True
+    assert loaded["diagnostics"]["validation_bytes"] == len(document)
+    assert loaded["diagnostics"]["selection_bytes"] == len(document)
+    for query in queries:
+        assert loaded["channel_warnings"][query["key"]] == ["event_date_conflict"]
+
+
+@pytest.mark.asyncio
+async def test_known_conflict_guard_preserves_complete_selection(monkeypatch):
+    guide = profile()
+    queries = [
+        guides._query(
+            guide,
+            channel(id=index, name=f"ONE Fight Night 47 @ Sep 04 09:{minute} PM", tvg_id=""),
+            None,
+            NOW,
+        )
+        for index, minute in enumerate(("00", "05", "10", "15"), start=1)
+    ]
+    ended_row = programme(
+        "ended.v", "ONE Fight Night 47",
+        start="20260905010000 +0000", stop="20260905012000 +0000",
+    )
+    conflicts = [
+        programme(
+            f"conflict-{index}.v", "ONE Fight Night 47",
+            start="20260906013000 +0000", stop="20260906023000 +0000",
+        )
+        for index in range(8)
+    ]
+    selected_row = programme(
+        "selected.v", "ONE Fight Night 47",
+        start="20260905012000 +0000", stop="20260905030000 +0000",
+    )
+    header = ET.fromstring('<channel id="selected.v"><display-name>Selected</display-name></channel>')
+    document = feed(ended_row, *conflicts, selected_row, headers=ET.tostring(header, encoding="unicode"))
+    install_transport(monkeypatch, lambda request: reply(document))
+
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+
+    assert {tvg_id: ET.tostring(value) for tvg_id, value in loaded["headers"].items()} == {
+        "selected.v": ET.tostring(header),
+    }
+    assert {
+        tvg_id: [ET.tostring(row) for row in rows]
+        for tvg_id, rows in loaded["rows"].items()
+    } == {"selected.v": [ET.tostring(selected_row)]}
+    assert loaded["warnings"] == []
+    assert loaded["diagnostics"]["transport_complete"] is True
+    assert loaded["diagnostics"]["xml_complete"] is True
+    assert loaded["diagnostics"]["validation_bytes"] == len(document)
+    assert loaded["diagnostics"]["selection_bytes"] == len(document)
+    assert loaded["size"] == (
+        len(ET.tostring(header)) + len(ET.tostring(selected_row))
+        + len(queries) * len(ET.tostring(ended_row))
+    )
+    assert len(loaded["ended"]) == len(queries)
+    for query in queries:
+        assert loaded["channel_warnings"][query["key"]] == ["event_date_conflict"]
+        witness = loaded["ended"][query["key"]]
+        assert witness[:3] == (
+            "ended.v",
+            datetime(2026, 9, 5, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 5, 1, 20, tzinfo=timezone.utc),
+        )
+        assert ET.tostring(witness[3]) == ET.tostring(ended_row)
+        rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
+        assert [ET.tostring(row) for row in rows] == [ET.tostring(selected_row)]
+        assert result == {
+            "channel_id": query["channel_id"],
+            "source_id": 50,
+            "source_tvg_id": "selected.v",
+            "match": "event",
+            "current": {
+                "start": "2026-09-05T01:20:00+00:00",
+                "stop": "2026-09-05T03:00:00+00:00",
+                "title": "ONE Fight Night 47",
+            },
+            "next": None,
+            "real_minutes": 100,
+            "gap_minutes": 2780,
+            "warnings": ["missing_artwork"],
+            "event": None,
+        }
+    assert score.call_count == 9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("starts", [
+    (("20260905130000 +0000", "20260905140000 +0000"),
+     ("20260905070001 +0000", "20260905080001 +0000")),
+    (("20260905070001 +0000", "20260905080001 +0000"),
+     ("20260905130000 +0000", "20260905140000 +0000")),
+])
+async def test_each_conflict_reason_is_scored_once_per_query(monkeypatch, starts):
+    queries = [
+        guides._query(profile(), channel(id=1, name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id=""), None, NOW),
+        guides._query(
+            profile(event_sync_config={"time_window_minutes": 300}),
+            channel(id=2, name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id=""),
+            None,
+            NOW,
+        ),
+    ]
+    install_feed(monkeypatch, feed(*[
+        programme(f"PPV({index})-05.v", "ONE Fight Night 47", start=begin, stop=end)
+        for index, (begin, end) in enumerate(starts, start=1)
+    ]))
+
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), queries, START, STOP, NOW)
+
+    assert len({query["key"] for query in queries}) == 2
+    assert score.call_count == 4
+    for query in queries:
+        assert loaded["channel_warnings"][query["key"]] == [
+            "event_date_conflict", "event_start_conflict",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_exact_window_match_survives_repeated_conflicts(monkeypatch):
+    query = guides._query(
+        profile(), channel(name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id=""), None, NOW,
+    )
+    expected = programme(
+        "exact-window.v", "ONE Fight Night 47",
+        start="20260905013000 +0000", stop="20260905023000 +0000",
+    )
+    document = feed(
+        programme(
+            "ended.v", "ONE Fight Night 47",
+            start="20260905010000 +0000", stop="20260905013000 +0000",
+        ),
+        programme(
+            "outside-1.v", "ONE Fight Night 47",
+            start="20260905013001 +0000", stop="20260905023001 +0000",
+        ),
+        programme(
+            "outside-2.v", "ONE Fight Night 47",
+            start="20260905013002 +0000", stop="20260905023002 +0000",
+        ),
+        expected,
+    )
+    install_transport(monkeypatch, lambda request: reply(document))
+
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+
+    assert score.call_count == 3, [
+        (call.args[1].start, call.kwargs["window_minutes"]) for call in score.call_args_list
+    ]
+    assert loaded["channel_warnings"][query["key"]] == ["event_start_conflict"]
+    assert loaded["ended"][query["key"]][0] == "ended.v"
+    assert ET.tostring(loaded["rows"]["exact-window.v"][0]) == ET.tostring(expected)
+
+    rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
+    assert [ET.tostring(row) for row in rows] == [ET.tostring(expected)]
+    assert result["source_tvg_id"] == "exact-window.v"
+    assert "event_start_conflict" not in result["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_window_keeps_far_event(monkeypatch):
+    query = guides._query(
+        profile(event_sync_config={"enforce_time_window": False}),
+        channel(name="ONE Fight Night 47 @ Sep 04 09:00 PM", tvg_id=""),
+        None,
+        NOW,
+    )
+    far_event = programme(
+        "far-date.v", "ONE Fight Night 47",
+        start="20260906010000 +0000", stop="20260906020000 +0000",
+    )
+    install_feed(monkeypatch, feed(far_event))
+
+    with patch.object(guides, "_score_parsed_pair", wraps=guides._score_parsed_pair) as score:
+        loaded = await guides._read_source(source(), [query], START, STOP, NOW)
+
+    assert score.call_count == 1
+    assert loaded["channel_warnings"] == {}
+    assert ET.tostring(loaded["rows"]["far-date.v"][0]) == ET.tostring(far_event)
+    rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
+    assert [ET.tostring(row) for row in rows] == [ET.tostring(far_event)]
+    assert result["source_tvg_id"] == "far-date.v"

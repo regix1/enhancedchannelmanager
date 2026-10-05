@@ -118,7 +118,7 @@ _REVIEWED_RAW_CALL_SITES = frozenset(
 )
 
 # Client-internal helpers whose FIRST positional argument is a URL path and
-# which issue a known method. Their call sites are extracted exactly like
+# which default to a known method. Their call sites are extracted exactly like
 # ``self._request`` ones, so the paths they forward stay covered.
 _PATH_FORWARDING_HELPERS = {"_get_json_bounded": "GET"}
 
@@ -573,7 +573,8 @@ def extract_client_calls(
 
     1. ``self._request("<METHOD>", <path expression>, ...)`` — the shared path.
     2. ``self._get_json_bounded(<path expression>, ...)`` — the bounded-stream
-       helper, which forwards its first argument to httpx as a GET.
+       helper, which forwards its first argument with a literal method that
+       defaults to GET.
     3. ``self._client.<verb>(<url expression>, ...)`` — the raw login /
        token-refresh posts, whose ``f"{self.base_url}/..."`` prefix is stripped.
 
@@ -648,9 +649,44 @@ def extract_client_calls(
             if is_self_call and func.attr == "_request":
                 _extract_request_call(node, owner, annotations, constants, result)
             elif is_self_call and func.attr in _PATH_FORWARDING_HELPERS:
+                unpacked_keyword = next(
+                    (keyword for keyword in node.keywords if keyword.arg is None),
+                    None,
+                )
+                if unpacked_keyword is not None:
+                    result.unresolved.append(
+                        UnresolvedExpression(
+                            owner,
+                            node.lineno,
+                            ast.unparse(unpacked_keyword.value),
+                            "bounded helper uses unpacked keyword arguments",
+                        )
+                    )
+                    continue
+                method = _PATH_FORWARDING_HELPERS[func.attr]
+                method_keyword = next(
+                    (keyword for keyword in node.keywords if keyword.arg == "method"),
+                    None,
+                )
+                if method_keyword is not None:
+                    method_value = method_keyword.value
+                    if not (
+                        isinstance(method_value, ast.Constant)
+                        and isinstance(method_value.value, str)
+                    ):
+                        result.unresolved.append(
+                            UnresolvedExpression(
+                                owner,
+                                node.lineno,
+                                ast.unparse(method_value),
+                                "forwarded HTTP method is not a string literal",
+                            )
+                        )
+                        continue
+                    method = method_value.value.upper()
                 _extract_forwarded_call(
                     node,
-                    _PATH_FORWARDING_HELPERS[func.attr],
+                    method,
                     owner,
                     annotations,
                     constants,
@@ -1216,6 +1252,45 @@ def test_extractor_reports_a_non_literal_http_method():
     result = extract_client_calls(source)
     assert result.calls == []
     assert "not a string literal" in result.unresolved[0].reason
+
+
+def test_extractor_reads_bounded_helper_default_and_literal_methods():
+    source = _SYNTHETIC_CLIENT_HEADER + (
+        "    async def get_thing(self):\n"
+        "        await self._get_json_bounded('/api/core/version/', params={}, max_bytes=1)\n"
+        "        return await self._get_json_bounded("
+        "'/api/epg/current-programs/', params={}, max_bytes=1, method='POST')\n"
+    )
+    result = extract_client_calls(source)
+    assert result.unresolved == []
+    assert result.templates == {
+        ("GET", "/api/core/version/"),
+        ("POST", "/api/epg/current-programs/"),
+    }
+
+
+def test_extractor_rejects_a_non_literal_bounded_helper_method():
+    source = _SYNTHETIC_CLIENT_HEADER + (
+        "    async def get_thing(self, method):\n"
+        "        return await self._get_json_bounded("
+        "'/api/core/version/', params={}, max_bytes=1, method=method)\n"
+    )
+    result = extract_client_calls(source)
+    assert result.calls == []
+    assert len(result.unresolved) == 1
+    assert "not a string literal" in result.unresolved[0].reason
+
+
+def test_extractor_rejects_unpacked_bounded_helper_options():
+    source = _SYNTHETIC_CLIENT_HEADER + (
+        "    async def get_thing(self, options):\n"
+        "        return await self._get_json_bounded("
+        "'/api/core/version/', params={}, max_bytes=1, **options)\n"
+    )
+    result = extract_client_calls(source)
+    assert result.calls == []
+    assert len(result.unresolved) == 1
+    assert "unpacked keyword arguments" in result.unresolved[0].reason
 
 
 def test_extractor_reports_an_unknown_module_constant():

@@ -1697,7 +1697,8 @@ class DispatcharrClient:
         self, path: str, *, params: dict, max_bytes: int,
         max_results: int | None = None, limits: dict | None = None,
         deadline: float | None = None, ids: frozenset[int] | None = None,
-        expires_at: datetime | None = None,
+        expires_at: datetime | None = None, method: str = "GET",
+        request_json: dict | None = None,
     ):
         """Read bounded JSON, retaining only selected rows from a filtered catalogue."""
         import codecs
@@ -1719,8 +1720,11 @@ class DispatcharrClient:
             headers["Accept-Encoding"] = "identity"
 
             async def send() -> httpx.Response:
+                request_options = {"headers": headers, "params": params}
+                if request_json is not None:
+                    request_options["json"] = request_json
                 request = self._client.build_request(
-                    "GET", f"{self.base_url}{path}", headers=headers, params=params
+                    method, f"{self.base_url}{path}", **request_options
                 )
                 return await self._client.send(request, stream=True)
 
@@ -1883,6 +1887,51 @@ class DispatcharrClient:
                 return selected if shape == "[" else {"results": selected, "next": next_page}
             finally:
                 await response.aclose()
+
+    async def get_epg_programmes(
+        self, epg_ids: frozenset[int], *, expires_at: datetime,
+    ) -> list[dict]:
+        """Get current programmes for explicit EPG data rows."""
+        if (
+            not isinstance(epg_ids, frozenset)
+            or not epg_ids
+            or len(epg_ids) > 50
+            or any(type(value) is not int or value <= 0 for value in epg_ids)
+            or not isinstance(expires_at, datetime)
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+        ):
+            raise ValueError("Current programme IDs and expiry are invalid")
+        if expires_at <= datetime.now(timezone.utc):
+            raise TimeoutError("Current programme request expired")
+
+        rows = await self._get_json_bounded(
+            "/api/epg/current-programs/",
+            params={},
+            max_bytes=_EPG_DATA_MIN_RESPONSE_BYTES,
+            expires_at=expires_at,
+            method="POST",
+            request_json={"epg_data_ids": sorted(epg_ids)},
+        )
+        if not isinstance(rows, list):
+            raise ValueError("Dispatcharr current programmes response must be an array")
+        if len(rows) > len(epg_ids):
+            raise ValueError("Dispatcharr current programmes response has too many rows")
+        observed = set()
+        ready = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dispatcharr current programmes response contains a non-object row")
+            row_id = row.get("epg_data_id")
+            if type(row_id) is not int or row_id <= 0 or row_id not in epg_ids:
+                raise ValueError("Dispatcharr current programmes response contains an invalid EPG ID")
+            if row_id in observed:
+                raise ValueError("Dispatcharr current programmes response contains a duplicate EPG ID")
+            observed.add(row_id)
+            if row.get("parsing") is True:
+                continue
+            ready.append(row)
+        return ready
 
     async def get_epg_data_by_id(self, data_id: int) -> dict:
         """Get a single EPG data entry by ID."""

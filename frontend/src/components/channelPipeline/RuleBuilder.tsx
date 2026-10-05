@@ -1482,6 +1482,6 @@ export function RuleBuilder({
 
 // Helper function to check if a condition type needs a value
 function needsValue(type: ConditionType): boolean {
-  const noValueTypes: ConditionType[] = ['always', 'never', 'tvg_id_exists', 'logo_exists', 'has_channel', 'channel_has_streams', 'has_audio_tracks', 'normalized_name_exists', 'normalized_name_not_exists'];
+  const noValueTypes: ConditionType[] = ['always', 'never', 'tvg_id_exists', 'logo_exists', 'has_channel', 'channel_has_streams', 'has_audio_tracks', 'normalized_name_exists', 'normalized_name_not_exists', 'stream_is_stale'];
   return !noValueTypes.includes(type);
 }

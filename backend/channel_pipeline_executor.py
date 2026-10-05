@@ -7694,15 +7694,6 @@ class ActionExecutor:
 
         if not self._event_pending:
             return set()
-        observed_at = datetime.now(timezone.utc)
-        try:
-            programmes = await self.client.get_epg_grid(
-                start=(observed_at - timedelta(hours=1)).isoformat(),
-                end=(observed_at + timedelta(hours=24)).isoformat(),
-            )
-        except Exception:
-            logger.exception("[EVENT-SYNC] Could not read imported programmes")
-            programmes = []
         touched = set()
 
         async def expire(
@@ -7852,8 +7843,47 @@ class ActionExecutor:
                 None,
             )
             xmltv_id = guide_row.get("tvg_id") if guide_row is not None else None
+            if isinstance(xmltv_id, str):
+                try:
+                    programmes = await self.client.get_epg_programmes(
+                        frozenset({guide_row["id"]}),
+                        expires_at=expires_at,
+                    )
+                except TimeoutError:
+                    if datetime.now(timezone.utc) >= expires_at:
+                        await expire(
+                            publication,
+                            event_key,
+                            receipt,
+                            channel=channel,
+                        )
+                    else:
+                        await fail(
+                            publication,
+                            event_key,
+                            receipt,
+                            "programme_missing",
+                            channel=channel,
+                        )
+                    continue
+                except Exception:
+                    logger.exception("[EVENT-SYNC] Could not read imported programmes")
+                    await fail(
+                        publication,
+                        event_key,
+                        receipt,
+                        "programme_missing",
+                        channel=channel,
+                    )
+                    continue
+            else:
+                programmes = []
             if (
                 not isinstance(xmltv_id, str)
+                or not any(
+                    row.get("epg_data_id") == guide_row["id"]
+                    for row in programmes
+                )
                 or not programme_matches(
                     programmes,
                     xmltv_id=xmltv_id,
@@ -7872,6 +7902,37 @@ class ActionExecutor:
                 )
                 continue
 
+            try:
+                channel = await self.client.get_channel(channel_id)
+            except Exception:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "channel_missing",
+                )
+                continue
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            current_value = self._event_receipt_current(
+                publication,
+                event_key,
+                channel=channel,
+            )
+            channel_link = channel.get("epg_data_id") or channel.get("epg_data")
+            if isinstance(channel_link, dict):
+                channel_link = channel_link.get("id")
+            if current_value is None or channel_link != guide_row["id"]:
+                continue
+            publication, receipt = current_value
+            self._event_publications[profile_id] = publication
+
             stream_ids = [row["id"] for row in receipt["streams"]]
             stream_names = {
                 row["id"]: row["name"] for row in receipt["streams"]
@@ -7889,6 +7950,36 @@ class ActionExecutor:
                 stream_names=stream_names,
                 expires_at=expires_at,
             )
+            try:
+                channel = await self.client.get_channel(channel_id)
+            except Exception:
+                await fail(
+                    publication,
+                    event_key,
+                    receipt,
+                    "channel_missing",
+                )
+                continue
+            if datetime.now(timezone.utc) >= expires_at:
+                await expire(
+                    publication,
+                    event_key,
+                    receipt,
+                    channel=channel,
+                )
+                continue
+            current_value = self._event_receipt_current(
+                publication,
+                event_key,
+                channel=channel,
+            )
+            channel_link = channel.get("epg_data_id") or channel.get("epg_data")
+            if isinstance(channel_link, dict):
+                channel_link = channel_link.get("id")
+            if current_value is None or channel_link != guide_row["id"]:
+                continue
+            publication, receipt = current_value
+            self._event_publications[profile_id] = publication
             if any(flow.get(stream_id) is not True for stream_id in stream_ids):
                 reason = (
                     "health_failed"
@@ -7939,6 +8030,9 @@ class ActionExecutor:
                     )
                     failed = True
                     break
+                fresh_link = fresh.get("epg_data_id") or fresh.get("epg_data")
+                if isinstance(fresh_link, dict):
+                    fresh_link = fresh_link.get("id")
                 merge_provenance = {
                     "kind": "event_sync_promote",
                     "rule_id": work["rule_id"],
@@ -7963,7 +8057,7 @@ class ActionExecutor:
                         publication,
                         event_key,
                         channel=fresh,
-                    ) is None:
+                    ) is None or fresh_link != guide_row["id"]:
                         guard_lost = True
                     else:
                         result = await self._add_stream_to_channel(
@@ -8059,12 +8153,15 @@ class ActionExecutor:
                     work["working_stream_ids"],
                 ):
                     guard_lost = False
+                    channel_link = channel.get("epg_data_id") or channel.get("epg_data")
+                    if isinstance(channel_link, dict):
+                        channel_link = channel_link.get("id")
                     async with publication_lock:
                         if self._event_receipt_current(
                             publication,
                             event_key,
                             channel=channel,
-                        ) is None:
+                        ) is None or channel_link != guide_row["id"]:
                             guard_lost = True
                         else:
                             stale_row = stale_rows[stale_id]
@@ -8134,12 +8231,15 @@ class ActionExecutor:
                 continue
 
             guard_lost = False
+            channel_link = channel.get("epg_data_id") or channel.get("epg_data")
+            if isinstance(channel_link, dict):
+                channel_link = channel_link.get("id")
             async with publication_lock:
                 if self._event_receipt_current(
                     publication,
                     event_key,
                     channel=channel,
-                ) is None:
+                ) is None or channel_link != guide_row["id"]:
                     guard_lost = True
                 elif channel.get("hidden_from_output"):
                     await self.client.update_channel(

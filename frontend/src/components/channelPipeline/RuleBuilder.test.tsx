@@ -1632,6 +1632,92 @@ describe('RuleBuilder', () => {
       expect(screen.getByLabelText('Channel ID (optional)')).toHaveValue('2933');
     });
 
+    it('saves and reopens an omitted-value stale cleanup rule without rewriting it', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn().mockResolvedValue(undefined);
+      const rule = {
+        name: 'Targeted stale cleanup',
+        description: 'Remove stale streams from one channel',
+        enabled: true,
+        priority: 65,
+        conditions: [{ type: 'stream_is_stale', connector: 'and' }],
+        actions: [{ type: 'remove_from_channel', channel_id: 2933 }],
+        run_on_refresh: false,
+        stop_on_first_match: true,
+      } as ChannelPipelineRule;
+      const view = render(<RuleBuilder rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText('Is Stale')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0]).toEqual(expect.objectContaining({
+        name: 'Targeted stale cleanup',
+        conditions: [{ type: 'stream_is_stale', connector: 'and' }],
+        actions: [{ type: 'remove_from_channel', channel_id: 2933 }],
+        run_on_refresh: false,
+      }));
+
+      view.unmount();
+      render(
+        <RuleBuilder
+          rule={{ ...rule, ...onSave.mock.calls[0][0] }}
+          onSave={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      );
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText('Is Stale')).toBeInTheDocument();
+      expect(screen.getByLabelText('Channel ID (optional)')).toHaveValue('2933');
+    });
+
+    it('saves and reopens a false negated stale merge rule through Enter', async () => {
+      const user = userEvent.setup();
+      const onSave = vi.fn().mockResolvedValue(undefined);
+      const rule = {
+        name: 'Existing stream merge',
+        description: 'Keep the stored condition representation',
+        enabled: true,
+        priority: 6,
+        conditions: [
+          { type: 'stream_name_contains', value: 'ESPN', connector: 'and' },
+          { type: 'stream_is_stale', value: false, negate: true, connector: 'or' },
+        ],
+        actions: [{ type: 'merge_streams', target: 'auto', remove_non_matching: true }],
+        run_on_refresh: true,
+        stop_on_first_match: false,
+      } as ChannelPipelineRule;
+      const view = render(<RuleBuilder rule={rule} onSave={onSave} onCancel={vi.fn()} />);
+
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText('Is Stale')).toBeInTheDocument();
+      screen.getByLabelText(/rule name/i).focus();
+      await user.keyboard('{Enter}');
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0]).toEqual(expect.objectContaining({
+        name: 'Existing stream merge',
+        conditions: [
+          { type: 'stream_name_contains', value: 'ESPN', connector: 'and' },
+          { type: 'stream_is_stale', value: false, negate: true, connector: 'or' },
+        ],
+        actions: [{ type: 'merge_streams', target: 'auto', remove_non_matching: true }],
+        run_on_refresh: true,
+      }));
+
+      view.unmount();
+      render(
+        <RuleBuilder
+          rule={{ ...rule, ...onSave.mock.calls[0][0] }}
+          onSave={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      );
+      expect(screen.getByText('Stream Status')).toBeInTheDocument();
+      expect(screen.getByText('Is Stale')).toBeInTheDocument();
+    });
+
     it('releases a refusal when the action type changes', async () => {
       const user = userEvent.setup();
       const onSave = vi.fn();

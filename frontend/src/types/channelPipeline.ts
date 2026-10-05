@@ -20,6 +20,7 @@ export type ConditionType =
   | 'stream_group_contains'
   | 'stream_group_matches'
   | 'stream_group_is'
+  | 'stream_is_stale'
   | 'tvg_id_exists'
   | 'tvg_id_matches'
   | 'logo_exists'

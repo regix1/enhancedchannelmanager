@@ -1704,22 +1704,12 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                         profile_id, source_id, guide_row["id"], xmltv_id,
                     )
 
-            programme_rows = []
-            if linked_rows:
-                try:
-                    programme_rows = await client.get_epg_grid(
-                        start=(now - timedelta(hours=1)).isoformat(),
-                        end=(now + timedelta(hours=24)).isoformat(),
-                    )
-                except Exception:
-                    logger.exception("[EVENT-WORKFLOW] Could not read the imported guide grid")
             from services.epg_programmes import programme_matches
 
-            programme_ready = set()
-            for channel_id, (profile_id, _, _, xmltv_id) in linked_rows.items():
+            programme_events = {}
+            for channel_id, (profile_id, _, _, _) in linked_rows.items():
                 publication_row = publications.get(f"profile:{profile_id}")
-                channel = channel_map[channel_id]
-                if publication_row is None:
+                if publication_row is None or not claim_current(channel_id):
                     continue
                 evidence = next((
                     item for item in publication_row["state"]["channels"]
@@ -1727,15 +1717,78 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 ), None)
                 if evidence is None:
                     continue
+                current_time = datetime.now(timezone.utc)
                 current_event = next((
                     item for item in evidence["events"]
-                    if datetime.fromisoformat(item["start"]) <= now
+                    if datetime.fromisoformat(item["start"]) <= current_time
                     < datetime.fromisoformat(item["stop"])
                 ), None)
-                if current_event is None:
+                if current_event is not None:
+                    programme_events[channel_id] = current_event
+
+            programme_rows = {}
+            for profile_id in sorted({
+                values[0] for channel_id, values in linked_rows.items()
+                if channel_id in programme_events
+            }):
+                publication_row = publications.get(f"profile:{profile_id}")
+                attempt_row = (
+                    publication_row["state"]["delivery"].get("guide_attempt")
+                    if publication_row is not None else None
+                )
+                if attempt_row is None:
+                    continue
+                profile_expiry = datetime.fromisoformat(attempt_row["expires_at"])
+                profile_channels = [
+                    channel_id
+                    for channel_id, values in linked_rows.items()
+                    if values[0] == profile_id
+                    and channel_id in programme_events
+                    and claim_current(channel_id)
+                ]
+                profile_ids = sorted({
+                    linked_rows[channel_id][2] for channel_id in profile_channels
+                })
+                for offset in range(0, len(profile_ids), 50):
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+                    batch = frozenset(profile_ids[offset:offset + 50])
+                    if not batch:
+                        continue
+                    try:
+                        rows = await client.get_epg_programmes(
+                            batch, expires_at=profile_expiry,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[EVENT-WORKFLOW] Could not read imported programmes for profile %s",
+                            profile_id,
+                        )
+                        continue
+                    if task._cancel_requested:
+                        return _finish_cancelled(started_at, details, publications)
+                    for row in rows:
+                        programme_rows[row["epg_data_id"]] = row
+
+            programme_ready = set()
+            for channel_id, (profile_id, _, _, xmltv_id) in linked_rows.items():
+                channel = channel_map[channel_id]
+                current_event = programme_events.get(channel_id)
+                programme_row = programme_rows.get(linked_rows[channel_id][2])
+                current_time = datetime.now(timezone.utc)
+                if (
+                    current_event is None
+                    or programme_row is None
+                    or not claim_current(channel_id)
+                    or not (
+                        datetime.fromisoformat(current_event["start"])
+                        <= current_time
+                        < datetime.fromisoformat(current_event["stop"])
+                    )
+                ):
                     continue
                 if programme_matches(
-                    programme_rows,
+                    [programme_row],
                     xmltv_id=xmltv_id,
                     channel_uuid=channel.get("uuid"),
                     title=current_event["title"],
@@ -1758,6 +1811,25 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     fresh = await current_channel(channel_id)
                     if fresh is None:
                         continue
+                    fresh_link = fresh.get("epg_data_id") or fresh.get("epg_data")
+                    if isinstance(fresh_link, dict):
+                        fresh_link = fresh_link.get("id")
+                    current_event = programme_events.get(channel_id)
+                    current_time = datetime.now(timezone.utc)
+                    if (
+                        state == "active"
+                        and (
+                            current_event is None
+                            or fresh_link != linked_rows.get(channel_id, (None, None, None))[2]
+                            or not (
+                                datetime.fromisoformat(current_event["start"])
+                                <= current_time
+                                < datetime.fromisoformat(current_event["stop"])
+                            )
+                        )
+                    ):
+                        programme_ready.discard(channel_id)
+                        link_pending = True
                     attached_ids = [
                         stream_id for stream_id in (_stream_id(row) for row in fresh.get("streams") or [])
                         if stream_id is not None

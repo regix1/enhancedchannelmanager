@@ -1,10 +1,11 @@
 """Bounded EPG-data response handling for migration callers."""
 
 import asyncio
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -683,5 +684,253 @@ async def test_exact_ids_pass_one_expiry_to_every_page():
             )
         assert result == [{"id": 8, "epg_source": 46, "tvg_id": "eight"}]
         assert pages == [expiry, expiry]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_posts_exact_ids_and_keeps_grid_get_behavior():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/api/epg/grid/":
+            return httpx.Response(200, json={"data": [{"title": "Visible"}]})
+        assert request.url.path == "/api/epg/current-programs/"
+        return httpx.Response(200, json=[{
+            "epg_data_id": 8,
+            "tvg_id": "hidden-eight",
+            "title": "Hidden Event",
+            "start_time": "2026-10-04T23:00:00+00:00",
+            "end_time": "2026-10-05T01:00:00+00:00",
+        }])
+
+    client = _client(handler)
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=30)
+    try:
+        rows = await client.get_epg_programmes(frozenset({13, 8}), expires_at=expiry)
+        assert rows[0]["epg_data_id"] == 8
+        assert rows[0]["start_time"] == "2026-10-04T23:00:00+00:00"
+        assert await client.get_epg_grid() == [{"title": "Visible"}]
+        programme_request, grid_request = requests
+        assert programme_request.method == "POST"
+        assert dict(programme_request.url.params) == {}
+        assert json.loads(programme_request.content) == {"epg_data_ids": [8, 13]}
+        assert programme_request.headers["X-API-Key"] == "k"
+        assert programme_request.headers["Accept-Encoding"] == "identity"
+        assert grid_request.method == "GET"
+        assert grid_request.url.path == "/api/epg/grid/"
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_refreshes_jwt_once_after_401():
+    authorizations = []
+
+    def handler(request):
+        authorizations.append(request.headers["Authorization"])
+        if len(authorizations) == 1:
+            return httpx.Response(401)
+        return httpx.Response(200, json=[])
+
+    settings = DispatcharrSettings(
+        url="http://dispatcharr", auth_method="password", username="u", password="p",
+    )
+    with patch("log_utils.register_sensitive_values_from_object"):
+        client = DispatcharrClient(settings)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client.access_token = "old"
+
+    async def refresh():
+        client.access_token = "new"
+
+    try:
+        with patch.object(client, "_ensure_authenticated", new=AsyncMock()), \
+             patch.object(client, "_refresh_access_token", side_effect=refresh) as refreshed:
+            assert await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            ) == []
+        assert authorizations == ["Bearer old", "Bearer new"]
+        refreshed.assert_awaited_once()
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("epg_ids", [
+    set(),
+    frozenset(),
+    frozenset({True}),
+    frozenset({0}),
+    frozenset(range(1, 52)),
+])
+async def test_current_programmes_rejects_invalid_ids_without_a_request(epg_ids):
+    requests = []
+    client = _client(lambda request: requests.append(request) or httpx.Response(200, json=[]))
+    try:
+        with pytest.raises(ValueError):
+            await client.get_epg_programmes(
+                epg_ids,
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+        assert requests == []
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_rejects_invalid_or_expired_expiry_before_authentication():
+    client = _client(lambda request: httpx.Response(200, json=[]))
+    ensure = AsyncMock(side_effect=AssertionError("authentication must not run"))
+    try:
+        with patch.object(client, "_ensure_authenticated", new=ensure):
+            with pytest.raises(ValueError):
+                await client.get_epg_programmes(
+                    frozenset({8}), expires_at=datetime.now(),
+                )
+            with pytest.raises(TimeoutError):
+                await client.get_epg_programmes(
+                    frozenset({8}),
+                    expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                )
+        ensure.assert_not_awaited()
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    {"results": []},
+    [{"epg_data_id": 9}],
+    [{"epg_data_id": True}],
+    [{"epg_data_id": 8}, {"epg_data_id": 8}],
+    [{"epg_data_id": 8}, {"epg_data_id": 9}],
+    ["row"],
+])
+async def test_current_programmes_rejects_untrusted_response_shapes(body):
+    client = _client(lambda request: httpx.Response(200, json=body))
+    try:
+        with pytest.raises(ValueError):
+            await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_omits_parsing_rows_and_keeps_native_missing_fields():
+    rows = [
+        {"epg_data_id": 8, "parsing": True},
+        {"epg_data_id": 13, "title": "Missing times"},
+    ]
+    client = _client(lambda request: httpx.Response(200, json=rows))
+    try:
+        assert await client.get_epg_programmes(
+            frozenset({8, 13}),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+        ) == [{"epg_data_id": 13, "title": "Missing times"}]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    b"[",
+    b"[" + (b" " * (1024 * 1024)) + b"]",
+])
+async def test_current_programmes_rejects_malformed_and_oversized_bodies(content):
+    stream = _TrackingStream(content, 4096)
+    client = _client(lambda request: httpx.Response(200, stream=stream))
+    try:
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+        assert stream.closed
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_rejects_encoded_body_without_consuming_it():
+    stream = _TrackingStream(b"[]")
+    client = _client(lambda request: httpx.Response(
+        200,
+        headers={"Content-Encoding": "gzip"},
+        stream=stream,
+    ))
+    try:
+        with pytest.raises(ValueError, match="unexpected Content-Encoding"):
+            await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+        assert stream.closed and not stream.iterated
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404, 500])
+async def test_current_programmes_http_errors_close_without_following_a_url(status):
+    stream = _TrackingStream(b'{"next":"http://untrusted.invalid/"}')
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, stream=stream)
+
+    client = _client(handler)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+            )
+        assert len(requests) == 1
+        assert stream.closed and not stream.iterated
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_programmes_cancellation_and_expiry_close_the_response():
+    started = asyncio.Event()
+
+    class Pending(_TrackingStream):
+        async def __aiter__(self):
+            started.set()
+            yield b"["
+            await asyncio.Event().wait()
+
+    first_stream = Pending(b"")
+    client = _client(lambda request: httpx.Response(200, stream=first_stream))
+    try:
+        task = asyncio.create_task(client.get_epg_programmes(
+            frozenset({8}),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert first_stream.closed
+    finally:
+        await client._client.aclose()
+
+    second_stream = Pending(b"")
+    client = _client(lambda request: httpx.Response(200, stream=second_stream))
+    try:
+        with pytest.raises(TimeoutError):
+            await client.get_epg_programmes(
+                frozenset({8}),
+                expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=50),
+            )
+        assert second_stream.closed
     finally:
         await client._client.aclose()
