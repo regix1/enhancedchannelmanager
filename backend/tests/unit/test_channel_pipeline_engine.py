@@ -6428,3 +6428,15 @@ async def test_new_link_requires_new_programme_import():
         assert await asyncio.wait_for(engine._refresh_epg_source(source, publications, expires_at=None, after_link=True), 10)
 
     assert imports == [False, True]
+
+
+def test_failed_action_summary_keeps_each_phase_error():
+    summary = ChannelPipelineEngine._summarize_failed_actions([
+        {"rule_name": None, "action_type": "refresh_epg_source", "error": "EPG programme import did not complete successfully"},
+        {"rule_name": None, "action_type": "dummy_epg_refresh", "error": "x" * 300},
+        {"rule_name": None, "action_type": "dummy_epg_refresh", "error": "x" * 300},
+    ])
+    assert summary.startswith(
+        "3 action(s) failed during this run (None refresh_epg_source: "
+        "EPG programme import did not complete successfully; None dummy_epg_refresh: " + "x" * 200 + ")."
+    )

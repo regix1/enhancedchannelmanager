@@ -2406,6 +2406,10 @@ class ChannelPipelineEngine:
         seen: list[str] = []
         for fa in failed_actions:
             label = f"{fa.get('rule_name')!r} {fa.get('action_type')}"
+            # Phase failures are stored nowhere else, so their error text has
+            # to travel with the summary to stay readable after the run.
+            if fa.get("error"):
+                label += f": {str(fa['error'])[:200]}"
             if label not in seen:
                 seen.append(label)
         SAMPLE = 5
