@@ -2101,6 +2101,144 @@ async def test_current_programme_batches_keep_profile_expiry_and_isolate_failure
 
 
 @pytest.mark.asyncio
+async def test_live_channel_in_a_later_profile_is_checked_before_idle_ones():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    event_start = now - timedelta(minutes=5)
+    event_stop = now + timedelta(hours=2)
+    profiles = []
+    channels = {}
+    guide_rows = {46: [], 47: []}
+    coverage = {"profiles": {}, "channels": []}
+    plans = {}
+    epg_channel = {}
+    publication_channels = {1: [], 2: []}
+    for profile_id, channel_ids in {1: list(range(1001, 1301)), 2: [2001]}.items():
+        group_id = 6 + profile_id
+        source_id = 45 + profile_id
+        live = profile_id == 2
+        states, desired, primary_ids, event_starts, assignments = {}, {}, {}, {}, []
+        for channel_id in channel_ids:
+            channels[channel_id] = {
+                "id": channel_id, "name": f"Arena {channel_id}", "channel_group_id": group_id,
+                "hidden_from_output": True, "epg_data_id": None, "streams": [],
+            }
+            assignments.append({"channel_id": channel_id, "channel_name": channels[channel_id]["name"]})
+            states[channel_id] = "active" if live else "idle"
+            desired[channel_id] = []
+            if live:
+                stream_id, epg_id = 10000 + channel_id, 20000 + channel_id
+                coverage["channels"].append({
+                    "profile_id": profile_id, "channel_id": channel_id,
+                    "current": {"title": f"Event {channel_id}", "start": event_start.isoformat()},
+                })
+                publication_channels[profile_id].append({"channel_id": channel_id, "events": [{
+                    "title": f"Event {channel_id}", "start": event_start.isoformat(), "stop": event_stop.isoformat(),
+                }]})
+                guide_rows[source_id].append({"id": epg_id, "tvg_id": f"custom-{channel_id}", "epg_source": source_id})
+                epg_channel[epg_id] = channel_id
+                desired[channel_id] = [stream_id]
+                primary_ids[channel_id] = [stream_id]
+                event_starts[stream_id] = event_start
+        profile = _profile(
+            id=profile_id, name=f"Arena {profile_id}", channel_group_ids=[group_id],
+            hide_empty_group_ids=[group_id], channel_assignments=assignments,
+            event_sync_config=_config([{"group_id": 5, "m3u_account_id": None}]),
+        )
+        profiles.append(profile)
+        coverage["profiles"][str(profile_id)] = {"profile_id": profile_id, "can_publish": True, "reason_codes": []}
+        plans[profile_id] = {
+            "profile": profile, "states": states, "desired": desired, "primary_ids": primary_ids,
+            "event_starts": event_starts, "scan_complete": True, "observations": None,
+        }
+    publications = {
+        "all": _publication("all"),
+        "profile:1": _publication("profile:1", channels=publication_channels[1]),
+        "profile:2": _publication("profile:2", channels=publication_channels[2]),
+    }
+
+    def update(scope, *, expected_revision, expected_hash=None,
+               expected_config_hash=None, expected_attempt_id=None,
+               required_dispatcharr_hashes=None, confirmed_dispatcharr_hashes=None,
+               pending_emby=None, source_refreshes=None):
+        row = publications[scope]
+        if row["revision"] != expected_revision:
+            return None
+        if required_dispatcharr_hashes is not None:
+            row["state"]["delivery"]["required_dispatcharr_hashes"] = dict(required_dispatcharr_hashes)
+        if confirmed_dispatcharr_hashes is not None:
+            row["state"]["delivery"]["confirmed_dispatcharr_hashes"] = dict(confirmed_dispatcharr_hashes)
+        if pending_emby is not None:
+            row["state"]["delivery"]["pending_emby"] = pending_emby
+        if source_refreshes is not None:
+            row["state"]["delivery"]["source_refreshes"] = copy.deepcopy(source_refreshes)
+        row["revision"] += 1
+        return row["revision"]
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[
+        {"id": 46, "name": "Generated one", "url": "http://ecm/api/dummy-epg/xmltv/1", "is_active": True},
+        {"id": 47, "name": "Generated two", "url": "http://ecm/api/dummy-epg/xmltv/2", "is_active": True},
+    ])
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(next(
+        row for row in client.get_epg_sources.return_value if row["id"] == source_id
+    )))
+    stream_rows = {12001: {"id": 12001, "name": "Stream 12001", "url": "https://media.test/12001",
+                           "channel_group_id": 5, "m3u_account": None}}
+    original = {key: (row["name"], None, 5, row["url"]) for key, row in stream_rows.items()}
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [copy.deepcopy(stream_rows[key]) for key in ids])
+    stats = {12001: {"stream_name": "Stream 12001", "probe_status": "success", "measured_bitrate": 5000000,
+                     "last_probed": datetime.now(timezone.utc).isoformat(),
+                     "black_screen_checked_at": datetime.now(timezone.utc).isoformat(), "is_black_screen": False}}
+    client.get_epg_data = AsyncMock(side_effect=lambda **kwargs: copy.deepcopy(guide_rows[kwargs["epg_source"]]))
+    client.get_channel = AsyncMock(side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]))
+
+    async def update_channel(channel_id, values):
+        channels[channel_id].update(copy.deepcopy(values))
+
+    async def get_epg_programmes(epg_ids, *, expires_at):
+        return [{
+            "epg_data_id": epg_id, "tvg_id": f"custom-{epg_channel[epg_id]}",
+            "title": f"Event {epg_channel[epg_id]}",
+            "start_time": event_start.isoformat(), "end_time": event_stop.isoformat(),
+        } for epg_id in sorted(epg_ids)]
+
+    client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_epg_programmes = AsyncMock(side_effect=get_epg_programmes)
+    client.get_epg_grid = AsyncMock(return_value=[])
+    client.refresh_epg_source = AsyncMock()
+    result = PublicationResult(
+        published_profile_ids=(1, 2),
+        xmltv_by_scope={"all": "<tv/>", "profile:1": "<tv/>", "profile:2": "<tv/>"},
+        hashes_by_scope={"all": "a" * 64, "profile:1": "a" * 64, "profile:2": "a" * 64},
+    )
+
+    async def collect(stream_ids, **kwargs):
+        return {stream_id: True for stream_id in stream_ids}
+
+    with patch("tasks.event_visibility._load_profiles", return_value=(profiles, [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("tasks.event_visibility._plan_profile", side_effect=lambda profile, *args: plans[profile["id"]]), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(profiles, coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], {(5, None)}, {}, original))), \
+         patch("services.event_sync_stream_health.collect_stream_flow", side_effect=collect), \
+         patch("services.event_sync_stream_health._load_stats", new=AsyncMock(return_value=stats)), \
+         patch("concurrency.run_cpu_bound", new=_publication_run(result)), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=True)), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock(return_value=None)), \
+         patch("cache.get_cache"):
+        outcome = await reconcile_profiles(EventVisibilityTask(), wait_for_sources=True)
+
+    assert channels[2001]["hidden_from_output"] is False
+    assert channels[2001]["streams"] == [12001]
+    assert outcome.details["active_channel_count"] == 1
+    assert outcome.details["idle_channel_count"] == 255
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_keeps_unconfirmed_import_pending():
     profile = _profile(channel_assignments=[])
     coverage = {

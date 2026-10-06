@@ -1136,25 +1136,36 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             examined = set()
             original_ids = {stream.stream_id for stream in streams}
             extras = set()
-            for profile_id, plan in plans.items():
-                for channel_id in sorted(plan["states"]):
-                    selected_ids = set(plan["primary_ids"].get(channel_id, [])) | set(plan["desired"].get(channel_id, []))
-                    attached = channel_map[channel_id].get("streams") or []
-                    selected_ids.update(
-                        stream_id for stream_id in (_stream_id(item) for item in attached)
-                        if stream_id is not None
-                    )
-                    if len(relevant) >= 256 or len(examined | selected_ids) > 1000:
-                        plan["states"][channel_id] = "unknown"
-                        plan["desired"].pop(channel_id, None)
-                        continue
-                    relevant[channel_id] = selected_ids
-                    examined.update(selected_ids)
-                    for item in attached:
-                        stream_id = _stream_id(item)
-                        if stream_id in selected_ids and stream_id not in original_ids:
-                            if not any(_matches_scope(item, scope) for scope in configs[profile_id].get("secondary", [])):
-                                extras.add(stream_id)
+            # The bounded budget goes first to channels whose event is on, then to
+            # visible ones that may need hiding; ascending ids alone let one large
+            # profile spend it every run and left the other profiles unchecked.
+            candidates = sorted(
+                (
+                    (plans[profile_id]["states"][channel_id] != "active",
+                     channel_map[channel_id].get("hidden_from_output") is True,
+                     profile_id, channel_id)
+                    for profile_id in plans for channel_id in plans[profile_id]["states"]
+                ),
+            )
+            for _, _, profile_id, channel_id in candidates:
+                plan = plans[profile_id]
+                selected_ids = set(plan["primary_ids"].get(channel_id, [])) | set(plan["desired"].get(channel_id, []))
+                attached = channel_map[channel_id].get("streams") or []
+                selected_ids.update(
+                    stream_id for stream_id in (_stream_id(item) for item in attached)
+                    if stream_id is not None
+                )
+                if len(relevant) >= 256 or len(examined | selected_ids) > 1000:
+                    plan["states"][channel_id] = "unknown"
+                    plan["desired"].pop(channel_id, None)
+                    continue
+                relevant[channel_id] = selected_ids
+                examined.update(selected_ids)
+                for item in attached:
+                    stream_id = _stream_id(item)
+                    if stream_id in selected_ids and stream_id not in original_ids:
+                        if not any(_matches_scope(item, scope) for scope in configs[profile_id].get("secondary", [])):
+                            extras.add(stream_id)
             if extras:
                 rows = await _await_preparation(
                     client.get_streams_by_ids(sorted(extras)),
