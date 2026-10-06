@@ -997,15 +997,19 @@ def _token_similarity(a: str, b: str) -> float:
     return fuzz.ratio(a, b) / 100.0
 
 
+def _initialism_token(single: str) -> str:
+    """'mufc' -> 'mu': the letters an initialism must spell, FC-style suffix removed."""
+    for suffix in _INITIALISM_SUFFIXES:
+        if single.endswith(suffix) and len(single) > len(suffix):
+            return single[: -len(suffix)]
+    return single
+
+
 def _initialism_matches(single: str, words: list[str]) -> bool:
     """'mufc' ↔ ['manchester', 'united'] (strippable FC-style suffix)."""
     if not words or len(words) < 2:
         return False
-    token = single
-    for suffix in _INITIALISM_SUFFIXES:
-        if token.endswith(suffix) and len(token) > len(suffix):
-            token = token[: -len(suffix)]
-            break
+    token = _initialism_token(single)
     initials = "".join(w[0] for w in words)
     return len(token) >= 2 and token == initials
 
@@ -1208,14 +1212,17 @@ def _collapse_title_initialisms(
     }
     if not shorts:
         return expansion_tokens
+    # Scoring calls this for every candidate pair, so each acronym is reduced
+    # once and each word run's initials are built once, in the set's order.
+    tokens = [(short, _initialism_token(short)) for short in shorts]
     result: list[str] = []
     i, n = 0, len(expansion_tokens)
     while i < n:
         hit = None
         for run_len in range(min(_TITLE_ACRONYM_MAX_RUN, n - i), 1, -1):
-            window = expansion_tokens[i:i + run_len]
+            initials = "".join(word[0] for word in expansion_tokens[i:i + run_len])
             hit = next(
-                (s for s in shorts if _initialism_matches(s, window)), None
+                (short for short, token in tokens if len(token) >= 2 and token == initials), None
             )
             if hit:
                 result.append(hit)

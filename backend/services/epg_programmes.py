@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import copy
+from collections import Counter
 from collections.abc import Mapping
 from functools import lru_cache
 import hashlib
@@ -405,7 +407,12 @@ def _query(
     identity = {key: value for key, value in query.items() if key != "channel_id"}
     if mapping:
         identity["mapping"] = {key: value for key, value in mapping.items() if key != "channel_id"}
-    if parsed.start is not None:
+    if not query["dynamic"]:
+        # A static channel is selected by its mapping, IDs and name. The event
+        # its current stream carries changes nothing a scan keeps, so it must
+        # not make the source look uncovered and force another full scan.
+        identity.pop("event")
+    elif parsed.start is not None:
         # Dated matches use the parsed event, even after promotion changes its display name and TVG.
         identity.pop("name")
         identity.pop("ids")
@@ -456,6 +463,31 @@ async def _read_source(
     ended_queries = [query for query in dated_queries if query["dynamic"]]
     query_terms = {id(query): set(normalize_alias_term(query["event"].title or ""))
                    for query in dated_queries}
+    # A programme can only affect the dated queries that start within a
+    # matching window of it, have no window, or share two title terms with it
+    # (the conflict check). Indexing those once keeps each programme from
+    # being compared with every dated query in the profile.
+    timed = sorted(
+        (query["event"].start.timestamp(), index)
+        for index, query in enumerate(dated_queries) if query["enforce_time_window"]
+    )
+    timed_starts = [moment for moment, _ in timed]
+    widest = max(
+        (query["time_window_minutes"] * 60 for query in dated_queries if query["enforce_time_window"]),
+        default=0,
+    )
+    untimed = {index for index, query in enumerate(dated_queries) if not query["enforce_time_window"]}
+    term_index = {}
+    for index, query in enumerate(dated_queries):
+        for term in query_terms[id(query)]:
+            term_index.setdefault(term, []).append(index)
+
+    def near(begin: datetime) -> set[int]:
+        moment = begin.timestamp()
+        low = bisect.bisect_left(timed_starts, moment - widest)
+        high = bisect.bisect_right(timed_starts, moment + widest)
+        return untimed | {index for _, index in timed[low:high]}
+
     mapped_queries = {}
     direct_queries = {}
     named_queries = {}
@@ -572,7 +604,8 @@ async def _read_source(
                 else:
                     if now - timedelta(hours=24) < end <= now and end - begin <= timedelta(hours=24) and not _placeholder(element):
                         ended_event = None
-                        for query in ended_queries:
+                        for index in sorted(near(begin)):
+                            query = ended_queries[index]
                             parsed = query["event"]
                             window = query["time_window_minutes"] if query["enforce_time_window"] else None
                             if window is not None and abs((parsed.start - begin).total_seconds()) > window * 60:
@@ -606,8 +639,13 @@ async def _read_source(
                             wanted = bool(matched_queries)
                             if not wanted and dated_queries:
                                 event_title = _event(element, begin)
-                                event_terms = None
-                                for query in dated_queries:
+                                event_terms = set(normalize_alias_term(event_title.title or ""))
+                                shared = Counter(
+                                    index for term in event_terms for index in term_index.get(term, ())
+                                )
+                                candidates = near(begin) | {index for index, hits in shared.items() if hits >= 2}
+                                for index in sorted(candidates):
+                                    query = dated_queries[index]
                                     parsed = query["event"]
                                     delta = abs((parsed.start - begin).total_seconds())
                                     window = query["time_window_minutes"] if query["enforce_time_window"] else None
@@ -615,8 +653,6 @@ async def _read_source(
                                         reason = "event_date_conflict" if delta >= 43200 else "event_start_conflict"
                                         if reason in channel_warnings.get(query["key"], ()):
                                             continue
-                                        if event_terms is None:
-                                            event_terms = set(normalize_alias_term(event_title.title or ""))
                                         common = query_terms[id(query)] & event_terms
                                         if len(common) >= 2 and _score_parsed_pair(
                                             parsed, event_title, window_minutes=None,

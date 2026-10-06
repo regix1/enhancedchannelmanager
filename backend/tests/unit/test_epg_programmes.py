@@ -381,6 +381,19 @@ def test_query_ignores_only_the_generated_outward_id():
     assert query["ids"] == ["ecm-external"]
 
 
+def test_mapped_query_key_ignores_the_event_its_stream_carries():
+    selected = profile(name_source="stream")
+    mapping = {"channel_id": 1, "source_id": 51, "tvg_id": "ESPN+05.rtv"}
+
+    def key(stream_name, tvg_id="espn-plus-5"):
+        mapped = channel(name="ESPN+ 05", tvg_id=tvg_id, streams=[{"id": 5, "name": stream_name}])
+        return guides._query(selected, mapped, mapping, NOW)["key"]
+
+    first = key("Falcons vs Wolves @ Sep 05 7:00 PM")
+    assert key("Hawks vs Bears @ Sep 05 9:30 PM") == first
+    assert key("Hawks vs Bears @ Sep 05 9:30 PM", tvg_id="espn-plus-6") != first
+
+
 def test_query_uses_configured_slot_and_matching_knobs():
     selected = profile(
         event_sync_config={
