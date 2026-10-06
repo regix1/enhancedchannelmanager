@@ -2704,7 +2704,12 @@ class TestGuideDelivery:
                 "expected_hash": document_hash, "attempt_id": "a" * 32,
                 "links": {"10": 900, "11": 901}, "pending_links": None,
             }},
-            pending_channels={"arena:main": {"stage": "importing"}},
+            pending_channels={"arena:main": {
+                "stage": "failed", "reason": "health_failed", "detail": "no playable stream",
+                "channel_id": 10, "attempt_no": 2,
+                "terminal_at": "2026-10-06T02:30:00+00:00", "retry_at": "2026-10-06T02:35:00+00:00",
+                "history": [{"stage": "failed", "reason": "health_unknown"}],
+            }},
         )
         return record
 
@@ -2740,7 +2745,12 @@ class TestGuideDelivery:
         assert published["attempt_stage"] == "preparing"
         assert published["required_source_ids"] == [46]
         assert published["confirmed_source_ids"] == []
-        assert published["pending_channels"] == {"arena:main": "importing"}
+        assert published["pending_channels"] == {"arena:main": {
+            "stage": "failed", "reason": "health_failed", "detail": "no playable stream",
+            "channel_id": 10, "attempt_no": 2,
+            "terminal_at": "2026-10-06T02:30:00+00:00", "retry_at": "2026-10-06T02:35:00+00:00",
+            "earlier_reasons": ["failed: health_unknown"],
+        }}
         assert published["imports"] == [{
             "source_id": 46, "triggered": True, "completed": False,
             "current_guide": True, "current_attempt": True,

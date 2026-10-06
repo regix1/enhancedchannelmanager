@@ -216,6 +216,17 @@ class GuideImportState(BaseModel):
     links_changed: Optional[int]
 
 
+class PendingChannelState(BaseModel):
+    stage: str
+    reason: Optional[str]
+    detail: Optional[str]
+    channel_id: Optional[int]
+    attempt_no: int
+    terminal_at: Optional[str]
+    retry_at: Optional[str]
+    earlier_reasons: list[str]
+
+
 class ProfileDelivery(BaseModel):
     profile_id: int
     name: str
@@ -230,7 +241,7 @@ class ProfileDelivery(BaseModel):
     required_source_ids: list[int] = []
     confirmed_source_ids: list[int] = []
     pending_emby: Optional[bool] = None
-    pending_channels: dict[str, str] = {}
+    pending_channels: dict[str, PendingChannelState] = {}
     imports: list[GuideImportState] = []
 
 
@@ -711,7 +722,19 @@ async def get_guide_delivery(db: Session = Depends(get_session)) -> GuideDeliver
                 if document_hash == state["xmltv_hash"]
             ),
             pending_emby=delivery.get("pending_emby"),
-            pending_channels={key: receipt["stage"] for key, receipt in delivery["pending_channels"].items()},
+            pending_channels={
+                key: PendingChannelState(
+                    stage=receipt["stage"],
+                    reason=receipt["reason"],
+                    detail=receipt.get("detail"),
+                    channel_id=receipt["channel_id"],
+                    attempt_no=receipt["attempt_no"],
+                    terminal_at=receipt["terminal_at"],
+                    retry_at=receipt["retry_at"],
+                    earlier_reasons=[f"{item['stage']}: {item['reason']}" for item in receipt["history"]],
+                )
+                for key, receipt in delivery["pending_channels"].items()
+            },
             imports=imports,
         ))
     return GuideDeliveryResponse(
