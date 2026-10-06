@@ -50,7 +50,9 @@ TERMINAL_PENDING_STAGES = frozenset({"complete", "failed", "expired", "allocatio
 RECOVERABLE_REASONS = frozenset({
     "guide_failed", "guide_expired", "programme_missing", "health_unknown", "health_failed",
 })
-HEALTH_REASONS = frozenset({"health_unknown", "health_failed"})
+# Failures a staged channel retries on every retry time while its event is on:
+# the stream may start playing and the guide may finish importing at any point.
+LIVE_RETRY_REASONS = frozenset({"health_unknown", "health_failed", "programme_missing"})
 
 
 @dataclass(frozen=True)
@@ -314,7 +316,7 @@ def _pending_channel(event_key: str, value) -> dict:
         latest = history[-1]
         if (
             latest["stage"] != "failed"
-            or latest["reason"] not in HEALTH_REASONS
+            or latest["reason"] not in LIVE_RETRY_REASONS
             or latest["input_hash"] != value["input_hash"]
         ):
             raise ValueError("Extended pending channel history is invalid.")
@@ -1501,26 +1503,26 @@ def _admit_pending(
         or (existing["channel_uuid"] is not None and candidate["channel_uuid"] != existing["channel_uuid"])
     ):
         return None
-    health_failure = (
+    failure = (
         existing["stage"] == "failed"
-        and existing["reason"] in HEALTH_REASONS
+        and existing["reason"] in LIVE_RETRY_REASONS
     )
-    same_health_input = (
-        health_failure
+    same_input = (
+        failure
         and existing["input_hash"] == candidate["input_hash"]
     )
-    health_recovery = (
-        same_health_input
+    recovery = (
+        same_input
         and existing["title"] == candidate["title"]
         and existing["channel_name"] == candidate["channel_name"]
         and existing["execution_id"] == candidate["execution_id"]
         and existing["channel_uuid"] is not None
         and candidate["channel_uuid"] == existing["channel_uuid"]
     )
-    if same_health_input and not health_recovery:
+    if same_input and not recovery:
         return None
     retry_at = _utc(existing["retry_at"], "pending channel retry time") if existing["retry_at"] else None
-    if health_recovery:
+    if recovery:
         if retry_at is None or now < retry_at:
             return None
     else:

@@ -5865,14 +5865,14 @@ class ActionExecutor:
             .get("pending_channels", {}).get(event_key)
         )
         receipt = current["state"]["delivery"]["pending_channels"].get(event_key)
+        # Delivery bookkeeping and guide republishes move the revision and the
+        # document hash every few minutes, inside a single run; the guide attempt
+        # and the receipt attempt are what identify the work this run owns.
         if (
             expected_attempt is None
             or current_attempt is None
             or expected_receipt is None
             or receipt is None
-            or current["revision"] != publication.get("revision")
-            or current["state"]["xmltv_hash"]
-            != publication.get("state", {}).get("xmltv_hash")
             or current["state"]["config_hash"]
             != publication.get("state", {}).get("config_hash")
             or current_attempt["attempt_id"] != expected_attempt.get("attempt_id")
@@ -6964,7 +6964,7 @@ class ActionExecutor:
             }
 
         event_states = {}
-        health_recoveries: dict[str, tuple[str, str]] = {}
+        recoveries: dict[str, tuple[str, str]] = {}
         if config.get("retire_finished_events"):
             now = datetime.now(timezone.utc)
             sampled_keys = {unit.event_key for unit in health_units}
@@ -6999,6 +6999,22 @@ class ActionExecutor:
                 publication["state"]["delivery"]["pending_channels"]
                 if publication is not None else {}
             )
+            # A staged channel whose last attempt ended without streams has
+            # nothing left to prove once its event is over; retire it like a
+            # finished event.
+            for receipt in pending.values():
+                channel_id = receipt.get("channel_id")
+                if channel_id not in event_states:
+                    continue
+                channel = self._channel_by_id[channel_id]
+                if (
+                    receipt["stage"] in {"failed", "expired"}
+                    and datetime.fromisoformat(receipt["stop"]) <= now
+                    and channel.get("streams") == []
+                    and channel.get("hidden_from_output") is True
+                    and receipt.get("channel_uuid") in (None, channel.get("uuid"))
+                ):
+                    event_states[channel_id] = "idle"
             for event_key, unit in lifecycle_units.items():
                 receipt = pending.get(event_key)
                 if (
@@ -7094,7 +7110,7 @@ class ActionExecutor:
                     continue
                 _, current_receipt = current_value
                 eligible.add(event_key)
-                health_recoveries[event_key] = (
+                recoveries[event_key] = (
                     current_receipt["attempt_id"],
                     current_receipt["input_hash"],
                 )
@@ -7434,7 +7450,7 @@ class ActionExecutor:
                     promo["guide_pending"] += 1
                     _keep_existing_channel(unit)
                     continue
-                recovery = health_recoveries.get(unit.event_key)
+                recovery = recoveries.get(unit.event_key)
                 if recovery is not None:
                     observed_attempt_id, observed_input_hash = recovery
                     if (

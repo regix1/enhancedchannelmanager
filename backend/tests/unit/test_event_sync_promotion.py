@@ -2885,8 +2885,6 @@ def test_receipt_guard_keeps_live_and_expired_authority_separate(
 
 
 @pytest.mark.parametrize("mismatch", [
-    "revision",
-    "xmltv_hash",
     "config_hash",
     "guide_attempt",
     "receipt_attempt",
@@ -2899,7 +2897,6 @@ def test_receipt_guard_keeps_live_and_expired_authority_separate(
     "channel_uuid",
     "missing_channel",
     "missing_channel_with_evidence",
-    "replacement",
 ])
 def test_expired_writer_cannot_close_a_mismatched_owner(
     mismatch,
@@ -2922,11 +2919,7 @@ def test_expired_writer_cannot_close_a_mismatched_owner(
     channel_missing = False
     durable_before = copy.deepcopy(expected)
 
-    if mismatch == "revision":
-        expected["revision"] += 1
-    elif mismatch == "xmltv_hash":
-        expected["state"]["xmltv_hash"] = "0" * 64
-    elif mismatch == "config_hash":
+    if mismatch == "config_hash":
         expected["state"]["config_hash"] = "0" * 64
     elif mismatch == "guide_attempt":
         expected["state"]["delivery"]["guide_attempt"]["attempt_id"] = "0" * 32
@@ -2963,26 +2956,8 @@ def test_expired_writer_cannot_close_a_mismatched_owner(
         channel["uuid"] = "replacement-900"
     elif mismatch == "missing_channel":
         channel = None
-    elif mismatch == "missing_channel_with_evidence":
-        channel_missing = True
     else:
-        live_at = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
-        with patch("database.get_session", side_effect=db_session_factory), \
-             patch(
-                 "services.epg_publication.get_session",
-                 side_effect=db_session_factory,
-             ), \
-             patch("channel_pipeline_executor.datetime", _clock(live_at)):
-            replacement = _run(executor._write_event_receipt(
-                expected,
-                event_key,
-                {"allocated", "importing", "linking", "ready"},
-                {"stage": "linking", "reason": "guide_pending"},
-                guide_stage="linking",
-                channel=channel,
-            ))
-        assert replacement is not None
-        durable_before = replacement
+        channel_missing = True
 
     expires_at = datetime.fromisoformat(receipt["expires_at"])
     with patch("database.get_session", side_effect=db_session_factory), \
@@ -3007,6 +2982,58 @@ def test_expired_writer_cannot_close_a_mismatched_owner(
 
     assert closed is None
     assert _read_event_publication(db_session_factory, profile_id) == durable_before
+
+
+@pytest.mark.parametrize("change", ["bookkeeping", "replacement"])
+def test_expired_writer_closes_its_receipt_after_the_guide_moved_on(
+    change,
+    db_session_factory,
+    monkeypatch,
+):
+    from services import epg_publication
+
+    setup, executor, _ = _pending_completion(db_session_factory, monkeypatch)
+    expected = _read_event_publication(db_session_factory, setup["profile_id"])
+    event_key, receipt = next(iter(
+        expected["state"]["delivery"]["pending_channels"].items()
+    ))
+    channel = copy.deepcopy(setup["state"].channels[900])
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    live_at = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory):
+        if change == "bookkeeping":
+            assert epg_publication.update_delivery(
+                expected["scope"],
+                expected_revision=expected["revision"],
+                pending_emby=not expected["state"]["delivery"]["pending_emby"],
+            ) == expected["revision"] + 1
+        else:
+            with patch("channel_pipeline_executor.datetime", _clock(live_at)):
+                assert _run(executor._write_event_receipt(
+                    expected,
+                    event_key,
+                    {"allocated", "importing", "linking", "ready"},
+                    {"stage": "linking", "reason": "guide_pending"},
+                    guide_stage="linking",
+                    channel=channel,
+                )) is not None
+        with patch("channel_pipeline_executor.datetime", _clock(expires_at)):
+            closed = _run(executor._write_event_receipt(
+                expected,
+                event_key,
+                {"allocated", "importing", "linking", "ready"},
+                {
+                    "stage": "expired",
+                    "reason": "guide_expired",
+                    "terminal_at": expires_at.isoformat(),
+                    "retry_at": (expires_at + timedelta(minutes=5)).isoformat(),
+                },
+                channel=channel,
+            ))
+
+    assert closed["state"]["delivery"]["pending_channels"][event_key]["stage"] == "expired"
+    assert _read_event_publication(db_session_factory, setup["profile_id"]) == closed
 
 
 @pytest.mark.parametrize("expired", [False, True])
@@ -6029,9 +6056,12 @@ def test_staged_event_retries_after_its_guide_was_missing(
             "black_screen_checked_at": observed_at,
         }
 
-    async def guide_missing_once(executor):
-        if executor._event_pending and not withheld:
-            withheld.append(copy.deepcopy(state.guide_programmes))
+    missing = [True]
+
+    async def guide_missing_while_set(executor):
+        if executor._event_pending and missing[0]:
+            if state.guide_programmes:
+                withheld[:] = [copy.deepcopy(state.guide_programmes)]
             state.guide_programmes.clear()
         return await finish(executor)
 
@@ -6052,7 +6082,7 @@ def test_staged_event_retries_after_its_guide_was_missing(
     with patch.object(
         ActionExecutor,
         "_finish_event_promotions",
-        new=guide_missing_once,
+        new=guide_missing_while_set,
     ), patch(
         "services.event_sync_resolver.datetime",
         _clock(lambda: current[0]),
@@ -6077,19 +6107,204 @@ def test_staged_event_retries_after_its_guide_was_missing(
         state.guide_programmes[:] = withheld[0]
         current[0] = datetime.fromisoformat(first_receipt["retry_at"]) + timedelta(seconds=1)
         second_result = run()
+        second_receipt = _read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )["state"]["delivery"]["pending_channels"][event_key]
+        assert (second_receipt["attempt_no"], second_receipt["stage"], second_receipt["reason"]) == (
+            2, "failed", "programme_missing",
+        )
+        assert state.channels[900]["streams"] == []
+
+        state.guide_programmes[:] = withheld[0]
+        missing[0] = False
+        current[0] = datetime.fromisoformat(second_receipt["retry_at"]) + timedelta(seconds=1)
+        third_result = run()
 
     completed = _read_event_publication(
         db_session_factory,
         setup["profile_id"],
     )["state"]["delivery"]["pending_channels"][event_key]
-    assert completed["attempt_no"] == 2
+    assert completed["attempt_no"] == 3
     assert completed["stage"] == "complete"
     assert completed["channel_id"] == first_receipt["channel_id"]
     assert client.create_channel.await_count == 1
     assert state.channels[900]["epg_data_id"] == 502
     assert state.channels[900]["streams"] == [7301]
     assert state.channels[900]["hidden_from_output"] is False
-    assert [first_result["channels_created"], second_result["channels_created"]] == [1, 0]
+    assert [
+        first_result["channels_created"],
+        second_result["channels_created"],
+        third_result["channels_created"],
+    ] == [1, 0, 0]
+
+
+def test_staged_event_finishes_after_the_guide_revision_moves(
+    db_session_factory,
+    monkeypatch,
+):
+    from services import epg_publication, event_sync_stream_health
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = setup["event_start"] + timedelta(minutes=1)
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current,
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+    bumps = []
+
+    def bump_revision(step):
+        # The visibility check writes delivery bookkeeping while a run is busy.
+        with patch("services.epg_publication.get_session", side_effect=db_session_factory):
+            publication = epg_publication.read_publication(f"profile:{setup['profile_id']}")
+            revision = epg_publication.update_delivery(
+                publication["scope"],
+                expected_revision=publication["revision"],
+                pending_emby=not publication["state"]["delivery"]["pending_emby"],
+            )
+            bumps.append((step, revision == publication["revision"] + 1))
+
+    async def finish_after_bookkeeping(executor):
+        if executor._event_pending:
+            bump_revision("finish")
+        return await finish(executor)
+
+    observed_at = current.astimezone(timezone.utc).isoformat()
+    health[7301] = {
+        "stream_name": setup["event_name"],
+        "probe_status": "success",
+        "measured_bitrate": 5_000_000,
+        "last_probed": observed_at,
+        "is_black_screen": False,
+        "black_screen_checked_at": observed_at,
+    }
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=finish_after_bookkeeping,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current),
+    ):
+        dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    receipt = next(iter(_read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"].values()))
+    assert bumps and all(moved for _, moved in bumps)
+    assert (receipt["attempt_no"], receipt["stage"]) == (1, "complete")
+    assert state.channels[900]["streams"] == [7301]
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_failed_staged_channel_is_removed_after_its_event(
+    db_session_factory,
+    monkeypatch,
+):
+    from services import event_sync_stream_health
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+
+    async def guide_missing(executor):
+        if executor._event_pending:
+            state.guide_programmes.clear()
+        return await finish(executor)
+
+    def run():
+        observed_at = current[0].astimezone(timezone.utc).isoformat()
+        health[7301] = {
+            "stream_name": setup["event_name"],
+            "probe_status": "success",
+            "measured_bitrate": 5_000_000,
+            "last_probed": observed_at,
+            "is_black_screen": False,
+            "black_screen_checked_at": observed_at,
+        }
+        return dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=guide_missing,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        run()
+        receipt = next(iter(_read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )["state"]["delivery"]["pending_channels"].values()))
+        assert (receipt["stage"], receipt["reason"]) == ("failed", "programme_missing")
+        assert state.channels[900]["streams"] == []
+        assert state.deleted_channel_ids == []
+
+        current[0] = datetime.fromisoformat(receipt["stop"]) + timedelta(minutes=1)
+        run()
+
+    assert state.deleted_channel_ids == [900]
+    assert 900 not in state.channels
+    assert client.create_channel.await_count == 1
 
 
 @pytest.mark.parametrize("guard", [
@@ -6865,10 +7080,10 @@ class TestDedicatedDelivery:
         ("test_fresh_receipt_cannot_use_the_expired_writer", ()),
         ("test_receipt_guard_keeps_live_and_expired_authority_separate", ()),
         *[("test_expired_writer_cannot_close_a_mismatched_owner", (value,)) for value in [
-            "revision", "xmltv_hash", "config_hash", "guide_attempt", "receipt_attempt",
+            "config_hash", "guide_attempt", "receipt_attempt",
             "profile_disabled", "profile_changed", "rule_disabled", "rule_changed",
             "managed_channel", "channel_group", "channel_uuid", "missing_channel",
-            "missing_channel_with_evidence", "replacement",
+            "missing_channel_with_evidence",
         ]],
         *[("test_completion_rejects_removed_current_rule_ownership", (expired, missing, foreign))
           for expired in (False, True) for missing in (False, True) for foreign in (False, True)],

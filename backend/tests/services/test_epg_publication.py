@@ -950,7 +950,7 @@ def test_delivery_attempt_reuses_expiry_and_bounds_successor_history():
     ) is None
 
 
-@pytest.mark.parametrize("reason", ["health_failed", "health_unknown"])
+@pytest.mark.parametrize("reason", ["health_failed", "health_unknown", "programme_missing"])
 def test_health_recovery_keeps_latest_attempts(reason):
     publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
     current = read_publication("profile:1")
@@ -1169,7 +1169,7 @@ def test_health_recovery_outlives_failed_attempt():
     assert read_publication("profile:2") == ended_failure
 
 
-@pytest.mark.parametrize("reason", ["guide_failed", "programme_missing"])
+@pytest.mark.parametrize("reason", ["guide_failed"])
 def test_health_recovery_keeps_nonhealth_limits(reason):
     publish_profiles([profile()], channel_map(1), coverage(1), observations={}, now=NOW)
     current = read_publication("profile:1")

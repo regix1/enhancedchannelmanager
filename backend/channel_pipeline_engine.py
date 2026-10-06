@@ -5547,13 +5547,14 @@ class ChannelPipelineEngine:
                     expected = executor._event_publications.get(profile_id)
                     current = read_publication(f"profile:{profile_id}")
                     if expected is not None:
+                        # Bookkeeping writes during the run move the revision;
+                        # only a new guide attempt or profile config replaces it.
                         if (
                             current is None
-                            or current["revision"] != expected["revision"]
-                            or current["state"]["xmltv_hash"]
-                            != expected["state"]["xmltv_hash"]
                             or current["state"]["config_hash"]
                             != expected["state"]["config_hash"]
+                            or (current["state"]["delivery"].get("guide_attempt") or {}).get("attempt_id")
+                            != expected["state"]["delivery"]["guide_attempt"]["attempt_id"]
                         ):
                             admitted = None
                         else:
