@@ -756,18 +756,11 @@ class ChannelPipelineEngine:
         linked_ids: set[int] = set()
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         try:
-            # The engine's own paginated fetch. self._existing_channels is read
-            # at run start, so the channels this run just created are missing
-            # from it — exactly the ones that need a link. [8]
-            all_channels = []
-            page = 1
-            while True:
-                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
-                channels = result.get("results", [])
-                all_channels.extend(channels)
-                if len(all_channels) >= result.get("count", 0) or not channels:
-                    break
-                page += 1
+            # The engine's own fetch. self._existing_channels is read at run
+            # start, so the channels this run just created are missing from
+            # it — exactly the ones that need a link. [8]
+            result = await self.client.get_channels(page=None, page_size=None, visibility_filter="all")
+            all_channels = result if isinstance(result, list) else result.get("results", [])
 
             unlinked =[c for c in all_channels if c.get("epg_data_id") is None]
             unlinked_ids = {c["id"] for c in unlinked}
@@ -1379,45 +1372,31 @@ class ChannelPipelineEngine:
         """Load existing channels and groups from Dispatcharr."""
         self._channels_complete = False
         try:
-            # get_channels() returns paginated dict {"count": N, "results": [...]}
-            # Fetch all pages
-            all_channels = []
-            page = 1
-            total = None
-            complete = True
+            # Event channels wait hidden between events, and Dispatcharr lists
+            # only visible channels unless asked for all of them. One unpaged
+            # read, because page order is not stable across hidden channels
+            # that share an empty channel number.
+            result = await self.client.get_channels(
+                page=None, page_size=None, visibility_filter="all",
+                **({"channel_group": channel_group_id} if channel_group_id is not None else {}),
+            )
+            if isinstance(result, list):
+                all_channels, total, complete = result, len(result), True
+            else:
+                all_channels = result.get("results", [])
+                total = result.get("count")
+                complete = (
+                    type(total) is int and total >= 0 and isinstance(all_channels, list)
+                    and not result.get("next")
+                )
             seen = set()
-            while True:
-                # Event channels wait hidden between events, and Dispatcharr
-                # lists only visible channels unless asked for all of them.
-                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all", **(
-                    {"channel_group": channel_group_id} if channel_group_id is not None else {}
-                ))
-                channels = result.get("results", [])
-                count = result.get("count")
-                if (type(count) is not int or count < 0 or not isinstance(channels, list)
-                        or result.get("next") is not None and not isinstance(result["next"], str)):
+            for channel in all_channels:
+                channel_id = channel.get("id") if isinstance(channel, dict) else None
+                if type(channel_id) is not int or channel_id < 1 or channel_id in seen:
                     complete = False
-                if total is None:
-                    total = count
-                elif count != total:
+                if channel_group_id is not None and channel.get("channel_group_id") != channel_group_id:
                     complete = False
-                for channel in channels:
-                    channel_id = channel.get("id") if isinstance(channel, dict) else None
-                    if type(channel_id) is not int or channel_id < 1 or channel_id in seen:
-                        complete = False
-                    if channel_group_id is not None and channel.get("channel_group_id") != channel_group_id:
-                        complete = False
-                    seen.add(channel_id)
-                all_channels.extend(channels)
-                if type(count) is int and (
-                    len(all_channels) > count
-                    or not channels and len(all_channels) < count
-                    or bool(result.get("next")) != (len(all_channels) < count)
-                ):
-                    complete = False
-                if len(all_channels) >= result.get("count", 0) or not channels:
-                    break
-                page += 1
+                seen.add(channel_id)
             self._existing_channels = all_channels
 
             # get_channel_groups() returns a flat list
@@ -2445,16 +2424,9 @@ class ChannelPipelineEngine:
         self, rule_ids: list[int] | None, execution_id: int,
     ) -> ActionExecutor:
         """Build the live event executor from current commit-scoped inputs."""
-        channels = []
-        page = 1
-        while True:
-            response = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
-            batch = response.get("results", [])
-            channels.extend(batch)
-            if len(channels) >= response.get("count", 0) or not batch:
-                break
-            page += 1
-        groups = await self.client.get_channel_groups() or []
+        response = await self.client.get_channels(page=None, page_size=None, visibility_filter="all")
+        channels = response if isinstance(response, list) else response.get("results", [])
+        groups =await self.client.get_channel_groups() or []
         self._existing_channels = channels
         self._existing_groups = groups
 

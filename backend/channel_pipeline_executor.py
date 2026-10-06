@@ -4294,15 +4294,8 @@ class ActionExecutor:
             group_name = group.get("name", f"ID:{group_id}")
 
             # Fetch current channels in the group
-            all_channels = []
-            page = 1
-            while True:
-                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
-                channels = result.get("results", [])
-                all_channels.extend(channels)
-                if len(all_channels) >= result.get("count", 0) or not channels:
-                    break
-                page += 1
+            result = await self.client.get_channels(page=None, page_size=None, visibility_filter="all")
+            all_channels = result if isinstance(result, list) else result.get("results", [])
 
             channels_in_group =[c for c in all_channels if c.get("channel_group") == group_id]
 

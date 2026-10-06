@@ -171,7 +171,7 @@ class TestChannelPipelineEngineLoadData:
 
         assert len(self.engine._existing_channels) == 2
         assert len(self.engine._existing_groups) == 2
-        self.client.get_channels.assert_called_once_with(page=1, page_size=100, visibility_filter="all")
+        self.client.get_channels.assert_called_once_with(page=None, page_size=None, visibility_filter="all")
         self.client.get_channel_groups.assert_called_once()
 
     def test_load_existing_data_api_failure(self):
@@ -6373,7 +6373,10 @@ class TestCompleteChannelInventory:
 
         async def get_channels(page=1, page_size=100, visibility_filter=None, **_kwargs):
             rows = [visible, hidden] if visibility_filter == "all" else [visible]
-            return {"count": len(rows), "next": None, "results": [dict(row) for row in rows]}
+            if page is None:
+                return [dict(row) for row in rows]
+            # Paged reads repeat rows when hidden channels share an empty number.
+            return {"count": len(rows), "next": None, "results": [dict(rows[0]) for _ in rows]}
 
         client = MagicMock()
         client.get_channels = AsyncMock(side_effect=get_channels)

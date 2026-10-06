@@ -860,7 +860,7 @@ async def test_probe_route_persists_results_and_replays_fresh_exact_write(
     foreign_stream = deepcopy(streams[105])
 
     async def get_channels(page=1, page_size=100, **_kwargs):
-        assert page == 1
+        assert page in (None, 1)
         return {
             "count": len(channels),
             "results": deepcopy(list(channels.values())),
