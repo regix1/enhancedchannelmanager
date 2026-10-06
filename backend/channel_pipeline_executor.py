@@ -6985,7 +6985,7 @@ class ActionExecutor:
                 advance=not exec_ctx.dry_run,
             )
             from services.epg_publication import (
-                HEALTH_REASONS,
+                RECOVERABLE_REASONS,
                 TERMINAL_PENDING_STAGES,
                 read_publication,
             )
@@ -7014,7 +7014,9 @@ class ActionExecutor:
                 if (
                     receipt is None
                     or receipt["stage"] != "failed"
-                    or receipt["reason"] not in HEALTH_REASONS
+                    # A staged channel has no streams to prove its event is on,
+                    # so this is the only way a failed attempt is tried again.
+                    or receipt["reason"] not in RECOVERABLE_REASONS
                     or receipt["event_key"] != event_key
                     or receipt["rule_id"] != rule_id
                     or receipt["profile_id"] != profile_id

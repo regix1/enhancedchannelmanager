@@ -5993,8 +5993,107 @@ def test_staged_event_recovers_after_health_failures(
     assert all(result["channels_created"] == 0 for result in negative_results)
 
 
+def test_staged_event_retries_after_its_guide_was_missing(
+    db_session_factory,
+    monkeypatch,
+):
+    from services import event_sync_stream_health
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=True)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    finish = ActionExecutor._finish_event_promotions
+    withheld = []
+
+    def set_positive():
+        observed_at = current[0].astimezone(timezone.utc).isoformat()
+        health[7301] = {
+            "stream_name": setup["event_name"],
+            "probe_status": "success",
+            "measured_bitrate": 5_000_000,
+            "last_probed": observed_at,
+            "is_black_screen": False,
+            "black_screen_checked_at": observed_at,
+        }
+
+    async def guide_missing_once(executor):
+        if executor._event_pending and not withheld:
+            withheld.append(copy.deepcopy(state.guide_programmes))
+            state.guide_programmes.clear()
+        return await finish(executor)
+
+    def run():
+        set_positive()
+        return dummy_epg._manual_run(
+            client,
+            db_session_factory,
+            regenerate,
+            wait_refresh,
+        )
+
+    monkeypatch.setattr(
+        event_sync_stream_health,
+        "_probe_and_collect_failures",
+        AsyncMock(return_value=None),
+    )
+    with patch.object(
+        ActionExecutor,
+        "_finish_event_promotions",
+        new=guide_missing_once,
+    ), patch(
+        "services.event_sync_resolver.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "channel_pipeline_executor.datetime",
+        _clock(lambda: current[0]),
+    ), patch(
+        "services.event_sync_stream_health.datetime",
+        _clock(lambda: current[0]),
+    ):
+        first_result = run()
+        event_key, first_receipt = next(iter(_read_event_publication(
+            db_session_factory,
+            setup["profile_id"],
+        )["state"]["delivery"]["pending_channels"].items()))
+        assert (first_receipt["stage"], first_receipt["reason"]) == (
+            "failed", "programme_missing",
+        )
+        assert state.channels[900]["hidden_from_output"] is True
+        assert state.channels[900]["streams"] == []
+
+        state.guide_programmes[:] = withheld[0]
+        current[0] = datetime.fromisoformat(first_receipt["retry_at"]) + timedelta(seconds=1)
+        second_result = run()
+
+    completed = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"][event_key]
+    assert completed["attempt_no"] == 2
+    assert completed["stage"] == "complete"
+    assert completed["channel_id"] == first_receipt["channel_id"]
+    assert client.create_channel.await_count == 1
+    assert state.channels[900]["epg_data_id"] == 502
+    assert state.channels[900]["streams"] == [7301]
+    assert state.channels[900]["hidden_from_output"] is False
+    assert [first_result["channels_created"], second_result["channels_created"]] == [1, 0]
+
+
 @pytest.mark.parametrize("guard", [
-    "expired", "nonhealth_failed", "allocation_unknown", "missing_uuid",
+    "expired", "allocation_unknown", "missing_uuid",
     "foreign_uuid", "ownership", "changed_identity", "new_event",
     "missing_stream", "changed_stream", "changed_config", "changed_source",
     "reached_stop", "positive_idle",
@@ -6047,8 +6146,6 @@ def test_staged_health_recovery_keeps_retirement_guards(
         ))
         if guard == "expired":
             current[0] = datetime.fromisoformat(receipt["expires_at"])
-        elif guard == "nonhealth_failed":
-            state.guide_programmes.clear()
         else:
             observed_at = current[0].astimezone(timezone.utc).isoformat()
             health[7301] = {
@@ -6100,10 +6197,6 @@ def test_staged_health_recovery_keeps_retirement_guards(
     if guard == "expired":
         assert (receipt["stage"], receipt["reason"]) == (
             "expired", "guide_expired",
-        )
-    elif guard == "nonhealth_failed":
-        assert (receipt["stage"], receipt["reason"]) == (
-            "failed", "programme_missing",
         )
     elif guard == "allocation_unknown":
         assert (receipt["stage"], receipt["reason"]) == (
