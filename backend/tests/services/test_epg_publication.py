@@ -720,6 +720,52 @@ def test_stale_publication_candidate_rolls_back_every_candidate(monkeypatch):
     assert read_publication("all") == aggregate_before
 
 
+def test_slow_run_publishes_profiles_whose_guides_did_not_change():
+    publish_profiles(
+        [profile(1), profile(2)], channel_map(1, 2), coverage(1, 2), observations={}, now=NOW,
+    )
+    expected = {}
+    for profile_id in (1, 2):
+        current = read_publication(f"profile:{profile_id}")
+        admitted = begin_delivery(
+            f"profile:{profile_id}", expected_revision=current["revision"],
+            expected_hash=current["state"]["xmltv_hash"], profile=profile(profile_id), now=NOW,
+        )
+        expected[f"profile:{profile_id}"] = {
+            "revision": admitted["revision"],
+            "xmltv_hash": admitted["state"]["xmltv_hash"],
+            "config_hash": admitted["state"]["config_hash"],
+            "attempt_id": admitted["state"]["delivery"]["guide_attempt"]["attempt_id"],
+        }
+    # While the slow run works, profile 1 only gets delivery bookkeeping and
+    # profile 2 gets a newer guide from another run.
+    current = read_publication("profile:1")
+    assert update_delivery(
+        "profile:1", expected_revision=current["revision"], pending_emby=False,
+    ) == current["revision"] + 1
+    newer = channel_map(1, 2)
+    newer[2]["name"] = "Hawks vs Bears 6:30 PM"
+    mixed = coverage(2)
+    mixed["profiles"].update(coverage(1, ready=False)["profiles"])
+    publish_profiles([profile(1), profile(2)], newer, mixed, observations={}, now=NOW)
+    newer_two = read_publication("profile:2")["state"]["xmltv_hash"]
+    assert newer_two != expected["profile:2"]["xmltv_hash"]
+
+    final = channel_map(1, 2)
+    final[1]["name"] = "Falcons vs Wolves 5:45 PM"
+    result = publish_profiles(
+        [profile(1), profile(2)], final, coverage(1, 2), observations={},
+        now=NOW + timedelta(minutes=30), expected=expected,
+    )
+
+    assert result.superseded is False
+    assert result.published_profile_ids == (1,)
+    assert 2 in result.retained_profile_ids
+    assert "GUIDE_PUBLICATION_SUPERSEDED" in result.reason_codes
+    assert read_publication("profile:1")["state"]["xmltv_hash"] != expected["profile:1"]["xmltv_hash"]
+    assert read_publication("profile:2")["state"]["xmltv_hash"] == newer_two
+
+
 def test_profile_capacity_failure_retains_the_last_complete_documents(monkeypatch):
     from services import epg_publication
 

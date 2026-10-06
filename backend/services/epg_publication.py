@@ -1023,23 +1023,24 @@ def publish_profiles(
     finally:
         session.close()
 
+    superseded_scopes = set()
     for scope, claim in normalized_expected.items():
         current = prior.get(scope)
         attempt = (
             current["state"]["delivery"].get("guide_attempt")
             if current is not None else None
         )
+        # Delivery bookkeeping raises the revision without changing the guide,
+        # and the write below is still guarded by the revision read here. Only
+        # a newer guide, config or attempt makes this run's profile stale, and
+        # only that profile: a slow run must not lose every other profile.
         if (
             current is None
-            or current["revision"] != claim["revision"]
             or current["state"]["xmltv_hash"] != claim["xmltv_hash"]
             or current["state"]["config_hash"] != claim["config_hash"]
             or (attempt or {}).get("attempt_id") != claim["attempt_id"]
         ):
-            return _result(
-                set(), set(), set(), {}, {}, superseded=True,
-                reasons={"GUIDE_PUBLICATION_SUPERSEDED"},
-            )
+            superseded_scopes.add(scope)
 
     candidates = {}
     published, retained, unavailable = set(), set(), set()
@@ -1049,6 +1050,9 @@ def publish_profiles(
         scope = _scope(profile_id)
         readiness = profile_coverage.get(str(profile_id), profile_coverage.get(profile_id))
         ready = isinstance(readiness, Mapping) and readiness.get("can_publish") is True
+        if scope in superseded_scopes:
+            ready = False
+            reasons.add("GUIDE_PUBLICATION_SUPERSEDED")
         if isinstance(readiness, Mapping) and any(
             source.get("status") == "retained"
             for source in readiness.get("sources", ())
@@ -1185,17 +1189,6 @@ def publish_profiles(
 
     session = get_session()
     try:
-        for scope, claim in normalized_expected.items():
-            current_revision = session.query(GuidePublication.revision).filter(
-                GuidePublication.scope == scope
-            ).scalar()
-            if current_revision != claim["revision"]:
-                session.rollback()
-                return _result(
-                    set(), retained | published, unavailable, documents, states,
-                    superseded=True,
-                    reasons=reasons | {"GUIDE_PUBLICATION_SUPERSEDED"},
-                )
         for scope, candidate in sorted(candidates.items()):
             values = {
                 "xmltv": candidate["xmltv"],
