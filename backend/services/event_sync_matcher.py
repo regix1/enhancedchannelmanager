@@ -332,6 +332,12 @@ _EXPLICIT_START_PATTERN = {
     ),
 }
 
+# The provider that writes start:/stop: stamps writes them in UK time. Its
+# MLB listings sit exactly five hours after Peacock's Eastern listings for the
+# same games, so reading them as Eastern opened each event five hours late,
+# after the game had ended.
+_START_STAMP_TIMEZONE = "Europe/London"
+
 DEFAULT_EVENT_PATTERNS: tuple[dict, ...] = (
     {
         "name": "slot-title-day-first-date",
@@ -755,7 +761,14 @@ def parse_event_name(
             _log_parsed_event(parsed)
         return parsed
 
-    start = _build_start(complete_groups, tz, event_timezone, now)
+    if re.search(_EXPLICIT_START_PATTERN["date_pattern"], name):
+        # Operator patterns read the same stamp, so the stamp decides the zone.
+        start = _build_start(
+            complete_groups, pytz.timezone(_START_STAMP_TIMEZONE), _START_STAMP_TIMEZONE, now,
+        )
+        start = start.astimezone(tz) if start is not None else None
+    else:
+        start = _build_start(complete_groups, tz, event_timezone, now)
     title = _cap_title(complete_groups.get("title"))
     parsed = ParsedEvent(
         raw_name=name,

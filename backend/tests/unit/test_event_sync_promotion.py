@@ -5518,7 +5518,8 @@ async def test_lifecycle_uses_scoped_iso_patterns(retirement, shape, with_witnes
     setup = retirement
     now = setup["now"]
     start = now - timedelta(minutes=30)
-    local = start.astimezone(EASTERN)
+    # The provider writes start: stamps in UK time; the ESPN+ shape is Eastern.
+    local = start.astimezone(EASTERN if shape == "espn" else pytz.timezone("Europe/London"))
     seconds = "00" if case == "seconds_zero" else "37"
     stamp = local.strftime("%Y-%m-%d %H:%M:") + seconds
     if shape == "espn":

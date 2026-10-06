@@ -51,6 +51,7 @@ from services.event_sync_matcher import (
     parse_event_name,
     score_pair,
 )
+from services.event_sync_promote import promoted_channel_name
 
 _ET = pytz.timezone(DEFAULT_EVENT_TIMEZONE)
 
@@ -278,19 +279,19 @@ class TestParseEventName:
                 "MLB 15 : Padres x Giants start:2026-09-14 00:20:00 "
                 "stop:2026-09-14 07:33:20",
                 "Padres x Giants",
-                _et(2026, 9, 14, 0, 20),
+                _et(2026, 9, 13, 19, 20),
             ),
             (
                 "UFC 04 : NOCHE UFC: POST FIGHT PRESS CONFERENCE "
                 "start:2026 09 13 02:10:00 stop:2026 09 13 03:15:00",
                 "NOCHE UFC: POST FIGHT PRESS CONFERENCE",
-                _et(2026, 9, 13, 2, 10),
+                _et(2026, 9, 12, 21, 10),
             ),
             (
                 "MLB 04 | Orioles x Blue Jays start:2026-09-12 20:07:00 "
                 "stop:2026-09-13 03:20:20",
                 "Orioles x Blue Jays",
-                _et(2026, 9, 12, 20, 7),
+                _et(2026, 9, 12, 15, 7),
             ),
         ],
     )
@@ -317,7 +318,26 @@ class TestParseEventName:
             now=_NOW,
         )
         assert parsed.title == "Royals x Red Sox"
-        assert parsed.start == _et(2026, 9, 13, 20, 5)
+        assert parsed.start == _et(2026, 9, 13, 15, 5)
+
+    def test_operator_pattern_reading_a_start_stamp_uses_uk_time(self):
+        pattern = {
+            "name": "mlb-iso-date",
+            "title_pattern": (
+                r"^MLB\s+\d+\s*\|\s*(?P<title>.+?)\s+start:(?P<year>\d{4})-"
+                r"(?P<month>\d{2})-(?P<day>\d{2})\s+(?P<hour>\d{2}):"
+                r"(?P<minute>\d{2}):[0-5]\d\s+stop:.*$"
+            ),
+        }
+        parsed = parse_event_name(
+            "MLB 02 | Yankees x Rays start:2026-10-06 01:00:00 "
+            "stop:2026-10-06 08:13:20",
+            [pattern],
+            now=_NOW,
+        )
+        assert parsed.matched_pattern == "mlb-iso-date"
+        assert parsed.start == _et(2026, 10, 5, 20, 0)
+        assert promoted_channel_name(parsed) == "Yankees X Rays @ Oct 05 08:00 PM"
 
     def test_invalid_explicit_start_date_is_never_guessed(self):
         parsed = parse_event_name(
