@@ -418,7 +418,7 @@ ENDPOINTS: dict[str, Endpoint] = {
             "id", "status", "mode", "streams_evaluated", "streams_matched",
             "channels_created", "channels_updated", "groups_created",
             "streams_skipped", "duration_seconds", "error_message",
-            "dry_run_results",
+            "dry_run_results", "execution_log",
         }),
     ),
     "ac_rollback": Endpoint(

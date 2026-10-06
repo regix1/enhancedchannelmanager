@@ -1401,6 +1401,46 @@ def register(mcp: FastMCP):
             return f"Error getting pipeline execution: {e}"
 
     @mcp.tool()
+    async def get_channel_pipeline_run_failures(execution_id: int, limit: int = 50) -> str:
+        """List the failed actions of one pipeline run with their error text.
+
+        The run summary only counts failures; this reads the run's stored log, which
+        also holds the Pass 5 guide refresh and guide-link retry errors.
+
+        Args:
+            execution_id: Execution ID from list_channel_pipeline_executions.
+            limit: Maximum failures to return; failure_count reports the full total.
+        """
+        try:
+            client = get_ecm_client()
+            run = await client.call_endpoint(
+                ENDPOINTS["ac_get_execution"],
+                path_args={"execution_id": execution_id},
+                query={"include_log": "true"},
+            )
+            failures = [
+                {
+                    "step": entry.get("stream_name"),
+                    "type": action.get("type"),
+                    "description": action.get("description"),
+                    "error": action.get("error"),
+                }
+                for entry in run.get("execution_log") or []
+                for action in entry.get("actions_executed") or []
+                if action.get("success") is False
+            ]
+            return json.dumps({
+                "execution_id": execution_id,
+                "status": run.get("status"),
+                "error_message": run.get("error_message"),
+                "failure_count": len(failures),
+                "failures": failures[:limit],
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[MCP] get_channel_pipeline_run_failures failed: %s", e)
+            return f"Error reading pipeline run failures: {e}"
+
+    @mcp.tool()
     async def list_channel_pipeline_executions(limit: int = 10) -> str:
         """List recent auto-creation pipeline executions.
 
