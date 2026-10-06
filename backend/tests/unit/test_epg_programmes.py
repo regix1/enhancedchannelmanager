@@ -2994,7 +2994,7 @@ async def test_incomplete_source_retries_once_with_fresh_selection(monkeypatch, 
     assert PARSER_KEYS.isdisjoint(entry["diagnostics"])
     assert [item.findtext("title") for item in entry["rows"]["ESPN.us"]] == ["SportsCenter"]
     assert len(opened) == 2 and all(item.closed for item in opened)
-    assert list(tmp_path.iterdir()) == []
+    assert [item for item in tmp_path.iterdir() if item.name != "guide_scans"] == []
 
 
 @pytest.mark.asyncio
@@ -3209,7 +3209,8 @@ async def test_source_without_expiry_keeps_transport_limits_and_cleanup(monkeypa
     assert bool(entry.get("error")) is idle
     assert bool(entry.get("success")) is not idle
     assert entry["diagnostics"]["attempts"] == 1
-    assert len(closed) == 1 and closed[0].closed and list(tmp_path.iterdir()) == []
+    assert len(closed) == 1 and closed[0].closed
+    assert [item for item in tmp_path.iterdir() if item.name != "guide_scans"] == []
 
 
 @pytest.mark.asyncio
@@ -4122,3 +4123,86 @@ async def test_disabled_window_keeps_far_event(monkeypatch):
     rows, result = guides._compose(query, [source()], {50: loaded}, START, STOP, NOW)
     assert [ET.tostring(row) for row in rows] == [ET.tostring(far_event)]
     assert result["source_tvg_id"] == "far-date.v"
+
+
+def _saved_scan_entry(success):
+    start = success - timedelta(hours=1)
+    return {
+        "headers": {"espn.us": ET.fromstring('<channel id="espn.us"><display-name>ESPN</display-name></channel>')},
+        "rows": {"espn.us": [ET.fromstring(
+            '<programme channel="espn.us" start="20261006150000 +0000" stop="20261006170000 +0000">'
+            '<title>Golics</title></programme>'
+        )]},
+        "ended": {"a" * 64: ("espn.us", start, success, ET.fromstring(
+            '<programme channel="espn.us" start="20261006130000 +0000" stop="20261006150000 +0000">'
+            '<title>Earlier</title></programme>'
+        ))},
+        "warnings": ["invalid_schedule"],
+        "size": 512,
+        "channel_warnings": {"a" * 64: ["ambiguous_event"]},
+        "diagnostics": {"download_ms": 10},
+        "success": success,
+        "checked": time.monotonic(),
+        "error": None,
+        "selection": {"queries": frozenset({"a" * 64, "b" * 64}), "start": start, "stop": success + timedelta(days=1)},
+        "demand": {"a" * 64: {"query": {}}},
+    }
+
+
+def test_saved_guide_scan_restores_the_same_schedules(tmp_path):
+    success = datetime.now(timezone.utc) - timedelta(minutes=10)
+    entry = _saved_scan_entry(success)
+    with patch("config.CONFIG_DIR", tmp_path):
+        guides._save_scan("c" * 64, entry)
+        restored = guides._restore_scans()
+
+    scan = restored["c" * 64]
+    assert {key: ET.tostring(value) for key, value in scan["headers"].items()} == {
+        key: ET.tostring(value) for key, value in entry["headers"].items()
+    }
+    assert [ET.tostring(row) for row in scan["rows"]["espn.us"]] == [ET.tostring(row) for row in entry["rows"]["espn.us"]]
+    tvg_id, begin, end, element = scan["ended"]["a" * 64]
+    assert (tvg_id, begin, end, ET.tostring(element)) == (
+        "espn.us", entry["ended"]["a" * 64][1], success, ET.tostring(entry["ended"]["a" * 64][3]),
+    )
+    assert scan["selection"] == entry["selection"]
+    assert (scan["success"], scan["warnings"], scan["size"], scan["channel_warnings"]) == (
+        success, ["invalid_schedule"], 512, {"a" * 64: ["ambiguous_event"]},
+    )
+    assert scan["demand"] == {} and scan["error"] is None
+    assert 590 <= time.monotonic() - scan["checked"] <= 610
+
+
+def test_saved_guide_scan_past_its_freshness_limit_is_scanned_again(tmp_path):
+    with patch("config.CONFIG_DIR", tmp_path):
+        guides._save_scan("c" * 64, _saved_scan_entry(
+            datetime.now(timezone.utc) - timedelta(seconds=guides.SOURCE_MAX_AGE + 60),
+        ))
+        guides._save_scan("d" * 64, _saved_scan_entry(datetime.now(timezone.utc) - timedelta(minutes=1)))
+        (tmp_path / "guide_scans" / f"{'e' * 64}.json").write_text("{not json", encoding="utf-8")
+        restored = guides._restore_scans()
+
+    assert set(restored) == {"d" * 64}
+
+
+@pytest.mark.asyncio
+async def test_restart_reuses_the_saved_scan_without_downloading_again(monkeypatch, tmp_path):
+    monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+    install_feed(monkeypatch, feed(programme()))
+    _, before = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+    assert before["sources"][0]["status"] == "ready"
+
+    guides._SOURCE_CACHE.clear()
+    downloads = []
+
+    async def counted(selected, **_):
+        downloads.append(selected["id"])
+        yield feed(programme())
+
+    monkeypatch.setattr(guides, "stream_xmltv", counted)
+    await guides.restore_saved_scans()
+    _, after = await guides.prepare_profiles([profile()], {1: channel()}, client(), now=NOW, wait_for_sources=True)
+
+    assert downloads == []
+    assert after["sources"][0]["status"] == "ready"
+    assert after["channels"] == before["channels"]

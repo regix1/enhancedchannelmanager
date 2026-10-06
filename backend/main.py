@@ -1708,6 +1708,11 @@ async def startup_event():
         from tasks.dbas_sync import register_sync_target_tasks
         register_sync_target_tasks()
 
+        # Saved guide scans must be in place before the first scheduled guide
+        # task, or the restart rescans every source anyway.
+        from services.epg_programmes import restore_saved_scans
+        await restore_saved_scans()
+
         # Start the task engine
         from task_engine import start_engine, get_engine
         await start_engine()

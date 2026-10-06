@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -26,6 +27,8 @@ from services.event_sync_matcher import (
     BAND_ATTACH, ParsedEvent, _score_parsed_pair,
     _split_teams, build_team_alias_index, normalize_alias_term, parse_event_name,
 )
+
+logger = logging.getLogger(__name__)
 
 SOURCE_TTL = 900
 SOURCE_RETRY = 60
@@ -843,6 +846,99 @@ def _error_reason(exc: Exception) -> str:
     return reason
 
 
+def _scan_folder():
+    from config import CONFIG_DIR
+
+    return CONFIG_DIR / "guide_scans"
+
+
+def _save_scan(key: str, entry: dict) -> None:
+    """Keep a finished scan on the config volume so a restart can reuse it.
+
+    A scan that read correctly stays correct whether or not it could be saved,
+    so no failure here may reach the caller.
+    """
+    try:
+        _write_scan(key, entry)
+    except Exception as exc:
+        logger.warning("[EPG-PROGRAMMES] Could not save guide scan %s: %s", key, exc)
+
+
+def _write_scan(key: str, entry: dict) -> None:
+    record = {
+        "success": entry["success"].isoformat(),
+        "selection": {
+            "queries": sorted(entry["selection"]["queries"]),
+            "start": entry["selection"]["start"].isoformat(),
+            "stop": entry["selection"]["stop"].isoformat(),
+        },
+        "headers": {tvg_id: ET.tostring(element, encoding="unicode") for tvg_id, element in entry["headers"].items()},
+        "rows": {
+            tvg_id: [ET.tostring(element, encoding="unicode") for element in elements]
+            for tvg_id, elements in entry["rows"].items()
+        },
+        "ended": {
+            identity: [tvg_id, begin.isoformat(), end.isoformat(), ET.tostring(element, encoding="unicode")]
+            for identity, (tvg_id, begin, end, element) in entry["ended"].items()
+        },
+        "warnings": entry["warnings"],
+        "size": entry["size"],
+        "channel_warnings": entry["channel_warnings"],
+    }
+    folder = _scan_folder()
+    folder.mkdir(exist_ok=True)
+    temporary = folder / f"{key}.tmp"
+    temporary.write_text(json.dumps(record), encoding="utf-8")
+    temporary.replace(folder / f"{key}.json")
+
+
+def _restore_scans() -> dict:
+    """Read saved scans young enough to use, so a restart skips the first full rescan."""
+    folder = _scan_folder()
+    now = datetime.now(timezone.utc)
+    restored = {}
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else ():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            success = datetime.fromisoformat(record["success"])
+            age = (now - success).total_seconds()
+            if not 0 <= age <= SOURCE_MAX_AGE:
+                continue
+            restored[path.stem] = {
+                "headers": {tvg_id: ET.fromstring(text) for tvg_id, text in record["headers"].items()},
+                "rows": {
+                    tvg_id: [ET.fromstring(text) for text in texts]
+                    for tvg_id, texts in record["rows"].items()
+                },
+                "ended": {
+                    identity: (tvg_id, datetime.fromisoformat(begin), datetime.fromisoformat(end), ET.fromstring(text))
+                    for identity, (tvg_id, begin, end, text) in record["ended"].items()
+                },
+                "warnings": record["warnings"],
+                "size": record["size"],
+                "channel_warnings": record["channel_warnings"],
+                "diagnostics": {},
+                "success": success,
+                "checked": time.monotonic() - age,
+                "error": None,
+                "selection": {
+                    "queries": frozenset(record["selection"]["queries"]),
+                    "start": datetime.fromisoformat(record["selection"]["start"]),
+                    "stop": datetime.fromisoformat(record["selection"]["stop"]),
+                },
+                "demand": {},
+            }
+        except (OSError, ValueError, KeyError, TypeError, ET.ParseError) as exc:
+            logger.warning("[EPG-PROGRAMMES] Ignoring unreadable guide scan %s: %s", path.name, exc)
+    return restored
+
+
+async def restore_saved_scans() -> None:
+    """Load the scans saved before a restart, before any guide work starts."""
+    for key, entry in (await asyncio.to_thread(_restore_scans)).items():
+        _SOURCE_CACHE.setdefault(key, entry)
+
+
 async def _load_source(
     key: str,
     source: dict,
@@ -906,6 +1002,7 @@ async def _load_source(
         })
         if _SOURCE_LOADS.get(key) is owner:
             _SOURCE_CACHE[key] = loaded
+            await asyncio.to_thread(_save_scan, key, loaded)
     except asyncio.CancelledError as exc:
         diagnostics = getattr(exc, "diagnostics", diagnostics)
         if _SOURCE_LOADS.get(key) is owner:
