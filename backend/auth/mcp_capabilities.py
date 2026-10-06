@@ -196,6 +196,7 @@ _MCP_DECLARED_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ('POST', '/api/stream-stats/probe/{stream_id}'),
     ('POST', '/api/stream-stats/struck-out/remove'),
     ('POST', '/api/streams/by-ids'),
+    ('POST', '/api/stream-stats/by-ids'),
     ('POST', '/api/sync-targets'),
     ('POST', '/api/tags/groups'),
     ('POST', '/api/tags/groups/{group_id}/tags'),

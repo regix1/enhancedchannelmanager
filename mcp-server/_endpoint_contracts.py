@@ -1171,6 +1171,12 @@ ENDPOINTS: dict[str, Endpoint] = {
         path="/api/streams/by-ids",
         request_fields=frozenset({"stream_ids", "include_assignment"}),  # BulkStreamIdsRequest
     ),
+    "stream_stats_by_ids": Endpoint(
+        name="stream_stats_by_ids",
+        method="POST",
+        path="/api/stream-stats/by-ids",
+        request_fields=frozenset({"stream_ids"}),  # BulkStreamIdsRequest
+    ),
     "stream_stats_summary": Endpoint(
         name="stream_stats_summary",
         method="GET",

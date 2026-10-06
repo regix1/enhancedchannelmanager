@@ -945,6 +945,39 @@ def register(mcp: FastMCP):
             return f"Error fetching streams by IDs: {e}"
 
     @mcp.tool()
+    async def get_stream_probe_status(stream_ids: list[int]) -> str:
+        """Report each stream's stored test-play result: status, bitrate, black screen and when it was checked.
+
+        Event channels only attach a stream whose recent test-play passed, so this
+        shows why a matched stream was left off. Probe errors are omitted because
+        they can echo the provider URL.
+
+        Args:
+            stream_ids: Stream IDs to look up; streams never tested are listed as missing.
+        """
+        import json
+        fields = (
+            "stream_name", "probe_status", "last_probed", "measured_bitrate",
+            "is_black_screen", "black_screen_checked_at", "consecutive_failures",
+            "resolution",
+        )
+        try:
+            client = get_ecm_client()
+            stats = await client.call_endpoint(
+                ENDPOINTS["stream_stats_by_ids"], body={"stream_ids": stream_ids},
+            )
+            return json.dumps({
+                "streams": {
+                    str(stream_id): {field: row.get(field) for field in fields}
+                    for stream_id, row in stats.items()
+                },
+                "missing": [stream_id for stream_id in stream_ids if str(stream_id) not in stats],
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[MCP] get_stream_probe_status failed: %s", e)
+            return f"Error reading stream probe status: {e}"
+
+    @mcp.tool()
     async def probe_bulk_streams(stream_ids: list[int]) -> str:
         """Probe multiple streams at once and return a health results summary.
 
