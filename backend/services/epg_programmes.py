@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections.abc import Mapping
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -250,14 +251,18 @@ async def _fetch_all_channels(client=None) -> dict:
     return channel_map
 
 
+@lru_cache(maxsize=65536)
+def _programme_time(value: str) -> datetime:
+    # Guide files repeat a few thousand slot times across every channel, and
+    # strptime is slow enough that parsing each occurrence dominated scans.
+    if not re.fullmatch(r"\d{14}\s[+-]\d{4}", value):
+        raise ValueError("Programme timestamp must include an explicit UTC offset.")
+    return datetime.strptime(value, "%Y%m%d%H%M%S %z").astimezone(timezone.utc)
+
+
 def programme_times(programme: ET.Element) -> tuple[datetime, datetime]:
     """Require complete, timezone-aware source schedule timestamps."""
-    values = []
-    for field in ("start", "stop"):
-        value = programme.get(field, "").strip()
-        if not re.fullmatch(r"\d{14}\s[+-]\d{4}", value):
-            raise ValueError("Programme timestamp must include an explicit UTC offset.")
-        values.append(datetime.strptime(value, "%Y%m%d%H%M%S %z").astimezone(timezone.utc))
+    values = [_programme_time(programme.get(field, "").strip()) for field in ("start", "stop")]
     if values[1] <= values[0]:
         raise ValueError("Programme stop must follow its start.")
     return values[0], values[1]
