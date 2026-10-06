@@ -25,7 +25,8 @@ import shutil
 import time
 from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Query, Response
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from cache import get_cache
@@ -376,6 +377,74 @@ async def invalidate_cache(prefix: Optional[str] = None):
     else:
         count = cache.clear()
         return {"message": f"Cleared entire cache ({count} entries)"}
+
+
+_APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A thread whose innermost frame waits on a lock, a queue or the event loop's
+# selector is idle, as is a pool worker blocked on its work queue.
+_IDLE_FILES = ("threading.py", "queue.py", "selectors.py")
+
+
+class CpuProfileFrame(BaseModel):
+    frame: str
+    share_percent: float
+
+
+class CpuProfileResponse(BaseModel):
+    seconds: float
+    cpu_percent: float
+    samples: int
+    busy_thread_samples: int
+    top: list[CpuProfileFrame]
+
+
+def _sample_threads(seconds: int) -> CpuProfileResponse:
+    import sys
+    import threading
+    from collections import Counter
+
+    sampler = threading.get_ident()
+    counts: Counter[str] = Counter()
+    samples = busy = 0
+    started, cpu_started = time.monotonic(), time.process_time()
+    while time.monotonic() - started < seconds:
+        samples += 1
+        for ident, frame in sys._current_frames().items():
+            code = frame.f_code
+            if ident == sampler or code.co_filename.endswith(_IDLE_FILES) or (
+                code.co_name == "_worker" and code.co_filename.endswith("thread.py")
+            ):
+                continue
+            busy += 1
+            # Credit the deepest ECM frame, so time inside a library call is
+            # charged to the ECM line that made it.
+            label = f"{code.co_name} ({os.path.basename(code.co_filename)}:{frame.f_lineno})"
+            current = frame
+            while current is not None:
+                filename = current.f_code.co_filename
+                if filename.startswith(_APP_ROOT) and "site-packages" not in filename:
+                    label = f"{current.f_code.co_name} ({os.path.relpath(filename, _APP_ROOT)}:{current.f_lineno})"
+                    break
+                current = current.f_back
+            counts[label] += 1
+        time.sleep(0.02)
+    elapsed = time.monotonic() - started
+    return CpuProfileResponse(
+        seconds=round(elapsed, 2),
+        cpu_percent=round(100 * (time.process_time() - cpu_started) / elapsed, 1),
+        samples=samples,
+        busy_thread_samples=busy,
+        top=[
+            CpuProfileFrame(frame=label, share_percent=round(100 * count / busy, 1))
+            for label, count in counts.most_common(25)
+        ],
+    )
+
+
+@router.get("/api/health/cpu-profile", response_model=CpuProfileResponse)
+async def cpu_profile(seconds: int = Query(10, ge=1, le=20)) -> CpuProfileResponse:
+    """Sample every thread in this process and report where its CPU time goes."""
+    return await asyncio.to_thread(_sample_threads, seconds)
 
 
 @router.get("/api/cache/stats", tags=["Cache"])

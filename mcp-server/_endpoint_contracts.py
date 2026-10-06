@@ -656,6 +656,19 @@ ENDPOINTS: dict[str, Endpoint] = {
         path="/api/dummy-epg/profiles/{profile_id}/coverage",
         response_fields=frozenset({"generated_at", "window_start", "window_stop", "sources", "channels"}),
     ),
+    "dummy_epg_delivery": Endpoint(
+        name="dummy_epg_delivery",
+        method="GET",
+        path="/api/dummy-epg/delivery",
+        response_fields=frozenset({"dispatcharr_channel_count", "profiles"}),
+    ),
+    "health_cpu_profile": Endpoint(
+        name="health_cpu_profile",
+        method="GET",
+        path="/api/health/cpu-profile",
+        query_params=frozenset({"seconds"}),
+        response_fields=frozenset({"seconds", "cpu_percent", "samples", "busy_thread_samples", "top"}),
+    ),
     "dummy_epg_create_profile": Endpoint(
         name="dummy_epg_create_profile",
         method="POST",

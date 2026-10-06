@@ -113,6 +113,24 @@ def register(mcp: FastMCP):
             return f"Error getting settings: {e}"
 
     @mcp.tool()
+    async def get_cpu_profile(seconds: int = 10) -> str:
+        """Sample the ECM process for 1-20 seconds and report its CPU use and the busiest code lines.
+
+        Each busy thread sample is credited to the deepest ECM function on its
+        stack; idle threads waiting on queues, locks or the event loop are skipped.
+        """
+        import json
+        try:
+            client = get_ecm_client()
+            profile = await client.call_endpoint(
+                ENDPOINTS["health_cpu_profile"], query={"seconds": seconds},
+            )
+            return json.dumps(profile, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[MCP] get_cpu_profile failed: %s", e)
+            return f"Error sampling ECM CPU use: {e}"
+
+    @mcp.tool()
     async def create_backup() -> str:
         """Create and PERSIST a full backup of all ECM configuration (settings,
         database, logos) to the server.

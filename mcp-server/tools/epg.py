@@ -1077,6 +1077,24 @@ def register(mcp: FastMCP):
             return f"Could not inspect guide coverage for profile {profile_id}."
 
     @mcp.tool()
+    async def get_guide_delivery() -> str:
+        """Report each guide profile's delivery without building or refreshing anything.
+
+        Per profile: published state, delivery attempt stage, each Dispatcharr
+        import (started, done, current guide, link counts, links changed since
+        import), confirmed sources, pending channels, and guide channels that no
+        longer exist in Dispatcharr.
+        """
+        import json
+        try:
+            client = get_ecm_client()
+            delivery = await client.call_endpoint(ENDPOINTS["dummy_epg_delivery"])
+            return json.dumps(delivery, ensure_ascii=False)
+        except Exception:
+            logger.error("[MCP] Could not read guide delivery state")
+            return "Could not read guide delivery state."
+
+    @mcp.tool()
     async def create_dummy_epg_profile(
         name: str,
         enabled: bool = True,

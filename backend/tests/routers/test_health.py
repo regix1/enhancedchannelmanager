@@ -164,6 +164,41 @@ class TestCacheStats:
             assert data["entries"] == []
 
 
+class TestCpuProfile:
+    """Tests for GET /api/health/cpu-profile."""
+
+    @pytest.mark.asyncio
+    async def test_credits_a_busy_thread_to_its_ecm_function(self, async_client):
+        import threading
+
+        stop = threading.Event()
+
+        def spin_for_cpu_profile():
+            while not stop.is_set():
+                sum(range(1000))
+
+        worker = threading.Thread(target=spin_for_cpu_profile)
+        worker.start()
+        try:
+            response = await async_client.get("/api/health/cpu-profile", params={"seconds": 1})
+        finally:
+            stop.set()
+            worker.join()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["samples"] > 0
+        assert any(
+            row["frame"].startswith("spin_for_cpu_profile (tests/routers/test_health.py:")
+            for row in data["top"]
+        ), data["top"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_sample_longer_than_the_request_budget(self, async_client):
+        response = await async_client.get("/api/health/cpu-profile", params={"seconds": 21})
+        assert response.status_code == 422
+
+
 class TestCacheInvalidate:
     """Tests for POST /api/cache/invalidate endpoint."""
 

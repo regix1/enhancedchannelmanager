@@ -2686,6 +2686,89 @@ class TestProgrammeSources:
         assert response.status_code == 404
 
 
+class TestGuideDelivery:
+    """Tests for GET /api/dummy-epg/delivery."""
+
+    @staticmethod
+    def _record(profile):
+        record = _publication_record(profile.id, profile.to_dict(), channels=[
+            {"channel_id": channel_id, "xmltv_id": f"ecm-{channel_id}", "profile_id": profile.id, "events": []}
+            for channel_id in (10, 11, 12)
+        ])
+        document_hash = record["state"]["xmltv_hash"]
+        record["state"]["delivery"].update(
+            required_dispatcharr_hashes={"46": document_hash},
+            guide_attempt={"attempt_id": "a" * 32, "stage": "preparing", "admitted_at": "2026-10-06T02:00:00+00:00"},
+            source_refreshes={"profile:1:46": {
+                "source_id": 46, "triggered": True, "completed": False,
+                "expected_hash": document_hash, "attempt_id": "a" * 32,
+                "links": {"10": 900, "11": 901}, "pending_links": None,
+            }},
+            pending_channels={"arena:main": {"stage": "importing"}},
+        )
+        return record
+
+    @pytest.mark.asyncio
+    async def test_is_private(self, async_client):
+        with patch("main.get_auth_settings", return_value=_AuthOn()):
+            response = await async_client.get("/api/dummy-epg/delivery")
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_reports_imports_and_link_changes_against_dispatcharr(self, async_client, test_session):
+        live = _create_profile(test_session, name="Live Events")
+        _create_profile(test_session, name="Unpublished")
+        record = self._record(live)
+        client = MagicMock()
+        client.get_channels = AsyncMock(return_value=[
+            {"id": 10, "epg_data_id": 900},
+            {"id": 11, "epg_data_id": 905},
+        ])
+        with patch("routers.dummy_epg.get_client", return_value=client), patch(
+            "services.epg_publication.read_publication",
+            side_effect=lambda scope: record if scope == f"profile:{live.id}" else None,
+        ):
+            response = await async_client.get("/api/dummy-epg/delivery")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["dispatcharr_channel_count"] == 2
+        published, unpublished = body["profiles"]
+        assert published["name"] == "Live Events"
+        assert published["channel_count"] == 3
+        assert published["missing_channel_ids"] == [12]
+        assert published["attempt_stage"] == "preparing"
+        assert published["required_source_ids"] == [46]
+        assert published["confirmed_source_ids"] == []
+        assert published["pending_channels"] == {"arena:main": "importing"}
+        assert published["imports"] == [{
+            "source_id": 46, "triggered": True, "completed": False,
+            "current_guide": True, "current_attempt": True,
+            "link_count": 2, "pending_link_count": None, "links_changed": 1,
+        }]
+        assert unpublished["published"] is False
+        assert unpublished["imports"] == []
+        client.get_channels.assert_awaited_once_with(page=None, page_size=None, visibility_filter="all")
+
+    @pytest.mark.asyncio
+    async def test_reports_stored_state_when_dispatcharr_is_unreachable(self, async_client, test_session):
+        live = _create_profile(test_session, name="Live Events")
+        record = self._record(live)
+        client = MagicMock()
+        client.get_channels = AsyncMock(side_effect=RuntimeError("connection reset"))
+        with patch("routers.dummy_epg.get_client", return_value=client), patch(
+            "services.epg_publication.read_publication", return_value=record,
+        ):
+            response = await async_client.get("/api/dummy-epg/delivery")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["dispatcharr_channel_count"] is None
+        assert body["profiles"][0]["missing_channel_ids"] is None
+        assert body["profiles"][0]["imports"][0]["link_count"] == 2
+        assert body["profiles"][0]["imports"][0]["links_changed"] is None
+
+
 class TestXmltvCacheOutlivesRefreshInterval:
     @pytest.mark.asyncio
     async def test_combined_read_does_not_consult_process_cache(

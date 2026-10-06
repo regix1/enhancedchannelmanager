@@ -205,6 +205,40 @@ class BatchPreviewRequest(BaseModel):
     pattern_variants: Optional[list[PatternVariantModel]] = None
 
 
+class GuideImportState(BaseModel):
+    source_id: int
+    triggered: bool
+    completed: bool
+    current_guide: bool
+    current_attempt: bool
+    link_count: Optional[int]
+    pending_link_count: Optional[int]
+    links_changed: Optional[int]
+
+
+class ProfileDelivery(BaseModel):
+    profile_id: int
+    name: str
+    enabled: bool
+    published: bool
+    state_corrupt: bool = False
+    revision: Optional[int] = None
+    channel_count: int = 0
+    missing_channel_ids: Optional[list[int]] = None
+    attempt_stage: Optional[str] = None
+    attempt_admitted_at: Optional[str] = None
+    required_source_ids: list[int] = []
+    confirmed_source_ids: list[int] = []
+    pending_emby: Optional[bool] = None
+    pending_channels: dict[str, str] = {}
+    imports: list[GuideImportState] = []
+
+
+class GuideDeliveryResponse(BaseModel):
+    dispatcharr_channel_count: Optional[int]
+    profiles: list[ProfileDelivery]
+
+
 # =============================================================================
 # Profile CRUD
 # =============================================================================
@@ -607,6 +641,84 @@ async def get_profile(profile_id: int, db: Session = Depends(get_session)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+@router.get("/delivery", response_model=GuideDeliveryResponse)
+async def get_guide_delivery(db: Session = Depends(get_session)) -> GuideDeliveryResponse:
+    """Report each profile's stored guide delivery against Dispatcharr's current channels.
+
+    Reads stored state and one batch channel list; it builds and refreshes nothing.
+    """
+    from models import DummyEPGProfile
+    from services.epg_publication import read_publication
+
+    channels = None
+    try:
+        rows = await get_client().get_channels(page=None, page_size=None, visibility_filter="all")
+        channels = {row["id"]: row for row in (rows if isinstance(rows, list) else rows.get("results", []))}
+    except Exception as e:
+        logger.warning("[DUMMY-EPG] Delivery report could not read Dispatcharr channels: %s", e)
+
+    profiles = []
+    for profile in db.query(DummyEPGProfile).order_by(DummyEPGProfile.id).all():
+        identity = {"profile_id": profile.id, "name": profile.name, "enabled": profile.enabled}
+        try:
+            record = read_publication(f"profile:{profile.id}")
+        except ValueError:
+            profiles.append(ProfileDelivery(**identity, published=False, state_corrupt=True))
+            continue
+        if record is None:
+            profiles.append(ProfileDelivery(**identity, published=False))
+            continue
+        state = record["state"]
+        delivery = state["delivery"]
+        attempt = delivery.get("guide_attempt")
+        members = [member["channel_id"] for member in state["channels"]]
+        current_links = None if channels is None else {
+            str(channel_id): channels[channel_id]["epg_data_id"]
+            for channel_id in members
+            if channel_id in channels and channels[channel_id].get("epg_data_id") is not None
+        }
+        imports = []
+        for progress in delivery["source_refreshes"].values():
+            links = progress.get("links")
+            pending = progress.get("pending_links")
+            imports.append(GuideImportState(
+                source_id=progress["source_id"],
+                triggered=bool(progress.get("triggered")),
+                completed=bool(progress.get("completed")),
+                current_guide=progress.get("expected_hash") == state["xmltv_hash"],
+                current_attempt=attempt is not None and progress.get("attempt_id") == attempt["attempt_id"],
+                link_count=None if links is None else len(links),
+                pending_link_count=None if pending is None else len(pending),
+                links_changed=None if links is None or current_links is None else sum(
+                    links.get(key) != current_links.get(key)
+                    for key in links.keys() | current_links.keys()
+                ),
+            ))
+        profiles.append(ProfileDelivery(
+            **identity,
+            published=state.get("published") is True,
+            revision=record["revision"],
+            channel_count=len(members),
+            missing_channel_ids=None if channels is None else [
+                channel_id for channel_id in members if channel_id not in channels
+            ],
+            attempt_stage=attempt["stage"] if attempt else None,
+            attempt_admitted_at=attempt["admitted_at"] if attempt else None,
+            required_source_ids=sorted(int(source) for source in delivery["required_dispatcharr_hashes"]),
+            confirmed_source_ids=sorted(
+                int(source) for source, document_hash in delivery["confirmed_dispatcharr_hashes"].items()
+                if document_hash == state["xmltv_hash"]
+            ),
+            pending_emby=delivery.get("pending_emby"),
+            pending_channels={key: receipt["stage"] for key, receipt in delivery["pending_channels"].items()},
+            imports=imports,
+        ))
+    return GuideDeliveryResponse(
+        dispatcharr_channel_count=None if channels is None else len(channels),
+        profiles=profiles,
+    )
+
 
 @router.get("/profiles/{profile_id}/coverage")
 async def get_profile_coverage(profile_id: int, db: Session = Depends(get_session)):

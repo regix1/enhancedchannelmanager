@@ -486,6 +486,30 @@ class TestProgrammeSourceTools:
         assert "private-key" not in _text(result)
         assert "Could not inspect" in _text(result)
 
+    @pytest.mark.asyncio
+    async def test_guide_delivery_only_calls_read_endpoint(self):
+        import json
+        mcp = _mcp()
+        client = AsyncMock()
+        delivery = {"dispatcharr_channel_count": 2, "profiles": [{"profile_id": 1, "published": True}]}
+        client.call_endpoint.return_value = delivery
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("get_guide_delivery", {})
+        assert json.loads(_text(result)) == delivery
+        call = client.call_endpoint.call_args
+        assert call.args[0].name == "dummy_epg_delivery"
+        assert call.args[0].method == "GET"
+        assert call.kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_guide_delivery_errors_do_not_reveal_upstream_text(self):
+        mcp = _mcp()
+        client = AsyncMock()
+        client.call_endpoint.side_effect = RuntimeError("https://guide.example/private-key")
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await mcp.call_tool("get_guide_delivery", {})
+        assert _text(result) == "Could not read guide delivery state."
+
 class TestGenerateDummyEpg:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("status", "expected"), [
