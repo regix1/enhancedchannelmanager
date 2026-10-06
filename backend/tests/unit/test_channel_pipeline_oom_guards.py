@@ -233,6 +233,27 @@ class TestCrashSentinel:
             n = _abandon_orphaned_auto_creation_executions(session=test_session)
         assert n == 0
 
+    def test_stop_signal_records_the_marker_before_uvicorn_drains(self, tmp_path):
+        import signal
+
+        import main
+        from task_engine import CLEAN_SHUTDOWN_MARKER
+
+        received = []
+
+        def uvicorn_stop(signum, frame):
+            received.append(signum)
+
+        original = signal.signal(signal.SIGTERM, uvicorn_stop)
+        try:
+            main._record_shutdown_on_stop_signal()
+            with patch("config.CONFIG_DIR", tmp_path):
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        finally:
+            signal.signal(signal.SIGTERM, original)
+        assert (tmp_path / CLEAN_SHUTDOWN_MARKER).exists()
+        assert received == [signal.SIGTERM]
+
 
 class TestRunOnRefreshBreaker:
     """exo4j breaker/break-glass still trips/skips end-to-end through the new

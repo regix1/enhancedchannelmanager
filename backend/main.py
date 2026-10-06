@@ -9,6 +9,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 import os
 import logging
+import signal
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -1624,6 +1626,8 @@ async def startup_event():
         logger.info("[MAIN] HTTPS subprocess: skipping background services (task engine, prober, tracker)")
         return
 
+    _record_shutdown_on_stop_signal()
+
     # Start bandwidth tracker if configured
     if settings.is_configured():
         try:
@@ -1870,21 +1874,47 @@ async def startup_event():
     logger.info("=" * 60)
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up on shutdown."""
-    logger.info("[MAIN] Enhanced Channel Manager shutting down")
+def _record_clean_shutdown() -> None:
+    """Leave the marker the next boot reads to tell a deploy from a crash.
 
-    # Reaching this handler at all is the signal: SIGTERM ran it, an OOM kill
-    # could not have. The next boot reads this to tell a deploy apart from the
-    # crash the run-on-refresh breaker exists to catch. Written first so a later
-    # cleanup failure cannot lose it.
+    SIGTERM can run this and an OOM kill cannot, which is the difference the
+    run-on-refresh breaker relies on.
+    """
     try:
         from config import CONFIG_DIR
         from task_engine import CLEAN_SHUTDOWN_MARKER
         (CONFIG_DIR / CLEAN_SHUTDOWN_MARKER).touch()
     except Exception as e:
         logger.warning("[MAIN] Could not record the clean-shutdown marker: %s", e)
+
+
+def _record_shutdown_on_stop_signal() -> None:
+    """Record the orderly shutdown when SIGTERM arrives, then hand it to uvicorn.
+
+    uvicorn runs the shutdown handler only after open stream connections close,
+    and a deploy's stop timeout kills the process before that, so waiting for the
+    handler left every deploy looking like a crash.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        # Test clients run startup off the main thread, where handlers cannot be set.
+        return
+    uvicorn_stop = signal.getsignal(signal.SIGTERM)
+
+    def record_stop_signal(signum, frame):
+        _record_clean_shutdown()
+        if callable(uvicorn_stop):
+            uvicorn_stop(signum, frame)
+
+    signal.signal(signal.SIGTERM, record_stop_signal)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown."""
+    logger.info("[MAIN] Enhanced Channel Manager shutting down")
+
+    # Written first so a later cleanup failure cannot lose it.
+    _record_clean_shutdown()
 
     # Stop HTTPS server
     try:
