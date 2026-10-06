@@ -69,7 +69,7 @@ def _mock_client(
 
     client._channel_group_name_for_id = AsyncMock(side_effect=_group_name_for_id)
 
-    async def _get_channels(page=1, page_size=100, search=None, channel_group=None):
+    async def _get_channels(page=1, page_size=100, search=None, channel_group=None, visibility_filter=None):
         results = [
             c for c in master_channels
             if channel_group is None or c["channel_group_id"] == channel_group

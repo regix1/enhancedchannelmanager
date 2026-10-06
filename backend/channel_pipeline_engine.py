@@ -762,14 +762,14 @@ class ChannelPipelineEngine:
             all_channels = []
             page = 1
             while True:
-                result = await self.client.get_channels(page=page, page_size=100)
+                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
                 channels = result.get("results", [])
                 all_channels.extend(channels)
                 if len(all_channels) >= result.get("count", 0) or not channels:
                     break
                 page += 1
 
-            unlinked = [c for c in all_channels if c.get("epg_data_id") is None]
+            unlinked =[c for c in all_channels if c.get("epg_data_id") is None]
             unlinked_ids = {c["id"] for c in unlinked}
             if not unlinked:
                 self._epg_link_unmatched.clear()
@@ -1387,7 +1387,9 @@ class ChannelPipelineEngine:
             complete = True
             seen = set()
             while True:
-                result = await self.client.get_channels(page=page, page_size=100, **(
+                # Event channels wait hidden between events, and Dispatcharr
+                # lists only visible channels unless asked for all of them.
+                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all", **(
                     {"channel_group": channel_group_id} if channel_group_id is not None else {}
                 ))
                 channels = result.get("results", [])
@@ -2446,7 +2448,7 @@ class ChannelPipelineEngine:
         channels = []
         page = 1
         while True:
-            response = await self.client.get_channels(page=page, page_size=100)
+            response = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
             batch = response.get("results", [])
             channels.extend(batch)
             if len(channels) >= response.get("count", 0) or not batch:

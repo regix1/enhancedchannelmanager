@@ -4297,14 +4297,14 @@ class ActionExecutor:
             all_channels = []
             page = 1
             while True:
-                result = await self.client.get_channels(page=page, page_size=100)
+                result = await self.client.get_channels(page=page, page_size=100, visibility_filter="all")
                 channels = result.get("results", [])
                 all_channels.extend(channels)
                 if len(all_channels) >= result.get("count", 0) or not channels:
                     break
                 page += 1
 
-            channels_in_group = [c for c in all_channels if c.get("channel_group") == group_id]
+            channels_in_group =[c for c in all_channels if c.get("channel_group") == group_id]
 
             if channels_in_group:
                 return ActionResult(

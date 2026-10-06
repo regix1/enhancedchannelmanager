@@ -26,7 +26,7 @@ def phase_source(monkeypatch):
     stored = _publication("profile:1", pending=False, channels=[{"channel_id": 10, "events": []}])
     client = MagicMock(base_url="http://dispatcharr.local")
     client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(source))
-    client.get_channel = AsyncMock(side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]))
+    client.get_channels = AsyncMock(side_effect=lambda **_kwargs: copy.deepcopy(list(channels.values())))
     imports = []
 
     async def dispatch(source_id):

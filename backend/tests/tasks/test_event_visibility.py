@@ -1755,6 +1755,8 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
 
     async def import_source(*args, **kwargs):
         order.append(("import", args[1]))
+        if change_at == "import_error":
+            raise httpx.ReadError("connection reset")
         if change_at == "import" and channels[10]["epg_data_id"] == 900:
             change_stream()
         return True
@@ -1789,6 +1791,11 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
         assert lock_waiting.is_set()
         assert release_task is not None and release_task.done()
         await release_task
+    if change_at == "import_error":
+        assert outcome.details["revealed_channel_ids"] == []
+        assert outcome.details["pending_source_hashes"] != {}
+        assert channels[10]["hidden_from_output"] is True
+        return
     if identity_change is not None:
         assert outcome.details["revealed_channel_ids"] == []
         assert channels[10]["streams"] == []
@@ -1848,6 +1855,13 @@ async def test_reconciliation_orders_hide_import_link_reveal_and_emby(
 async def test_remote_stream_changes_block_delivery(identity_change, change_at):
     await test_reconciliation_orders_hide_import_link_reveal_and_emby(
         "positive", None, identity_change=identity_change, change_at=change_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dropped_source_connection_leaves_guide_pending():
+    await test_reconciliation_orders_hide_import_link_reveal_and_emby(
+        "positive", None, change_at="import_error",
     )
 
 

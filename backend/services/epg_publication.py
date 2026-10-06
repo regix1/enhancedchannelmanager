@@ -1968,6 +1968,7 @@ async def refresh_source(
     after_link=False, channel_map=None, wait=True, cancelled=None,
 ) -> bool:
     """Retain each source import phase until its own observed completion."""
+    from services.epg_programmes import _fetch_all_channels
     from tasks.dummy_epg_refresh import wait_for_epg_source_refresh
     from tasks.event_visibility import (
         _await_preparation, _generated_scope, _source_refresh_key,
@@ -2076,16 +2077,18 @@ async def refresh_source(
         return _links(result)
 
     async def read_bindings(record):
+        # One catalogue read instead of a request per guide channel.
+        members = record["state"]["channels"]
+        current = await _await_preparation(_fetch_all_channels(client), stopped) if members else {}
+        if stopped():
+            return None
         fresh = {}
-        for member in record["state"]["channels"]:
+        for member in members:
             channel_id = member["channel_id"]
             admitted = channel_map.get(channel_id) if channel_map is not None else None
-            if not isinstance(admitted, Mapping):
-                return None
-            channel = await _await_preparation(client.get_channel(channel_id), stopped)
+            channel = current.get(channel_id)
             if (
-                stopped() or not isinstance(channel, Mapping)
-                or channel.get("id") != channel_id
+                not isinstance(admitted, Mapping) or not isinstance(channel, Mapping)
                 or channel.get("uuid") != admitted.get("uuid")
                 or _stream_group_id(channel) != _stream_group_id(admitted)
             ):

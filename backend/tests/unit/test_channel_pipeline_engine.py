@@ -171,7 +171,7 @@ class TestChannelPipelineEngineLoadData:
 
         assert len(self.engine._existing_channels) == 2
         assert len(self.engine._existing_groups) == 2
-        self.client.get_channels.assert_called_once_with(page=1, page_size=100)
+        self.client.get_channels.assert_called_once_with(page=1, page_size=100, visibility_filter="all")
         self.client.get_channel_groups.assert_called_once()
 
     def test_load_existing_data_api_failure(self):
@@ -2911,7 +2911,7 @@ class TestOrdinaryStreamAdmission:
         ])
         test_session.commit()
 
-        async def get_channels(page=1, page_size=100):
+        async def get_channels(page=1, page_size=100, visibility_filter=None):
             return {
                 "count": len(channels),
                 "results": [
@@ -6366,6 +6366,22 @@ class TestCompleteChannelInventory:
         asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
         assert engine._channels_complete is (case == "valid")
         client.update_channel.assert_not_called()
+
+    def test_inventory_includes_hidden_event_channels(self):
+        visible = {"id": 10, "name": "Local", "channel_group_id": 1, "hidden_from_output": False}
+        hidden = {"id": 900, "name": "Event", "channel_group_id": 40, "hidden_from_output": True}
+
+        async def get_channels(page=1, page_size=100, visibility_filter=None, **_kwargs):
+            rows = [visible, hidden] if visibility_filter == "all" else [visible]
+            return {"count": len(rows), "next": None, "results": [dict(row) for row in rows]}
+
+        client = MagicMock()
+        client.get_channels = AsyncMock(side_effect=get_channels)
+        client.get_channel_groups = AsyncMock(return_value=[{"id": 1, "name": "Locals"}, {"id": 40, "name": "Events"}])
+        engine = ChannelPipelineEngine(client)
+        asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
+        assert [channel["id"] for channel in engine._existing_channels] == [10, 900]
+        assert engine._channels_complete is True
 
 
 @pytest.mark.asyncio

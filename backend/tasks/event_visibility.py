@@ -1663,6 +1663,19 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
 
             from services.epg_publication import refresh_source
 
+            async def refresh_guide_source(source, claimed, after_link):
+                # A dropped Dispatcharr connection leaves this source pending
+                # for the next run instead of failing every profile.
+                try:
+                    return await refresh_source(
+                        client, source, claimed, expires_at=None, after_link=after_link,
+                        channel_map=channel_map, wait=wait_for_sources,
+                        cancelled=lambda: task._cancel_requested,
+                    )
+                except Exception:
+                    logger.exception("[EVENT-WORKFLOW] Could not refresh guide source %s", source["id"])
+                    return False
+
             header_ready = set()
             for source_scope, sources in generated_sources.items():
                 for source in sources:
@@ -1674,11 +1687,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     }
                     if not claimed:
                         continue
-                    ready = await refresh_source(
-                        client, source, claimed, expires_at=None,
-                        channel_map=channel_map, wait=wait_for_sources,
-                        cancelled=lambda: task._cancel_requested,
-                    )
+                    ready = await refresh_guide_source(source, claimed, after_link=False)
                     publications.update({f"profile:{key}": row for key, row in claimed.items()})
                     if task._cancel_requested:
                         return _finish_cancelled(started_at, details, publications)
@@ -1811,11 +1820,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     if scope.startswith("profile:")
                     and (scope, source["id"]) in header_ready
                 }
-                await refresh_source(
-                    client, source, claimed, expires_at=None, after_link=True,
-                    channel_map=channel_map, wait=wait_for_sources,
-                    cancelled=lambda: task._cancel_requested,
-                )
+                await refresh_guide_source(source, claimed, after_link=True)
                 publications.update({f"profile:{key}": row for key, row in claimed.items()})
                 if task._cancel_requested:
                     return _finish_cancelled(started_at, details, publications)
