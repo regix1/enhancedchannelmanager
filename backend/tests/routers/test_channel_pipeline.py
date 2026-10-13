@@ -2227,6 +2227,38 @@ class TestImportYAML:
         kept = test_session.get(ChannelPipelineRule, existing.id)
         assert (kept.active_from, kept.active_until) == (date(2026, 1, 1), date(2026, 12, 31))
 
+    @pytest.mark.asyncio
+    async def test_overwrite_from_an_older_export_keeps_the_stored_group_timezones(
+        self, async_client, test_session
+    ):
+        # An export that predates the per-group listing zones omits the key.
+        # Group 30 keeps its zone; group 20 left the rule, so its zone goes.
+        existing = _create_rule(test_session, name="Zoned events")
+        existing.set_event_sync_config({
+            "master_group_id": 10, "secondary_group_ids": [20, 30],
+            "group_timezones": {"20": "Europe/London", "30": "Europe/Berlin"},
+        })
+        test_session.commit()
+        content = json.dumps({"rules": [{
+            "name": "Zoned events",
+            "conditions": [{"type": "always"}], "actions": [{"type": "skip"}],
+            "event_sync_config": {"master_group_id": 10, "secondary_group_ids": [30]},
+        }]})
+        mock_client = AsyncMock()
+        mock_client.get_channel_groups.return_value = []
+        mock_client.get_m3u_accounts.return_value = []
+        with patch("routers.channel_pipeline.get_client", return_value=mock_client), \
+             patch("channel_pipeline_schema.validate_rule", return_value={"valid": True, "errors": []}), \
+             patch("routers.channel_pipeline.journal"):
+            response = await async_client.post("/api/auto-creation/import/yaml", json={
+                "yaml_content": content, "overwrite": True,
+            })
+        assert response.status_code == 200, response.text
+        assert response.json()["errors"] == []
+        test_session.expire_all()
+        stored = test_session.get(ChannelPipelineRule, existing.id).get_event_sync_config()
+        assert stored["group_timezones"] == {"30": "Europe/Berlin"}
+
 
 class TestValidateRule:
     """Tests for POST /api/auto-creation/validate."""

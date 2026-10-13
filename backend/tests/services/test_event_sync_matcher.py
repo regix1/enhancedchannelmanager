@@ -99,6 +99,8 @@ class TestParseEventName:
             # 24-hour (no AM/PM marker)
             ("A vs B @ 11 Jul 18:30 ET", 18, 30),
             ("A vs B @ 11 Jul 00:05 ET", 0, 5),
+            # 24-hour with a stray marker, as the tennis listings write it.
+            ("A vs B @ Oct 3 13:00 PM", 13, 0),
         ],
     )
     def test_12h_and_24h_times(self, name, expected_hour, expected_minute):
@@ -293,6 +295,36 @@ class TestParseEventName:
                 "Orioles x Blue Jays",
                 _et(2026, 9, 12, 15, 7),
             ),
+            (
+                "MLB 02  Brewers x Padres start:2026-10-07 02:30:00 "
+                "stop:2026-10-07 09:43:20",
+                "Brewers x Padres",
+                _et(2026, 10, 6, 21, 30),
+            ),
+            (
+                "Formula 1 Grand Prix start:2026-10-11 13:00:00 "
+                "stop:2026-10-11 15:00:00",
+                "Formula 1 Grand Prix",
+                _et(2026, 10, 11, 8, 0),
+            ),
+            (
+                "Formula 1  Grand Prix start:2026-10-11 13:00:00 "
+                "stop:2026-10-11 15:00:00",
+                "Formula 1  Grand Prix",
+                _et(2026, 10, 11, 8, 0),
+            ),
+            (
+                "Dodgers x Braves Game 2  (Spanish) start:2026-10-07 02:30:00 "
+                "stop:2026-10-07 09:43:20",
+                "Dodgers x Braves Game 2  (Spanish)",
+                _et(2026, 10, 6, 21, 30),
+            ),
+            (
+                "NLDS Game 3  Phillies x Mets start:2026-10-07 02:30:00 "
+                "stop:2026-10-07 09:43:20",
+                "NLDS Game 3  Phillies x Mets",
+                _et(2026, 10, 6, 21, 30),
+            ),
         ],
     )
     def test_explicit_start_marker_formats_parse(
@@ -338,6 +370,62 @@ class TestParseEventName:
         assert parsed.matched_pattern == "mlb-iso-date"
         assert parsed.start == _et(2026, 10, 5, 20, 0)
         assert promoted_channel_name(parsed) == "Yankees X Rays @ Oct 05 08:00 PM"
+
+    @pytest.mark.parametrize(
+        ("name", "zone", "expected_utc"),
+        [
+            # Known start 23:00Z; the provider opens the slot 5 minutes early.
+            (
+                "UFC 00 : DANA WHITES CONTENDER SERIES: SEASON 10, WEEK 9 "
+                "start:2026 10 07 00:55:00 stop:2026 10 07 04:30:00",
+                {"stamp_timezone": "Europe/Berlin"},
+                datetime(2026, 10, 6, 22, 55),
+            ),
+            # Known start 22:00Z.
+            (
+                "UFC 03 : UFC 332: PRELIMS start:2026 10 03 23:55:00 "
+                "stop:2026 10 04 03:00:00",
+                {"stamp_timezone": "Europe/Berlin"},
+                datetime(2026, 10, 3, 21, 55),
+            ),
+            # A variant that names no zone, or a stored empty one, reads the
+            # stamp as UK time, as every stamp was read before.
+            (
+                "UFC 00 : DANA WHITES CONTENDER SERIES: SEASON 10, WEEK 9 "
+                "start:2026 10 07 00:55:00 stop:2026 10 07 04:30:00",
+                {},
+                datetime(2026, 10, 6, 23, 55),
+            ),
+            (
+                "UFC 00 : DANA WHITES CONTENDER SERIES: SEASON 10, WEEK 9 "
+                "start:2026 10 07 00:55:00 stop:2026 10 07 04:30:00",
+                {"stamp_timezone": None},
+                datetime(2026, 10, 6, 23, 55),
+            ),
+            # A name this variant does not read keeps UK time.
+            (
+                "MLB 02 : Dodgers x Braves start:2026 10 07 23:00:00 "
+                "stop:2026 10 08 06:13:20",
+                {"stamp_timezone": "Europe/Berlin"},
+                datetime(2026, 10, 7, 22, 0),
+            ),
+        ],
+    )
+    def test_variant_stamp_timezone_reads_its_start_stamps(
+        self, name, zone, expected_utc
+    ):
+        pattern = {
+            "name": "ufc-iso-date",
+            "title_pattern": (
+                r"^UFC\s*(?:INT\s*)?\d{1,2}\s*:\s*(?P<title>.+?)\s+start:"
+                r"(?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
+                r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\s+stop:\d{4}\s+"
+                r"\d{2}\s+\d{2}\s+\d{2}:\d{2}:[0-5]\d\s*$"
+            ),
+            **zone,
+        }
+        parsed = parse_event_name(name, [pattern], now=_NOW)
+        assert parsed.start == pytz.utc.localize(expected_utc)
 
     def test_invalid_explicit_start_date_is_never_guessed(self):
         parsed = parse_event_name(
@@ -496,6 +584,263 @@ class TestParseEventName:
     ):
         parsed = parse_event_name(name, now=_NOW)
         assert parsed.title == expected_title
+
+    @pytest.mark.parametrize(
+        ("name", "patterns", "expected_title", "expected_channel"),
+        [
+            (
+                "UFC: UFC 332 English @ Oct 3 3:00 PM :Paramount+  08",
+                None,
+                "UFC 332 English",
+                "Ufc 332 English @ Oct 03 03:00 PM",
+            ),
+            (
+                "English Football League: Reading vs Bradford City "
+                "@ Oct 3 9:30 AM :Paramount+  02",
+                None,
+                "Reading vs Bradford City",
+                "Reading Vs Bradford City @ Oct 03 09:30 AM",
+            ),
+            (
+                "Dana White's Contender Series: Dana Whites Contender Series "
+                "@ Oct 6 7:00 PM :Paramount+  01",
+                None,
+                "Dana Whites Contender Series",
+                "Dana Whites Contender Series @ Oct 06 07:00 PM",
+            ),
+            # Another provider's listing loses its category the same way.
+            (
+                "ATP: Zverev-Djokovic, kvartfinale, Beijing "
+                "@ 2026-10-04 13:00:00 :Tv2Play DK  07",
+                [{
+                    "name": "tv2-iso-date",
+                    "title_pattern": (
+                        r"^(?P<title>.+?)\s*@\s*(?P<year>\d{4})-(?P<month>\d{2})-"
+                        r"(?P<day>\d{2})\s+(?P<hour>\d{2}):(?P<minute>\d{2})"
+                    ),
+                }],
+                "Zverev-Djokovic, kvartfinale, Beijing",
+                "Zverev-Djokovic, Kvartfinale, Beijing @ Oct 04 01:00 PM",
+            ),
+            # A prefix with a number names the event and stays.
+            (
+                "UFC 333: Main Card @ Oct 10 10:00 PM :Paramount+  03",
+                None,
+                "UFC 333: Main Card",
+                "Ufc 333 Main Card @ Oct 10 10:00 PM",
+            ),
+        ],
+    )
+    def test_a_leading_category_leaves_the_title(
+        self, name, patterns, expected_title, expected_channel
+    ):
+        parsed = parse_event_name(name, patterns, now=_NOW)
+        assert parsed.title == expected_title
+        assert promoted_channel_name(parsed) == expected_channel
+
+    @pytest.mark.parametrize(
+        ("name", "expected_title", "expected_teams"),
+        [
+            (
+                "Arsenal vs Chelsea: Premier League @ Oct 18 3:00 PM",
+                "Arsenal vs Chelsea: Premier League",
+                ("Arsenal", "Chelsea: Premier League"),
+            ),
+            (
+                "Arsenal VS Chelsea: Premier League @ Oct 18 3:00 PM",
+                "Arsenal VS Chelsea: Premier League",
+                ("Arsenal", "Chelsea: Premier League"),
+            ),
+            (
+                "Real Madrid v Barcelona: LaLiga @ Oct 18 3:00 PM",
+                "Real Madrid v Barcelona: LaLiga",
+                None,
+            ),
+            (
+                "Brewers x Padres: Game 3 @ Oct 4 1:30 PM",
+                "Brewers x Padres: Game 3",
+                None,
+            ),
+            # A category ahead of the matchup still comes off.
+            ("NFL: Chiefs vs Bills @ Oct 19 8:20 PM", "Chiefs vs Bills", ("Chiefs", "Bills")),
+        ],
+    )
+    def test_a_lead_holding_a_matchup_is_not_a_category(self, name, expected_title, expected_teams):
+        parsed = parse_event_name(name, now=_NOW)
+        assert parsed.title == expected_title
+        assert parsed.teams == expected_teams
+
+    def test_two_matchups_at_one_kickoff_keep_two_event_keys(self):
+        """Taking "Arsenal vs Chelsea:" off as a category left both games
+        titled "Premier League" at one start, so they shared one channel."""
+        from services.event_sync_review import master_event_key
+
+        first = parse_event_name("Arsenal vs Chelsea: Premier League @ Oct 18 3:00 PM", now=_NOW)
+        second = parse_event_name("Spurs vs Leeds: Premier League @ Oct 18 3:00 PM", now=_NOW)
+        assert master_event_key(first) != master_event_key(second)
+
+    @pytest.mark.parametrize(
+        ("name", "title_pattern", "expected_title"),
+        [
+            (
+                "US (Peacock 100) | Performance View: UTA vs. GSW (2026 12 01 23:00:00)",
+                r"^US\s+\(Peacock\s+\d+\)\s*\|\s*(?P<title>.+?)\s*\("
+                r"(?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
+                r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\)\s*$",
+                "Performance View: UTA vs. GSW",
+            ),
+            (
+                "US (Paramount 098) | UFC Fight Night: English (2026 10 17 16:00:00)",
+                r"^(?:[^|]+\|\s*)?(?P<title>.+?)\s+\((?P<year>\d{4})[- ]"
+                r"(?P<month>\d{2})[- ](?P<day>\d{2})\s+(?P<hour>\d{1,2}):"
+                r"(?P<minute>\d{2}):[0-5]\d\)\s*$",
+                "UFC Fight Night: English",
+            ),
+            (
+                "US (Paramount 094) | UFC Fight Night Preview Show: Buckley vs. "
+                "Malott (2026 10 16 19:00:00)",
+                r"^(?:[^|]+\|\s*)?(?P<title>.+?)\s+\((?P<year>\d{4})[- ]"
+                r"(?P<month>\d{2})[- ](?P<day>\d{2})\s+(?P<hour>\d{1,2}):"
+                r"(?P<minute>\d{2}):[0-5]\d\)\s*$",
+                "UFC Fight Night Preview Show: Buckley vs. Malott",
+            ),
+            (
+                "US (UFC INT 25) | UFC EDMONTON: POST FIGHT PRESS CONFERENCE "
+                "(2026 10 17 23:15:00)",
+                r"^US\s+\(UFC(?:\s+INT)?\s*\d+\)\s*\|\s*(?P<title>.+?)\s*\("
+                r"(?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
+                r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\)\s*$",
+                "UFC EDMONTON: POST FIGHT PRESS CONFERENCE",
+            ),
+        ],
+    )
+    def test_a_title_after_the_slot_keeps_its_own_colon_text(
+        self, name, title_pattern, expected_title
+    ):
+        # Live names where the text before the colon is part of the title:
+        # dropping it would leave a feed name or merge a preview show with
+        # the fight it previews.
+        parsed = parse_event_name(
+            name, [{"name": "service-title", "title_pattern": title_pattern}], now=_NOW,
+        )
+        assert parsed.title == expected_title
+
+    @pytest.mark.parametrize(
+        ("name", "patterns", "earlier_key"),
+        [
+            (
+                "UFC: UFC 332 English @ Oct 3 3:00 PM :Paramount+  08",
+                None,
+                "ufc ufc 332 english|2026-10-03T19:00:00+00:00",
+            ),
+            (
+                "MLB 02  Brewers x Padres start:2026-10-07 02:30:00 "
+                "stop:2026-10-07 06:00:00",
+                [],
+                "mlb 02 brewers x padres|2026-10-07T01:30:00+00:00",
+            ),
+        ],
+    )
+    def test_earlier_title_parse_gives_the_key_the_earlier_rules_stored(
+        self, name, patterns, earlier_key
+    ):
+        from services.event_sync_review import master_event_key
+
+        parsed = parse_event_name(name, patterns, now=_NOW)
+        earlier = event_sync_matcher.earlier_title_parse(parsed)
+        assert master_event_key(earlier) == earlier_key
+        assert master_event_key(parsed) != earlier_key
+        # A row that already carries the earlier title has nothing earlier.
+        assert event_sync_matcher.earlier_title_parse(earlier) is None
+
+    @pytest.mark.parametrize(
+        ("name", "start"),
+        [
+            # The ATP Beijing final began at 11:00 UTC: Tennis TV listed it
+            # "Tue Oct 6 12:00PM UK" and TV2 Play DK "2026-10-06 12:55:00".
+            (
+                "Djokovic, Novak vs De Minaur, Alex @ Oct 6 13:00 PM "
+                "- ATP Beijing :Tennis  16",
+                pytz.utc.localize(datetime(2026, 10, 6, 11, 0)),
+            ),
+            # Tennis TV listed this one "Thu Oct 8 5:00AM UK".
+            (
+                "Coppejans, Kimmer vs Tsitsipas, Stefanos @ Oct 8 06:00 AM "
+                "- ATP Shanghai :Tennis  01",
+                pytz.utc.localize(datetime(2026, 10, 8, 4, 0)),
+            ),
+        ],
+    )
+    def test_tennis_listing_times_are_central_european(self, name, start):
+        assert parse_event_name(name, now=_NOW).start == start
+
+    @pytest.mark.parametrize(
+        ("name", "patterns", "start"),
+        [
+            # The same provider's MLB start: stamps stay UK time.
+            (
+                "MLB 04 : Brewers x Padres start:2026-10-08 03:00:00 "
+                "stop:2026-10-08 10:13:20",
+                [],
+                pytz.utc.localize(datetime(2026, 10, 8, 2, 0)),
+            ),
+            # Its other listings with a trailing label keep the rule's zone.
+            (
+                "Rochester Red Wings vs Oklahoma City Comets @ Sep 26 10:05 PM "
+                ":Milb  01",
+                None,
+                pytz.utc.localize(datetime(2026, 9, 27, 2, 5)),
+            ),
+            (
+                "UFC: UFC 332 English @ Oct 3 3:00 PM :Paramount+  08",
+                None,
+                pytz.utc.localize(datetime(2026, 10, 3, 19, 0)),
+            ),
+        ],
+    )
+    def test_other_listings_of_the_tennis_provider_keep_their_zone(
+        self, name, patterns, start
+    ):
+        assert parse_event_name(name, patterns, now=_NOW).start == start
+
+    @pytest.mark.parametrize(
+        ("name", "patterns", "zone", "start"),
+        [
+            # A zone the rule sets for the group replaces the tennis default.
+            (
+                "Coppejans, Kimmer vs Tsitsipas, Stefanos @ Oct 8 06:00 AM "
+                "- ATP Shanghai :Tennis  01",
+                None,
+                "Europe/London",
+                pytz.utc.localize(datetime(2026, 10, 8, 5, 0)),
+            ),
+            # It reads any listing time of the group, not only tennis.
+            (
+                "Rochester Red Wings vs Oklahoma City Comets @ Sep 26 10:05 PM "
+                ":Milb  01",
+                None,
+                "Europe/Berlin",
+                pytz.utc.localize(datetime(2026, 9, 26, 20, 5)),
+            ),
+            # A start: stamp keeps its own UK reading.
+            (
+                "MLB 04 : Brewers x Padres start:2026-10-08 03:00:00 "
+                "stop:2026-10-08 10:13:20",
+                [],
+                "Europe/Berlin",
+                pytz.utc.localize(datetime(2026, 10, 8, 2, 0)),
+            ),
+        ],
+    )
+    def test_a_group_listing_zone_reads_the_groups_listing_times(
+        self, name, patterns, zone, start
+    ):
+        parsed = parse_event_name(
+            name, patterns, now=_NOW, listing_timezone=zone,
+        )
+        assert parsed.start == start
+        # The channel name keeps the rule's own clock.
+        assert parsed.start.tzinfo.zone == "America/New_York"
 
 
 # ---------------------------------------------------------------------------

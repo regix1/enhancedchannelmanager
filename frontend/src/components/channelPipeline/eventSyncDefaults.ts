@@ -85,6 +85,8 @@ export interface ShippedEventSyncPattern {
   description: string;
   example: string;
   pattern: EventSyncPattern;
+  /** Title regexes of earlier shipped versions that saved rules may still hold. */
+  earlierTitlePatterns: string[];
 }
 
 export const SHIPPED_EVENT_SYNC_PATTERNS: ShippedEventSyncPattern[] =
@@ -94,6 +96,7 @@ export const SHIPPED_EVENT_SYNC_PATTERNS: ShippedEventSyncPattern[] =
     label: entry.label,
     description: entry.description,
     example: entry.example,
+    earlierTitlePatterns: entry.earlier_title_patterns ?? [],
     pattern: {
       name: entry.id,
       title_pattern: entry.title_pattern,

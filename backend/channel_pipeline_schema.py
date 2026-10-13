@@ -900,6 +900,9 @@ _EVENT_SYNC_ALLOWED_KEYS = frozenset({
     "secondary_group_ids",
     "patterns",
     "group_patterns",
+    # The zone each secondary group's listing times are written in, for a
+    # provider that lists in another zone than the default.
+    "group_timezones",
     "time_window_minutes",
     "enforce_time_window",
     "attach_threshold",
@@ -1537,6 +1540,34 @@ def validate_event_sync_config(
                 errors.extend(_validate_event_sync_patterns(
                     patterns, f"group_patterns[{raw_key!r}]"
                 ))
+
+    if "group_timezones" in config:
+        group_timezones = config["group_timezones"]
+        if not isinstance(group_timezones, dict):
+            errors.append(_event_sync_error(
+                "group_timezones", group_timezones,
+                "an object mapping secondary group ID -> time zone name",
+            ))
+        else:
+            # The matcher opens each zone for every listing of its group,
+            # and pytz raises on a name it does not know.
+            import pytz
+
+            for raw_key, zone in group_timezones.items():
+                try:
+                    group_id = int(raw_key)
+                except (TypeError, ValueError):
+                    group_id = None
+                if group_id not in secondary_group_ids:
+                    errors.append(_event_sync_error(
+                        f"group_timezones[{raw_key!r}]", raw_key,
+                        "the ID of one of secondary_group_ids",
+                    ))
+                if not isinstance(zone, str) or zone not in pytz.all_timezones_set:
+                    errors.append(_event_sync_error(
+                        f"group_timezones[{raw_key!r}]", zone,
+                        'a time zone name such as "Europe/Berlin"',
+                    ))
 
     # --- Matching knobs ---------------------------------------------------
     time_window_minutes = config.get("time_window_minutes")

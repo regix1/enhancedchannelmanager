@@ -242,6 +242,43 @@ class TestPatternRouting:
         assert resolved.best.master_name == masters[0]
         assert resolution.unparsed_master_names == ()
 
+    def test_a_group_zone_reads_only_that_groups_listing_times(self):
+        # One rule lists tennis in group 30, whose zone the user set, and MLB
+        # start: stamps in group 20, which saves its own patterns and no zone.
+        streams = [
+            SecondaryStream(
+                name=(
+                    "Coppejans, Kimmer vs Tsitsipas, Stefanos @ Oct 8 06:00 AM "
+                    "- ATP Shanghai :Tennis  01"
+                ),
+                group_id=30, stream_id=301,
+            ),
+            SecondaryStream(
+                name=(
+                    "MLB 04 : Brewers x Padres start:2026-10-08 03:00:00 "
+                    "stop:2026-10-08 10:13:20"
+                ),
+                group_id=20, stream_id=201,
+            ),
+        ]
+        config = _config(
+            group_patterns={"20": [{
+                "name": "never-matches",
+                "title_pattern": r"^ZZZ-(?P<title>.+)-ZZZ$",
+            }]},
+            group_timezones={"30": "Europe/London"},
+        )
+        resolution = resolve_event_sync(config, MASTERS, streams, now=NOW)
+        starts = {
+            r.stream.stream_id: r.result.parsed.start for r in resolution.resolved
+        }
+        assert starts == {
+            # The group's own zone, not the tennis default, reads the listing.
+            301: pytz.utc.localize(datetime(2026, 10, 8, 5, 0)),
+            # The MLB stamp keeps its UK reading.
+            201: pytz.utc.localize(datetime(2026, 10, 8, 2, 0)),
+        }
+
 
 class TestUnparsedMasters:
     def test_unparsable_masters_are_surfaced_loudly(self):

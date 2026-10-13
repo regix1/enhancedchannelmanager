@@ -373,8 +373,9 @@ class TestDatelessEventKeys:
     def test_24h_key_exact_format(self):
         parsed = _parse_dateless(DATELESS_24H)
         assert parsed.matched_pattern == "dateless-title-time-24h"
+        # The leading category ("MOTOR: ") is not part of the event.
         assert master_event_key(parsed) \
-            == "motor gp qualifying|dateless|19:00-05:00"
+            == "gp qualifying|dateless|19:00-05:00"
 
     def test_time_first_key_exact_format(self):
         parsed = _parse_dateless(DATELESS_TIME_FIRST)
@@ -436,7 +437,7 @@ class TestDatelessEventKeys:
             DATELESS_24H, now=NOW.astimezone(pytz.utc), event_timezone="UTC",
         )
         assert master_event_key(parsed) \
-            == "motor gp qualifying|dateless|19:00+00:00"
+            == "gp qualifying|dateless|19:00+00:00"
 
     def test_dateless_parse_without_start_still_yields_none(self):
         # Title-only fallback (no time captured) must stay unkeyable even

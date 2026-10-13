@@ -184,6 +184,7 @@ class DummyEPGRefreshTask(TaskScheduler):
             _config_hash,
             publication_lock,
             publish_profiles,
+            receipt_intervals,
         )
 
         if not isinstance(publications, Mapping):
@@ -257,37 +258,9 @@ class DummyEPGRefreshTask(TaskScheduler):
             "profiles": {},
         }
         for profile_id, (profile, publication, expires_at) in admitted.items():
-            if not profile.get("epg_source_ids"):
-                intervals = {}
-                attempt = publication["state"]["delivery"]["guide_attempt"]
-                for receipt in publication["state"]["delivery"]["pending_channels"].values():
-                    channel_id = receipt.get("channel_id")
-                    if (
-                        receipt.get("stage") in {"complete", "failed", "expired", "allocation_unknown"}
-                        or receipt.get("guide_attempt_id") != attempt["attempt_id"]
-                        or channel_id not in channel_map
-                        or datetime.fromisoformat(receipt["expires_at"]) <= now
-                    ):
-                        continue
-                    channel = channel_map[channel_id]
-                    group = channel.get("channel_group_id") or channel.get("channel_group")
-                    if isinstance(group, dict):
-                        group = group.get("id")
-                    if (
-                        group != receipt["target_group_id"]
-                        or (
-                            receipt.get("channel_uuid") is not None
-                            and channel.get("uuid") != receipt["channel_uuid"]
-                        )
-                    ):
-                        continue
-                    intervals.setdefault(channel_id, []).append({
-                        "start": receipt["start"],
-                        "stop": receipt["stop"],
-                        "title": receipt["title"],
-                    })
-                if intervals:
-                    profile["event_intervals"] = intervals
+            intervals = receipt_intervals(publication["state"]["delivery"], channel_map, now)
+            if intervals:
+                profile["event_intervals"] = intervals
             from tasks.event_visibility import _await_preparation
 
             preparation = await _await_preparation(

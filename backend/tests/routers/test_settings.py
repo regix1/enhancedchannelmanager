@@ -1994,6 +1994,56 @@ class TestRestartServices:
         mock_tracker.stop.assert_called_once()
         mock_prober.stop.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_restart_counts_probes_still_running_on_the_old_prober(self, async_client, monkeypatch):
+        """A provider line that allows one connection fails every probe past
+        the first, so the rebuilt prober must wait for the event probe that
+        still holds that line on the old prober."""
+        import stream_prober
+        from stream_prober import StreamProber
+
+        mock = _mock_settings(black_screen_sample_duration=5, low_fps_threshold=20)
+        mock.is_configured.return_value = True
+        old = StreamProber(MagicMock())
+        old.account_probe_limits = {2: 1}
+        monkeypatch.setattr(stream_prober, "_prober", old)
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def event_probe():
+            async with old.semaphore_for_account(2, event=True):
+                held.set()
+                await release.wait()
+
+        running = asyncio.create_task(event_probe())
+        await held.wait()
+        with patch("routers.settings.get_settings", return_value=mock), \
+             patch("routers.settings.get_tracker", return_value=None), \
+             patch("routers.settings.get_client", return_value=AsyncMock()), \
+             patch("routers.settings.BandwidthTracker") as MockTracker, \
+             patch("routers.settings.set_tracker"), \
+             patch("routers.settings.create_notification_internal"), \
+             patch("routers.settings.update_notification_internal"), \
+             patch("routers.settings.delete_notifications_by_source_internal"), \
+             patch.object(StreamProber, "start", AsyncMock()):
+            MockTracker.return_value = AsyncMock()
+            response = await async_client.post("/api/settings/restart-services")
+        assert response.json()["success"] is True
+        new = stream_prober.get_prober()
+        assert new is not old
+
+        # No refresh here: the sequential bulk probe takes its slot from the
+        # limits the restart handed over.
+        async def bulk_probe():
+            async with new.semaphore_for_account(2):
+                pass
+
+        second = asyncio.create_task(bulk_probe())
+        await asyncio.sleep(0.05)
+        assert not second.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(running, second), timeout=1)
+
 
 class TestResetStats:
     """Tests for POST /api/settings/reset-stats."""

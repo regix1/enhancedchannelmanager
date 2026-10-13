@@ -1853,6 +1853,9 @@ export interface PatternVariant {
   // program_duration applies, and every variant stored before the field
   // existed comes back with the key absent rather than null.
   program_duration?: number | null;
+  // Mirrors PatternVariantModel.stamp_timezone: the zone this variant's
+  // start: stamps are written in. Null or absent reads them as UK time.
+  stamp_timezone?: string | null;
 }
 
 // Dummy EPG profile configuration

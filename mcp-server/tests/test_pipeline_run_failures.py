@@ -55,3 +55,37 @@ async def test_run_failures_returns_failed_actions_with_their_errors():
     call = client.call_endpoint.call_args
     assert call.args[0].name == "ac_get_execution"
     assert call.kwargs == {"path_args": {"execution_id": 2073}, "query": {"include_log": "true"}}
+
+
+@pytest.mark.asyncio
+async def test_run_failures_report_the_summary_steps_missing_from_the_log():
+    run = {
+        "id": 2115,
+        "status": "completed_with_errors",
+        "error_message": (
+            "3 action(s) failed during this run ('[Pass 5 EPG retry]' assign_epg: "
+            "No EPG data match found; None dummy_epg_refresh: 1 staged event "
+            "promotion(s) remain pending). Some channels may have been left in an "
+            "inconsistent state (e.g. exclusive channel-profile membership not fully "
+            "enforced). It is safe to retry manually by rerunning the pipeline."
+        ),
+        "execution_log": [
+            {"stream_name": "[Pass 5 EPG retry]", "actions_executed": [{
+                "type": "assign_epg", "description": "Assign EPG", "success": False,
+                "error": "No EPG data match found",
+            }]},
+        ],
+    }
+    client = AsyncMock()
+    client.call_endpoint.return_value = run
+    with patch("tools.channel_pipeline.get_ecm_client", return_value=client):
+        result = await _register_pipeline().call_tool(
+            "get_channel_pipeline_run_failures", {"execution_id": 2115},
+        )
+    report = json.loads(_text(result))
+    assert report["failure_count"] == 1
+    assert report["summary_failure_count"] == 3
+    assert report["summary_failed_steps"] == [
+        "'[Pass 5 EPG retry]' assign_epg: No EPG data match found",
+        "None dummy_epg_refresh: 1 staged event promotion(s) remain pending",
+    ]

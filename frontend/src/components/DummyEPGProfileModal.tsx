@@ -23,6 +23,8 @@ import { SubstitutionPairsEditor } from './SubstitutionPairsEditor';
 import { PatternBuilder } from './patternBuilder';
 import { VariantTabs } from './patternBuilder/VariantTabs';
 import { ProviderScopedGroupPicker } from './channelPipeline/ProviderScopedGroupPicker';
+import { CustomSelect } from './CustomSelect';
+import { TIMEZONES, timezoneOptions } from './timezones';
 import {
   joinProviderRows,
   type GroupProviderRow,
@@ -71,29 +73,6 @@ const DISPATCHARR_STATUS_TEXT = {
   confirmed: 'Guide import confirmed',
   unknown: 'Guide import not confirmed',
 } as const;
-
-const TIMEZONES = [
-  { value: '', label: '-- None --' },
-  { value: 'US/Eastern', label: 'US/Eastern (ET)' },
-  { value: 'US/Central', label: 'US/Central (CT)' },
-  { value: 'US/Mountain', label: 'US/Mountain (MT)' },
-  { value: 'US/Pacific', label: 'US/Pacific (PT)' },
-  { value: 'US/Alaska', label: 'US/Alaska' },
-  { value: 'US/Hawaii', label: 'US/Hawaii' },
-  { value: 'America/New_York', label: 'America/New_York' },
-  { value: 'America/Chicago', label: 'America/Chicago' },
-  { value: 'America/Denver', label: 'America/Denver' },
-  { value: 'America/Los_Angeles', label: 'America/Los_Angeles' },
-  { value: 'America/Toronto', label: 'America/Toronto' },
-  { value: 'America/Vancouver', label: 'America/Vancouver' },
-  { value: 'Europe/London', label: 'Europe/London (GMT/BST)' },
-  { value: 'Europe/Paris', label: 'Europe/Paris (CET)' },
-  { value: 'Europe/Berlin', label: 'Europe/Berlin (CET)' },
-  { value: 'Europe/Amsterdam', label: 'Europe/Amsterdam (CET)' },
-  { value: 'Australia/Sydney', label: 'Australia/Sydney (AEST)' },
-  { value: 'Australia/Melbourne', label: 'Australia/Melbourne (AEST)' },
-  { value: 'UTC', label: 'UTC' },
-];
 
 function makeEmptyVariant(name: string = 'Default'): PatternVariant {
   return {
@@ -1395,6 +1374,16 @@ export const DummyEPGProfileModal = memo(function DummyEPGProfileModal({
                 placeholder="Use profile default"
               />
               <p className="form-hint">How long an event on this variant runs. Blank uses the profile duration.</p>
+            </div>
+            <div className="modal-form-group">
+              <label>Start Stamp Time Zone (Optional)</label>
+              <CustomSelect
+                options={timezoneOptions(activeVariant.stamp_timezone ?? '')}
+                value={activeVariant.stamp_timezone ?? ''}
+                onChange={(value) => updateActiveVariant({ stamp_timezone: value || null })}
+                ariaLabel="Start Stamp Time Zone"
+              />
+              <p className="form-hint">The zone of a start: stamp (start:2026 10 03 21:55:00) in names this variant reads, for event slots and event matching. Blank reads the stamp as UK time.</p>
             </div>
 
             {/* Per-Variant Template Overrides (optional — collapse by default) */}

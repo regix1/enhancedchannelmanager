@@ -411,6 +411,7 @@ def _plan_profile(
     from services.event_sync_resolver import (
         DISPOSITION_AMBIGUOUS,
         DISPOSITION_WOULD_ATTACH,
+        group_timezone,
         resolve_event_sync,
     )
 
@@ -440,6 +441,7 @@ def _plan_profile(
     duration = timedelta(minutes=profile.get("program_duration") or 180)
     observations = []
     intervals = {}
+    received = {}
     stored_intervals = profile.get("event_intervals") or {}
     if isinstance(stored_intervals, dict):
         for channel_id, values in stored_intervals.items():
@@ -448,6 +450,7 @@ def _plan_profile(
             except (TypeError, ValueError):
                 continue
             if isinstance(values, list):
+                received[parsed_channel_id] = copy.deepcopy(values)
                 real_events = [
                     copy.deepcopy(event)
                     for event in values
@@ -463,7 +466,11 @@ def _plan_profile(
                 if _guide_name(event, event_timezone) is not None
                 and datetime.fromisoformat(event["stop"]) > now
             ]
-            if retained_events:
+            # Stored events drop the receipt marker, so a receipt interval
+            # keeps its own title only if it is not replaced here.
+            if retained_events and not any(
+                event.get("receipt") for event in intervals.get(item["channel_id"], [])
+            ):
                 intervals[item["channel_id"]] = retained_events
     desired = {}
     primary_ids = {}
@@ -516,6 +523,7 @@ def _plan_profile(
                 "assume_current_date": config["assume_current_date"],
                 "demote_stale_dateless": config["demote_stale_dateless"],
                 "patterns": match_patterns or None,
+                "group_timezones": config.get("group_timezones"),
             }
             resolution = resolve_event_sync(
                 resolver_config,
@@ -551,6 +559,7 @@ def _plan_profile(
                 event_timezone=event_timezone,
                 now=now,
                 assume_current_date=config["assume_current_date"],
+                listing_timezone=group_timezone(config, stream.group_id),
             )
             if parsed.start is None:
                 continue
@@ -680,7 +689,9 @@ def _plan_profile(
             if stream_id not in desired[channel_id]:
                 desired[channel_id].append(stream_id)
 
-    profile["event_intervals"] = intervals
+    # A sourced profile renders managed programmes only for staged receipt
+    # channels; retained feed events and slot intervals stay internal here.
+    profile["event_intervals"] = received if profile.get("epg_source_ids") else intervals
     return {
         "profile": profile,
         "observations": observations if scan_complete else None,
@@ -868,8 +879,10 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
         publication_lock,
         publish_profiles,
         read_publication,
+        receipt_intervals,
         update_delivery,
     )
+    from channel_pipeline_schema import validate_event_sync_config
     from services.event_slots import event_config, validate_ownership
 
     started_at = datetime.utcnow()
@@ -938,38 +951,9 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 if profile_expiry is not None and profile_expiry <= now:
                     continue
                 selected = copy.deepcopy(profile)
-                if not selected.get("epg_source_ids"):
-                    intervals = {}
-                    for receipt in admitted["state"]["delivery"]["pending_channels"].values():
-                        channel_id = receipt.get("channel_id")
-                        if (
-                            receipt.get("stage") in {
-                                "complete", "failed", "expired", "allocation_unknown",
-                            }
-                            or receipt.get("guide_attempt_id") != guide_attempt["attempt_id"]
-                            or channel_id not in channel_map
-                            or datetime.fromisoformat(receipt["expires_at"]) <= now
-                        ):
-                            continue
-                        channel = channel_map[channel_id]
-                        group = channel.get("channel_group_id") or channel.get("channel_group")
-                        if isinstance(group, dict):
-                            group = group.get("id")
-                        if (
-                            group != receipt["target_group_id"]
-                            or (
-                                receipt.get("channel_uuid") is not None
-                                and channel.get("uuid") != receipt["channel_uuid"]
-                            )
-                        ):
-                            continue
-                        intervals.setdefault(channel_id, []).append({
-                            "start": receipt["start"],
-                            "stop": receipt["stop"],
-                            "title": receipt["title"],
-                        })
-                    if intervals:
-                        selected["event_intervals"] = intervals
+                intervals = receipt_intervals(admitted["state"]["delivery"], channel_map, now)
+                if intervals:
+                    selected["event_intervals"] = intervals
                 preparation = await _await_preparation(
                     prepare_profiles(
                         [selected],
@@ -1045,6 +1029,16 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
             configs = {}
             scopes = []
             invalid_profiles = set()
+            # A rule reads each stream group's listing times in its own zone;
+            # its guide profile must read them the same way, or a zoned
+            # listing never matches the event's guide row.
+            rule_zones = {}
+            for rule in rules:
+                rule_config = rule.get_event_sync_config()
+                if rule_config is not None and not validate_event_sync_config(rule_config):
+                    rule_zones.setdefault(rule_config.get("dummy_epg_profile_id"), {}).update(
+                        rule_config.get("group_timezones") or {}
+                    )
             for profile in prepared:
                 profile_id = profile["id"]
                 if profile_id not in admitted_by_id:
@@ -1055,6 +1049,7 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 except ValueError:
                     invalid_profiles.add(profile_id)
                     continue
+                config["group_timezones"] = rule_zones.get(profile_id, {})
                 configs[profile_id] = config
                 scopes.extend(config.get("secondary") or [])
             if task._cancel_requested:
@@ -1089,24 +1084,31 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 record["reason_codes"] = sorted(reasons)
                 if profile_id not in configs:
                     continue
-                plan = _plan_profile(
-                    profile,
-                    configs[profile_id],
-                    channel_map,
-                    coverage,
-                    streams,
-                    complete_scopes,
-                    retained.get(profile_id),
-                    now,
-                    {
-                        source["id"]
-                        for source in source_rows
-                        if isinstance(source, dict)
-                        and source.get("id") is not None
-                        and source.get("is_active", True)
-                        and _generated_scope(source) in {"all", f"profile:{profile_id}"}
-                    },
-                )
+                try:
+                    plan = _plan_profile(
+                        profile,
+                        configs[profile_id],
+                        channel_map,
+                        coverage,
+                        streams,
+                        complete_scopes,
+                        retained.get(profile_id),
+                        now,
+                        {
+                            source["id"]
+                            for source in source_rows
+                            if isinstance(source, dict)
+                            and source.get("id") is not None
+                            and source.get("is_active", True)
+                            and _generated_scope(source) in {"all", f"profile:{profile_id}"}
+                        },
+                    )
+                except pytz.UnknownTimeZoneError:
+                    # A zone a backup restore stored unchecked fails this
+                    # profile alone; the other profiles are still planned.
+                    record["can_publish"] = False
+                    record["reason_codes"] = sorted(reasons | {"GUIDE_CONFIG_INVALID"})
+                    continue
                 if target_groups & disputed_groups:
                     plan["states"] = {
                         channel_id: "unknown" for channel_id in plan["states"]
@@ -1491,7 +1493,13 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 profile_id = owners[channel_id]
                 plan = plans[profile_id]
                 ids = relevant.get(channel_id)
-                if ids is None or any(stream_id not in identities for stream_id in ids):
+                if ids is None:
+                    return None
+                # An idle slot keeps only its planned streams, so an old event
+                # stream it drops needs no identity: the provider delists those
+                # streams, and that must not keep the slot visible.
+                checked = set(plan["desired"][channel_id]) if plan["states"][channel_id] == "idle" else ids
+                if any(stream_id not in identities for stream_id in checked):
                     return None
                 fresh = await _await_preparation(
                     client.get_channel(channel_id), lambda: task._cancel_requested,
@@ -1516,16 +1524,16 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                 stats = await _await_preparation(_load_stats(primary), lambda: task._cancel_requested) if primary else {}
                 if task._cancel_requested:
                     return None
-                if ids:
+                if checked:
                     rows = await _await_preparation(
-                        client.get_streams_by_ids(sorted(ids)),
+                        client.get_streams_by_ids(sorted(checked)),
                         lambda: task._cancel_requested,
                     )
                     if (
                         task._cancel_requested or not isinstance(rows, list)
-                        or len(rows) != len(ids)
+                        or len(rows) != len(checked)
                         or any(not isinstance(row, dict) or isinstance(row.get("id"), bool) for row in rows)
-                        or {row.get("id") for row in rows} != ids
+                        or {row.get("id") for row in rows} != checked
                     ):
                         return None
                     for row in rows:
@@ -1944,9 +1952,24 @@ async def reconcile_profiles(task: TaskScheduler, *, wait_for_sources: bool) -> 
                     programme_ready.add(channel_id)
 
             link_pending = False
-            for plan in plans.values():
+            for profile_id, plan in plans.items():
+                publication_row = publications.get(f"profile:{profile_id}")
+                # A staged channel whose receipt is not complete is the
+                # pipeline run's to finish; claim_current refuses it here.
+                staged = {
+                    receipt.get("channel_id")
+                    for receipt in (
+                        publication_row["state"]["delivery"]["pending_channels"].values()
+                        if publication_row is not None else ()
+                    )
+                    if receipt.get("stage") != "complete"
+                }
                 for channel_id, state in plan["states"].items():
-                    if state != "active" or channel_id in programme_ready:
+                    if (
+                        state != "active"
+                        or channel_id in programme_ready
+                        or channel_id in staged
+                    ):
                         continue
                     link_pending = True
 

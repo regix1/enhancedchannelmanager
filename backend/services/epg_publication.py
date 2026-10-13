@@ -648,9 +648,52 @@ def _config_hash(profile: dict) -> str:
     ).hexdigest()
 
 
+def receipt_intervals(delivery: dict, channel_map: dict, now: datetime) -> dict[int, list[dict]]:
+    """Guide intervals for staged channels and for event channels they completed."""
+    intervals = {}
+    attempt = delivery["guide_attempt"]
+    for receipt in delivery["pending_channels"].values():
+        channel_id = receipt.get("channel_id")
+        stage = receipt.get("stage")
+        # A failed attempt that will be retried keeps its programme too, so
+        # the stored guide still carries it if the retry's own publish fails
+        # and the run imports the stored guide instead.
+        retrying = stage == "failed" and receipt.get("retry_at") is not None
+        # A completed channel keeps its programme until the event ends; a
+        # later guide attempt must not drop it while the event is on.
+        if (
+            (stage != "complete" and not retrying and (
+                stage in TERMINAL_PENDING_STAGES
+                or receipt.get("guide_attempt_id") != attempt["attempt_id"]
+            ))
+            or channel_id not in channel_map
+            or datetime.fromisoformat(receipt["expires_at"]) <= now
+        ):
+            continue
+        channel = channel_map[channel_id]
+        group = channel.get("channel_group_id") or channel.get("channel_group")
+        if isinstance(group, dict):
+            group = group.get("id")
+        if (
+            group != receipt["target_group_id"]
+            or (
+                receipt.get("channel_uuid") is not None
+                and channel.get("uuid") != receipt["channel_uuid"]
+            )
+        ):
+            continue
+        intervals.setdefault(channel_id, []).append({
+            "start": receipt["start"],
+            "stop": receipt["stop"],
+            "title": receipt["title"],
+            "receipt": True,
+        })
+    return intervals
+
+
 def _intervals(profile: dict, channel_map: dict) -> list[dict]:
     records = []
-    prepared = {} if profile.get("epg_source_ids") else profile.get("event_intervals") or {}
+    prepared = profile.get("event_intervals") or {}
     if isinstance(prepared, list):
         by_channel = {}
         for interval in prepared:
@@ -673,16 +716,19 @@ def _intervals(profile: dict, channel_map: dict) -> list[dict]:
 
         xmltv_id = get_xmltv_id(assignment, channel, profile)
         events = []
-        for programme in source_programmes.get(channel_id, []):
-            start, stop = programme_times(programme)
-            title = (programme.findtext("title") or "").strip()
-            if title:
-                events.append({"start": start.isoformat(), "stop": stop.isoformat(), "title": title})
         values = by_channel.get(channel_id, by_channel.get(str(channel_id), []))
         if values is None:
             values = []
         if not isinstance(values, list):
             raise ValueError("Prepared event intervals for a channel must be a list.")
+        # A channel with a receipt interval publishes only that programme until
+        # the event's stop, matching the guide document's managed branch.
+        if not values:
+            for programme in source_programmes.get(channel_id, []):
+                start, stop = programme_times(programme)
+                title = (programme.findtext("title") or "").strip()
+                if title:
+                    events.append({"start": start.isoformat(), "stop": stop.isoformat(), "title": title})
         for interval in values:
             if not isinstance(interval, Mapping):
                 raise ValueError("Prepared event interval must be an object.")
@@ -1120,7 +1166,9 @@ def publish_profiles(
                 states[profile_id] = state
                 published.add(profile_id)
                 continue
-            except (TypeError, ValueError):
+            # A zone a backup restore stored unchecked fails this profile
+            # alone; the other profiles still publish.
+            except (TypeError, ValueError, pytz.UnknownTimeZoneError):
                 reasons.add("GUIDE_PUBLICATION_INVALID")
         elif isinstance(readiness, Mapping):
             reasons.update(str(code) for code in readiness.get("reason_codes", ()) if code)
@@ -1433,6 +1481,8 @@ def _admit_pending(
     now: datetime,
     revision: int,
     xmltv_hash: str,
+    *,
+    retry_early: bool = False,
 ) -> dict | None:
     start = _utc(candidate["start"], "candidate event start")
     stop = _utc(candidate["stop"], "candidate event stop")
@@ -1522,8 +1572,11 @@ def _admit_pending(
     if same_input and not recovery:
         return None
     retry_at = _utc(existing["retry_at"], "pending channel retry time") if existing["retry_at"] else None
+    # A run that has just proven a stream of this attempt plays retries it
+    # without waiting out the rest of the backoff.
+    due = retry_at is not None and (retry_early or now >= retry_at)
     if recovery:
-        if retry_at is None or now < retry_at:
+        if not due:
             return None
     else:
         if existing["attempt_no"] >= 3:
@@ -1531,7 +1584,7 @@ def _admit_pending(
         attempted = [item["input_hash"] for item in existing["history"]]
         attempted.append(existing["input_hash"])
         matches = attempted.count(candidate["input_hash"])
-        if matches >= 2 or (matches == 1 and (retry_at is None or now < retry_at)):
+        if matches >= 2 or (matches == 1 and not due):
             return None
     history = [
         *copy.deepcopy(existing["history"]),
@@ -1570,6 +1623,7 @@ def begin_delivery(
     now: datetime,
     pending_channels: Mapping[str, Mapping] | None = None,
     plan_only: bool = False,
+    retry_early: bool = False,
 ) -> dict | None:
     """Admit or resume one guide attempt under revision protection."""
     if re.fullmatch(r"profile:[1-9]\d*", scope) is None:
@@ -1701,6 +1755,7 @@ def begin_delivery(
                 now,
                 revision,
                 state["xmltv_hash"],
+                retry_early=retry_early,
             )
             if admitted is None:
                 if (

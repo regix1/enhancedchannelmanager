@@ -6857,11 +6857,17 @@ def _restore_ffmpeg_profiles(items: list) -> dict:
 
 def _restore_dummy_epg_profiles(items: list) -> dict:
     """Delete all dummy EPG profiles+assignments and recreate from YAML."""
+    from routers.dummy_epg import PatternVariantModel
+
     session = get_session()
     try:
         session.query(DummyEPGChannelAssignment).delete()
         session.query(DummyEPGProfile).delete()
         for item in items:
+            # The guide pass opens each variant's stamp zone, so a hand-edited
+            # backup is refused here instead of failing that pass later.
+            for variant in item.get("pattern_variants") or []:
+                PatternVariantModel.model_validate(variant)
             # A backup exported before the tvg-id default moved still carries the
             # number-keyed literal, and channel numbers are handed out from 1 again
             # whenever channels are rebuilt, so restoring it attaches guide rows to

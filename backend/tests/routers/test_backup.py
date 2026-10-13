@@ -1707,6 +1707,27 @@ class TestRestoreYaml:
         mock_cache.invalidate_prefix.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_dummy_epg_restore_refuses_an_unknown_stamp_zone(
+        self, async_client, test_session
+    ):
+        """A hand-edited stamp zone is refused and the prior profiles stay."""
+        from pydantic import ValidationError
+
+        from routers.backup import _restore_dummy_epg_profiles
+
+        test_session.add(DummyEPGProfile(id=4, name="Existing Events"))
+        test_session.commit()
+
+        with patch("routers.backup.get_cache"), pytest.raises(ValidationError, match="Mars/Base"):
+            _restore_dummy_epg_profiles([{
+                "id": 12, "name": "UFC Events",
+                "pattern_variants": [{"name": "ufc-iso-date", "stamp_timezone": "Mars/Base"}],
+            }])
+
+        test_session.expire_all()
+        assert [profile.name for profile in test_session.query(DummyEPGProfile).all()] == ["Existing Events"]
+
+    @pytest.mark.asyncio
     async def test_dummy_epg_restore_invalidates_only_xmltv_cache(
         self, async_client
     ):

@@ -76,6 +76,13 @@ export interface EventSyncConfig {
   patterns?: EventSyncPattern[];
   /** Per-group overrides keyed by group ID (JSON object keys are strings). */
   group_patterns?: Record<string, EventSyncPattern[]>;
+  /**
+   * Zone each secondary group's stream names write their listing times in,
+   * keyed by group ID. A group without one keeps the default reading. The
+   * backend keeps the stored zones when a save omits the key; an empty
+   * object clears them.
+   */
+  group_timezones?: Record<string, string>;
   /** 1..1440; backend default 30. */
   time_window_minutes?: number;
   /**

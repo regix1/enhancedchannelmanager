@@ -267,7 +267,9 @@ def compute_event_times(
             if hour == 12:
                 hour = 0
         elif ampm_lower in ("pm", "p"):
-            if hour != 12:
+            # A 24-hour clock with a stray marker ("13:00 PM") already names
+            # the afternoon hour, so it is used as given.
+            if hour < 12:
                 hour += 12
 
     # Parse date components
@@ -542,6 +544,35 @@ def _duration_minutes(value, fallback: int, owner: str | None) -> int:
     return minutes
 
 
+def _event_times_for_name(
+    name: str,
+    groups: dict,
+    variant: dict | None,
+    source: dict,
+    event_timezone: str,
+    output_timezone: str | None,
+    program_duration: int,
+) -> dict:
+    """``compute_event_times`` with the start Event Sync reads from the same name and variant.
+
+    The matcher reads a ``start:`` stamp in its variant's ``stamp_timezone``,
+    else in its stamp default, and the visibility task publishes that start.
+    Building the programme in the profile's ``event_timezone`` instead put a
+    Berlin-stamped slot six hours late, so the guide showed whichever reading
+    ran last. A name the matcher cannot date keeps the reading of its groups.
+    """
+    from services.event_sync_matcher import parse_event_name
+
+    start = parse_event_name(name, [variant or source], event_timezone=event_timezone).start
+    if start is not None:
+        local = start.astimezone(pytz.timezone(event_timezone))
+        groups = {
+            "year": str(local.year), "month": str(local.month), "day": str(local.day),
+            "hour": str(local.hour), "minute": str(local.minute),
+        }
+    return compute_event_times(groups, event_timezone, output_timezone, program_duration)
+
+
 def generate_channel_xml(
     channel_id: int,
     channel_name: str,
@@ -638,7 +669,7 @@ def generate_channel_xml(
         return render_url_template(template, groups)
 
     managed = event_intervals
-    if managed is None and not profile.get("epg_source_ids") and "event_intervals" in profile:
+    if managed is None and "event_intervals" in profile:
         prepared = profile["event_intervals"]
         if isinstance(prepared, dict):
             managed = prepared.get(channel_id, prepared.get(str(channel_id), []))
@@ -649,7 +680,11 @@ def generate_channel_xml(
             ]
         else:
             raise ValueError("Prepared event intervals must be a list or object.")
-    if managed is not None and not profile.get("epg_source_ids"):
+        # A sourced profile carries intervals only for staged event channels;
+        # every other channel keeps its source programmes.
+        if profile.get("epg_source_ids") and not managed:
+            managed = None
+    if managed is not None:
         if not isinstance(managed, list):
             raise ValueError("Prepared event intervals for a channel must be a list.")
         for interval in managed:
@@ -682,9 +717,14 @@ def generate_channel_xml(
                 "day": str(display_start.day),
                 "year": str(display_start.year),
             }
-            title = _render(get_template("title_template"), interval_groups)
-            if not title:
+            # The finish step proves the guide by a receipt's exact title, so
+            # a pattern variant's title template must not rewrite it.
+            if interval.get("receipt"):
                 title = str(interval_groups["title"])
+            else:
+                title = _render(get_template("title_template"), interval_groups)
+                if not title:
+                    title = str(interval_groups["title"])
             description = _render(get_template("description_template"), interval_groups)
             poster_url = _render_url(get_template("program_poster_url_template"), interval_groups)
             programmes.append(_make_programme(
@@ -784,8 +824,9 @@ def generate_channel_xml(
 
     if groups is not None:
         # Matched -- compute times and render templates
-        time_vars = compute_event_times(
-            groups, event_timezone, output_timezone, program_duration
+        time_vars = _event_times_for_name(
+            substituted_name, groups, matched_variant, profile,
+            event_timezone, output_timezone, program_duration,
         )
         all_groups = {**base_groups, **groups, **time_vars}
 
@@ -1087,8 +1128,9 @@ def preview_pipeline(
         output_timezone = config.get("output_timezone")
         program_duration = _resolve_variant_duration(matched_variant, config)
 
-        time_vars = compute_event_times(
-            groups, event_timezone, output_timezone, program_duration
+        time_vars = _event_times_for_name(
+            substituted_name, groups, matched_variant, config,
+            event_timezone, output_timezone, program_duration,
         )
         # Build time_variables without datetime objects
         time_variables = {

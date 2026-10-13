@@ -1221,8 +1221,9 @@ export function RuleBuilder({
                       <details className="modal-why">
                         <summary>Why / when to use</summary>
                         <p className="rule-why-body">
-                          Off: equal-resolution streams stay in numeric stream-id order only. On: uses Save
-                          Priorities below.
+                          Off: equal-resolution streams go by country (the country most of the channel&apos;s
+                          streams carry first, foreign last), then stream id. On: Save Priorities below come
+                          before country.
                         </p>
                       </details>
                     </div>

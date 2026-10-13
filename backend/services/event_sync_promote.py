@@ -106,6 +106,7 @@ same isolation contract as ``services.event_sync_matcher``.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
@@ -113,10 +114,12 @@ from services.event_sync_matcher import (
     DEFAULT_TIME_WINDOW_MINUTES,
     SYNTHESIZED_DATE_PATTERN_NAMES,
     ParsedEvent,
+    earlier_title_parse,
 )
 from services.event_sync_resolver import (
     DISPOSITION_EXCLUDED,
     DISPOSITION_UNMATCHED,
+    EventSyncResolution,
 )
 from services.event_sync_review import master_event_key
 
@@ -136,6 +139,7 @@ __all__ = [
     "event_has_started",
     "event_is_early",
     "event_is_past",
+    "keep_earlier_keys",
     "promoted_channel_name",
 ]
 
@@ -591,6 +595,70 @@ def _fold_nearby_starts(
         if cluster:
             _keep(cluster)
     return folded
+
+
+def keep_earlier_keys(
+    resolution: EventSyncResolution,
+    pending: Mapping[str, dict],
+    rule_id: int,
+    existing_name_to_id: dict[str, int],
+) -> EventSyncResolution:
+    """Keep the held parse on the rows of an event held under an earlier key.
+
+    A change to a title rule or to a group's listing time zone moves an
+    event's key and channel name. A row whose key has no receipt takes the
+    title and start of this rule's receipt for its event: the receipt that
+    lists the row's stream under the same name, whatever zone read its time
+    then, or else the receipt under the key the earlier title rules give.
+    That receipt's channel must be the one the held name finds in the
+    target group. Every row with the row's key follows, so a stream that
+    joined the event later stays with it. The event then keeps its channel
+    and receipt until it ends instead of getting a second channel. The
+    resolution is returned unchanged when no row moves.
+    """
+    admitted = {
+        (stream["id"], stream["name"]): receipt
+        for receipt in pending.values()
+        if receipt["rule_id"] == rule_id
+        for stream in receipt["streams"]
+    }
+    held: dict[str, ParsedEvent] = {}
+    for row in resolution.resolved:
+        parsed = row.result.parsed
+        key = master_event_key(parsed)
+        if key is None or key in pending or key in held:
+            continue
+        earlier = earlier_title_parse(parsed) or parsed
+        receipt = admitted.get((row.stream.stream_id, row.stream.name))
+        if receipt is not None and receipt["title"] == earlier.title:
+            # The stream still carries the name its receipt was admitted
+            # with, so the stored start is the one the rule read then.
+            stored_start = datetime.fromisoformat(receipt["start"])
+            earlier = replace(earlier, start=stored_start.astimezone(parsed.start.tzinfo))
+        else:
+            receipt = pending.get(master_event_key(earlier))
+        if (
+            receipt is not None
+            and receipt["rule_id"] == rule_id
+            and receipt["channel_id"] is not None
+            and receipt["channel_id"]
+            == existing_name_to_id.get(promoted_channel_name(earlier).lower())
+        ):
+            held[key] = earlier
+    if not held:
+        return resolution
+    rows = []
+    for row in resolution.resolved:
+        earlier = held.get(master_event_key(row.result.parsed))
+        if earlier is not None:
+            row = replace(row, result=replace(row.result, parsed=replace(
+                row.result.parsed,
+                title=earlier.title,
+                teams=earlier.teams,
+                start=earlier.start,
+            )))
+        rows.append(row)
+    return replace(resolution, resolved=tuple(rows))
 
 
 def build_promotion_plan(

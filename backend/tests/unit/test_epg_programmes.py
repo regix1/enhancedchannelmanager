@@ -356,6 +356,44 @@ async def test_shared_source_uncovered_query_blocks_only_its_profile(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_staged_receipt_query_joins_scan_without_holding_profile_back(monkeypatch):
+    interval = {"start": NOW.isoformat(), "stop": NOW.isoformat(), "title": "Dodgers vs Braves"}
+    channels = {
+        1: channel(),
+        2: channel(id=2, name="Dodgers vs Braves @ Sep 05 7:00 PM", tvg_id="", channel_group_id=65),
+    }
+    install_feed(monkeypatch, feed(programme()))
+    warm = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}])
+    await guides.prepare_profiles(
+        [warm], {1: channels[1]}, client(), expires_at=None, now=NOW, wait_for_sources=True,
+    )
+    # Production calls are minutes apart; move the last check past the retry spacing.
+    for entry in guides._SOURCE_CACHE.values():
+        entry["checked"] = entry.get("checked", 0) - 2 * guides.SOURCE_RETRY
+    warm_demand = {key for entry in guides._SOURCE_CACHE.values() for key in entry.get("demand", {})}
+    staged = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}, {"channel_id": 2}])
+    staged["event_intervals"] = {2: [interval]}
+
+    _, first = await guides.prepare_profiles(
+        [staged], channels, client(), expires_at=None, now=NOW,
+        wait_for_sources=False, recover_sources=True,
+    )
+    staged_demand = {key for entry in guides._SOURCE_CACHE.values() for key in entry.get("demand", {})}
+    if guides._SOURCE_LOADS:
+        await asyncio.wait(list(guides._SOURCE_LOADS.values()))
+    done = profile(channel_group_ids=[], channel_assignments=[{"channel_id": 1}, {"channel_id": 2}])
+    _, second = await guides.prepare_profiles(
+        [done], channels, client(), expires_at=None, now=NOW,
+        wait_for_sources=False, recover_sources=True,
+    )
+
+    assert first["profiles"]["1"]["can_publish"] is True
+    assert "GUIDE_QUERY_PENDING" not in first["profiles"]["1"]["reason_codes"]
+    assert second["profiles"]["1"]["can_publish"] is True
+    assert len(staged_demand - warm_demand) == 1
+
+
+@pytest.mark.asyncio
 async def test_complete_empty_source_is_publishable(monkeypatch):
     install_feed(monkeypatch, feed())
 

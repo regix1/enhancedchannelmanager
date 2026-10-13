@@ -451,6 +451,113 @@ async def test_bulk_paths_wait_for_active_event_claim(mode):
     assert prober._event_probes == 0
 
 
+async def _hold(prober, account, *, event=False):
+    claim = prober.semaphore_for_account(account, event=event)
+    await claim.__aenter__()
+    return claim
+
+
+@pytest.mark.asyncio
+async def test_queued_event_probe_takes_next_free_account_slot():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+    order = []
+
+    async def acquire(name, event):
+        async with prober.semaphore_for_account(1, event=event):
+            order.append(name)
+
+    holder = await _hold(prober, 1)
+    bulk = [
+        asyncio.create_task(acquire(f"bulk-{index}", False))
+        for index in range(5)
+    ]
+    await _wait_for_gate_waiters(prober, 5)
+    event_task = asyncio.create_task(acquire("event", True))
+    await _wait_for_gate_waiters(prober, 6)
+
+    await holder.__aexit__(None, None, None)
+    await asyncio.wait_for(asyncio.gather(*bulk, event_task), timeout=1)
+
+    assert order[0] == "event", order
+    assert prober._event_waiting == {}
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+async def test_canceled_event_probe_stops_holding_the_account():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+
+    async def acquire(event):
+        async with prober.semaphore_for_account(1, event=event):
+            pass
+
+    holder = await _hold(prober, 1)
+    bulk = [asyncio.create_task(acquire(False)) for _ in range(5)]
+    await _wait_for_gate_waiters(prober, 5)
+    event_task = asyncio.create_task(acquire(True))
+    await _wait_for_gate_waiters(prober, 6)
+    event_task.cancel()
+    await asyncio.gather(event_task, return_exceptions=True)
+
+    await holder.__aexit__(None, None, None)
+    await asyncio.wait_for(asyncio.gather(*bulk), timeout=1)
+
+    assert prober._event_waiting == {}
+    assert prober._account_active == {}
+
+
+@pytest.mark.asyncio
+async def test_event_probe_waiting_on_aggregate_does_not_block_free_account():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+    other_event = await _hold(prober, 3, event=True)
+    entered = asyncio.Event()
+
+    async def acquire(event):
+        async with prober.semaphore_for_account(2, event=event):
+            if not event:
+                entered.set()
+
+    event_task = asyncio.create_task(acquire(True))
+    await _wait_for_gate_waiters(prober, 1)
+    bulk = asyncio.create_task(acquire(False))
+    done, _ = await asyncio.wait({bulk}, timeout=0.5)
+
+    assert bulk in done
+    assert entered.is_set()
+    await other_event.__aexit__(None, None, None)
+    await asyncio.wait_for(event_task, timeout=1)
+    assert prober._event_waiting == {}
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
+@pytest.mark.asyncio
+async def test_event_probe_releases_account_hold_when_account_frees():
+    prober = _make_prober(AsyncMock(), max_concurrent_probes=1)
+    account_holder = await _hold(prober, 2)
+    other_event = await _hold(prober, 3, event=True)
+
+    async def acquire(event):
+        async with prober.semaphore_for_account(2, event=event):
+            pass
+
+    event_task = asyncio.create_task(acquire(True))
+    await _wait_for_gate_waiters(prober, 1)
+    assert prober._event_waiting == {2: 1}
+
+    await account_holder.__aexit__(None, None, None)
+    bulk = asyncio.create_task(acquire(False))
+    done, _ = await asyncio.wait({bulk}, timeout=0.5)
+
+    assert bulk in done
+    await other_event.__aexit__(None, None, None)
+    await asyncio.wait_for(event_task, timeout=1)
+    assert prober._event_waiting == {}
+    assert prober._account_active == {}
+    assert prober._event_probes == 0
+
+
 @pytest.mark.asyncio
 async def test_cancelled_sequential_probe_does_not_start_queued_media():
     client = AsyncMock()

@@ -4,6 +4,7 @@ Unit tests for the Dummy EPG generation engine.
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
+import pytest
 import pytz
 
 from dummy_epg_engine import (
@@ -16,6 +17,7 @@ from dummy_epg_engine import (
     render_template,
     render_url_template,
 )
+from services.event_sync_matcher import parse_event_name
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +372,15 @@ def test_compute_times_12pm_is_noon():
     groups = {"hour": "12", "minute": "00", "ampm": "PM"}
     result = compute_event_times(groups, "America/New_York")
     assert result["start_dt"].hour == 12
+
+
+def test_compute_times_24_hour_clock_with_a_stray_pm_keeps_its_hour():
+    """A tennis listing's "13:00 PM" is 13:00, not hour 25."""
+    groups = {"hour": "13", "minute": "00", "ampm": "PM",
+              "month": "10", "day": "3", "year": "2026"}
+    result = compute_event_times(groups, "America/New_York")
+    assert result["start_dt"].hour == 13
+    assert result["start_dt"].day == 3
 
 
 def test_compute_times_pm_lowercase():
@@ -1022,6 +1033,57 @@ def test_explicit_start_delimiter_drift_keeps_variant_artwork():
     )
 
 
+_UFC_STAMPED_NAME = "UFC 01 : UFC Fight Night start:2026 10 17 21:00:00 stop:2026 10 18 01:00:00"
+
+
+def _ufc_stamp_variant(stamp_timezone: str | None) -> dict:
+    """The UFC slot variant of a source-free profile, with or without its own stamp zone."""
+    return {
+        "name": "ufc-iso-date",
+        "title_pattern": (
+            r"^UFC\s*(?:INT\s*)?\d{1,2}\s*:\s*(?P<title>.+?)\s+start:"
+            r"(?P<year>\d{4})\s+(?P<month>\d{2})\s+(?P<day>\d{2})\s+"
+            r"(?P<hour>\d{2}):(?P<minute>\d{2}):[0-5]\d\s+stop:\d{4}\s+"
+            r"\d{2}\s+\d{2}\s+\d{2}:\d{2}:[0-5]\d\s*$"
+        ),
+        "stamp_timezone": stamp_timezone,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stamp_timezone", "expected_start"),
+    [
+        ("Europe/Berlin", datetime(2026, 10, 17, 19, 0, tzinfo=timezone.utc)),
+        (None, datetime(2026, 10, 17, 20, 0, tzinfo=timezone.utc)),
+    ],
+    ids=["variant-zone", "stamp-default"],
+)
+def test_a_start_stamp_opens_the_programme_when_event_sync_does(stamp_timezone, expected_start):
+    """A source-free profile builds its guide from the name. The stamp is read
+    the way the matcher reads it, in the variant's stamp zone or else the
+    matcher's UK default, not in the profile's own zone."""
+    variant = _ufc_stamp_variant(stamp_timezone)
+    matcher_start = parse_event_name(_UFC_STAMPED_NAME, [variant], event_timezone=_EVENT_TZ).start
+    assert matcher_start == expected_start
+    main = [
+        p for p in _programmes_for(_variant_profile(360, [variant]), _UFC_STAMPED_NAME)
+        if _programme_window(p) == (matcher_start, matcher_start + timedelta(minutes=360))
+    ]
+    assert [p.findtext("title") for p in main] == ["UFC Fight Night"]
+
+
+@pytest.mark.parametrize(
+    ("stamp_timezone", "expected_starttime24"),
+    [("Europe/Berlin", "15:00"), (None, "16:00")],
+    ids=["variant-zone", "stamp-default"],
+)
+def test_preview_reads_a_start_stamp_as_event_sync_does(stamp_timezone, expected_starttime24):
+    """The profile editor's preview shows the start the guide will carry."""
+    config = _variant_profile(360, [_ufc_stamp_variant(stamp_timezone)])
+    result = preview_pipeline(config, _UFC_STAMPED_NAME)
+    assert result["time_variables"]["starttime24"] == expected_starttime24
+
+
 def test_preview_uses_variant_duration():
     """The preview path resolves the duration through the variant as well."""
     name, _start = _event_name_today()
@@ -1580,6 +1642,112 @@ def test_external_source_gap_control_preserves_headers_and_real_programmes():
     assert [row.findtext("title") for row in controlled_document.findall("programme")] == [
         "Confirmed event",
     ]
+
+
+def test_sourced_profile_renders_receipt_interval_only_for_its_channel():
+    start = datetime(2026, 10, 3, 15, tzinfo=timezone.utc)
+    event_start = start + timedelta(hours=2)
+    event_stop = event_start + timedelta(hours=3)
+    real = ET.fromstring(
+        f'<programme start="{event_start:%Y%m%d%H%M%S %z}" '
+        f'stop="{event_stop:%Y%m%d%H%M%S %z}">'
+        '<title>Confirmed event</title>'
+        '</programme>'
+    )
+    profile = {
+        **_variant_profile(180, []),
+        "enabled": True,
+        "epg_source_ids": [46],
+        "guide_start": start,
+        "guide_stop": start + timedelta(hours=6),
+        "source_programmes": {1: [], 2: [real]},
+        "channel_assignments": [{"channel_id": 1}, {"channel_id": 2}],
+        "tvg_id_template": "event-{channel_id}",
+        "event_intervals": {1: [{
+            "start": event_start.isoformat(),
+            "stop": event_stop.isoformat(),
+            "title": "Dodgers X Braves",
+        }]},
+    }
+    channel_data = {
+        1: {"id": 1, "name": "Arena 1", "channel_number": 100, "streams": []},
+        2: {"id": 2, "name": "Arena 2", "channel_number": 101, "streams": []},
+    }
+
+    document = ET.fromstring(generate_xmltv([profile], channel_data, without_gaps={1, 2}))
+
+    assert [row.findtext("title") for row in document.findall("programme[@channel='event-1']")] == [
+        "Dodgers X Braves",
+    ]
+    assert [row.findtext("title") for row in document.findall("programme[@channel='event-2']")] == [
+        "Confirmed event",
+    ]
+
+
+@pytest.mark.parametrize("sourced,receipt,titles", [
+    (True, True, ["MLB On TBS Yankees At Red Sox", "Qualifying FIA WEC 6 Hours Of Fuji"]),
+    (False, True, ["MLB On TBS Yankees At Red Sox", "Qualifying FIA WEC 6 Hours Of Fuji"]),
+    # A source-free slot interval is not a receipt, so its variant applies.
+    (False, False, ["Yankees at Red Sox", "FIA WEC 6 Hours Of Fuji: Qualifying"]),
+])
+def test_receipt_interval_keeps_its_title_over_a_variant_title(sourced, receipt, titles):
+    start = datetime(2026, 10, 7, 15, tzinfo=timezone.utc)
+    event_start = start + timedelta(hours=2)
+    event_stop = event_start + timedelta(hours=3)
+    when = r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[AaPp])"
+    day = r"@\s*(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})"
+    variants = [
+        {
+            "name": "MLB matchup",
+            "title_pattern": r"^Mlb On Tbs\s+(?P<away>.+?)\s+(?:At|Vs\.?)\s+(?P<home>.+?)\s*@",
+            "time_pattern": when,
+            "date_pattern": day,
+            "title_template": "{away} at {home}",
+        },
+        {
+            "name": "FIA WEC",
+            "title_pattern": r"^(?P<session>.+?)\s+Fia Wec\s+(?P<event>.+?)\s*@",
+            "time_pattern": when,
+            "date_pattern": day,
+            "title_template": "FIA WEC {event}: {session}",
+        },
+    ]
+    profile = {
+        **_variant_profile(180, variants),
+        "enabled": True,
+        "guide_start": start,
+        "guide_stop": start + timedelta(hours=6),
+        "channel_assignments": [{"channel_id": 1}, {"channel_id": 2}],
+        "tvg_id_template": "event-{channel_id}",
+        "event_intervals": {
+            channel_id: [{
+                "start": event_start.isoformat(),
+                "stop": event_stop.isoformat(),
+                "title": title,
+                **({"receipt": True} if receipt else {}),
+            }]
+            for channel_id, title in (
+                (1, "MLB On TBS Yankees At Red Sox"),
+                (2, "Qualifying FIA WEC 6 Hours Of Fuji"),
+            )
+        },
+    }
+    if sourced:
+        profile.update(epg_source_ids=[46], source_programmes={1: [], 2: []})
+    channel_data = {
+        1: {"id": 1, "name": "Mlb On Tbs Yankees At Red Sox @ Oct 07 1:08 PM",
+            "channel_number": 100, "streams": []},
+        2: {"id": 2, "name": "Qualifying Fia Wec 6 Hours Of Fuji @ Oct 07 1:00 PM",
+            "channel_number": 101, "streams": []},
+    }
+
+    document = ET.fromstring(generate_xmltv([profile], channel_data, without_gaps={1, 2}))
+
+    assert [
+        row.findtext("title")
+        for channel_id in (1, 2)
+        for row in document.findall(f"programme[@channel='event-{channel_id}']")
+    ] == titles
 
 
 def test_source_event_gaps_keep_the_title_without_claiming_a_schedule():

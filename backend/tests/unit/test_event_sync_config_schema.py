@@ -234,6 +234,37 @@ class TestGroupPatterns:
         assert any("group_patterns['20']" in e for e in errors)
 
 
+class TestGroupTimezones:
+    def test_a_secondary_group_zone_passes(self):
+        config = _valid_config(group_timezones={"30": "Europe/Berlin"})
+        assert validate_event_sync_config(config) == []
+        assert config["group_timezones"] == {"30": "Europe/Berlin"}
+
+    def test_an_empty_object_passes(self):
+        # The editor sends an empty object to clear every group's zone.
+        assert validate_event_sync_config(_valid_config(group_timezones={})) == []
+
+    @pytest.mark.parametrize("bad", [[], "Europe/Berlin", 42])
+    def test_not_an_object_rejected(self, bad):
+        errors = validate_event_sync_config(_valid_config(group_timezones=bad))
+        assert any("group_timezones" in e for e in errors)
+
+    @pytest.mark.parametrize("key", ["10", "99", "abc"])
+    def test_a_key_that_is_not_a_secondary_group_rejected(self, key):
+        # Only a secondary group's stream names read a group zone.
+        errors = validate_event_sync_config(
+            _valid_config(group_timezones={key: "Europe/Berlin"})
+        )
+        assert any(f"group_timezones[{key!r}]" in e for e in errors)
+
+    @pytest.mark.parametrize("zone", ["Europe/Atlantis", "", None, 1])
+    def test_an_unknown_zone_rejected(self, zone):
+        errors = validate_event_sync_config(
+            _valid_config(group_timezones={"30": zone})
+        )
+        assert any("group_timezones['30']" in e for e in errors)
+
+
 class TestMatchingKnobs:
     @pytest.mark.parametrize("bad", [True, "30", 0, -5, 1.5, 1441, 100000])
     def test_time_window_minutes_invalid(self, bad):

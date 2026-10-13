@@ -241,6 +241,56 @@ class TestUpdateRuleEventSyncConfig:
         assert response.status_code == 200
         rule.set_event_sync_config.assert_not_called()
 
+    def _put_config(self, test_client, mock_db_session, stored: dict, sent: dict) -> dict:
+        rule = self._mock_rule(mock_db_session)
+        rule.get_event_sync_config.return_value = stored
+        with patch("routers.channel_pipeline.journal.log_entry"):
+            response = test_client.put(
+                "/api/auto-creation/rules/1", json={"event_sync_config": sent},
+            )
+        assert response.status_code == 200, response.text
+        return rule.set_event_sync_config.call_args.args[0]
+
+    def test_update_stores_group_timezones(self, test_client, mock_db_session):
+        stored = self._put_config(
+            test_client, mock_db_session, _valid_config(),
+            _valid_config(group_timezones={"30": "Europe/Berlin"}),
+        )
+        assert stored["group_timezones"] == {"30": "Europe/Berlin"}
+
+    def test_update_from_an_older_client_keeps_the_stored_group_timezones(
+        self, test_client, mock_db_session
+    ):
+        # An editor that predates the setting sends the whole config without
+        # it. Group 30 keeps its zone; group 20 left the rule, so its zone goes.
+        stored = self._put_config(
+            test_client, mock_db_session,
+            _valid_config(group_timezones={"20": "Europe/London", "30": "Europe/Berlin"}),
+            _valid_config(secondary_group_ids=[30]),
+        )
+        assert stored["group_timezones"] == {"30": "Europe/Berlin"}
+
+    def test_update_drops_stored_group_timezones_that_are_not_an_object(
+        self, test_client, mock_db_session
+    ):
+        # A backup restore stores the key unchecked.
+        stored = self._put_config(
+            test_client, mock_db_session,
+            _valid_config(group_timezones=["30"]),
+            _valid_config(secondary_group_ids=[30]),
+        )
+        assert "group_timezones" not in stored
+
+    def test_update_with_empty_group_timezones_clears_them(
+        self, test_client, mock_db_session
+    ):
+        stored = self._put_config(
+            test_client, mock_db_session,
+            _valid_config(group_timezones={"30": "Europe/Berlin"}),
+            _valid_config(group_timezones={}),
+        )
+        assert stored["group_timezones"] == {}
+
 
 class TestBulkUpdateRejectsEventSyncConfig:
     def test_bulk_update_with_event_sync_config_rejected(

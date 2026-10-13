@@ -280,6 +280,7 @@ async def collect_stream_flow(
     probe_while_busy: bool = False,
     stop_when_playable: bool = False,
     event_streams: Mapping[str, frozenset[int]] | None = None,
+    probe_first: frozenset[int] = frozenset(),
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[int, bool | None]:
     """Return fresh measured-flow verdicts for a bounded stream set.
@@ -374,6 +375,7 @@ async def collect_stream_flow(
             )
             return states
         confirmed: set[int] = set()
+        probed: dict[int, dict] = {}
         await _probe_and_collect_failures(
             client,
             missing,
@@ -385,8 +387,10 @@ async def collect_stream_flow(
             cancelled=cancelled,
             stop_when_playable=stop_when_playable,
             confirmed=confirmed,
+            probed=probed,
             event_streams=event_streams,
             checked_after=caller_cutoff,
+            probe_first=probe_first,
         )
         if _expired(expires_at) or (cancelled is not None and cancelled()):
             return {sid: None for sid in ids}
@@ -401,6 +405,23 @@ async def collect_stream_flow(
             )
         if _expired(expires_at) or (cancelled is not None and cancelled()):
             return {sid: None for sid in ids}
+        # A scheduled probe of the same stream can save after this one
+        # without a content check, which leaves the stored content proof
+        # older than the stored probe; this call's own success keeps it.
+        # Any other newer evidence decides: a failure, a zero flow reading
+        # in either probe, a content check newer than this probe, or a
+        # rename. A saved row no newer than this probe is this probe's own
+        # save, so keeping this probe's result there changes nothing. With
+        # no saved row to read, this probe's result is the only evidence.
+        for sid in confirmed:
+            if sid not in probed:
+                continue
+            own = probed[sid]
+            if sid not in refreshed:
+                refreshed[sid] = own
+                continue
+            if _own_probe_stands(own, refreshed[sid]):
+                refreshed[sid] = own
         now = datetime.now(timezone.utc)
         for sid in ids:
             if sid in confirmed:
@@ -536,6 +557,20 @@ def _sample_says_dead(stat: dict | None) -> bool | None:
     return measured == 0
 
 
+def _own_probe_stands(own: dict, saved: dict) -> bool:
+    """Return whether this probe's result outranks the saved row for its stream."""
+    content_at = _utc_time(saved.get("black_screen_checked_at"))
+    return (
+        (content_at is None
+         or content_at <= _utc_time(own.get("last_probed")))
+        and saved.get("stream_name") == own.get("stream_name")
+        and _sample_says_dead(saved) is not True
+        and _sample_says_dead(own) is not True
+        and saved.get("probe_status") not in _FAILED_PROBE_STATUSES
+        and own.get("probe_status") not in _FAILED_PROBE_STATUSES
+    )
+
+
 def _is_struck(stat: dict | None, threshold: int) -> bool:
     """Has this stream failed often enough in a row to count as struck out?"""
     if (
@@ -613,8 +648,10 @@ async def _probe_and_collect_failures(
     cancelled: Callable[[], bool] | None = None,
     stop_when_playable: bool = False,
     confirmed: set[int] | None = None,
+    probed: dict[int, dict] | None = None,
     event_streams: Mapping[str, frozenset[int]] | None = None,
     checked_after: datetime | None = None,
+    probe_first: frozenset[int] = frozenset(),
 ) -> set[int]:
     """Probe bounded candidates and return current conclusive failures."""
     from stream_prober import ensure_prober
@@ -704,11 +741,36 @@ async def _probe_and_collect_failures(
                 if last_stream_id in ordered:
                     start = ordered.index(last_stream_id) + 1
                     ordered = ordered[start:] + ordered[:start]
+            # The cursor keeps fairness within each tier, and the cap must not
+            # cut a live or retry-awaiting stream.
+            ordered = (
+                [sid for sid in ordered if sid in probe_first]
+                + [sid for sid in ordered if sid not in probe_first]
+            )
+            # Priority streams go first every run, so only the other tier
+            # moves the cursor. When the cap leaves no room for the other
+            # tier, the cursor rotates the priority streams instead, or the
+            # ones past the cap would never be probed.
+            pinned = (
+                probe_first
+                if any(
+                    sid not in probe_first
+                    for sid in ordered[:MAX_HEALTH_PROBES_PER_RUN]
+                )
+                else frozenset()
+            )
             stream_ids = ordered[:MAX_HEALTH_PROBES_PER_RUN]
             positions.pop(identity, None)
             positions[identity] = {
                 "expires_at": retention_expiry,
-                "stream_id": stream_ids[0] if stop_when_playable else stream_ids[-1],
+                "stream_id": (
+                    (
+                        position["stream_id"]
+                        if position is not None and stream_ids[0] in pinned
+                        else stream_ids[0]
+                    )
+                    if stop_when_playable else stream_ids[-1]
+                ),
                 **({"selection_id": selection_id} if stop_when_playable else {}),
             }
             while len(positions) > 256:
@@ -743,7 +805,11 @@ async def _probe_and_collect_failures(
                     # A queued task cannot start media after another task supplies proof.
                     if _expired(expiry) or (stop_when_playable and memberships[stream_id] <= positive) or (cancelled is not None and cancelled()):
                         return
-                    if stop_when_playable and identity is not None:
+                    if (
+                        stop_when_playable
+                        and identity is not None
+                        and stream_id not in pinned
+                    ):
                         with _selection_lock:
                             cache = get_cache()
                             positions = cache.get("event_sync_health_positions", ttl=86400)
@@ -757,11 +823,23 @@ async def _probe_and_collect_failures(
                             ):
                                 position["stream_id"] = stream_id
                                 cache.set("event_sync_health_positions", positions)
-                    await prober.probe_stream(
+                    result = await prober.probe_stream(
                         stream_id, url, name, content=True, expires_at=expiry,
                     )
+                    # An empty result is a probe that ran out of time and
+                    # saved nothing.
+                    if probed is not None and result:
+                        probed[stream_id] = result
                     if stop_when_playable and not _expired(expiry):
                         stats = await _load_stats([stream_id])
+                        # The early stop weighs this probe by the same rules
+                        # as the final verdict: against the saved row, and
+                        # only while the stream itself is unchanged.
+                        if result and (
+                            stream_id not in stats
+                            or _own_probe_stands(result, stats[stream_id])
+                        ):
+                            stats[stream_id] = result
                         classified_at = datetime.now(timezone.utc)
                         event_start = _utc_time(event_start_by_stream.get(stream_id))
                         if (
@@ -774,6 +852,9 @@ async def _probe_and_collect_failures(
                                 stream_name=stream_names[stream_id],
                                 now=classified_at,
                             ) is True
+                            and (await _probe_urls(
+                                client, [stream_id], stream_names=stream_names,
+                            )).get(stream_id) == urls[stream_id]
                         ):
                             positive.update(memberships[stream_id])
         except asyncio.TimeoutError:
@@ -784,9 +865,11 @@ async def _probe_and_collect_failures(
                 stream_id, e,
             )
 
+    # _probe_urls returns rows in provider order; tasks start in selection order.
     tasks = {
-        asyncio.create_task(_probe_one(sid, url, name, account)): sid
-        for sid, (url, name, account, _group) in urls.items()
+        asyncio.create_task(_probe_one(sid, *urls[sid][:3])): sid
+        for sid in stream_ids
+        if sid in urls
     }
     pending = set(tasks)
     try:
@@ -808,6 +891,7 @@ async def _probe_and_collect_failures(
 
     if _expired(expiry) or (cancelled is not None and cancelled()):
         return set()
+    unchanged: list[int] = []
     try:
         current = await asyncio.wait_for(
             _probe_urls(client, list(urls), stream_names=stream_names),
@@ -822,6 +906,10 @@ async def _probe_and_collect_failures(
         return set()
     except Exception as e:
         logger.warning("[EVENT-SYNC] Probed stream health reload failed (%s)", e)
+        # Names already rechecked keep their own probe results in the
+        # caller when the saved rows cannot be read.
+        if confirmed is not None:
+            confirmed.update(unchanged)
         return set()
     classified_at = datetime.now(timezone.utc)
     if _expired(expiry) or (cancelled is not None and cancelled()):

@@ -1326,6 +1326,64 @@ def register(mcp: FastMCP):
             return f"Error updating dummy EPG profile {profile_id}: {e}"
 
     @mcp.tool()
+    async def update_dummy_epg_variant(
+        profile_id: int,
+        variant_name: str,
+        field: str,
+        value: str | int | None,
+    ) -> str:
+        """Change one field of one pattern variant in a Dummy EPG profile.
+
+        Reads the profile and sends its pattern variants back exactly as
+        read, with only ``field`` of the variant named ``variant_name``
+        changed, so no other variant or field changes.
+
+        Args:
+            profile_id: The profile ID.
+            variant_name: The ``name`` of the pattern variant to change.
+            field: The variant field, for example ``title_pattern`` or
+                ``stamp_timezone``.
+            value: The new value; null clears the field.
+        """
+        try:
+            client = get_ecm_client()
+            profile = await client.call_endpoint(
+                ENDPOINTS["dummy_epg_get_profile"], path_args={"profile_id": profile_id}
+            )
+            variants = profile["pattern_variants"]
+            matches = [
+                index for index, variant in enumerate(variants)
+                if variant.get("name") == variant_name
+            ]
+            if len(matches) != 1:
+                return (
+                    f"Error: profile {profile_id} has {len(matches)} pattern "
+                    f"variants named {variant_name!r}; expected exactly 1."
+                )
+            variants[matches[0]][field] = value
+            result = await client.call_endpoint(
+                ENDPOINTS["dummy_epg_update_profile"],
+                path_args={"profile_id": profile_id},
+                body={"pattern_variants": variants},
+            )
+            stored = result["pattern_variants"][matches[0]]
+            # The profile endpoint ignores a key its variant model does not
+            # define, so a misspelled field comes back missing.
+            if field not in stored or stored[field] != value:
+                return (
+                    f"Error: profile {profile_id} did not store {field!r} on "
+                    f"variant {variant_name!r} as sent; it holds "
+                    f"{stored.get(field)!r}."
+                )
+            return (
+                f"Dummy EPG profile {profile_id} variant {variant_name!r}: "
+                f"{field} updated."
+            )
+        except Exception as e:
+            logger.error("[MCP] update_dummy_epg_variant failed: %s", e)
+            return f"Error updating dummy EPG profile {profile_id} variant: {e}"
+
+    @mcp.tool()
     async def delete_dummy_epg_profile(profile_id: int, confirm: bool = False) -> str:
         """Delete a Dummy EPG profile (bd-omxy5).
 

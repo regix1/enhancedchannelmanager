@@ -1354,6 +1354,8 @@ class TestEventSyncStreamSortBehavior:
             {"id": 9001, "name": "native", "m3u_account": 1},
         ])
         client.update_channel = AsyncMock(return_value={})
+        # What Dispatcharr holds after the attach, read before the sort writes.
+        client.get_channels = AsyncMock(return_value=[{"id": 100, "streams": [9001, 7001]}])
 
         engine = ChannelPipelineEngine(client)
         engine._existing_channels = channels

@@ -8,32 +8,9 @@ import { render as renderTemplate, TemplateSyntaxError } from '../utils/template
 import * as api from '../services/api';
 import { logger } from '../utils/logger';
 import { TemplateHelp } from './TemplateHelp';
+import { TIMEZONES } from './timezones';
 import './ModalBase.css';
 import './DummyEPGSourceModal.css';
-
-// Common timezones for the dropdown
-const TIMEZONES = [
-  { value: '', label: '-- None --' },
-  { value: 'US/Eastern', label: 'US/Eastern (ET)' },
-  { value: 'US/Central', label: 'US/Central (CT)' },
-  { value: 'US/Mountain', label: 'US/Mountain (MT)' },
-  { value: 'US/Pacific', label: 'US/Pacific (PT)' },
-  { value: 'US/Alaska', label: 'US/Alaska' },
-  { value: 'US/Hawaii', label: 'US/Hawaii' },
-  { value: 'America/New_York', label: 'America/New_York' },
-  { value: 'America/Chicago', label: 'America/Chicago' },
-  { value: 'America/Denver', label: 'America/Denver' },
-  { value: 'America/Los_Angeles', label: 'America/Los_Angeles' },
-  { value: 'America/Toronto', label: 'America/Toronto' },
-  { value: 'America/Vancouver', label: 'America/Vancouver' },
-  { value: 'Europe/London', label: 'Europe/London (GMT/BST)' },
-  { value: 'Europe/Paris', label: 'Europe/Paris (CET)' },
-  { value: 'Europe/Berlin', label: 'Europe/Berlin (CET)' },
-  { value: 'Europe/Amsterdam', label: 'Europe/Amsterdam (CET)' },
-  { value: 'Australia/Sydney', label: 'Australia/Sydney (AEST)' },
-  { value: 'Australia/Melbourne', label: 'Australia/Melbourne (AEST)' },
-  { value: 'UTC', label: 'UTC' },
-];
 
 interface DummyEPGSourceModalProps {
   isOpen: boolean;

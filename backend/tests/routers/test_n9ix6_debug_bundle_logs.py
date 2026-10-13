@@ -223,6 +223,27 @@ async def test_ring_only_fallback_reports_exact_saturation_and_parse_failures(
 
 
 @pytest.mark.asyncio
+async def test_deeply_nested_log_line_counts_as_one_parse_failure(test_engine):
+    ring = _ring(
+        [
+            "2026-08-28 10:00:00,000 - ring - INFO - first",
+            "[" * 100_000,
+        ],
+    )
+
+    payload = await build_bundle(
+        test_engine,
+        persistent_log_snapshot=_snapshot(handler_degraded=True),
+        ring_log_snapshot=ring,
+    )
+    metadata = json.loads(extract_members(payload)["manifest.json"])["log_members"][0]
+
+    assert metadata["line_count"] == 2
+    assert metadata["timestamp_parse_failures"] == 1
+    assert metadata["first_timestamp"] == "2026-08-28 10:00:00,000"
+
+
+@pytest.mark.asyncio
 async def test_empty_but_available_persistent_set_uses_ring_as_no_files_fallback(
     test_engine,
 ):

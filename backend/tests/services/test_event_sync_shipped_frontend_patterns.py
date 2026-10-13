@@ -161,3 +161,46 @@ def test_generic_patterns_strip_two_digit_slot_prefixes():
     )
     assert parsed.title == "Yankees vs Red Sox"
     assert parsed.start is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [e for e in _PATTERNS if e.get("earlier_title_patterns")],
+    ids=[e["id"] for e in _PATTERNS if e.get("earlier_title_patterns")],
+)
+def test_saved_earlier_shipped_copy_parses_like_the_current_pattern(entry):
+    """A rule that saved an earlier shipped copy parses as a fresh selection.
+
+    The editor counts that copy as the shipped pattern, so the matcher must
+    give it the current pattern's result too.
+    """
+    name = "MLB 02  Brewers x Padres start:2026-10-06 20:07:00 stop:2026-10-07 01:00:00"
+    current = parse_event_name(name, [_pattern_dict(entry)], event_timezone=_TZ, now=_NOW)
+    assert current.title == "Brewers x Padres"
+    for title_pattern in entry["earlier_title_patterns"]:
+        earlier = parse_event_name(
+            name,
+            [{**_pattern_dict(entry), "title_pattern": title_pattern}],
+            event_timezone=_TZ,
+            now=_NOW,
+        )
+        assert (earlier.title, earlier.start) == (current.title, current.start)
+
+
+@pytest.mark.parametrize(
+    ("name", "title"),
+    [
+        ("MLB 02  Brewers x Padres start:2026-10-06 20:07:00 stop:2026-10-07 01:00:00",
+         "Brewers x Padres"),
+        ("Dodgers x Braves Game 2  (Spanish) start:2026-10-06 20:07:00 stop:2026-10-07 01:00:00",
+         "Dodgers x Braves Game 2  (Spanish)"),
+        ("Formula 1  Grand Prix start:2026-10-06 20:07:00 stop:2026-10-07 01:00:00",
+         "Formula 1  Grand Prix"),
+        ("NLDS Game 3  Phillies x Mets start:2026-10-06 20:07:00 stop:2026-10-07 01:00:00",
+         "NLDS Game 3  Phillies x Mets"),
+    ],
+)
+def test_explicit_start_double_space_ends_only_a_slot_code(name, title):
+    entry = next(e for e in _PATTERNS if e["id"] == "slot-title-explicit-start")
+    parsed = parse_event_name(name, [_pattern_dict(entry)], event_timezone=_TZ, now=_NOW)
+    assert parsed.title == title

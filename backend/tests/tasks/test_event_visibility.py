@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 import database
 from services import epg_programmes as guides
 from services.epg_publication import PublicationResult
-from services.epg_publication import publish_profiles, read_publication
+from services.epg_publication import publish_profiles, read_publication, receipt_intervals
 from stream_prober import StreamProber
 from task_scheduler import ScheduleType
 from tasks.event_visibility import (
@@ -596,10 +596,10 @@ async def test_reconciliation_allows_runtime_updates(change):
         updated_at=before.isoformat(),
         last_generated_at=before.isoformat(),
     )
-    rule = SimpleNamespace(
-        id=3, enabled=True, event_sync_config={"secondary": []},
-        last_run_at=before, match_count=1, updated_at=before,
-    )
+    from models import ChannelPipelineRule
+
+    rule = ChannelPipelineRule(id=3, enabled=True, last_run_at=before, match_count=1, updated_at=before)
+    rule.set_event_sync_config({"secondary": []})
     coverage = {
         "profiles": {"1": {"can_publish": True, "reason_codes": []}},
         "channels": [],
@@ -740,10 +740,10 @@ async def test_reconciliation_copies_only_present_profile_mapping_checks():
 @pytest.mark.parametrize("change", ["pattern", "timezone", "secondary"])
 async def test_reconciliation_rejects_changed_config(change):
     profile = _profile(channel_assignments=[])
-    rule = SimpleNamespace(
-        id=3, enabled=True, event_sync_config={"secondary": []},
-        updated_at=ATTEMPT_ADMITTED_AT,
-    )
+    from models import ChannelPipelineRule
+
+    rule = ChannelPipelineRule(id=3, enabled=True, updated_at=ATTEMPT_ADMITTED_AT)
+    rule.set_event_sync_config({"secondary": []})
     coverage = {
         "profiles": {"1": {"can_publish": True, "reason_codes": []}},
         "channels": [],
@@ -764,10 +764,12 @@ async def test_reconciliation_rejects_changed_config(change):
                 "America/Chicago" if preparation.await_count == 1 else "US/Eastern"
             )
         else:
-            rule.event_sync_config["secondary"].append({
+            config = rule.get_event_sync_config()
+            config["secondary"].append({
                 "group_id": 5 + preparation.await_count,
                 "m3u_account_id": 2,
             })
+            rule.set_event_sync_config(config)
         return [copy.deepcopy(profile)], coverage
 
     preparation = AsyncMock(side_effect=prepare)
@@ -1167,7 +1169,224 @@ def test_placeholder_activity_does_not_keep_complete_owned_channel_active(source
 
     assert result["states"] == {10: "idle"}
     assert result["desired"] == {10: []}
-    assert result["profile"]["event_intervals"] == {}
+    assert result["profile"]["event_intervals"] == ({10: [placeholder]} if source == "interval" else {})
+
+
+def _event_channel():
+    return {
+        "id": 10,
+        "uuid": "channel-10",
+        "name": "Dodgers X Braves",
+        "channel_group_id": 7,
+        "hidden_from_output": False,
+        "epg_data": {"id": 900, "epg_source": 46, "tvg_id": "custom-10"},
+        "streams": [{"id": 5, "name": "Dodgers X Braves"}],
+    }
+
+
+def test_completed_receipt_keeps_sourced_channel_active_until_its_stop():
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    stop = now + timedelta(minutes=150)
+    delivery = {
+        "guide_attempt": {"attempt_id": "2" * 32},
+        "pending_channels": {"event-1": {
+            "stage": "complete",
+            "guide_attempt_id": "1" * 32,
+            "channel_id": 10,
+            "channel_uuid": "channel-10",
+            "target_group_id": 7,
+            "start": (now - timedelta(minutes=30)).isoformat(),
+            "stop": stop.isoformat(),
+            "title": "Dodgers X Braves",
+            "expires_at": stop.isoformat(),
+        }},
+    }
+    channel = _event_channel()
+    intervals = receipt_intervals(delivery, {10: channel}, now)
+    profile = _profile(
+        epg_source_ids=[100],
+        event_intervals=intervals,
+        channel_assignments=[{"channel_id": 10, "channel_name": "Dodgers X Braves"}],
+    )
+    retained = _publication("profile:1", channels=[{"channel_id": 10, "events": []}])
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile, profile["event_sync_config"], {10: channel}, coverage,
+        [], set(), retained, now, {46},
+    )
+
+    assert result["states"] == {10: "active"}
+    assert intervals == {10: [{
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "stop": stop.isoformat(),
+        "title": "Dodgers X Braves",
+        "receipt": True,
+    }]}
+    assert result["profile"]["event_intervals"] == intervals
+    assert receipt_intervals(delivery, {10: channel}, stop) == {}
+
+
+@pytest.mark.parametrize(("waiting", "kept"), [(True, True), (False, False)])
+def test_failed_receipt_waiting_for_a_retry_keeps_its_programme(waiting, kept):
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    stop = now + timedelta(minutes=150)
+    receipt = {
+        "stage": "failed",
+        "reason": "health_failed",
+        "retry_at": (now + timedelta(minutes=5)).isoformat() if waiting else None,
+        "guide_attempt_id": "1" * 32,
+        "channel_id": 10,
+        "channel_uuid": "channel-10",
+        "target_group_id": 7,
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "stop": stop.isoformat(),
+        "title": "Dodgers X Braves",
+        "expires_at": stop.isoformat(),
+    }
+    delivery = {
+        "guide_attempt": {"attempt_id": "2" * 32},
+        "pending_channels": {"event-1": receipt},
+    }
+    channel = {**_event_channel(), "hidden_from_output": True, "streams": []}
+
+    intervals = receipt_intervals(delivery, {10: channel}, now)
+
+    assert intervals == ({10: [{
+        "start": receipt["start"],
+        "stop": receipt["stop"],
+        "title": "Dodgers X Braves",
+        "receipt": True,
+    }]} if kept else {})
+    assert receipt_intervals(delivery, {10: channel}, stop) == {}
+
+
+@pytest.mark.parametrize("published_before", [False, True])
+def test_source_free_receipt_keeps_its_title_after_a_publication(published_before):
+    from dummy_epg_engine import generate_xmltv
+
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    start = now - timedelta(minutes=20)
+    stop = start + timedelta(hours=3)
+    delivery = {
+        "guide_attempt": {"attempt_id": "1" * 32},
+        "pending_channels": {"event-1": {
+            "stage": "allocated",
+            "guide_attempt_id": "1" * 32,
+            "channel_id": 10,
+            "channel_uuid": "channel-10",
+            "target_group_id": 7,
+            "start": start.isoformat(),
+            "stop": stop.isoformat(),
+            "title": "Dodgers X Braves",
+            "expires_at": stop.isoformat(),
+        }},
+    }
+    channel = _event_channel()
+    profile = _profile(
+        event_intervals=receipt_intervals(delivery, {10: channel}, now),
+        title_template="Arena: {title}",
+        channel_assignments=[{"channel_id": 10, "channel_name": "Dodgers X Braves"}],
+    )
+    stored_events = [{"start": start.isoformat(), "stop": stop.isoformat(), "title": "Dodgers X Braves"}]
+    retained = _publication(
+        "profile:1",
+        channels=[{"channel_id": 10, "events": stored_events if published_before else []}],
+    )
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile, profile["event_sync_config"], {10: channel}, coverage,
+        [], set(), retained, now, {46},
+    )
+    rendered = dict(result["profile"])
+    rendered["guide_start"] = now - timedelta(hours=1)
+    rendered["guide_stop"] = now + timedelta(hours=6)
+    channel_data = {10: {"id": 10, "name": "Dodgers X Braves", "channel_number": 100, "streams": []}}
+    document = ET.fromstring(generate_xmltv([rendered], channel_data, without_gaps={10}))
+
+    assert [row.findtext("title") for row in document.findall("programme")] == ["Dodgers X Braves"]
+
+
+def test_sourced_profile_publishes_only_incoming_receipt_intervals():
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    feed_event = {
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "stop": (now + timedelta(minutes=150)).isoformat(),
+        "title": "Dodgers X Braves",
+    }
+    receipt = {
+        "start": (now + timedelta(hours=1)).isoformat(),
+        "stop": (now + timedelta(hours=4)).isoformat(),
+        "title": "Cubs X Reds",
+    }
+    profile = _profile(
+        epg_source_ids=[100],
+        event_intervals={11: [receipt]},
+        channel_assignments=[{"channel_id": 10, "channel_name": "Dodgers X Braves"}],
+    )
+    retained = _publication("profile:1", channels=[{"channel_id": 10, "events": [feed_event]}])
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile, profile["event_sync_config"], {10: _event_channel()}, coverage,
+        [], set(), retained, now, {46},
+    )
+
+    assert result["profile"]["event_intervals"] == {11: [receipt]}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_gives_sourced_profile_its_staged_receipt_interval():
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=10)
+    stop = start + timedelta(hours=3)
+    profile = _profile(epg_source_ids=[46])
+    stored = _publication("profile:1")
+    stored["state"]["delivery"]["pending_channels"] = {"event-1": {
+        "stage": "allocated",
+        "guide_attempt_id": "1" * 32,
+        "channel_id": 10,
+        "target_group_id": 7,
+        "start": start.isoformat(),
+        "stop": stop.isoformat(),
+        "title": "Dodgers X Braves",
+        "expires_at": stop.isoformat(),
+    }}
+    task = EventVisibilityTask()
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [],
+    }
+
+    async def finish_preparation(selected, *args, **kwargs):
+        task._cancel_requested = True
+        return selected, coverage
+
+    prepare = AsyncMock(side_effect=finish_preparation)
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=MagicMock()), \
+         patch("services.epg_programmes._fetch_all_channels",
+               new=AsyncMock(return_value={10: _event_channel()})), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("services.epg_publication.read_publication", return_value=stored), \
+         patch("services.epg_publication.begin_delivery",
+               side_effect=_admit({"profile:1": stored})):
+        await task.execute()
+
+    assert prepare.await_args.args[0][0]["event_intervals"] == {10: [{
+        "start": start.isoformat(), "stop": stop.isoformat(), "title": "Dodgers X Braves",
+        "receipt": True,
+    }]}
 
 
 @pytest.mark.parametrize(
@@ -1293,6 +1512,154 @@ def test_event_stream_activation_honors_family_bootstrap_without_current_guide(b
         "matched_variant": "test-pattern",
         "provisional": False,
     }])
+
+
+def test_a_zoned_groups_live_listing_stays_on_its_channel():
+    from services.event_sync_resolver import SecondaryStream
+
+    # The run read "08:00 PM" in the group's London zone: 19:00 UTC, 3:00 PM Eastern.
+    start = datetime(2026, 10, 13, 19, tzinfo=timezone.utc)
+    config = _config([{"group_id": 9, "m3u_account_id": None}])
+    config["group_timezones"] = {"9": "Europe/London"}
+    profile = _profile(
+        event_timezone="US/Eastern",
+        epg_source_ids=[100],
+        event_sync_config=config,
+        channel_assignments=[{"channel_id": 10, "channel_name": "Brewers x Padres"}],
+    )
+    name = "Brewers x Padres @ Oct 13 08:00 PM"
+    channel = {
+        "id": 10, "name": "Brewers x Padres", "channel_group_id": 7, "hidden_from_output": False,
+        "epg_data": {"id": 900, "epg_source": 46, "tvg_id": "custom-10"},
+        "streams": [{"id": 90, "name": name, "channel_group": 9, "m3u_account": None}],
+    }
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": {
+            "title": "Brewers x Padres",
+            "start": start.isoformat(),
+            "stop": (start + timedelta(hours=3)).isoformat(),
+        }}],
+    }
+
+    result = _plan_profile(
+        profile, config, {10: channel}, coverage,
+        [SecondaryStream(name=name, group_id=9, stream_id=90, is_stale=False)],
+        {(9, None)}, None, start + timedelta(minutes=30), {46},
+    )
+
+    assert result["states"] == {10: "active"}
+    assert result["desired"] == {10: [90]}
+
+
+def test_a_zoned_groups_slot_listing_starts_in_the_groups_zone():
+    from services.event_sync_resolver import SecondaryStream
+
+    start = datetime(2026, 10, 13, 19, tzinfo=timezone.utc)
+    config = _config([{"group_id": 9, "m3u_account_id": None}])
+    config["group_timezones"] = {"9": "Europe/London"}
+    profile = _profile(
+        event_timezone="US/Eastern",
+        event_sync_config=config,
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+    )
+    channels = {10: {"id": 10, "name": "Arena 1", "channel_group_id": 7, "hidden_from_output": False, "streams": []}}
+    coverage = {
+        "profiles": {"1": {"can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    result = _plan_profile(
+        profile, config, channels, coverage,
+        [SecondaryStream(name="LIVE 1 Main Event @ Oct 13 08:00 PM", group_id=9, stream_id=90, is_stale=False)],
+        {(9, None)}, None, start + timedelta(minutes=30),
+    )
+
+    assert result["states"] == {10: "active"}
+    assert [datetime.fromisoformat(row["start"]) for row in result["observations"]] == [start]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_reads_listings_in_the_profiles_rule_zones(test_session):
+    from models import ChannelPipelineRule, DummyEPGProfile
+
+    # Rule validation looks the guide profile up by id.
+    test_session.add(DummyEPGProfile(id=1, name="Arena"))
+    test_session.commit()
+    profile = _profile(channel_assignments=[])
+    rules = []
+    for rule_id, zone in ((3, "Europe/London"), (4, "Mars/Base")):
+        rule = ChannelPipelineRule(id=rule_id, enabled=True)
+        rule.set_event_sync_config({
+            "master_group_id": 10, "secondary_group_ids": [rule_id + 6],
+            "dummy_epg_profile_id": 1, "group_timezones": {str(rule_id + 6): zone},
+        })
+        rules.append(rule)
+    coverage = {"profiles": {"1": {"can_publish": True, "reason_codes": []}}, "channels": []}
+    publications = {"profile:1": _publication("profile:1", pending=False)}
+    task = EventVisibilityTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    planned = []
+
+    def plan(profile, config, *args):
+        # A rule config that fails validation, such as a restored unknown zone, adds nothing.
+        planned.append(dict(config["group_timezones"]))
+        task._cancel_requested = True
+        return {"states": {}, "desired": {}, "primary_ids": {}, "observations": []}
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], rules)), \
+         patch("database.get_session", return_value=test_session), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("tasks.event_visibility._plan_profile", side_effect=plan), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([copy.deepcopy(profile)], coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("cache.get_cache"):
+        await reconcile_profiles(task, wait_for_sources=False)
+
+    assert planned == [{"9": "Europe/London"}]
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_an_unknown_stored_zone_fails_alone():
+    import pytz
+
+    profiles = [_profile(id=2, name="Restored", channel_assignments=[]), _profile(id=1, channel_assignments=[])]
+    coverage = {
+        "profiles": {str(item["id"]): {"can_publish": True, "reason_codes": []} for item in profiles},
+        "channels": [],
+    }
+    publications = {f"profile:{item['id']}": _publication(f"profile:{item['id']}", pending=False) for item in profiles}
+    task = EventVisibilityTask()
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[])
+    planned = []
+
+    def plan(profile, *args):
+        if profile["id"] == 2:
+            # What the matcher raises for a stamp zone a backup restore stored unchecked.
+            raise pytz.UnknownTimeZoneError("Mars/Base")
+        planned.append(profile["id"])
+        task._cancel_requested = True
+        return {"states": {}, "desired": {}, "primary_ids": {}, "observations": [], "scan_complete": True}
+
+    with patch("tasks.event_visibility._load_profiles", return_value=(profiles, [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("tasks.event_visibility._plan_profile", side_effect=plan), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value={})), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(copy.deepcopy(profiles), coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("cache.get_cache"):
+        await reconcile_profiles(task, wait_for_sources=False)
+
+    assert planned == [1]
+    assert coverage["profiles"]["2"]["can_publish"] is False
+    assert "GUIDE_CONFIG_INVALID" in coverage["profiles"]["2"]["reason_codes"]
 
 
 def test_source_free_no_slot_interval_stays_active_and_renders_programme():
@@ -1858,6 +2225,153 @@ async def test_remote_stream_changes_block_delivery(identity_change, change_at):
     )
 
 
+async def _reconcile_slot_holding_an_old_stream(case: str) -> tuple:
+    """Run one check over slot channel 10, which still holds stream 601 from an
+    earlier event beside its placeholder 701. "stale": the provider no longer
+    lists 601. "unmatched": the profile's stream scan does not return 601.
+    "live": 601 is stale and the slot carries a current event on stream 501.
+    "moved": 601 is stale and the reread channel is outside the slot group."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    event_start = now - timedelta(minutes=5)
+    event_stop = now + timedelta(hours=2)
+    live = case == "live"
+    profile = _profile(
+        event_sync_config=_config([{"group_id": 5, "m3u_account_id": 4}]),
+        channel_assignments=[{"channel_id": 10, "channel_name": "Arena 1"}],
+    )
+    stream_rows = {
+        stream_id: {
+            "id": stream_id, "name": name, "url": f"https://media.test/{stream_id}",
+            "m3u_account": 4, "channel_group": 5, "is_stale": stale,
+        }
+        for stream_id, name, stale in (
+            (501, _guide_name({"title": "Main Event", "start": event_start.isoformat()}, "UTC"), False),
+            (601, "Navy vs. Army (10.09 4:00PM ET)", case != "unmatched"),
+            (701, "Backup 1", False),
+        )
+    }
+    listed = [row for stream_id, row in stream_rows.items() if case != "unmatched" or stream_id != 601]
+    channel = {
+        "id": 10, "uuid": "channel-10", "name": "Arena 1", "channel_number": 101,
+        "channel_group_id": 7, "hidden_from_output": False, "epg_data_id": None,
+        "streams": [501, 601, 701] if live else [601, 701],
+    }
+    reread_group = 8 if case == "moved" else 7
+    coverage = {
+        "profiles": {"1": {"profile_id": 1, "can_publish": True, "reason_codes": []}},
+        "channels": [{
+            "profile_id": 1, "channel_id": 10,
+            "current": {"title": "Main Event", "start": event_start.isoformat()} if live else None,
+        }],
+    }
+    publications = {
+        "all": _publication("all"),
+        "profile:1": _publication("profile:1", channels=[{
+            "channel_id": 10,
+            "events": [{
+                "title": "Main Event",
+                "start": event_start.isoformat(),
+                "stop": event_stop.isoformat(),
+            }],
+        }] if live else []),
+    }
+
+    def update(scope, *, expected_revision, **values):
+        row = publications[scope]
+        if row["revision"] != expected_revision:
+            return None
+        for key in (
+            "required_dispatcharr_hashes", "confirmed_dispatcharr_hashes",
+            "pending_emby", "source_refreshes",
+        ):
+            if values.get(key) is not None:
+                row["state"]["delivery"][key] = copy.deepcopy(values[key])
+        row["revision"] += 1
+        return row["revision"]
+
+    async def update_channel(channel_id, values):
+        channel.update(copy.deepcopy(values))
+
+    async def collect(stream_ids, **kwargs):
+        return {stream_id: True for stream_id in stream_ids}
+
+    client = MagicMock()
+    client.get_channels = AsyncMock(return_value=[copy.deepcopy(channel)])
+    client.get_channel = AsyncMock(side_effect=lambda channel_id: {
+        **copy.deepcopy(channel), "channel_group_id": reread_group,
+    })
+    client.update_channel = AsyncMock(side_effect=update_channel)
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        copy.deepcopy(stream_rows[stream_id]) for stream_id in ids
+    ])
+    client._channel_group_name_for_id = AsyncMock(return_value="Arena feeds")
+    client.get_streams = AsyncMock(return_value={"results": listed, "next": None})
+    client.get_epg_sources = AsyncMock(return_value=[{
+        "id": 46, "name": "Generated one",
+        "url": "http://ecm/api/dummy-epg/xmltv/1", "is_active": True,
+    }])
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(
+        client.get_epg_sources.return_value[0]
+    ))
+    client.get_epg_data = AsyncMock(return_value=[
+        {"id": 900, "tvg_id": "custom-10", "epg_source": 46},
+    ])
+    client.get_epg_programmes = AsyncMock(return_value=[{
+        "epg_data_id": 900, "tvg_id": "custom-10", "title": "Main Event",
+        "start_time": event_start.isoformat(), "end_time": event_stop.isoformat(),
+    }])
+    client.get_epg_grid = AsyncMock(return_value=[])
+    client.refresh_epg_source = AsyncMock()
+    result = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"all": "<tv/>", "profile:1": "<tv/>"},
+        hashes_by_scope={"all": "a" * 64, "profile:1": "a" * 64},
+    )
+    stats = {501: {
+        "stream_name": stream_rows[501]["name"], "probe_status": "success",
+        "measured_bitrate": 5000000, "last_probed": now.isoformat(),
+        "black_screen_checked_at": now.isoformat(), "is_black_screen": False,
+    }}
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(
+             return_value=([copy.deepcopy(profile)], coverage),
+         )), \
+         patch("services.event_sync_stream_health.collect_stream_flow", side_effect=collect), \
+         patch("services.event_sync_stream_health._load_stats", new=AsyncMock(return_value=stats)), \
+         patch("concurrency.run_cpu_bound", new=_publication_run(result)), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=True)), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock(return_value=None)), \
+         patch("cache.get_cache"):
+        outcome = await reconcile_profiles(EventVisibilityTask(), wait_for_sources=True)
+    return outcome, channel, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["stale", "unmatched"])
+async def test_idle_slot_drops_an_old_stream_it_cannot_identify_and_hides(case):
+    outcome, channel, _ = await _reconcile_slot_holding_an_old_stream(case)
+
+    assert channel["hidden_from_output"] is True
+    assert channel["streams"] == [701]
+    assert outcome.details["hidden_channel_ids"] == [10]
+    assert outcome.details["stream_updated_channel_ids"] == [10]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["live", "moved"])
+async def test_old_stream_leaves_a_live_slot_and_a_moved_channel_untouched(case):
+    outcome, channel, client = await _reconcile_slot_holding_an_old_stream(case)
+
+    client.update_channel.assert_not_awaited()
+    assert channel["hidden_from_output"] is False
+    assert outcome.details["hidden_channel_ids"] == []
+
+
 @pytest.mark.asyncio
 async def test_dropped_source_connection_leaves_guide_pending():
     await test_reconciliation_orders_hide_import_link_reveal_and_emby(
@@ -2098,6 +2612,94 @@ async def test_current_programme_batches_keep_profile_expiry_and_isolate_failure
     assert channels[2001]["streams"] == [12001]
     assert outcome.details["delivery_pending"] is True
     client.get_epg_grid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hidden_channel_waiting_for_a_retry_leaves_the_pass_healthy():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    stop = now + timedelta(hours=2)
+    channel = {**_event_channel(), "hidden_from_output": True, "streams": []}
+    del channel["epg_data"]
+    channels = {10: channel}
+    profile = _profile(channel_assignments=[{"channel_id": 10, "channel_name": channel["name"]}])
+    # The planner keeps a failed attempt's programme while it waits for its
+    # retry, so the channel is planned active.
+    plan = {
+        "profile": profile, "states": {10: "active"}, "desired": {},
+        "primary_ids": {}, "event_starts": {}, "scan_complete": True,
+        "observations": None,
+    }
+    document_hash = hashlib.sha256("<tv/>".encode()).hexdigest()
+    publications = {
+        "all": _publication("all"),
+        "profile:1": _publication("profile:1", pending=False, confirmed={"46": document_hash}),
+    }
+    publications["profile:1"]["state"]["delivery"]["pending_channels"] = {"event-1": {
+        "stage": "failed",
+        "reason": "programme_missing",
+        "retry_at": (now + timedelta(minutes=2)).isoformat(),
+        "guide_attempt_id": "1" * 32,
+        "channel_id": 10,
+        "channel_uuid": "channel-10",
+        "target_group_id": 7,
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "stop": stop.isoformat(),
+        "title": "Dodgers X Braves",
+        "expires_at": stop.isoformat(),
+    }}
+
+    def update(scope, *, expected_revision, **values):
+        row = publications[scope]
+        if row["revision"] != expected_revision:
+            return None
+        for key in ("required_dispatcharr_hashes", "confirmed_dispatcharr_hashes"):
+            if values.get(key) is not None:
+                row["state"]["delivery"][key] = dict(values[key])
+        row["revision"] += 1
+        return row["revision"]
+
+    client = MagicMock()
+    client.get_epg_sources = AsyncMock(return_value=[{
+        "id": 46, "name": "Generated one",
+        "url": "http://ecm/api/dummy-epg/xmltv/1", "is_active": True,
+    }])
+    client.get_epg_source = AsyncMock(side_effect=lambda source_id: copy.deepcopy(
+        client.get_epg_sources.return_value[0]
+    ))
+    client.get_epg_data = AsyncMock(return_value=[])
+    client.get_channel = AsyncMock(side_effect=lambda channel_id: copy.deepcopy(channels[channel_id]))
+    client.update_channel = AsyncMock()
+    client.get_epg_programmes = AsyncMock(return_value=[])
+    client.get_epg_grid = AsyncMock(return_value=[])
+    client.refresh_epg_source = AsyncMock()
+    result = PublicationResult(
+        published_profile_ids=(1,),
+        xmltv_by_scope={"all": "<tv/>", "profile:1": "<tv/>"},
+        hashes_by_scope={"all": "a" * 64, "profile:1": "a" * 64},
+    )
+    coverage = {
+        "profiles": {"1": {"profile_id": 1, "can_publish": True, "reason_codes": []}},
+        "channels": [{"profile_id": 1, "channel_id": 10, "current": None}],
+    }
+
+    with patch("tasks.event_visibility._load_profiles", return_value=([profile], [])), \
+         patch("tasks.event_visibility.get_client", return_value=client), \
+         patch("tasks.event_visibility._plan_profile", return_value=plan), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=([profile], coverage))), \
+         patch("tasks.event_visibility._fetch_match_streams", new=AsyncMock(return_value=([], set(), {}, {}))), \
+         patch("concurrency.run_cpu_bound", new=_publication_run(result)), \
+         patch("services.epg_publication.read_publication", side_effect=publications.get), \
+         patch("services.epg_publication.begin_delivery", side_effect=_admit(publications)), \
+         patch("services.epg_publication.update_delivery", side_effect=update), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", new=AsyncMock(return_value=True)), \
+         patch("emby_client.request_guide_refresh", new=AsyncMock(return_value=None)), \
+         patch("cache.get_cache"):
+        outcome = await reconcile_profiles(EventVisibilityTask(), wait_for_sources=True)
+
+    assert outcome.success is True, outcome.details["reason_codes"]
+    assert "GUIDE_IMPORT_PENDING" not in outcome.details["reason_codes"]
+    assert channels[10]["hidden_from_output"] is True
 
 
 @pytest.mark.asyncio

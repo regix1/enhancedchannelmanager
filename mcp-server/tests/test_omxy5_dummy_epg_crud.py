@@ -294,6 +294,78 @@ class TestUpdateDummyEpgProfile:
         client.call_endpoint.assert_not_called()
 
 
+class TestUpdateDummyEpgVariant:
+    # Shapes of live profile 1: each variant holds only the keys it was
+    # saved with.
+    STORED = [
+        {"name": "mlb-iso-date", "title_pattern": r"^MLB\s+\d+\s*\|\s*(?P<title>.+?)$",
+         "title_template": "{title}"},
+        {"name": "espn-iso-date",
+         "title_pattern": r"^US\s+\(ESPN\+\s+\d+\)\s*\|\s*(?P<title>.+?)\s*\((?P<year>\d{4})-",
+         "title_template": "{title}", "upcoming_title_template": "Upcoming: {title}"},
+        {"name": "ppv-dot-date", "title_pattern": r"^PPV\s+(?P<title>.+?)\s*\(",
+         "time_pattern": r"(?P<hour>\d{1,2}):(?P<minute>\d{2})", "ended_title_template": "Ended: {title}"},
+    ]
+    NEW_PATTERN = r"^US\s+\(ESPN\+\s+\d+\)\s*\|\s*(?P<title>.+?)\s*\((?P<year>\d{4})[-\s]"
+
+    def _client(self, stored_after=None):
+        client = AsyncMock()
+
+        async def call_endpoint(endpoint, path_args=None, body=None):
+            if endpoint.name == "dummy_epg_get_profile":
+                return {"id": 1, "name": "Live Events (auto)",
+                        "pattern_variants": json.loads(json.dumps(self.STORED))}
+            return {"id": 1, "pattern_variants": stored_after or body["pattern_variants"]}
+
+        client.call_endpoint.side_effect = call_endpoint
+        return client
+
+    @pytest.mark.asyncio
+    async def test_one_field_change_sends_every_other_variant_and_field_as_read(self):
+        client = self._client()
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("update_dummy_epg_variant", {
+                "profile_id": 1, "variant_name": "espn-iso-date",
+                "field": "title_pattern", "value": self.NEW_PATTERN,
+            })
+
+        expected = json.loads(json.dumps(self.STORED))
+        expected[1]["title_pattern"] = self.NEW_PATTERN
+        update = client.call_endpoint.call_args_list[-1]
+        assert update.args[0].name == "dummy_epg_update_profile"
+        assert update.kwargs["path_args"] == {"profile_id": 1}
+        assert json.dumps(update.kwargs["body"]) == json.dumps({"pattern_variants": expected})
+        assert "title_pattern updated" in _text(result)
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_name_that_is_not_exactly_one_variant(self):
+        client = self._client()
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("update_dummy_epg_variant", {
+                "profile_id": 1, "variant_name": "no-such-variant",
+                "field": "title_pattern", "value": "x",
+            })
+
+        assert "expected exactly 1" in _text(result)
+        assert [c.args[0].name for c in client.call_endpoint.call_args_list] == [
+            "dummy_epg_get_profile",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reports_a_field_the_profile_did_not_store(self):
+        client = self._client(stored_after=json.loads(json.dumps(self.STORED)))
+
+        with patch("tools.epg.get_ecm_client", return_value=client):
+            result = await _mcp().call_tool("update_dummy_epg_variant", {
+                "profile_id": 1, "variant_name": "espn-iso-date",
+                "field": "title_patern", "value": self.NEW_PATTERN,
+            })
+
+        assert "did not store 'title_patern'" in _text(result)
+
+
 class TestDeleteDummyEpgProfile:
     @pytest.mark.asyncio
     async def test_preview_on_confirm_false_deletes_nothing(self):

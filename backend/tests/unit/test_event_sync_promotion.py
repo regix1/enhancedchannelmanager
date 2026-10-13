@@ -2147,9 +2147,9 @@ def _add_pending_sibling(setup, executor, session_factory):
 
     profile_id = setup["profile_id"]
     current = _read_event_publication(session_factory, profile_id)
-    first_key = next(iter(executor._event_pending))
+    _, first_key = next(iter(executor._event_pending))
     first_receipt = current["state"]["delivery"]["pending_channels"][first_key]
-    work = executor._event_pending[first_key]
+    work = executor._event_pending[(profile_id, first_key)]
     source = next(
         row for row in executor._epg_sources
         if row.get("id") == work["source_id"]
@@ -2511,7 +2511,7 @@ def test_expiry_at_a_publication_guard_closes_outside_the_lock(
     ))
     expires_at = datetime.fromisoformat(receipt["expires_at"])
     current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
-    work = executor._event_pending[event_key]
+    work = executor._event_pending[(setup["profile_id"], event_key)]
     if stale:
         parsed = work["unit"].rows[0].result.parsed
         stale_row = ResolvedStream(
@@ -2660,6 +2660,8 @@ def test_channel_read_failure_uses_live_failure_or_expiry(
     ))
     expires_at = datetime.fromisoformat(receipt["expires_at"])
     current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    from tests.fixtures.sync_harness import _http_status_error
+
     client = setup["client"]
     get_channel = client.get_channel.side_effect
     reads = {"count": 0}
@@ -2669,7 +2671,8 @@ def test_channel_read_failure_uses_live_failure_or_expiry(
         if reads["count"] == read_number:
             if expire:
                 current[0] = expires_at
-            raise RuntimeError("channel unavailable")
+            # Dispatcharr answers that the channel no longer exists.
+            raise _http_status_error(404, "Not found.")
         return await get_channel(channel_id)
 
     client.get_channel.side_effect = fail_selected_read
@@ -2706,6 +2709,67 @@ def test_channel_read_failure_uses_live_failure_or_expiry(
     guide_after = after["state"]["delivery"]["guide_attempt"]
     for field in ("admitted_at", "expires_at", "attempt_id", "config_hash"):
         assert guide_after[field] == guide_before[field]
+
+
+@pytest.mark.parametrize("read_number", [1, 4])
+@pytest.mark.parametrize("expire", [False, True])
+def test_unavailable_channel_read_leaves_the_attempt_open(
+    read_number,
+    expire,
+    db_session_factory,
+    monkeypatch,
+):
+    setup, executor, finish = _pending_completion(
+        db_session_factory,
+        monkeypatch,
+    )
+    publication = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )
+    event_key, receipt = next(iter(
+        publication["state"]["delivery"]["pending_channels"].items()
+    ))
+    expires_at = datetime.fromisoformat(receipt["expires_at"])
+    current = [datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)]
+    client = setup["client"]
+    get_channel = client.get_channel.side_effect
+    reads = {"count": 0}
+
+    async def fail_selected_read(channel_id):
+        reads["count"] += 1
+        if reads["count"] == read_number:
+            if expire:
+                current[0] = expires_at
+            raise ConnectionError("Dispatcharr is unavailable")
+        return await get_channel(channel_id)
+
+    client.get_channel.side_effect = fail_selected_read
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch(
+             "services.epg_publication.get_session",
+             side_effect=db_session_factory,
+         ), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])):
+        _run(finish(executor))
+
+    closed = _read_event_publication(
+        db_session_factory,
+        setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"][event_key]
+    assert reads["count"] == read_number
+    if expire:
+        # The guide attempt's own expiry still closes it.
+        assert (closed["stage"], closed["reason"], closed["retry_at"]) == (
+            "expired",
+            "guide_expired",
+            (current[0] + timedelta(minutes=5)).isoformat(),
+        )
+    else:
+        # A failed request is not a missing channel: the attempt stays open
+        # for the next finish.
+        assert closed["stage"] == ("linking" if read_number == 4 else receipt["stage"])
+        assert closed.get("terminal_at") is None
 
 
 @pytest.mark.parametrize("stages,changes,guide_stage", [
@@ -5224,6 +5288,230 @@ async def test_event_preview_reports_guarded_retirement_without_writing(retireme
 
 
 @pytest.mark.asyncio
+async def test_event_preview_settles_staged_channels_like_the_run(
+    retirement, async_client, monkeypatch,
+):
+    from services import epg_publication
+
+    setup = retirement
+    setup["state"].channels[900].update(streams=[], hidden_from_output=True)
+
+    async def undecided(*args, **kwargs):
+        return set(), {900: "unknown"}
+
+    def ended_attempt(scope):
+        assert scope == f"profile:{setup['config']['dummy_epg_profile_id']}"
+        return {"state": {"delivery": {"pending_channels": {"event-1": {
+            "event_key": "event-1",
+            "rule_id": setup["rule"].id,
+            "channel_id": 900,
+            "channel_uuid": "event-900",
+            "stage": "failed",
+            "reason": "health_failed",
+            "start": (setup["now"] - timedelta(hours=3)).isoformat(),
+            "stop": (setup["now"] - timedelta(minutes=5)).isoformat(),
+            "streams": [{"id": 7301, "name": "No EVENT Today"}],
+        }}}}}
+
+    monkeypatch.setattr(ActionExecutor, "_event_lifecycle", undecided)
+    monkeypatch.setattr(epg_publication, "read_publication", ended_attempt)
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
+    assert response.status_code == 200, response.text
+    promotion = response.json()["promotion"]
+    # The run retires a staged channel whose failed attempt has ended
+    # without streams, so the preview reports it the same way.
+    assert promotion["event_states"] == [{"channel_id": 900, "status": "idle"}]
+
+
+@pytest.mark.asyncio
+async def test_event_preview_keeps_an_event_held_under_its_earlier_key_on_its_channel(
+    retirement, async_client, monkeypatch,
+):
+    from services import epg_publication, event_sync_matcher
+
+    setup = retirement
+    patterns = [{
+        "name": "slot-title-explicit-start",
+        "title_pattern": event_sync_matcher._EARLIER_EXPLICIT_START_TITLE,
+        "time_pattern": None,
+        "date_pattern": event_sync_matcher._EXPLICIT_START_PATTERN["date_pattern"],
+    }]
+    start = setup["now"] - timedelta(minutes=30)
+    name = "MLB 02  Fury vs. Usyk start:" + start.astimezone(
+        pytz.timezone("Europe/London"),
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    earlier = event_sync_matcher.earlier_title_parse(parse_event_name(
+        name, patterns, event_timezone="US/Eastern", now=setup["now"],
+    ))
+    held_key = master_event_key(earlier)
+    setup["state"].channels[900]["name"] = promoted_channel_name(earlier)
+    setup["state"].secondary_streams[SECONDARY_B_NAME] = [
+        {"id": 7301, "name": name, "m3u_account": 2},
+    ]
+    setup["streams"][0]["name"] = name
+    setup["stats"][7301] = {
+        "stream_name": name,
+        "probe_status": "success",
+        "measured_bitrate": 5000000,
+        "last_probed": setup["now"].isoformat(),
+        "is_black_screen": False,
+        "black_screen_checked_at": setup["now"].isoformat(),
+    }
+    setup["config"]["patterns"] = patterns
+    setup["db"].get(ChannelPipelineRule, setup["rule"].id).set_event_sync_config(setup["config"])
+    setup["db"].commit()
+
+    async def every_event_eligible(executor, rule_id, config, units, *args, **kwargs):
+        return {unit.event_key for unit in units}, {}
+
+    def held_receipt(scope):
+        return {"state": {"delivery": {"pending_channels": {held_key: {
+            "event_key": held_key,
+            "rule_id": setup["rule"].id,
+            "channel_id": 900,
+            "channel_uuid": "event-900",
+            "stage": "complete",
+            "reason": None,
+            "start": start.isoformat(),
+            "stop": (start + timedelta(hours=3)).isoformat(),
+            # The provider has renamed the stream since the receipt was
+            # admitted, so only the earlier title rules find the event.
+            "streams": [{"id": 7301, "name": f"{name} stop:2026-10-08 10:13:20"}],
+        }}}}}
+
+    monkeypatch.setattr(ActionExecutor, "_event_lifecycle", every_event_eligible)
+    monkeypatch.setattr(epg_publication, "read_publication", held_receipt)
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
+    assert response.status_code == 200, response.text
+    promotion = response.json()["promotion"]
+    # The run keeps this event on channel 900, so the preview plans no create.
+    assert (promotion["would_create"], promotion["would_attach_existing"]) == (0, 1)
+    assert promotion["units"][0]["existing_channel_id"] == 900
+
+
+@pytest.mark.asyncio
+async def test_event_preview_keeps_a_failed_staged_channel_during_its_event(
+    retirement, async_client, monkeypatch,
+):
+    from services import epg_publication
+
+    setup = retirement
+    setup["state"].channels[900].update(streams=[], hidden_from_output=True)
+    start = setup["now"] - timedelta(hours=1)
+
+    async def ended(*args, **kwargs):
+        return set(), {900: "idle"}
+
+    def failed_attempt(scope):
+        # The event's only stream is unproven, so the health replan drops
+        # its unit; the provider still lists it.
+        event_key = f"fury vs. usyk|{start.isoformat()}"
+        return {"state": {"delivery": {"pending_channels": {event_key: {
+            "event_key": event_key,
+            "rule_id": setup["rule"].id,
+            "channel_id": 900,
+            "channel_uuid": "event-900",
+            "stage": "failed",
+            "reason": "health_failed",
+            "start": start.isoformat(),
+            "stop": (setup["now"] + timedelta(hours=2)).isoformat(),
+            "streams": [{"id": 7301, "name": "No EVENT Today"}],
+        }}}}}
+
+    monkeypatch.setattr(ActionExecutor, "_event_lifecycle", ended)
+    monkeypatch.setattr(epg_publication, "read_publication", failed_attempt)
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
+    assert response.status_code == 200, response.text
+    promotion = response.json()["promotion"]
+    assert promotion["event_states"] == [{"channel_id": 900, "status": "unknown"}]
+    assert promotion["retirements"] == []
+
+
+@pytest.mark.asyncio
+async def test_event_preview_releases_a_failed_channel_whose_streams_are_all_delisted(
+    retirement, async_client, monkeypatch,
+):
+    from services import epg_publication
+
+    setup = retirement
+    setup["state"].channels[900].update(streams=[], hidden_from_output=True)
+    for streams in setup["state"].secondary_streams.values():
+        for stream in streams:
+            if stream["id"] == 7301:
+                stream["is_stale"] = True
+    start = setup["now"] - timedelta(hours=1)
+
+    async def ended(*args, **kwargs):
+        return set(), {900: "idle"}
+
+    def failed_attempt(scope):
+        event_key = f"fury vs. usyk|{start.isoformat()}"
+        return {"state": {"delivery": {"pending_channels": {event_key: {
+            "event_key": event_key,
+            "rule_id": setup["rule"].id,
+            "channel_id": 900,
+            "channel_uuid": "event-900",
+            "stage": "failed",
+            "reason": "health_failed",
+            "start": start.isoformat(),
+            "stop": (setup["now"] + timedelta(hours=2)).isoformat(),
+            "streams": [{"id": 7301, "name": "No EVENT Today"}],
+        }}}}}
+
+    monkeypatch.setattr(ActionExecutor, "_event_lifecycle", ended)
+    monkeypatch.setattr(epg_publication, "read_publication", failed_attempt)
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
+    assert response.status_code == 200, response.text
+    promotion = response.json()["promotion"]
+    assert promotion["event_states"] == [{"channel_id": 900, "status": "idle"}]
+
+
+@pytest.mark.asyncio
+async def test_event_preview_reports_a_corrupt_guide_state(
+    retirement, async_client, monkeypatch,
+):
+    from services import epg_publication
+
+    setup = retirement
+
+    def corrupt(scope):
+        raise ValueError("Stored publication revision is invalid.")
+
+    monkeypatch.setattr(epg_publication, "read_publication", corrupt)
+    with patch("routers.channel_pipeline.get_client", return_value=setup["client"]), \
+         patch("routers.channel_pipeline.get_session", side_effect=setup["session_factory"]), \
+         patch("channel_pipeline_engine.get_session", side_effect=setup["session_factory"]), \
+         patch("routers.channel_pipeline.datetime") as clock:
+        clock.now.return_value = setup["now"]
+        response = await async_client.post("/api/channel-pipeline/event-sync-preview", json={"rule_id": setup["rule"].id})
+    assert response.status_code == 500
+    assert response.json() == {"detail": {
+        "code": "GUIDE_PUBLICATION_FAILED",
+        "reason_codes": ["GUIDE_STATE_CORRUPT"],
+    }}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stale_measurement", [False, True])
 async def test_later_valid_event_can_use_the_retained_stream(retirement, stale_measurement):
     from channel_pipeline_executor import ExecutionContext
@@ -5345,6 +5633,7 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
     prober._probe_condition = asyncio.Condition()
     prober._account_active = {}
     prober._event_probes = 0
+    prober._event_waiting = {}
     prober.refresh_account_probe_limits = AsyncMock()
     # Simulated clock: every dial costs two seconds, so a batch that also
     # dials the 200 attached streams ends 400 seconds later, past the
@@ -5394,7 +5683,9 @@ async def test_old_attached_streams_leave_probe_capacity_for_current_event(retir
     assert [result["promoted_created"] for result in results] == [1, 0]
     # Independent retained events get evidence without probing every alternate.
     assert batches[0] == [7301, old_ids[0]], batches
-    assert set(batches[1]) == {7301, old_ids[0] if age == 26 else old_ids[1]}, batches
+    # Probes start in selection order, so the second run continues past the
+    # stream the first run proved instead of re-probing it.
+    assert set(batches[1]) == {7301, old_ids[1]}, batches
     assert len(batches[1]) == 2
     assert len(batches[1]) <= MAX_HEALTH_PROBES_PER_RUN
     assert 900 in result["channel_ids"]
@@ -5425,6 +5716,7 @@ async def test_probe_batch_drops_queued_streams_after_cancel():
     prober._probe_condition = asyncio.Condition()
     prober._account_active = {}
     prober._event_probes = 0
+    prober._event_waiting = {}
     prober.refresh_account_probe_limits = AsyncMock()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -5655,6 +5947,7 @@ def promotion_candidates(retirement, monkeypatch):
     prober._probe_condition = asyncio.Condition()
     prober._account_active = {}
     prober._event_probes = 0
+    prober._event_waiting = {}
     prober.refresh_account_probe_limits = AsyncMock()
 
     async def probe(sid, url, name, **kwargs):
@@ -5849,10 +6142,10 @@ def test_staged_event_recovers_after_health_failures(
                 "black_screen_checked_at": observed_at.isoformat(),
             }
 
-    async def fail_after_admission(executor):
+    async def fail_after_admission(executor, *args, **kwargs):
         attempt_id = next((
             receipt.get("attempt_id")
-            for event_key, work in executor._event_pending.items()
+            for (_, event_key), work in executor._event_pending.items()
             for receipt in [
                 executor._event_publications.get(
                     work["profile_id"], {}
@@ -5867,7 +6160,7 @@ def test_staged_event_recovers_after_health_failures(
             seen_attempts.add(attempt_id)
             if final_failures:
                 set_health(final_failures.pop(0))
-        return await finish(executor)
+        return await finish(executor, *args, **kwargs)
 
     def run_at(when, kind):
         current[0] = when
@@ -6058,12 +6351,12 @@ def test_staged_event_retries_after_its_guide_was_missing(
 
     missing = [True]
 
-    async def guide_missing_while_set(executor):
+    async def guide_missing_while_set(executor, *args, **kwargs):
         if executor._event_pending and missing[0]:
             if state.guide_programmes:
                 withheld[:] = [copy.deepcopy(state.guide_programmes)]
             state.guide_programmes.clear()
-        return await finish(executor)
+        return await finish(executor, *args, **kwargs)
 
     def run():
         set_positive()
@@ -6310,7 +6603,7 @@ def test_failed_staged_channel_is_removed_after_its_event(
 @pytest.mark.parametrize("guard", [
     "expired", "allocation_unknown", "missing_uuid",
     "foreign_uuid", "ownership", "changed_identity", "new_event",
-    "missing_stream", "changed_stream", "changed_config", "changed_source",
+    "missing_stream", "changed_stream", "changed_source",
     "reached_stop", "positive_idle",
 ])
 def test_staged_health_recovery_keeps_retirement_guards(
@@ -6426,7 +6719,9 @@ def test_staged_health_recovery_keeps_retirement_guards(
         current[0] = datetime.fromisoformat(receipt["retry_at"]) + timedelta(seconds=1)
     else:
         current[0] += timedelta(minutes=6)
-    if guard == "reached_stop":
+    # A hidden failed channel is retried while its event is on, so a real
+    # idle verdict on it comes only once the event is over.
+    if guard in {"reached_stop", "positive_idle"}:
         current[0] = datetime.fromisoformat(receipt["stop"])
     if guard == "missing_uuid":
         state.channels[900].pop("uuid", None)
@@ -6452,16 +6747,6 @@ def test_staged_health_recovery_keeps_retirement_guards(
     elif guard == "changed_stream":
         state.secondary_streams[SECONDARY_B_NAME][0]["id"] = 7302
         health[7302] = copy.deepcopy(health[7301])
-    elif guard == "changed_config":
-        session = db_session_factory()
-        try:
-            rule = session.get(ChannelPipelineRule, setup["rule_id"])
-            config = rule.get_event_sync_config()
-            config["max_promote_per_run"] = 2
-            rule.set_event_sync_config(config)
-            session.commit()
-        finally:
-            session.close()
     elif guard == "changed_source":
         state.guide_sources[0]["url"] = (
             state.guide_sources[0]["url"].rstrip("/") + "/changed"
@@ -6651,10 +6936,10 @@ def test_staged_health_recovery_outlives_failed_attempt(
             "black_screen_checked_at": observed_at if working else None,
         }
 
-    async def fail_then_pause(executor):
+    async def fail_then_pause(executor, *args, **kwargs):
         attempt_id = next((
             receipt.get("attempt_id")
-            for event_key, work in executor._event_pending.items()
+            for (_, event_key), work in executor._event_pending.items()
             for receipt in [
                 executor._event_publications.get(
                     work["profile_id"], {}
@@ -6666,11 +6951,11 @@ def test_staged_health_recovery_outlives_failed_attempt(
             and receipt.get("stage") in active_stages
         ), None)
         if attempt_id is None or attempt_id in seen_attempts:
-            return await finish(executor)
+            return await finish(executor, *args, **kwargs)
         seen_attempts.add(attempt_id)
         if len(seen_attempts) == 1:
             set_health(False)
-            return await finish(executor)
+            return await finish(executor, *args, **kwargs)
         raise asyncio.CancelledError
 
     set_health(True)
@@ -7317,6 +7602,7 @@ async def test_lifecycle_checks_current_evidence_after_wait(retirement, monkeypa
     prober._probe_condition = asyncio.Condition()
     prober._account_active = {}
     prober._event_probes = 0
+    prober._event_waiting = {}
     prober.refresh_account_probe_limits = AsyncMock()
 
     async def probe(sid, url, stream_name, **kwargs):
@@ -7372,6 +7658,41 @@ async def test_owned_positive_does_not_skip_new_health(retirement):
     assert collect.await_args_list[0].args[0] == {7302}
     assert collect.await_args_list[0].kwargs["probe_missing"] is True
     assert flow == {7302: None, 7301: True}
+
+
+@pytest.mark.asyncio
+async def test_retry_streams_go_first_in_a_run_without_new_events(retirement):
+    from services import event_sync_stream_health
+
+    setup = retirement
+    current = setup["now"] - timedelta(minutes=30)
+    waiting = _resolved(STREAM_FURY, DISPOSITION_UNMATCHED, _parsed("Fury vs. Usyk", current),
+                        provider_id=2, stream_id=7301, group_id=SECONDARY_A)
+    other = _resolved("DAZN 07: Ali vs. Frazier @ 11 Jul 11:30 PM ET", DISPOSITION_UNMATCHED,
+                      _parsed("Ali vs. Frazier", current), provider_id=2, stream_id=7302,
+                      group_id=SECONDARY_A)
+    # Both events already have a channel, so the run has no new-event streams.
+    plan = build_promotion_plan(
+        setup["config"], [waiting, other],
+        {
+            promoted_channel_name(waiting.result.parsed).lower(): 900,
+            promoted_channel_name(other.result.parsed).lower(): 901,
+        },
+        now=setup["now"],
+    )
+    waiting_key = next(
+        unit.event_key for unit in plan.units
+        if unit.rows[0].stream.stream_id == 7301
+    )
+    collect = AsyncMock(return_value={})
+    with patch.object(event_sync_stream_health, "collect_stream_flow", collect), \
+         patch.object(setup["executor"], "_waiting_event_keys", return_value={waiting_key}):
+        await setup["executor"]._event_health(
+            setup["rule"].id, setup["config"], plan.units, [waiting, other], setup["now"],
+            probe_missing=True, expires_at=None,
+        )
+    assert collect.await_args_list[0].args[0] == {7301, 7302}
+    assert collect.await_args_list[0].kwargs["probe_first"] == frozenset({7301})
 
 
 @pytest.mark.asyncio
@@ -7634,3 +7955,2994 @@ async def test_lifecycle_rechecks_after_other_event_probe(promotion_candidates, 
     assert states[-2] == "active"
     setup["prober"].probe_stream.assert_awaited_once()
     assert setup["prober"]._account_active == {}
+
+
+# =========================================================================
+# Retrying a staged event on its working streams.
+# =========================================================================
+
+STREAM_A = 7301
+STREAM_B = 7302
+
+
+def _retry_case(db_session_factory, monkeypatch, *, dedicated=True):
+    """One current event with two streams on one account, staged by real runs.
+
+    Probing goes through the real collector with a one-connection prober
+    whose results come from ``plays``; ``probes`` records each run's probe
+    order and ``marks`` the probe count when the lifecycle starts, so
+    ``probes[:marks[0]]`` is what the run's first health pass probed.
+    """
+    from stream_prober import StreamProber
+
+    setup = _staged_event(db_session_factory, monkeypatch, dedicated=dedicated)
+    if not dedicated:
+        # The live shared rule (Live Events) retires finished events and
+        # skips dead streams, as the dedicated rules do.
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, setup["rule_id"])
+            rule.set_event_sync_config({
+                **rule.get_event_sync_config(),
+                "retire_finished_events": True,
+                "skip_dead_streams": True,
+            })
+            session.commit()
+        finally:
+            session.close()
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    health = setup["health"]
+    current = [setup["event_start"] + timedelta(minutes=1)]
+    streams = state.secondary_streams[SECONDARY_B_NAME]
+    streams[0]["url"] = "https://example.invalid/7301"
+    streams.append({
+        "id": STREAM_B,
+        "name": setup["event_name"].replace("DAZN 05", "FightBox 02"),
+        "m3u_account": 2,
+        "url": "https://example.invalid/7302",
+    })
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+        now=current[0],
+    )
+    state.guide_sources[0]["is_active"] = True
+    plays = {}
+    probes = []
+    marks = []
+    promos = []
+
+    def stream_name(stream_id):
+        return next(
+            stream["name"]
+            for group in state.secondary_streams.values()
+            for stream in group
+            if stream["id"] == stream_id
+        )
+
+    def set_stat(stream_id, playable, *, age=timedelta(0), name=None):
+        observed_at = (current[0] - age).astimezone(timezone.utc).isoformat()
+        health[stream_id] = {
+            "stream_name": name if name is not None else stream_name(stream_id),
+            "probe_status": "success" if playable else "failed",
+            "measured_bitrate": 5_000_000 if playable else 0,
+            "last_probed": observed_at,
+            "is_black_screen": False if playable else None,
+            "black_screen_checked_at": observed_at if playable else None,
+        }
+
+    prober = StreamProber.__new__(StreamProber)
+    prober.max_concurrent_probes = 1
+    prober.account_probe_limits = {2: 1}
+    prober._account_active = {}
+    prober._event_probes = 0
+    prober._event_waiting = {}
+    prober._probing_in_progress = False
+    prober.refresh_account_probe_limits = AsyncMock()
+
+    async def probe(stream_id, url, name, **kwargs):
+        probes.append(stream_id)
+        set_stat(stream_id, plays[stream_id], name=name)
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    monkeypatch.setattr("stream_prober.ensure_prober", lambda: prober)
+    monkeypatch.setattr("stream_prober.get_prober", lambda: prober)
+
+    def run(*, before_finish=None, after_lifecycle=None, skip_finish=False):
+        prober._probe_condition = asyncio.Condition()
+        probes.clear()
+        marks.clear()
+        promos.clear()
+        lifecycle = ActionExecutor._event_lifecycle
+        finish = ActionExecutor._finish_event_promotions
+        promote = ActionExecutor._execute_event_sync_promotion
+
+        async def mark_lifecycle(executor, *args, **kwargs):
+            marks.append(len(probes))
+            result = await lifecycle(executor, *args, **kwargs)
+            if after_lifecycle is not None:
+                after_lifecycle()
+            return result
+
+        async def finish_step(executor, *args, **kwargs):
+            if skip_finish:
+                return set()
+            if before_finish is not None and executor._event_pending:
+                before_finish()
+            return await finish(executor, *args, **kwargs)
+
+        async def capture_promotion(executor, *args, **kwargs):
+            promo = await promote(executor, *args, **kwargs)
+            # The early pass of each rule returns no summary of its own.
+            if promo is not None:
+                promos.append(promo)
+            return promo
+
+        with patch.object(ActionExecutor, "_event_lifecycle", new=mark_lifecycle), \
+             patch.object(ActionExecutor, "_finish_event_promotions", new=finish_step), \
+             patch.object(
+                 ActionExecutor, "_execute_event_sync_promotion", new=capture_promotion,
+             ), \
+             patch("services.event_sync_resolver.datetime", _clock(lambda: current[0])), \
+             patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+             patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+            return dummy_epg._manual_run(client, db_session_factory, regenerate, wait_refresh)
+
+    def receipts():
+        return _read_event_publication(
+            db_session_factory, setup["profile_id"],
+        )["state"]["delivery"]["pending_channels"]
+
+    def stage_failed_attempt():
+        """Run 1 stages both streams; both fail the finish check."""
+        set_stat(STREAM_A, True)
+        set_stat(STREAM_B, True)
+        run(before_finish=lambda: (
+            set_stat(STREAM_A, False), set_stat(STREAM_B, False),
+        ))
+        event_key, receipt = next(iter(receipts().items()))
+        assert (receipt["stage"], receipt["reason"]) == ("failed", "health_failed")
+        assert [row["id"] for row in receipt["streams"]] == [STREAM_A, STREAM_B]
+        assert state.channels[900]["hidden_from_output"] is True
+        assert state.channels[900]["streams"] == []
+        current[0] = datetime.fromisoformat(receipt["retry_at"]) + timedelta(seconds=1)
+        return event_key, receipt
+
+    def stage_repeat_failure():
+        """Run 2 retries the failed attempt; both streams fail its finish too."""
+        event_key, _ = stage_failed_attempt()
+        plays.update({STREAM_A: True, STREAM_B: True})
+        run(before_finish=lambda: (
+            set_stat(STREAM_A, False), set_stat(STREAM_B, False),
+        ))
+        receipt = receipts()[event_key]
+        assert (receipt["attempt_no"], receipt["stage"]) == (2, "failed")
+        current[0] = datetime.fromisoformat(receipt["retry_at"]) + timedelta(seconds=1)
+        return event_key, receipt
+
+    def stage_interrupted_attempt():
+        """Run 1 stages both streams and stops before its finish step."""
+        set_stat(STREAM_A, True)
+        set_stat(STREAM_B, True)
+        run(skip_finish=True)
+        event_key, receipt = next(iter(receipts().items()))
+        assert receipt["stage"] not in {"complete", "failed", "expired"}
+        assert [row["id"] for row in receipt["streams"]] == [STREAM_A, STREAM_B]
+        current[0] += timedelta(minutes=6)
+        return event_key, receipt
+
+    def add_event(stream_id, title):
+        """List a second, unrelated event that starts with the first one."""
+        state.secondary_streams[SECONDARY_B_NAME].append({
+            "id": stream_id,
+            "name": setup["event_name"].replace("Fury vs. Usyk", title),
+            "m3u_account": 2,
+            "url": f"https://example.invalid/{stream_id}",
+        })
+        set_stat(stream_id, True)
+        plays[stream_id] = True
+
+    return {
+        **setup,
+        "current": current,
+        "plays": plays,
+        "probes": probes,
+        "marks": marks,
+        "promos": promos,
+        "prober": prober,
+        "set_stat": set_stat,
+        "run": run,
+        "receipts": receipts,
+        "stage_failed_attempt": stage_failed_attempt,
+        "stage_repeat_failure": stage_repeat_failure,
+        "stage_interrupted_attempt": stage_interrupted_attempt,
+        "add_event": add_event,
+        "regenerate": regenerate,
+        "wait_refresh": wait_refresh,
+    }
+
+
+def test_plan_apply_keeps_the_plans_retry_decision(db_session_factory, monkeypatch):
+    from services.pipeline_write_plan import (
+        EVENT_PROMOTE_METHOD,
+        PlanningDispatcharrClient,
+    )
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    current = case["current"]
+    event_key, failed = case["stage_repeat_failure"]()
+    # A playing stream left on the hidden channel makes the event eligible,
+    # but before its retry time the gate does not recover a repeat failure,
+    # so the plan stages the unit's own rows.
+    case["state"].channels[900]["streams"] = [STREAM_A]
+    current[0] = datetime.fromisoformat(failed["retry_at"]) - timedelta(minutes=1)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+    case["plays"].update({STREAM_A: True, STREAM_B: False})
+    executors = []
+    promote = ActionExecutor._execute_event_sync_promotion
+
+    async def capture_executor(executor, *args, **kwargs):
+        executors.append(executor)
+        return await promote(executor, *args, **kwargs)
+
+    planning_client = PlanningDispatcharrClient(case["client"])
+    engine = ChannelPipelineEngine(planning_client)
+    task_cls = MagicMock()
+    task_cls.return_value._regenerate_xmltv = case["regenerate"]
+    with patch.object(
+        ActionExecutor, "_execute_event_sync_promotion", new=capture_executor,
+    ), \
+         patch("channel_pipeline_engine.get_session", side_effect=db_session_factory), \
+         patch("routers.channel_pipeline.get_session", side_effect=db_session_factory), \
+         patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+         patch("tasks.dummy_epg_refresh.DummyEPGRefreshTask", task_cls), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", case["wait_refresh"]), \
+         patch("journal.log_entries"), \
+         patch("services.event_sync_resolver.datetime", _clock(lambda: current[0])), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+        _run(engine.run_pipeline(
+            dry_run=False, triggered_by="manual", record_execution=False,
+            plan_only=True, skip_prerefresh=True,
+        ))
+        writes = [
+            write for write in planning_client.plan.writes
+            if write.method == EVENT_PROMOTE_METHOD
+        ]
+        assert len(writes) == 1
+        operation = writes[0].args[0]
+        assert operation["recovered"] is False
+        planned_rows = [
+            *executors[0]._event_unit_from_plan(operation["unit"]).rows,
+            *(
+                executors[0]._event_row_from_plan(value)
+                for value in operation["stale_streams"]
+            ),
+        ]
+        # The shared fixture's streams carry no group or stale field, so the
+        # apply's identity check reads the planned values back.
+        case["client"].get_streams_by_ids = AsyncMock(return_value=[
+            {
+                "id": row.stream.stream_id,
+                "name": row.stream.name,
+                "channel_group_id": row.stream.group_id,
+                "m3u_account": row.stream.provider_id,
+                "is_stale": row.stream.is_stale,
+            }
+            for row in planned_rows
+        ])
+        work = _run(executors[0].validate_event_promotion(
+            operation, writes[0].result_id, original_publication=True,
+        ))
+
+    assert work["unit"].event_key == event_key
+    assert [row["id"] for row in work["candidate"]["streams"]] == [STREAM_A]
+
+
+def test_retry_takes_a_dead_stream_off_before_the_reveal(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    # An earlier run attached A before the attempt failed; A is still
+    # listed but no longer plays.
+    state.channels[900]["streams"] = [STREAM_A]
+    case["set_stat"](STREAM_A, False)
+    case["set_stat"](STREAM_B, True)
+    case["plays"].update({STREAM_A: False, STREAM_B: True})
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_B]
+
+
+def test_listed_event_with_no_proven_stream_keeps_its_hidden_channel(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    health = case["health"]
+    event_key, failed = case["stage_failed_attempt"]()
+    state.channels[900]["streams"] = [STREAM_A]
+    _stream(case, STREAM_A)["is_stale"] = True
+
+    async def inconclusive_b(stream_id, url, name, **kwargs):
+        # The probe answers but measures no rate and checks no content.
+        health[stream_id] = {
+            "stream_name": name,
+            "probe_status": "success",
+            "measured_bitrate": None,
+            "last_probed": case["current"][0].astimezone(timezone.utc).isoformat(),
+        }
+
+    case["prober"].probe_stream.side_effect = inconclusive_b
+    health.pop(STREAM_B)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["stage"], receipt["attempt_no"]) == ("failed", 1)
+    assert 900 in state.channels
+    assert state.channels[900]["hidden_from_output"] is True
+    assert any(900 in promo["channel_ids"] for promo in case["promos"])
+
+
+def test_fully_delisted_event_releases_its_hidden_failed_channel(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    case["stage_failed_attempt"]()
+    state.channels[900]["streams"] = [STREAM_A]
+    _stream(case, STREAM_A)["is_stale"] = True
+    _stream(case, STREAM_B)["is_stale"] = True
+
+    case["run"]()
+
+    assert not any(900 in promo["channel_ids"] for promo in case["promos"])
+
+
+def test_retry_goes_live_with_its_working_stream(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert [row["id"] for row in receipt["streams"]] == [STREAM_A, STREAM_B]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+def test_retry_probes_its_streams_first_and_attaches_every_working_one(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    finishes = []
+
+    result = case["run"](before_finish=lambda: finishes.append(len(case["probes"])))
+
+    # The finish step checks every receipt stream, so the health pass is
+    # what runs before the first finish.
+    first_pass = case["probes"][:finishes[0]]
+    assert len({STREAM_A, STREAM_B} & set(first_pass)) == 1, case["probes"]
+    # The new event is admitted after the early guide publish and import,
+    # and the later imports still accept the stored guide.
+    assert len(case["receipts"]()) == 2
+    assert not [
+        entry for entry in result["failed_actions"]
+        if "did not complete successfully" in (entry.get("error") or "")
+    ], result["failed_actions"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert sorted(state.channels[900]["streams"]) == [STREAM_A, STREAM_B]
+
+
+# A dedicated rule on a profile without guide sources (Peacock, Paramount) and
+# a shared rule on a profile with guide sources (Live Events).
+@pytest.mark.parametrize("dedicated", [True, False])
+@pytest.mark.parametrize(
+    ("attempt", "guide_pass"),
+    [("failed", True), ("failed", False), ("interrupted", True), ("unlinked", False)],
+)
+def test_retry_is_revealed_before_new_event_streams_are_tested(
+    db_session_factory, monkeypatch, attempt, guide_pass, dedicated,
+):
+    from models import DummyEPGProfile
+    from services.epg_publication import begin_delivery, read_publication, refresh_source
+
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=dedicated)
+    state = case["state"]
+    client = case["client"]
+    if attempt == "interrupted":
+        event_key, staged = case["stage_interrupted_attempt"]()
+    else:
+        event_key, staged = case["stage_failed_attempt"]()
+    if attempt == "unlinked":
+        # The first attempt failed before its channel got a guide link, so
+        # Dispatcharr has no guide row or programme for it yet.
+        state.channels[900]["epg_data_id"] = None
+        state.guide_rows[:] = []
+        state.guide_programmes[:] = []
+    # The five-minute guide pass between the attempts opens a new guide
+    # attempt and imports the guide after linking.
+    scope = f"profile:{case['profile_id']}"
+    if guide_pass:
+        with patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+             patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", case["wait_refresh"]):
+            session = db_session_factory()
+            try:
+                profile = session.get(DummyEPGProfile, case["profile_id"]).to_dict()
+            finally:
+                session.close()
+            stored = read_publication(scope)
+            admitted = begin_delivery(
+                scope,
+                expected_revision=stored["revision"],
+                expected_hash=stored["state"]["xmltv_hash"],
+                profile=profile,
+                now=case["current"][0],
+            )
+            assert admitted is not None
+            assert _run(refresh_source(
+                client,
+                state.guide_sources[0],
+                {case["profile_id"]: admitted},
+                expires_at=None,
+                after_link=True,
+                channel_map={cid: copy.deepcopy(ch) for cid, ch in state.channels.items()},
+            )) is True
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    dead = {7401: "Tyson vs. Paul", 7402: "Joshua vs. Parker",
+            7403: "Canelo vs. Crawford", 7404: "Inoue vs. Nakatani"}
+    for stream_id, title in dead.items():
+        case["add_event"](stream_id, title)
+        case["health"].pop(stream_id)
+        case["plays"][stream_id] = False
+    reveals = []
+    links = []
+    update_channel = client.update_channel
+
+    async def record_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False:
+            reveals.append((channel_id, list(case["probes"])))
+        if "epg_data_id" in data:
+            links.append((channel_id, data["epg_data_id"]))
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", record_reveal)
+    reloads = []
+    get_epg_data = client.get_epg_data
+
+    async def record_reload(*args, **kwargs):
+        reloads.append(len(case["probes"]))
+        return await get_epg_data(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_epg_data", record_reload)
+
+    result = case["run"]()
+
+    promo = case["promos"][-1]
+    assert (
+        promo["units"], promo["promoted_adopted"], promo["streams_attached"],
+        promo["guide_pending"],
+    ) == (1, 1, 2, 0), promo
+    assert not [
+        entry for entry in result["failed_actions"]
+        if "remain pending" in (entry.get("error") or "")
+    ], result["failed_actions"]
+    assert reveals and reveals[0][0] == 900, reveals
+    assert set(reveals[0][1]) <= {STREAM_A, STREAM_B}, reveals
+    assert set(dead) <= set(case["probes"]), case["probes"]
+    assert len(case["probes"]) == len(set(case["probes"])), case["probes"]
+    # The guide link is written once, and only for the channel that had none.
+    assert links == ([(900, 502)] if attempt == "unlinked" else []), links
+    # Before the reveal, guide rows are read again only for a channel that
+    # had no guide link; the read at zero probes is the run's own start.
+    assert len([
+        count for count in reloads if 0 < count <= len(reveals[0][1])
+    ]) == (1 if attempt == "unlinked" else 0), reloads
+    receipt = case["receipts"]()[event_key]
+    assert receipt["stage"] == "complete"
+    if attempt == "interrupted":
+        assert receipt["attempt_id"] == staged["attempt_id"]
+    else:
+        assert receipt["attempt_no"] == 2
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_a_channel_deferred_early_and_by_its_rule_is_retried_once(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    state.channels[900]["epg_data_id"] = None
+    state.guide_rows[:] = []
+    state.guide_programmes[:] = []
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    get_epg_data = client.get_epg_data
+    emptied = []
+
+    async def early_reload_without_rows(*args, **kwargs):
+        rows = await get_epg_data(*args, **kwargs)
+        # The early import reports success while the source has no rows yet,
+        # so both the early link and the rule's own link defer the channel.
+        if case["probes"] and not emptied:
+            emptied.append(len(rows))
+            return []
+        return rows
+
+    monkeypatch.setattr(client, "get_epg_data", early_reload_without_rows)
+
+    result = case["run"]()
+
+    assert emptied
+    summaries = [
+        action["description"]
+        for entry in result["execution_log"]
+        if entry["stream_name"] == "[Pass 5] Summary"
+        for action in entry["actions_executed"]
+    ]
+    assert summaries == [
+        "Refreshed dummy EPG and retried 1 deferred assignments (1 succeeded, 0 failed)",
+    ]
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_retry_due_during_the_run_is_revealed_before_new_event_streams_are_tested(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, failed = case["stage_failed_attempt"]()
+    # The next run starts two minutes before the retry time, and both streams
+    # played when they were last read.
+    case["current"][0] = datetime.fromisoformat(failed["retry_at"]) - timedelta(minutes=2)
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    dead = {7401: "Tyson vs. Paul", 7402: "Joshua vs. Parker",
+            7403: "Canelo vs. Crawford", 7404: "Inoue vs. Nakatani"}
+    for stream_id, title in dead.items():
+        case["add_event"](stream_id, title)
+        case["health"].pop(stream_id)
+        case["plays"][stream_id] = False
+    probe = case["prober"].probe_stream.side_effect
+
+    async def slow_probe(stream_id, url, name, **kwargs):
+        await probe(stream_id, url, name, **kwargs)
+        if stream_id in dead:
+            # The retry time passes while the run tests new-event streams.
+            case["current"][0] += timedelta(minutes=1)
+
+    case["prober"].probe_stream.side_effect = slow_probe
+    reveals = []
+    update_channel = client.update_channel
+
+    async def record_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False:
+            reveals.append((channel_id, list(case["probes"])))
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", record_reveal)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert reveals and reveals[0][0] == 900, reveals
+    assert not set(dead) & set(reveals[0][1]), reveals
+
+
+def test_repeat_failure_waits_its_retry_time_while_its_streams_play(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, failed = case["stage_repeat_failure"]()
+    # The next run starts two minutes before the retry time, and both streams
+    # played when they were last read.
+    case["current"][0] = datetime.fromisoformat(failed["retry_at"]) - timedelta(minutes=2)
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    imports = client.refresh_epg_source.await_count
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["attempt_id"]) == (2, failed["attempt_id"])
+    assert client.refresh_epg_source.await_count == imports
+    assert case["state"].channels[900]["hidden_from_output"] is True
+
+
+def test_dry_run_predicts_the_early_retry_of_a_first_failure(
+    db_session_factory, monkeypatch,
+):
+    import functools
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    module = case["dummy_epg"]
+    event_key, failed = case["stage_failed_attempt"]()
+    # A live run at this time retries the attempt in its early pass.
+    case["current"][0] = datetime.fromisoformat(failed["retry_at"]) - timedelta(minutes=2)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    monkeypatch.setattr(
+        module, "_manual_run", functools.partial(module._manual_run, dry_run=True),
+    )
+
+    case["run"]()
+
+    assert [promo["units"] for promo in case["promos"]] == [1]
+    assert case["receipts"]()[event_key]["attempt_id"] == failed["attempt_id"]
+
+
+def test_plan_predicts_the_early_retry_of_a_first_failure(
+    db_session_factory, monkeypatch,
+):
+    from services.pipeline_write_plan import (
+        EVENT_PROMOTE_METHOD,
+        PlanningDispatcharrClient,
+    )
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    current = case["current"]
+    event_key, failed = case["stage_failed_attempt"]()
+    # A live run at this time retries the attempt in its early pass.
+    current[0] = datetime.fromisoformat(failed["retry_at"]) - timedelta(minutes=2)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    executors = []
+    promote = ActionExecutor._execute_event_sync_promotion
+
+    async def capture_executor(executor, *args, **kwargs):
+        executors.append(executor)
+        return await promote(executor, *args, **kwargs)
+
+    planning_client = PlanningDispatcharrClient(case["client"])
+    engine = ChannelPipelineEngine(planning_client)
+    task_cls = MagicMock()
+    task_cls.return_value._regenerate_xmltv = case["regenerate"]
+    with patch.object(
+        ActionExecutor, "_execute_event_sync_promotion", new=capture_executor,
+    ), \
+         patch("channel_pipeline_engine.get_session", side_effect=db_session_factory), \
+         patch("routers.channel_pipeline.get_session", side_effect=db_session_factory), \
+         patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+         patch("tasks.dummy_epg_refresh.DummyEPGRefreshTask", task_cls), \
+         patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", case["wait_refresh"]), \
+         patch("journal.log_entries"), \
+         patch("services.event_sync_resolver.datetime", _clock(lambda: current[0])), \
+         patch("channel_pipeline_executor.datetime", _clock(lambda: current[0])), \
+         patch("services.event_sync_stream_health.datetime", _clock(lambda: current[0])):
+        _run(engine.run_pipeline(
+            dry_run=False, triggered_by="manual", record_execution=False,
+            plan_only=True, skip_prerefresh=True,
+        ))
+        writes = [
+            write for write in planning_client.plan.writes
+            if write.method == EVENT_PROMOTE_METHOD
+        ]
+        assert len(writes) == 1
+        operation = writes[0].args[0]
+        assert operation["recovered"] is True
+        case["client"].get_streams_by_ids = AsyncMock(return_value=[
+            {
+                "id": row.stream.stream_id,
+                "name": row.stream.name,
+                "channel_group_id": row.stream.group_id,
+                "m3u_account": row.stream.provider_id,
+                "is_stale": row.stream.is_stale,
+            }
+            for row in executors[0]._event_unit_from_plan(operation["unit"]).rows
+        ])
+        work = _run(executors[0].validate_event_promotion(
+            operation, writes[0].result_id, original_publication=True,
+        ))
+
+    # The apply admits the recovery before the retry time, as the plan did.
+    assert work["recovered"] is True
+    assert case["receipts"]()[event_key]["attempt_id"] == failed["attempt_id"]
+
+
+def test_retry_of_a_later_rule_is_revealed_before_an_earlier_rule_tests_new_events(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Another event rule runs first and lists new events whose streams are dead.
+    dead = {7401: "Tyson vs. Paul", 7402: "Joshua vs. Parker"}
+    for stream_id, title in dead.items():
+        state.secondary_streams[SECONDARY_A_NAME].append({
+            "id": stream_id,
+            "name": case["event_name"].replace("Fury vs. Usyk", title),
+            "m3u_account": 2,
+            "url": f"https://example.invalid/{stream_id}",
+        })
+        case["plays"][stream_id] = False
+    session = db_session_factory()
+    try:
+        session.add(ChannelPipelineRule(
+            name="Earlier Event Rule", enabled=True, priority=-1,
+            conditions=json.dumps([{"type": "always"}]),
+            actions=json.dumps([{"type": "skip"}]),
+            event_sync_config=json.dumps(_promote_config(
+                secondary_group_ids=[SECONDARY_A],
+                promote_target_group_id=PROMOTE_GROUP_ID + 1,
+                skip_dead_streams=True,
+            )),
+        ))
+        session.commit()
+    finally:
+        session.close()
+    reveals = []
+    update_channel = client.update_channel
+
+    async def record_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False:
+            reveals.append((channel_id, list(case["probes"])))
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", record_reveal)
+
+    case["run"]()
+
+    assert set(dead) <= set(case["probes"]), case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert reveals and reveals[0][0] == 900, reveals
+    assert not set(dead) & set(reveals[0][1]), reveals
+
+
+def _add_second_guide_rule(
+    session_factory, setup: dict, regenerate: AsyncMock, **config: object,
+) -> int:
+    """Add a second guide profile with its own generated source and a second
+    shared rule, run after the first, that lists the same event.
+
+    The guide stubs then publish every profile and serve the second rule's
+    channel (901) its guide row and receipt programme. Returns the second
+    profile's id.
+    """
+    from models import DummyEPGProfile
+    from services.epg_publication import publish_profiles, read_publication
+
+    state = setup["state"]
+    client = setup["client"]
+    second_profile_id = setup["profile_id"] + 1
+    second_source_id = setup["source_id"] + 1
+    session = session_factory()
+    try:
+        profile = DummyEPGProfile(
+            id=second_profile_id,
+            name="Second event guide",
+            enabled=True,
+            name_source="channel",
+            event_timezone="US/Eastern",
+            output_timezone="UTC",
+            program_duration=180,
+        )
+        profile.set_channel_group_ids([MASTER_GROUP_ID])
+        profile.set_epg_source_ids([second_source_id])
+        session.add(profile)
+        session.add(ChannelPipelineRule(
+            name="Second Event Rule", enabled=True, priority=1,
+            conditions=json.dumps([{"type": "always"}]),
+            actions=json.dumps([{"type": "skip"}]),
+            event_sync_config=json.dumps(_promote_config(
+                dummy_epg_profile_id=second_profile_id,
+                promote_target_group_id=PROMOTE_GROUP_ID + 1,
+                **config,
+            )),
+        ))
+        session.commit()
+    finally:
+        session.close()
+    state.guide_sources.append({
+        "id": second_source_id,
+        "name": "ECM Dummy EPG second guide",
+        "url": f"http://ecm:8000/api/dummy-epg/xmltv/{second_profile_id}",
+        "status": "ready",
+        "updated_at": "2026-07-11T15:00:00+00:00",
+    })
+    published_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    async def publish_each_profile(*, publications, wait_for_sources=True):
+        # Each guide carries the receipt interval of every staged channel.
+        profiles = []
+        channels = {}
+        coverage = {"profiles": {}}
+        expected = {}
+        for profile_id, admitted in publications.items():
+            session = session_factory()
+            try:
+                profile = session.get(DummyEPGProfile, profile_id).to_dict()
+            finally:
+                session.close()
+            receipts = [
+                receipt
+                for receipt in admitted["state"]["delivery"]["pending_channels"].values()
+                if receipt.get("channel_id") in state.channels
+            ]
+            profile["channel_assignments"] = [
+                {
+                    "channel_id": receipt["channel_id"],
+                    "channel_name": state.channels[receipt["channel_id"]]["name"],
+                }
+                for receipt in receipts
+            ]
+            profile["event_intervals"] = {
+                receipt["channel_id"]: [{
+                    "start": receipt["start"],
+                    "stop": receipt["stop"],
+                    "title": receipt["title"],
+                }]
+                for receipt in receipts
+            }
+            channels.update({
+                receipt["channel_id"]: copy.deepcopy(state.channels[receipt["channel_id"]])
+                for receipt in receipts
+            })
+            coverage["profiles"][str(profile_id)] = {
+                "profile_id": profile_id,
+                "can_publish": True,
+                "reason_codes": [],
+            }
+            attempt = admitted["state"]["delivery"]["guide_attempt"]
+            expected[f"profile:{profile_id}"] = {
+                "revision": admitted["revision"],
+                "xmltv_hash": admitted["state"]["xmltv_hash"],
+                "config_hash": admitted["state"]["config_hash"],
+                "attempt_id": attempt["attempt_id"],
+            }
+            profiles.append(profile)
+        return publish_profiles(
+            profiles, channels, coverage,
+            observations={}, now=published_at, expected=expected,
+        )
+
+    regenerate.side_effect = publish_each_profile
+    refresh_first_source = client.refresh_epg_source.side_effect
+    row = setup["dummy_epg"]._dummy_entry(
+        503, 901, setup["event_channel_name"], source_id=second_source_id,
+    )
+
+    async def refresh_each_source(*args, **kwargs):
+        # Like the first source: an import adds the channel's guide row, and
+        # a later one its receipt programme.
+        completed = await refresh_first_source(*args, **kwargs)
+        if row["tvg_id"] not in {known["tvg_id"] for known in state.guide_rows}:
+            if 901 in state.channels:
+                state.guide_rows.append(copy.deepcopy(row))
+        else:
+            receipt = next(
+                value for value in read_publication(
+                    f"profile:{second_profile_id}"
+                )["state"]["delivery"]["pending_channels"].values()
+                if value.get("channel_id") == 901
+            )
+            state.guide_programmes[:] = [
+                programme for programme in state.guide_programmes
+                if programme["tvg_id"] != row["tvg_id"]
+            ] + [{
+                "epg_data_id": row["id"],
+                "tvg_id": row["tvg_id"],
+                "title": receipt["title"],
+                "start_time": receipt["start"],
+                "end_time": receipt["stop"],
+            }]
+        state.guide_sources[1].update(
+            status=state.guide_sources[0]["status"],
+            updated_at=state.guide_sources[0]["updated_at"],
+        )
+        return completed
+
+    client.refresh_epg_source.side_effect = refresh_each_source
+    return second_profile_id
+
+
+def test_a_later_rule_staging_the_same_event_in_another_guide_profile_keeps_the_first_finish(
+    db_session_factory, monkeypatch,
+):
+    setup = _staged_event(db_session_factory, monkeypatch)
+    state = setup["state"]
+    client = setup["client"]
+    dummy_epg = setup["dummy_epg"]
+    _, regenerate, wait_refresh = dummy_epg._wire_epg(
+        state,
+        client,
+        db_session_factory,
+        regenerated_entries=[
+            dummy_epg._dummy_entry(501, 100, MASTER_MERCURY),
+            dummy_epg._dummy_entry(502, 900, setup["event_channel_name"]),
+        ],
+    )
+    second_profile_id = _add_second_guide_rule(db_session_factory, setup, regenerate)
+
+    with patch("services.event_sync_resolver.datetime") as resolver_clock:
+        resolver_clock.now.return_value = setup["event_start"] + timedelta(minutes=1)
+        dummy_epg._manual_run(client, db_session_factory, regenerate, wait_refresh)
+
+    first = _read_event_publication(
+        db_session_factory, setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"]
+    second = _read_event_publication(
+        db_session_factory, second_profile_id,
+    )["state"]["delivery"]["pending_channels"]
+    assert list(first) == list(second)
+    event_key = next(iter(first))
+    assert second[event_key]["channel_id"] == 901
+    assert first[event_key]["stage"] == "complete", first[event_key]["stage"]
+    assert second[event_key]["stage"] == "complete", second[event_key]["stage"]
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [7301]
+    assert state.channels[901]["hidden_from_output"] is False
+
+
+def test_each_rules_early_finish_reveals_the_retry_in_its_own_guide_profile(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=False)
+    client = case["client"]
+    # The second rule runs with the same settings _retry_case gives the first.
+    second_profile_id = _add_second_guide_rule(
+        db_session_factory, case, case["regenerate"],
+        retire_finished_events=True, skip_dead_streams=True,
+    )
+    # Both rules' first attempts at the same event fail; both retries are due.
+    event_key, _ = case["stage_failed_attempt"]()
+    second = _read_event_publication(
+        db_session_factory, second_profile_id,
+    )["state"]["delivery"]["pending_channels"][event_key]
+    assert (second["channel_id"], second["stage"]) == (901, "failed")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    main_passes = []
+    reveals = []
+    execute_rule = ActionExecutor.execute_event_sync_rule
+
+    async def count_main_pass(executor, *args, **kwargs):
+        if not kwargs.get("early"):
+            main_passes.append(args[0])
+        return await execute_rule(executor, *args, **kwargs)
+
+    monkeypatch.setattr(ActionExecutor, "execute_event_sync_rule", count_main_pass)
+    update_channel = client.update_channel
+
+    async def record_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False:
+            reveals.append((channel_id, len(main_passes)))
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", record_reveal)
+
+    case["run"]()
+
+    # Each rule's early pass imports its own guide and reveals its own retry
+    # before any rule's main pass starts.
+    assert sorted(reveals) == [(900, 0), (901, 0)], reveals
+
+
+def test_early_pass_error_of_one_rule_leaves_every_main_pass_running(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Another event rule runs first and lists new events whose streams are dead.
+    dead = {7401: "Tyson vs. Paul", 7402: "Joshua vs. Parker"}
+    for stream_id, title in dead.items():
+        state.secondary_streams[SECONDARY_A_NAME].append({
+            "id": stream_id,
+            "name": case["event_name"].replace("Fury vs. Usyk", title),
+            "m3u_account": 2,
+            "url": f"https://example.invalid/{stream_id}",
+        })
+        case["plays"][stream_id] = False
+    session = db_session_factory()
+    try:
+        session.add(ChannelPipelineRule(
+            name="Earlier Event Rule", enabled=True, priority=-1,
+            conditions=json.dumps([{"type": "always"}]),
+            actions=json.dumps([{"type": "skip"}]),
+            event_sync_config=json.dumps(_promote_config(
+                secondary_group_ids=[SECONDARY_A],
+                promote_target_group_id=PROMOTE_GROUP_ID + 1,
+                skip_dead_streams=True,
+            )),
+        ))
+        session.commit()
+    finally:
+        session.close()
+    # The retry rule's early pass cannot read the guide store once.
+    waiting_event_keys = ActionExecutor._waiting_event_keys
+    calls = []
+
+    def unavailable_once(executor, *args, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("the guide store is unavailable")
+        return waiting_event_keys(executor, *args, **kwargs)
+
+    monkeypatch.setattr(ActionExecutor, "_waiting_event_keys", unavailable_once)
+
+    case["run"]()
+
+    assert set(dead) <= set(case["probes"]), case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_refused_early_reveal_leaves_the_retry_to_the_end_of_the_run(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["add_event"](7401, "Tyson vs. Paul")
+    before = set(state.channels)
+    update_channel = client.update_channel
+    refused = []
+
+    async def refuse_first_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False and not refused:
+            refused.append(channel_id)
+            raise ConnectionError("Dispatcharr is unavailable")
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", refuse_first_reveal)
+
+    case["run"]()
+
+    # The run goes on to stage the new event and reveals the retry at its end.
+    assert refused == [900]
+    assert len(set(state.channels) - before) == 1
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_early_finish_error_leaves_the_retry_to_the_end_of_the_run(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["add_event"](7401, "Tyson vs. Paul")
+    before = set(state.channels)
+    finishes = []
+
+    def first_finish_fails():
+        finishes.append(len(finishes))
+        if len(finishes) == 1:
+            raise RuntimeError("the guide store is unavailable")
+
+    case["run"](before_finish=first_finish_fails)
+
+    assert len(set(state.channels) - before) == 1
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_channel_read_error_while_assigning_the_guide_does_not_end_the_run(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Every read of the staged channel times out for one whole run.
+    failing = [True]
+    get_channel = client.get_channel
+
+    async def time_out(channel_id, *args, **kwargs):
+        if failing[0] and channel_id == 900:
+            raise TimeoutError("Dispatcharr timed out")
+        return await get_channel(channel_id, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get_channel", time_out)
+
+    result = case["run"]()
+
+    assert result["failed_actions"], result
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "allocated")
+    assert state.channels[900]["hidden_from_output"] is True
+    failing[0] = False
+    case["current"][0] += timedelta(minutes=6)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+@pytest.mark.parametrize("guide_pass", ["published", "imported"])
+def test_guide_pass_between_staging_and_the_end_of_run_import_keeps_the_import(
+    db_session_factory, monkeypatch, guide_pass,
+):
+    from models import DummyEPGProfile
+    from services.epg_publication import begin_delivery, read_publication, refresh_source
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Dispatcharr refuses requests until the run's lifecycle checks start, so
+    # the early guide import fails and the retry is finished at the end.
+    down = [True]
+    for name in ("get_epg_source", "get_channel"):
+
+        async def refuse(*args, _call=getattr(client, name), **kwargs):
+            if down:
+                raise ConnectionError("Dispatcharr is unavailable")
+            return await _call(*args, **kwargs)
+
+        monkeypatch.setattr(client, name, refuse)
+    scope = f"profile:{case['profile_id']}"
+    passes = []
+    reconcile = ChannelPipelineEngine._reconcile_orphans
+
+    async def reconcile_then_guide_pass(self, *args, **kwargs):
+        result = await reconcile(self, *args, **kwargs)
+        if not passes:
+            # The five-minute guide pass publishes the profile after the run
+            # staged its event and before the run's own guide import.
+            session = db_session_factory()
+            try:
+                profile = session.get(DummyEPGProfile, case["profile_id"]).to_dict()
+            finally:
+                session.close()
+            stored = read_publication(scope)
+            admitted = begin_delivery(
+                scope,
+                expected_revision=stored["revision"],
+                expected_hash=stored["state"]["xmltv_hash"],
+                profile=profile,
+                now=case["current"][0],
+            )
+            await case["regenerate"](
+                publications={case["profile_id"]: admitted}, wait_for_sources=False,
+            )
+            if guide_pass == "imported":
+                await refresh_source(
+                    case["client"],
+                    state.guide_sources[0],
+                    {case["profile_id"]: read_publication(scope)},
+                    expires_at=None,
+                    after_link=True,
+                    channel_map={cid: copy.deepcopy(ch) for cid, ch in state.channels.items()},
+                )
+            passes.append(read_publication(scope)["revision"] - stored["revision"])
+        return result
+
+    monkeypatch.setattr(ChannelPipelineEngine, "_reconcile_orphans", reconcile_then_guide_pass)
+
+    result = case["run"](after_lifecycle=down.clear)
+
+    # The guide pass moved the stored revision past the run's copy.
+    assert passes and passes[0] > 0, passes
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+    assert not [
+        entry for entry in result["failed_actions"]
+        if "did not complete successfully" in (entry.get("error") or "")
+    ], result["failed_actions"]
+
+
+def test_early_import_lost_to_a_guide_pass_is_finished_at_the_end_of_the_run(
+    db_session_factory, monkeypatch,
+):
+    from services.epg_publication import read_publication, update_delivery
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    dead = {7401: "Tyson vs. Paul", 7402: "Joshua vs. Parker"}
+    for stream_id, title in dead.items():
+        case["add_event"](stream_id, title)
+        case["health"].pop(stream_id)
+        case["plays"][stream_id] = False
+    scope = f"profile:{case['profile_id']}"
+    writes = []
+    refresh = client.refresh_epg_source.side_effect
+
+    async def refresh_during_a_guide_pass(*args, **kwargs):
+        result = await refresh(*args, **kwargs)
+        if not writes:
+            # The guide pass writes the profile while Dispatcharr imports the
+            # early guide, so the early import no longer holds the revision.
+            stored = read_publication(scope)
+            writes.append(update_delivery(
+                scope,
+                expected_revision=stored["revision"],
+                pending_emby=not stored["state"]["delivery"].get("pending_emby", False),
+            ))
+        return result
+
+    client.refresh_epg_source.side_effect = refresh_during_a_guide_pass
+
+    result = case["run"]()
+
+    assert writes and writes[0] is not None
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert case["state"].channels[900]["hidden_from_output"] is False
+    assert not [
+        entry for entry in result["failed_actions"]
+        if "did not complete successfully" in (entry.get("error") or "")
+    ], result["failed_actions"]
+
+
+def test_failed_channel_read_is_named_in_the_run_summary(db_session_factory, monkeypatch):
+    import httpx
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Every finish of the run times out reading the staged channel.
+    armed = [False]
+    get_channel = client.get_channel
+
+    async def time_out_in_finishes(channel_id, *args, **kwargs):
+        if armed[0] and channel_id == 900:
+            armed[0] = False
+            # The client's real timeout carries no text.
+            raise httpx.ReadTimeout("")
+        return await get_channel(channel_id, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get_channel", time_out_in_finishes)
+
+    result = case["run"](before_finish=lambda: armed.__setitem__(0, True))
+
+    assert case["receipts"]()[event_key]["stage"] not in {"complete", "failed", "expired"}
+    assert [
+        (entry["entity_id"], entry["error"]) for entry in result["failed_actions"]
+        if entry["stream_name"] == "Complete staged event promotions"
+        and entry["entity_id"] is not None
+    ] == [(900, "ReadTimeout: ")]
+
+
+def test_channel_read_that_succeeds_later_is_not_named_in_the_run_summary(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # The early finish times out reading the staged channel. The finish at the
+    # end of the run reads it, and then Dispatcharr refuses the reveal.
+    finishes = []
+    timed_out = []
+    get_channel = client.get_channel
+    update_channel = client.update_channel
+
+    async def time_out_in_the_early_finish(channel_id, *args, **kwargs):
+        if channel_id == 900 and len(finishes) == 1 and not timed_out:
+            timed_out.append(channel_id)
+            raise TimeoutError("Dispatcharr timed out")
+        return await get_channel(channel_id, *args, **kwargs)
+
+    async def refuse_reveal(channel_id, data, *args, **kwargs):
+        if data.get("hidden_from_output") is False:
+            raise ConnectionError("Dispatcharr is unavailable")
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get_channel", time_out_in_the_early_finish)
+    monkeypatch.setattr(client, "update_channel", refuse_reveal)
+
+    result = case["run"](before_finish=lambda: finishes.append(len(finishes)))
+
+    assert timed_out == [900]
+    assert case["receipts"]()[event_key]["stage"] not in {"complete", "failed", "expired"}
+    assert [
+        (entry["entity_id"], entry["error"]) for entry in result["failed_actions"]
+        if entry["stream_name"] == "Complete staged event promotions"
+    ] == [(None, "1 staged event promotion(s) remain pending")]
+
+
+def test_event_left_pending_counts_once_when_pass_5_runs(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # The new event's channel finds no guide row, so Pass 5 runs the finish
+    # step too and the new event stays pending.
+    case["add_event"](7401, "Tyson vs. Paul")
+
+    result = case["run"]()
+
+    assert case["receipts"]()[event_key]["stage"] == "complete"
+    assert [
+        entry["error"] for entry in result["failed_actions"]
+        if entry["stream_name"] == "Complete staged event promotions"
+    ] == ["1 staged event promotion(s) remain pending"]
+
+
+@pytest.mark.parametrize("error", [TimeoutError, RuntimeError])
+def test_programme_read_error_in_the_early_finish_leaves_the_retry_to_the_end_of_the_run(
+    db_session_factory, monkeypatch, error,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    failed_reads = []
+    get_epg_programmes = client.get_epg_programmes
+
+    async def fail_first_read(*args, **kwargs):
+        if not failed_reads:
+            failed_reads.append(error)
+            raise error("Dispatcharr did not answer")
+        return await get_epg_programmes(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_epg_programmes", fail_first_read)
+
+    case["run"]()
+
+    assert failed_reads == [error]
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert case["state"].channels[900]["hidden_from_output"] is False
+
+
+def test_retry_left_for_the_end_of_the_run_is_staged_once(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    event_key, failed = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Dispatcharr refuses requests until the run's lifecycle checks start,
+    # so the early guide import fails and the finish at the end of the run
+    # takes the event.
+    down = [True]
+    for name in ("get_epg_source", "get_channel"):
+
+        async def refuse(*args, _call=getattr(client, name), **kwargs):
+            if down:
+                raise ConnectionError("Dispatcharr is unavailable")
+            return await _call(*args, **kwargs)
+
+        monkeypatch.setattr(client, name, refuse)
+    finishes = []
+
+    case["run"](
+        before_finish=lambda: finishes.append(bool(down)),
+        after_lifecycle=down.clear,
+    )
+
+    # No finish runs on a guide this run could not import.
+    assert finishes and not any(finishes), finishes
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert case["state"].channels[900]["hidden_from_output"] is False
+    promo = case["promos"][-1]
+    assert (promo["units"], promo["promoted_adopted"], promo["guide_pending"]) == (1, 1, 0), promo
+
+
+def test_attaches_of_a_retry_left_for_the_end_of_the_run_are_logged(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    client = case["client"]
+    case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # The run also stages a new event, so its summary lists more entries
+    # than the early pass did.
+    case["add_event"](7401, "Ali vs. Frazier")
+    # As in the staged-once test, the early guide import fails and the
+    # finish at the end of the run attaches the retry's streams.
+    down = [True]
+    for name in ("get_epg_source", "get_channel"):
+
+        async def refuse(*args, _call=getattr(client, name), **kwargs):
+            if down:
+                raise ConnectionError("Dispatcharr is unavailable")
+            return await _call(*args, **kwargs)
+
+        monkeypatch.setattr(client, name, refuse)
+
+    result = case["run"](after_lifecycle=down.clear)
+
+    attached = [
+        entry["match"]["secondary_stream_id"]
+        for log in result["execution_log"]
+        for entry in log["actions_executed"]
+        if entry.get("type") == "event_sync_promote_attach"
+        and entry.get("entity_id") == 900
+    ]
+    assert sorted(attached) == [STREAM_A, STREAM_B], attached
+
+
+def test_guide_proof_lost_before_the_early_finish_is_left_to_the_end_of_the_run(
+    db_session_factory, monkeypatch,
+):
+    from services.epg_publication import read_publication, update_delivery
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    event_key, _ = case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    scope = f"profile:{case['profile_id']}"
+    finishes = []
+
+    def guide_republished():
+        # A guide pass that publishes a new document between the early
+        # import and the early finish drops the import's confirmation.
+        if not finishes:
+            stored = read_publication(scope)
+            assert update_delivery(
+                scope,
+                expected_revision=stored["revision"],
+                confirmed_dispatcharr_hashes={},
+            ) is not None
+        finishes.append(len(case["probes"]))
+
+    case["run"](before_finish=guide_republished)
+
+    assert len(finishes) == 2
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert case["state"].channels[900]["hidden_from_output"] is False
+
+
+@pytest.mark.parametrize("refused", ["link", "reload"])
+def test_failed_early_guide_link_is_left_to_the_end_of_the_run(
+    db_session_factory, monkeypatch, refused,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    event_key, _ = case["stage_failed_attempt"]()
+    state.channels[900]["epg_data_id"] = None
+    state.guide_rows[:] = []
+    state.guide_programmes[:] = []
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    # Until the run's lifecycle checks start, Dispatcharr refuses the guide
+    # link write, or the guide row reload and channel reads, so the early
+    # link fails and the run links and finishes the event at its end.
+    down = [True]
+    links = []
+    update_channel = client.update_channel
+
+    async def record_link(channel_id, data, *args, **kwargs):
+        if "epg_data_id" in data:
+            links.append((channel_id, bool(down)))
+            if down and refused == "link":
+                raise ConnectionError("Dispatcharr is unavailable")
+        return await update_channel(channel_id, data, *args, **kwargs)
+
+    monkeypatch.setattr(client, "update_channel", record_link)
+    if refused == "reload":
+        for name in ("get_epg_data", "get_channel"):
+
+            async def refuse(*args, _call=getattr(client, name), **kwargs):
+                if down:
+                    raise ConnectionError("Dispatcharr is unavailable")
+                return await _call(*args, **kwargs)
+
+            monkeypatch.setattr(client, name, refuse)
+    finishes = []
+
+    case["run"](
+        before_finish=lambda: finishes.append(bool(down)),
+        after_lifecycle=down.clear,
+    )
+
+    # The early finish runs only on a confirmed import: a refused link write
+    # leaves the import confirmed, a refused reload does not.
+    assert finishes[0] is (refused == "link"), finishes
+    assert links == (
+        [(900, True), (900, False)] if refused == "link" else [(900, False)]
+    ), links
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["epg_data_id"] == 502
+    assert state.channels[900]["hidden_from_output"] is False
+    promo = case["promos"][-1]
+    assert (promo["units"], promo["promoted_adopted"], promo["guide_pending"]) == (1, 1, 0), promo
+
+
+def test_early_finish_keeps_its_new_stream_through_the_stream_sort(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    third = 7303
+    state.secondary_streams[SECONDARY_B_NAME].append({
+        "id": third,
+        "name": case["event_name"].replace("DAZN 05", "TrillerTV 03"),
+        "m3u_account": 2,
+        "url": "https://example.invalid/7303",
+    })
+    for stream_id in (STREAM_A, STREAM_B, third):
+        case["set_stat"](stream_id, True)
+    case["run"](before_finish=lambda: [
+        case["set_stat"](stream_id, False) for stream_id in (STREAM_A, STREAM_B, third)
+    ])
+    event_key, failed = next(iter(case["receipts"]().items()))
+    assert (failed["stage"], failed["reason"]) == ("failed", "health_failed")
+    case["current"][0] = datetime.fromisoformat(failed["retry_at"]) + timedelta(seconds=1)
+    # An earlier attempt attached two of the three streams before it failed,
+    # and the rule sorts each channel's streams by name.
+    state.channels[900]["streams"] = [STREAM_B, STREAM_A]
+    session = db_session_factory()
+    try:
+        session.get(ChannelPipelineRule, case["rule_id"]).stream_sort_field = "stream_name"
+        session.commit()
+    finally:
+        session.close()
+    for stream_id in (STREAM_A, STREAM_B, third):
+        case["set_stat"](stream_id, True)
+        case["plays"][stream_id] = True
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A, STREAM_B, third]
+
+
+def _sorted_retry_case(db_session_factory, monkeypatch):
+    """A retry whose rule sorts streams by name; its early finish attaches a
+    third stream, so the stream sort later in the run writes the channel."""
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    third = 7303
+    state.secondary_streams[SECONDARY_B_NAME].append({
+        "id": third,
+        "name": case["event_name"].replace("DAZN 05", "TrillerTV 03"),
+        "m3u_account": 2,
+        "url": "https://example.invalid/7303",
+    })
+    for stream_id in (STREAM_A, STREAM_B, third):
+        case["set_stat"](stream_id, True)
+    case["run"](before_finish=lambda: [
+        case["set_stat"](stream_id, False) for stream_id in (STREAM_A, STREAM_B, third)
+    ])
+    event_key, failed = next(iter(case["receipts"]().items()))
+    case["current"][0] = datetime.fromisoformat(failed["retry_at"]) + timedelta(seconds=1)
+    state.channels[900]["streams"] = [STREAM_B, STREAM_A]
+    session = db_session_factory()
+    try:
+        session.get(ChannelPipelineRule, case["rule_id"]).stream_sort_field = "stream_name"
+        session.commit()
+    finally:
+        session.close()
+    for stream_id in (STREAM_A, STREAM_B, third):
+        case["set_stat"](stream_id, True)
+        case["plays"][stream_id] = True
+    return case, event_key, third
+
+
+def test_stream_sort_keeps_a_detach_written_after_the_early_reveal(
+    db_session_factory, monkeypatch,
+):
+    case, event_key, third = _sorted_retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    revealed = []
+
+    def visibility_check_detaches():
+        # The guide visibility check proves STREAM_B dead on the revealed
+        # channel and writes its list without it.
+        revealed.append(state.channels[900]["hidden_from_output"] is False)
+        state.channels[900]["streams"] = [STREAM_A, third]
+
+    case["run"](after_lifecycle=visibility_check_detaches)
+
+    assert revealed == [True]
+    assert case["receipts"]()[event_key]["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_A, third]
+
+
+def test_stream_sort_keeps_an_attach_another_run_cannot_see(
+    db_session_factory, monkeypatch,
+):
+    case, event_key, third = _sorted_retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    engines = []
+    loaded = {}
+    load = ChannelPipelineEngine._load_existing_data
+
+    async def capture(engine, *args, **kwargs):
+        engines.append(engine)
+        await load(engine, *args, **kwargs)
+        loaded["channels"] = copy.deepcopy(engine._existing_channels)
+
+    monkeypatch.setattr(ChannelPipelineEngine, "_load_existing_data", capture)
+
+    def overlapping_run_loads():
+        # An overlapping run on the same engine loads its channel list,
+        # read before this run's early attach.
+        engines[0]._existing_channels = loaded["channels"]
+
+    case["run"](after_lifecycle=overlapping_run_loads)
+
+    assert case["receipts"]()[event_key]["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_A, STREAM_B, third]
+
+
+@pytest.mark.parametrize("failed_reads", ["one", "every_finish"])
+@pytest.mark.parametrize("attempt", ["first", "retry"])
+def test_failed_channel_read_leaves_the_event_to_be_finished_later(
+    db_session_factory, monkeypatch, attempt, failed_reads,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    client = case["client"]
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    if attempt == "retry":
+        case["stage_failed_attempt"]()
+    # Dispatcharr times out on the first channel read of a finish; the
+    # channel itself still exists.
+    armed = [False]
+    get_channel = client.get_channel
+
+    async def time_out_once(channel_id, *args, **kwargs):
+        if armed[0] and channel_id == 900:
+            armed[0] = False
+            raise TimeoutError("Dispatcharr timed out")
+        return await get_channel(channel_id, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get_channel", time_out_once)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    finishes = []
+
+    def arm():
+        if failed_reads == "every_finish" or not finishes:
+            armed[0] = True
+        finishes.append(len(finishes))
+
+    case["run"](before_finish=arm)
+
+    event_key, receipt = next(iter(case["receipts"]().items()))
+    attempt_no = 1 if attempt == "first" else 2
+    assert len(finishes) == 2
+    if failed_reads == "one":
+        # The run's next finish reads the channel again and completes it.
+        assert (receipt["attempt_no"], receipt["stage"]) == (attempt_no, "complete")
+        assert state.channels[900]["hidden_from_output"] is False
+    else:
+        # Every finish of this run failed its read, so the attempt stays
+        # open, and the next run, with Dispatcharr answering, completes it.
+        assert receipt["attempt_no"] == attempt_no
+        assert receipt["stage"] not in {"complete", "failed", "expired"}
+        assert state.channels[900]["hidden_from_output"] is True
+        case["current"][0] += timedelta(minutes=6)
+        case["set_stat"](STREAM_A, True)
+        case["set_stat"](STREAM_B, True)
+        case["run"]()
+        receipt = case["receipts"]()[event_key]
+        assert (receipt["attempt_no"], receipt["stage"]) == (attempt_no, "complete")
+        assert state.channels[900]["hidden_from_output"] is False
+
+
+@pytest.mark.parametrize("main_read", [True, False])
+def test_owned_attachment_keeps_the_newer_dead_reading(
+    db_session_factory, monkeypatch, main_read,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    case["stage_failed_attempt"]()
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    if main_read:
+        # A new event gives the run its own health read after the early one.
+        case["add_event"](7401, "Ali vs. Frazier")
+    # An owned attachment the early read finds dead. A scheduled probe
+    # proves it alive before the run's main read, which no longer lists it;
+    # without a main read the early read is the run's only evidence.
+    revived = 7999
+    health = ActionExecutor._event_health
+    reads = []
+
+    async def early_read_sees_it_dead(executor, *args, **kwargs):
+        flow, dead = await health(executor, *args, **kwargs)
+        reads.append(len(reads))
+        return flow, (dead | {revived} if len(reads) == 1 else dead)
+
+    lifecycle = ActionExecutor._event_lifecycle
+    dead_sets = []
+
+    async def record_dead(executor, rule_id, config, units, now, dead_stream_ids=frozenset(), **kwargs):
+        dead_sets.append(set(dead_stream_ids))
+        return await lifecycle(executor, rule_id, config, units, now, dead_stream_ids, **kwargs)
+
+    monkeypatch.setattr(ActionExecutor, "_event_health", early_read_sees_it_dead)
+    monkeypatch.setattr(ActionExecutor, "_event_lifecycle", record_dead)
+
+    case["run"]()
+
+    assert len(reads) == (2 if main_read else 1)
+    assert len(dead_sets) == 1
+    assert (revived in dead_sets[0]) is not main_read, dead_sets
+
+
+def test_retry_time_is_read_after_the_lifecycle_checks(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    current = case["current"]
+    # A repeat failure is not retried before its retry time, so the early
+    # pass leaves it and the gate after the lifecycle checks decides it.
+    event_key, failed = case["stage_repeat_failure"]()
+    retry_at = datetime.fromisoformat(failed["retry_at"])
+    current[0] = retry_at - timedelta(seconds=85)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+
+    def lifecycle_runs_long():
+        current[0] = retry_at + timedelta(seconds=5)
+
+    case["run"](after_lifecycle=lifecycle_runs_long)
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 3
+    assert receipt["stage"] == "complete"
+
+
+@pytest.mark.parametrize("dedicated", [False, True])
+@pytest.mark.parametrize("rule_edited", [True, False])
+def test_retry_goes_ahead_after_the_rule_or_its_guide_profile_changed(
+    db_session_factory, monkeypatch, rule_edited, dedicated,
+):
+    # A rule that shares its guide profile: the first run's guide pass adds
+    # the event group to the profile, so the profile changes after the
+    # failed attempt even when the operator edits nothing. A dedicated rule's
+    # own channels must still read as its own after the operator's edit.
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=dedicated)
+    state = case["state"]
+
+    def edit_rule(change):
+        session = db_session_factory()
+        try:
+            rule = session.get(ChannelPipelineRule, case["rule_id"])
+            config = rule.get_event_sync_config()
+            change(config)
+            rule.set_event_sync_config(config)
+            session.commit()
+        finally:
+            session.close()
+
+    event_key, _ = case["stage_failed_attempt"]()
+    if rule_edited:
+        # The operator edits the event rule while the game is on.
+        edit_rule(lambda config: config.update(
+            time_window_minutes=config["time_window_minutes"] + 1,
+        ))
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def test_event_held_under_its_earlier_key_keeps_its_one_channel(
+    db_session_factory, monkeypatch,
+):
+    # The rule saved the earlier explicit-start pattern, which kept the slot
+    # code "MLB 02" in the title. The event went live under that title's key,
+    # and the next run reads the title without the slot code.
+    from services import event_sync_matcher
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    stamp = case["event_start"].astimezone(pytz.timezone("Europe/London"))
+    name = (
+        "MLB 02  Fury vs. Usyk start:" + stamp.strftime("%Y-%m-%d %H:%M:%S")
+        + " stop:" + (stamp + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    )
+    for stream in state.secondary_streams[SECONDARY_B_NAME]:
+        stream["name"] = name
+    session = db_session_factory()
+    try:
+        rule = session.get(ChannelPipelineRule, case["rule_id"])
+        config = rule.get_event_sync_config()
+        config.update(
+            retire_finished_events=True,
+            patterns=[{
+                "name": "slot-title-explicit-start",
+                "title_pattern": event_sync_matcher._EARLIER_EXPLICIT_START_TITLE,
+                "time_pattern": None,
+                "date_pattern": event_sync_matcher._EXPLICIT_START_PATTERN["date_pattern"],
+            }],
+        )
+        rule.set_event_sync_config(config)
+        session.commit()
+    finally:
+        session.close()
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    with patch.dict(
+        event_sync_matcher._EXPLICIT_START_PATTERN,
+        {"title_pattern": event_sync_matcher._EARLIER_EXPLICIT_START_TITLE},
+    ):
+        case["run"]()
+    ((event_key, receipt),) = case["receipts"]().items()
+    assert event_key.startswith("mlb 02 fury vs. usyk|")
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+
+    case["current"][0] += timedelta(minutes=6)
+    case["run"]()
+
+    assert case["client"].create_channel.await_count == 1
+    assert set(case["receipts"]()) == {event_key}
+    assert case["receipts"]()[event_key]["attempt_id"] == receipt["attempt_id"]
+    assert state.channels[900]["hidden_from_output"] is False
+    session = db_session_factory()
+    try:
+        managed = session.get(ChannelPipelineRule, case["rule_id"]).get_managed_channel_ids()
+    finally:
+        session.close()
+    assert 900 in managed
+
+
+def test_tennis_event_held_under_its_late_start_keeps_its_one_channel(
+    db_session_factory, monkeypatch,
+):
+    # The rule read the tennis listing's time in its Eastern zone, so the
+    # event was staged under a start six hours late and its first attempt
+    # failed. The retry run reads the listing in Central European time.
+    from services import event_sync_matcher
+
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=False)
+    state = case["state"]
+    listed = case["event_start"]
+    name = (
+        f"Fury, Tyson vs Usyk, Oleksandr @ {listed:%b} {listed.day} "
+        f"{listed:%I:%M %p} - ATP Beijing :Tennis  16"
+    )
+    for stream in state.secondary_streams[SECONDARY_B_NAME]:
+        stream["name"] = name
+    with patch.object(
+        event_sync_matcher,
+        "_TENNIS_LISTING_TIMEZONE",
+        event_sync_matcher.DEFAULT_EVENT_TIMEZONE,
+    ):
+        event_key, _ = case["stage_failed_attempt"]()
+    assert event_key.endswith("|" + listed.astimezone(timezone.utc).isoformat())
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+
+    case["run"]()
+
+    assert case["client"].create_channel.await_count == 1
+    assert set(case["receipts"]()) == {event_key}
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert state.channels[900]["hidden_from_output"] is False
+
+
+def _set_group_zone(db_session_factory, rule_id: int, zone: str) -> None:
+    session = db_session_factory()
+    try:
+        rule = session.get(ChannelPipelineRule, rule_id)
+        rule.set_event_sync_config({
+            **rule.get_event_sync_config(),
+            "group_timezones": {str(SECONDARY_B): zone},
+        })
+        session.commit()
+    finally:
+        session.close()
+
+
+def _tennis_listing(listed: datetime) -> str:
+    return (
+        f"Fury, Tyson vs Usyk, Oleksandr @ {listed:%b} {listed.day} "
+        f"{listed:%I:%M %p} - ATP Beijing :Tennis  16"
+    )
+
+
+def _live_tennis_event(db_session_factory, monkeypatch, zone: str) -> tuple[dict, datetime]:
+    """Run a tennis match onto its channel while its group reads listing times in ``zone``."""
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=False)
+    listed = case["event_start"].astimezone(pytz.timezone(zone))
+    for stream in case["state"].secondary_streams[SECONDARY_B_NAME]:
+        stream["name"] = _tennis_listing(listed)
+    _set_group_zone(db_session_factory, case["rule_id"], zone)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, True)
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["run"]()
+    case["current"][0] += timedelta(minutes=6)
+    return case, listed
+
+
+def test_a_group_zone_change_keeps_a_held_event_on_its_one_channel(
+    db_session_factory, monkeypatch,
+):
+    # The first attempt failed while the group read Central European time.
+    # Before the retry run the group's zone was changed to UK time, which
+    # moves the listed start an hour later.
+    case = _retry_case(db_session_factory, monkeypatch, dedicated=False)
+    listed = case["event_start"].astimezone(pytz.timezone("Europe/Berlin"))
+    for stream in case["state"].secondary_streams[SECONDARY_B_NAME]:
+        stream["name"] = _tennis_listing(listed)
+    _set_group_zone(db_session_factory, case["rule_id"], "Europe/Berlin")
+    event_key, _ = case["stage_failed_attempt"]()
+    assert event_key.endswith("|" + listed.astimezone(timezone.utc).isoformat())
+    _set_group_zone(db_session_factory, case["rule_id"], "Europe/London")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+
+    case["run"]()
+
+    assert case["client"].create_channel.await_count == 1
+    assert set(case["receipts"]()) == {event_key}
+    receipt = case["receipts"]()[event_key]
+    assert (receipt["attempt_no"], receipt["stage"]) == (2, "complete")
+    assert case["state"].channels[900]["hidden_from_output"] is False
+
+
+def test_a_stream_that_joins_a_held_event_stays_with_it_after_a_zone_change(
+    db_session_factory, monkeypatch,
+):
+    # The match is live while its group reads UK time. A third listing
+    # appears, and the group's zone is changed to Central European time,
+    # which moves the listed start an hour earlier: further than this rule's
+    # 30-minute window for folding same-title starts. The new listing was
+    # never admitted, so only the event's moved key can take it along.
+    case, listed = _live_tennis_event(db_session_factory, monkeypatch, "Europe/London")
+    ((event_key, receipt),) = case["receipts"]().items()
+    assert receipt["stage"] == "complete"
+    case["state"].secondary_streams[SECONDARY_B_NAME].append({
+        "id": 7303,
+        "name": _tennis_listing(listed),
+        "m3u_account": 2,
+        "url": "https://example.invalid/7303",
+    })
+    case["plays"][7303] = True
+    _set_group_zone(db_session_factory, case["rule_id"], "Europe/Berlin")
+
+    case["run"]()
+
+    assert case["client"].create_channel.await_count == 1
+    assert set(case["receipts"]()) == {event_key}
+
+
+def test_a_group_zone_reaches_the_runs_lifecycle_check(
+    db_session_factory, monkeypatch,
+):
+    # The lifecycle check re-reads each stream name. It must read the
+    # group's zone as the plan did, or the event on the channel would not
+    # match its own streams.
+    case, _ = _live_tennis_event(db_session_factory, monkeypatch, "Europe/London")
+
+    case["run"]()
+
+    assert case["promos"][-1]["event_states"] == [{"channel_id": 900, "status": "active"}]
+
+
+@pytest.mark.parametrize("refusal", ["ended", "unlisted_stream"])
+def test_retry_streams_the_gate_would_refuse_are_not_probed_first(
+    db_session_factory, monkeypatch, refusal,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    if refusal == "ended":
+        case["current"][0] = (
+            datetime.fromisoformat(failed["stop"]) + timedelta(minutes=1)
+        )
+    else:
+        state.channels[900]["streams"] = [9999]
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+
+    case["run"]()
+
+    first_pass = case["probes"][:case["marks"][0]]
+    assert not {STREAM_A, STREAM_B} & set(first_pass), case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_id"] == failed["attempt_id"]
+
+
+def test_interrupted_attempt_finishes_with_every_working_stream(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, staged = case["stage_interrupted_attempt"]()
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+
+    case["run"]()
+
+    first_pass = case["probes"][:case["marks"][0]]
+    assert {STREAM_A, STREAM_B} & set(first_pass), case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_id"] == staged["attempt_id"]
+    assert receipt["input_hash"] == staged["input_hash"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert sorted(state.channels[900]["streams"]) == [STREAM_A, STREAM_B]
+
+
+def test_half_attached_interrupted_attempt_is_probed_first(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, staged = case["stage_interrupted_attempt"]()
+    state.channels[900]["streams"] = [STREAM_A]
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: False})
+
+    case["run"]()
+
+    first_pass = case["probes"][:case["marks"][0]]
+    assert STREAM_A in first_pass, case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+def _stream(case, stream_id):
+    return next(
+        stream for stream in case["state"].secondary_streams[SECONDARY_B_NAME]
+        if stream["id"] == stream_id
+    )
+
+
+def test_delisted_backup_stream_stays_off_the_retried_channel(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, _ = case["stage_failed_attempt"]()
+    _stream(case, STREAM_B)["is_stale"] = True
+    case["set_stat"](STREAM_A, True)
+
+    # The delisted stream still plays when the finish step checks it.
+    case["run"](before_finish=lambda: case["set_stat"](STREAM_B, True))
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+def test_retry_probes_while_a_scheduled_probe_runs(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    current = case["current"]
+    event_key, _ = case["stage_failed_attempt"]()
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: True})
+    case["prober"]._probing_in_progress = True
+
+    def lifecycle_runs_long():
+        current[0] += timedelta(minutes=6)
+
+    finishes = []
+
+    case["run"](
+        after_lifecycle=lifecycle_runs_long,
+        before_finish=lambda: finishes.append(len(case["probes"])),
+    )
+
+    mark = finishes[0]
+    assert {STREAM_A, STREAM_B} & set(case["probes"][:mark]), case["probes"]
+    assert {STREAM_A, STREAM_B} & set(case["probes"][mark:]), case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["stage"] == "complete"
+
+
+def test_retry_ignores_a_stream_that_joined_the_event(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    state.secondary_streams[SECONDARY_B_NAME].append({
+        "id": 7303,
+        "name": case["event_name"].replace("DAZN 05", "Other 03"),
+        "m3u_account": 2,
+        "url": "https://example.invalid/7303",
+    })
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+    case["set_stat"](7303, True)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert [row["id"] for row in receipt["streams"]] == [STREAM_A, STREAM_B]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+def test_dead_receipt_stream_listed_under_another_event_stays_dead(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, _ = case["stage_failed_attempt"]()
+    backup = _stream(case, STREAM_B)
+    backup["name"] = backup["name"].replace("Fury vs. Usyk", "Tyson vs. Paul")
+    case["add_event"](7402, "Tyson vs. Paul")
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+
+    case["run"]()
+
+    receipts = case["receipts"]()
+    assert receipts[event_key]["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_A]
+    other = next(
+        receipt for key, receipt in receipts.items() if key != event_key
+    )
+    assert [row["id"] for row in other["streams"]] == [7402]
+
+
+def test_retry_after_a_partial_attach_goes_live(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    state.channels[900]["streams"] = [STREAM_A]
+    case["add_event"](7401, "Tyson vs. Paul")
+    case["plays"].update({STREAM_A: True, STREAM_B: False})
+
+    case["run"]()
+
+    assert STREAM_A in case["probes"][:case["marks"][0]], case["probes"]
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]
+    assert case["promos"][-1]["already_attached"] == 1
+
+
+@pytest.mark.parametrize("attached", ["unlisted", "other_event"])
+def test_retry_refuses_a_channel_holding_another_events_stream(
+    db_session_factory, monkeypatch, attached,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    if attached == "unlisted":
+        state.channels[900]["streams"] = [9999]
+        case["set_stat"](STREAM_A, True)
+        case["set_stat"](STREAM_B, False)
+    else:
+        state.channels[900]["streams"] = [STREAM_A]
+        working = _stream(case, STREAM_A)
+        working["name"] = working["name"].replace("Fury vs. Usyk", "Tyson vs. Paul")
+        case["set_stat"](STREAM_A, True)
+        case["set_stat"](STREAM_B, True)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_id"] == failed["attempt_id"]
+    assert state.channels[900]["hidden_from_output"] is True
+
+
+def test_retry_replaces_a_delisted_attached_stream(db_session_factory, monkeypatch):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    state.channels[900]["streams"] = [STREAM_A]
+    _stream(case, STREAM_A)["is_stale"] = True
+    case["set_stat"](STREAM_B, True)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_B]
+    assert 900 in case["promos"][-1]["channel_ids"]
+
+
+@pytest.mark.parametrize("attempt", ["failed", "failed_with_fresh_stat", "interrupted"])
+def test_retry_goes_live_when_the_provider_deleted_a_stream(
+    db_session_factory, monkeypatch, attempt,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    if attempt == "interrupted":
+        event_key, staged = case["stage_interrupted_attempt"]()
+    else:
+        event_key, staged = case["stage_failed_attempt"]()
+    deleted_name = _stream(case, STREAM_B)["name"]
+    state.secondary_streams[SECONDARY_B_NAME] = [
+        stream for stream in state.secondary_streams[SECONDARY_B_NAME]
+        if stream["id"] != STREAM_B
+    ]
+    case["health"].pop(STREAM_B, None)
+    case["set_stat"](STREAM_A, True)
+    before_finish = None
+    if attempt == "failed_with_fresh_stat":
+        def before_finish():
+            case["set_stat"](
+                STREAM_B, True, age=timedelta(minutes=1), name=deleted_name,
+            )
+
+    case["run"](before_finish=before_finish)
+
+    receipt = case["receipts"]()[event_key]
+    if attempt == "interrupted":
+        assert receipt["attempt_id"] == staged["attempt_id"]
+    else:
+        assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == staged["input_hash"]
+    assert [row["id"] for row in receipt["streams"]] == [STREAM_A, STREAM_B]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+def test_retry_keeps_the_event_times_when_its_first_listing_dies(
+    db_session_factory, monkeypatch,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    first_listing = case["event_start"] - timedelta(minutes=10)
+    _stream(case, STREAM_A)["name"] = (
+        "DAZN 05: Fury vs. Usyk @ " + first_listing.strftime("%d %b %I:%M %p ET")
+    )
+    event_key, failed = case["stage_failed_attempt"]()
+    assert datetime.fromisoformat(failed["start"]) == first_listing
+    case["set_stat"](STREAM_A, False)
+    case["set_stat"](STREAM_B, True)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert (receipt["title"], receipt["start"], receipt["stop"]) == (
+        failed["title"], failed["start"], failed["stop"],
+    )
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_B]
+
+
+def test_retry_keeps_the_event_stop_when_a_renamed_stream_matches_a_variant(
+    db_session_factory, monkeypatch,
+):
+    from models import DummyEPGProfile
+
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    session = db_session_factory()
+    try:
+        profile = session.get(DummyEPGProfile, case["profile_id"])
+        profile.pattern_variants = json.dumps([{
+            "name": "Short slot",
+            "title_pattern": r"^DAZN 15: (?P<title>.+?) @",
+            "program_duration": 60,
+        }])
+        session.commit()
+    finally:
+        session.close()
+    event_key, failed = case["stage_failed_attempt"]()
+    assert (
+        datetime.fromisoformat(failed["stop"]) - datetime.fromisoformat(failed["start"])
+    ) == timedelta(minutes=180)
+    working = _stream(case, STREAM_A)
+    working["name"] = working["name"].replace("DAZN 05", "DAZN 15")
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["stop"] == failed["stop"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["streams"] == [STREAM_A]
+
+
+@pytest.mark.parametrize("overlap", ["nested_finish", "unhide_error"])
+def test_one_run_at_a_time_finishes_an_event(
+    db_session_factory, monkeypatch, overlap,
+):
+    from channel_pipeline_executor import _FINISHING_EVENTS
+    from services import event_sync_stream_health
+
+    setup, executor, finish = _pending_completion(db_session_factory, monkeypatch)
+    state = setup["state"]
+    client = setup["client"]
+    event_key, receipt = next(iter(_read_event_publication(
+        db_session_factory, setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"].items()))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    update_channel = client.update_channel.side_effect
+    get_channel = client.get_channel.side_effect
+    collect = event_sync_stream_health.collect_stream_flow
+    unhidden = []
+    nested = []
+
+    async def watch_update(channel_id, changes, *args, **kwargs):
+        if changes == {"hidden_from_output": False}:
+            if overlap == "unhide_error":
+                raise RuntimeError("update refused")
+            unhidden.append(channel_id)
+        return await update_channel(channel_id, changes, *args, **kwargs)
+
+    async def overlapping_get(channel_id, *args, **kwargs):
+        if unhidden and not nested:
+            # A second run reaches the same attempt after the reveal and
+            # proves none of its streams.
+            nested.append(channel_id)
+            await finish(executor)
+        return await get_channel(channel_id, *args, **kwargs)
+
+    async def collect_flow(*args, **kwargs):
+        if nested:
+            return {}
+        return await collect(*args, **kwargs)
+
+    client.update_channel.side_effect = watch_update
+    client.get_channel.side_effect = overlapping_get
+    monkeypatch.setattr(event_sync_stream_health, "collect_stream_flow", collect_flow)
+    try:
+        with patch("database.get_session", side_effect=db_session_factory), \
+             patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+             patch("channel_pipeline_executor.datetime", _clock(current)):
+            _run(finish(executor))
+
+        assert _FINISHING_EVENTS == set()
+        if overlap == "unhide_error":
+            # A refused reveal leaves the attempt open for a later finish.
+            stored = _read_event_publication(
+                db_session_factory, setup["profile_id"],
+            )["state"]["delivery"]["pending_channels"][event_key]
+            assert stored["stage"] == "linking"
+            assert state.channels[900]["hidden_from_output"] is True
+        if overlap == "nested_finish":
+            assert nested == [900]
+            completed = _read_event_publication(
+                db_session_factory, setup["profile_id"],
+            )["state"]["delivery"]["pending_channels"][event_key]
+            assert completed["stage"] == "complete"
+            assert state.channels[900]["hidden_from_output"] is False
+    finally:
+        _FINISHING_EVENTS.clear()
+
+
+def test_run_that_skips_an_event_another_run_is_finishing_records_no_failure():
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+
+    promo = {"guide_pending": 1}
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={},
+        _event_pending={(7, "event-1"): {
+            "profile_id": 7,
+            "source_id": None,
+            "promo": promo,
+            "exec_ctx": ExecutionContext(),
+        }},
+    )
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    _FINISHING_EVENTS.add((7, "event-1"))
+    try:
+        _run(ChannelPipelineEngine(MagicMock())._refresh_linked_epg(
+            executor, results, [],
+        ))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert promo["guide_pending"] == 0
+    assert results["failed_actions"] == []
+
+
+def test_event_another_run_is_finishing_does_not_hide_this_runs_pending_event():
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+
+    promo = {"guide_pending": 2}
+    context = ExecutionContext()
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={},
+        _event_pending={
+            key: {
+                "profile_id": 7,
+                "source_id": None,
+                "promo": promo,
+                "exec_ctx": context,
+            }
+            for key in ((7, "event-1"), (7, "event-2"))
+        },
+    )
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    engine = ChannelPipelineEngine(MagicMock())
+    _FINISHING_EVENTS.add((7, "event-1"))
+    try:
+        # Pass 5 runs the finish step first and leaves the report to the
+        # finish at the end of the run.
+        _run(engine._refresh_linked_epg(
+            executor, results, [], report_pending=False,
+        ))
+        _run(engine._refresh_linked_epg(executor, results, []))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert promo["guide_pending"] == 1
+    assert [entry["error"] for entry in results["failed_actions"]] == [
+        "1 staged event promotion(s) remain pending",
+    ]
+
+
+def test_event_pending_through_both_finish_calls_is_reported_when_the_other_completes():
+    from types import SimpleNamespace
+
+    from channel_pipeline_executor import ExecutionContext
+
+    promo = {"guide_pending": 2}
+    context = ExecutionContext()
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={},
+        _event_pending={
+            key: {
+                "profile_id": 7,
+                "source_id": None,
+                "promo": promo,
+                "exec_ctx": context,
+            }
+            for key in ((7, "event-1"), (7, "event-2"))
+        },
+    )
+    calls = []
+
+    async def finish():
+        calls.append(len(calls))
+        # Pass 5's finish completes nothing; the finish at the end of the
+        # run completes event-1, and event-2 stays pending through both.
+        if len(calls) == 2:
+            promo["guide_pending"] -= 1
+            executor._event_pending[(7, "event-1")]["settled"] = True
+        return set()
+
+    executor._finish_event_promotions = finish
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    engine = ChannelPipelineEngine(MagicMock())
+
+    _run(engine._refresh_linked_epg(executor, results, [], report_pending=False))
+    _run(engine._refresh_linked_epg(executor, results, []))
+
+    assert promo["guide_pending"] == 1
+    assert [entry["error"] for entry in results["failed_actions"]] == [
+        "1 staged event promotion(s) remain pending",
+    ]
+
+
+def test_event_this_run_completed_and_another_run_claims_is_not_counted_twice():
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+
+    # This run's first finish call completed event-1 and lowered the count
+    # from 2 to 1; event-2 is still pending.
+    promo = {"guide_pending": 1}
+    context = ExecutionContext()
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={7: {"state": {"delivery": {"pending_channels": {
+            "event-1": {"stage": "complete", "channel_id": 900},
+        }}}}},
+        _event_pending={
+            key: {
+                "profile_id": 7,
+                "source_id": None,
+                "promo": promo,
+                "exec_ctx": context,
+            }
+            for key in ((7, "event-1"), (7, "event-2"))
+        },
+    )
+    executor._event_pending[(7, "event-1")]["settled"] = True
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    session = MagicMock()
+    session.query.return_value.all.return_value = []
+    _FINISHING_EVENTS.add((7, "event-1"))
+    try:
+        with patch("services.epg_publication.get_session", return_value=session):
+            _run(ChannelPipelineEngine(MagicMock())._refresh_linked_epg(
+                executor, results, [],
+            ))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert promo["guide_pending"] == 1
+    assert [entry["error"] for entry in results["failed_actions"]] == [
+        "1 staged event promotion(s) remain pending",
+    ]
+
+
+@pytest.mark.parametrize("cached_stage", ["complete", "linking"])
+def test_event_another_run_completed_is_not_reported_pending(cached_stage):
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+
+    stop = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    stored = {"state": {"delivery": {"pending_channels": {"event-1": {
+        "stage": "complete", "channel_id": 900, "expires_at": stop,
+    }}}}}
+    promo = {"guide_pending": 1}
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={7: {"state": {"delivery": {"pending_channels": {
+            "event-1": {"stage": cached_stage, "channel_id": 900, "expires_at": stop},
+        }}}}},
+        _event_pending={(7, "event-1"): {
+            "profile_id": 7,
+            "source_id": None,
+            "promo": promo,
+            "exec_ctx": ExecutionContext(),
+        }},
+        client=SimpleNamespace(get_channel=AsyncMock(return_value={"id": 900})),
+        _event_receipt_current=lambda publication, event_key, **kwargs: (
+            stored, stored["state"]["delivery"]["pending_channels"][event_key]
+        ),
+    )
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    session = MagicMock()
+    session.query.return_value.all.return_value = []
+    flow = AsyncMock()
+    try:
+        with patch("services.epg_publication.get_session", return_value=session), \
+                patch("services.event_sync_stream_health.collect_stream_flow", flow):
+            _run(ChannelPipelineEngine(MagicMock())._refresh_linked_epg(
+                executor, results, [],
+            ))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert promo["guide_pending"] == 0
+    assert results["failed_actions"] == []
+    flow.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cached_stage", ["expired", "linking"])
+def test_event_the_guide_expired_at_its_stop_is_still_reported_pending(cached_stage):
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+
+    # The guide closed the receipt at the event's stop, so storage already
+    # holds `expired` and this run's guarded expiry write accepts nothing.
+    stop = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    promo = {"guide_pending": 1}
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={7: {"state": {"delivery": {"pending_channels": {
+            "event-1": {
+                "stage": cached_stage, "channel_id": 900,
+                "expires_at": stop, "profile_id": 7,
+            },
+        }}}}},
+        _event_pending={(7, "event-1"): {
+            "profile_id": 7,
+            "source_id": None,
+            "promo": promo,
+            "exec_ctx": ExecutionContext(),
+        }},
+        client=SimpleNamespace(get_channel=AsyncMock(return_value={"id": 900})),
+        _write_event_receipt=AsyncMock(return_value=None),
+    )
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    session = MagicMock()
+    session.query.return_value.all.return_value = []
+    try:
+        with patch("services.epg_publication.get_session", return_value=session):
+            _run(ChannelPipelineEngine(MagicMock())._refresh_linked_epg(
+                executor, results, [],
+            ))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert promo["guide_pending"] == 1
+    assert [entry["error"] for entry in results["failed_actions"]] == [
+        "1 staged event promotion(s) remain pending",
+    ]
+
+
+def test_event_this_run_failed_is_still_counted_in_the_next_finish_call():
+    from types import MethodType, SimpleNamespace
+
+    from channel_pipeline_executor import _FINISHING_EVENTS, ExecutionContext
+    from tests.fixtures.sync_harness import _http_status_error
+
+    stop = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    promo = {"guide_pending": 1}
+
+    def publication(stage):
+        return {"state": {"delivery": {"pending_channels": {"event-1": {
+            "stage": stage, "channel_id": 900, "expires_at": stop, "profile_id": 7,
+        }}}}}
+
+    async def write(publication_value, event_key, stages, changes, **kwargs):
+        return publication(changes["stage"])
+
+    executor = SimpleNamespace(
+        _epg_import_sources=set(),
+        _epg_import_attempts=set(),
+        _channel_by_id={},
+        _event_publications={7: publication("linking")},
+        _event_pending={(7, "event-1"): {
+            "profile_id": 7,
+            "source_id": None,
+            "promo": promo,
+            "exec_ctx": ExecutionContext(),
+        }},
+        client=SimpleNamespace(get_channel=AsyncMock(
+            side_effect=_http_status_error(404, "Not found."),
+        )),
+        _write_event_receipt=write,
+    )
+    executor._finish_event_promotions = MethodType(
+        ActionExecutor._finish_event_promotions, executor,
+    )
+    results = {
+        "failed_actions": [],
+        "streams_merged": 0,
+        "streams_skipped": 0,
+        "channels_updated": 0,
+        "modified_entities": [],
+        "channels_touched": 0,
+    }
+    session = MagicMock()
+    session.query.return_value.all.return_value = []
+    engine = ChannelPipelineEngine(MagicMock())
+    try:
+        with patch("services.epg_publication.get_session", return_value=session):
+            # Pass 5 runs the finish step first and leaves the report to the
+            # finish at the end of the run.
+            _run(engine._refresh_linked_epg(
+                executor, results, [], report_pending=False,
+            ))
+            _run(engine._refresh_linked_epg(executor, results, []))
+    finally:
+        _FINISHING_EVENTS.clear()
+
+    assert executor._event_publications[7]["state"]["delivery"][
+        "pending_channels"
+    ]["event-1"]["stage"] == "failed"
+    assert promo["guide_pending"] == 1
+    assert [entry["error"] for entry in results["failed_actions"]] == [
+        "1 staged event promotion(s) remain pending",
+    ]
+
+
+def test_event_this_run_completed_is_counted_once_across_finish_calls(
+    db_session_factory, monkeypatch,
+):
+    setup, executor, finish = _pending_completion(db_session_factory, monkeypatch)
+    event_key, receipt = next(iter(_read_event_publication(
+        db_session_factory, setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"].items()))
+    current = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    work = executor._event_pending[(setup["profile_id"], event_key)]
+    # A second staged event of the same rule is still waiting for its guide.
+    executor._event_pending[(setup["profile_id"], "event-2")] = {**work}
+    work["promo"]["guide_pending"] += 1
+    pending_before = work["promo"]["guide_pending"]
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+         patch("channel_pipeline_executor.datetime", _clock(current)):
+        for _ in range(2):
+            _run(finish(executor))
+
+    assert _read_event_publication(
+        db_session_factory, setup["profile_id"],
+    )["state"]["delivery"]["pending_channels"][event_key]["stage"] == "complete"
+    assert work["promo"]["guide_pending"] == pending_before - 1
+
+
+@pytest.mark.parametrize("stage,replaced", [
+    ("complete", False),
+    ("failed", False),
+    # A third run admits the event again after the failure.
+    ("failed", True),
+])
+def test_event_another_run_settled_this_runs_attempt_after_the_guide_moved_on(
+    db_session_factory, monkeypatch, stage, replaced,
+):
+    from models import DummyEPGProfile
+    from services.epg_publication import begin_delivery
+    from tasks.event_visibility import _source_refresh_key
+
+    setup, executor, finish = _pending_completion(db_session_factory, monkeypatch)
+    profile_id = setup["profile_id"]
+    stored = _read_event_publication(db_session_factory, profile_id)
+    event_key, receipt = next(iter(
+        stored["state"]["delivery"]["pending_channels"].items()
+    ))
+    now = datetime.fromisoformat(receipt["admitted_at"]) + timedelta(seconds=1)
+    work = executor._event_pending[(profile_id, event_key)]
+    cached = copy.deepcopy(executor._event_publications[profile_id])
+    session = db_session_factory()
+    try:
+        profile = session.get(DummyEPGProfile, profile_id).to_dict()
+    finally:
+        session.close()
+    pending_channels = {}
+    if replaced:
+        source = next(
+            row for row in executor._epg_sources
+            if row.get("id") == work["source_id"]
+        )
+        _, endpoint_hash, source_url_hash = _source_refresh_key(
+            executor.client, source, stored["scope"],
+        )
+        candidate = {
+            key: copy.deepcopy(receipt[key]) for key in (
+                "event_key", "rule_id", "rule_hash", "profile_id",
+                "target_group_id", "title", "start", "stop", "channel_name",
+                "channel_id", "channel_uuid", "execution_id",
+            )
+        }
+        # The provider renamed the stream, so the new attempt starts at once.
+        candidate.update({
+            "streams": [
+                {**stream, "name": f"{stream['name']} HD"}
+                for stream in receipt["streams"]
+            ],
+            "source_hashes": [{
+                "endpoint_hash": endpoint_hash,
+                "source_url_hash": source_url_hash,
+            }],
+            "owner_proven": True,
+            "channel_exists": True,
+            "health_playable": True,
+        })
+        pending_channels = {event_key: candidate}
+
+    with patch("database.get_session", side_effect=db_session_factory), \
+         patch("services.epg_publication.get_session", side_effect=db_session_factory), \
+         patch("channel_pipeline_executor.datetime", _clock(now)):
+        # Another run settles this run's attempt through the same guarded writer.
+        settled = _run(executor._write_event_receipt(
+            stored,
+            event_key,
+            {"allocated", "importing", "linking", "ready"},
+            {
+                "stage": stage,
+                "reason": None if stage == "complete" else "programme_missing",
+                "terminal_at": now.isoformat(),
+                "retry_at": (
+                    None if stage == "complete"
+                    else (now + timedelta(minutes=5)).isoformat()
+                ),
+            },
+            channel=copy.deepcopy(setup["state"].channels[900]),
+        ))
+        # The next guide admission replaces the finished guide attempt.
+        moved = begin_delivery(
+            settled["scope"],
+            expected_revision=settled["revision"],
+            expected_hash=settled["state"]["xmltv_hash"],
+            profile=profile,
+            now=now,
+            pending_channels=pending_channels,
+        )
+        # This run never read either write.
+        executor._event_publications[profile_id] = cached
+        pending_before = work["promo"]["guide_pending"]
+        _run(finish(executor))
+
+    assert moved["state"]["delivery"]["guide_attempt"]["attempt_id"] != (
+        stored["state"]["delivery"]["guide_attempt"]["attempt_id"]
+    )
+    assert _read_event_publication(db_session_factory, profile_id)["revision"] == (
+        moved["revision"]
+    )
+    assert work["promo"]["guide_pending"] == pending_before - 1
+    assert work["claimed_elsewhere"] is True
+
+
+def _staged_states(receipts, *, listed=("event-1",), uuid="event-900"):
+    from types import MethodType, SimpleNamespace
+
+    executor = SimpleNamespace(_channel_by_id={900: {
+        "id": 900, "uuid": uuid, "streams": [], "hidden_from_output": True,
+    }})
+    states = {900: "idle"}
+    MethodType(ActionExecutor._staged_event_states, executor)(
+        states,
+        {receipt["event_key"]: receipt for receipt in receipts},
+        {"event-1": {7301}},
+        set(listed),
+        FROZEN_NOW,
+    )
+    return states[900]
+
+
+def _failed_receipt(event_key, start, stop):
+    return {
+        "event_key": event_key,
+        "channel_id": 900,
+        "channel_uuid": "event-900",
+        "stage": "failed",
+        "reason": "health_failed",
+        "start": start.isoformat(),
+        "stop": stop.isoformat(),
+        "streams": [{"id": 7301}],
+    }
+
+
+def test_failed_staged_channel_waits_for_its_retry_while_listed():
+    receipt = _failed_receipt(
+        "event-1", FROZEN_NOW - timedelta(minutes=10), FROZEN_NOW + timedelta(hours=1),
+    )
+    assert _staged_states([receipt]) == "unknown"
+
+
+@pytest.mark.parametrize("change", ["unlisted", "other_uuid"])
+def test_failed_staged_channel_is_not_kept_for_a_retry_that_cannot_run(change):
+    receipt = _failed_receipt(
+        "event-1", FROZEN_NOW - timedelta(minutes=10), FROZEN_NOW + timedelta(hours=1),
+    )
+    if change == "unlisted":
+        assert _staged_states([receipt], listed=()) == "idle"
+    else:
+        assert _staged_states([receipt], uuid="event-901") == "idle"
+
+
+@pytest.mark.parametrize("ended_first", [True, False])
+def test_two_receipts_on_one_channel_leave_it_to_the_retry(ended_first):
+    # The repeated hour of a fall-back night gives one channel name two
+    # event keys; the ended one must not retire the one still on.
+    on_now = _failed_receipt(
+        "event-1", FROZEN_NOW - timedelta(minutes=10), FROZEN_NOW + timedelta(hours=1),
+    )
+    ended = _failed_receipt(
+        "event-0", FROZEN_NOW - timedelta(hours=2), FROZEN_NOW - timedelta(minutes=5),
+    )
+    receipts = [ended, on_now] if ended_first else [on_now, ended]
+    assert _staged_states(receipts) == "unknown"
+
+
+@pytest.mark.parametrize("renamed", [STREAM_B, STREAM_A])
+def test_retry_keeps_the_receipt_input_when_a_stream_is_renamed(
+    db_session_factory, monkeypatch, renamed,
+):
+    case = _retry_case(db_session_factory, monkeypatch)
+    state = case["state"]
+    event_key, failed = case["stage_failed_attempt"]()
+    stream = _stream(case, renamed)
+    # Another slot number on the same listing: the event parses the same.
+    stream["name"] = stream["name"].replace("0", "1", 1)
+    case["set_stat"](STREAM_A, True)
+    case["set_stat"](STREAM_B, False)
+
+    case["run"]()
+
+    receipt = case["receipts"]()[event_key]
+    assert receipt["attempt_no"] == 2
+    assert receipt["input_hash"] == failed["input_hash"]
+    assert receipt["stage"] == "complete"
+    assert state.channels[900]["hidden_from_output"] is False
+    assert state.channels[900]["streams"] == [STREAM_A]

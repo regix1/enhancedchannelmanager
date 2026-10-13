@@ -32,7 +32,7 @@ from security.stream_outbound import (
 from database import get_session
 from epg_matching import detect_country_from_streams
 from models import StreamStats
-from stream_normalization import COUNTRY_CODE_ALIASES, get_country_rank
+from stream_normalization import COUNTRY_CODE_ALIASES, get_country_prefix, get_country_rank
 
 logger = logging.getLogger(__name__)
 
@@ -217,13 +217,22 @@ def get_codec_rank(codec_name: str | None) -> int:
     return CODEC_RANK.get(codec_name.lower(), 0)
 
 
-def get_channel_country(stream_names: list[str]) -> str | None:
-    """Country most of a channel's stream names declare, or None when none do.
+def get_channel_country(stream_names: list[str], group_names: list[str] | None = None) -> str | None:
+    """Country most of a channel's streams declare, or None when none do.
 
     The channel row itself carries no country, so the streams attached to it are
-    the only signal available to a sort that receives stream IDs.
+    the only signal available to a sort that receives stream IDs. Each stream
+    counts once, by the rule ``get_country_rank`` ranks it with: its name's
+    country, else its M3U group's, where a provider that puts a brand in the
+    name (``T2|``) puts the country. A name and its group counted as two votes
+    let one feed labeled in both outvote two feeds labeled once. On an even
+    split the stream listed first decides.
     """
-    country = detect_country_from_streams([{"name": name} for name in stream_names])
+    groups = group_names or [""] * len(stream_names)
+    country = detect_country_from_streams([
+        {"name": name} if get_country_prefix(name) else {"channel_group_name": group}
+        for name, group in zip(stream_names, groups)
+    ])
     if country is None:
         return None
     return COUNTRY_CODE_ALIASES.get(country, country)
@@ -617,6 +626,7 @@ class StreamProber:
         self._probe_condition = asyncio.Condition()
         self._account_active: dict[int | None, int] = {}
         self._event_probes = 0
+        self._event_waiting: dict[int | None, int] = {}
         self.profile_distribution_strategy = profile_distribution_strategy
         self.skip_recently_probed_hours = skip_recently_probed_hours
         self.refresh_m3us_before_probe = refresh_m3us_before_probe
@@ -744,28 +754,56 @@ class StreamProber:
         """
         account_id = self._extract_m3u_account_id(m3u_account)
         async with self._probe_condition:
-            while True:
-                limit = max(1, min(
-                    self.max_concurrent_probes,
-                    self.account_probe_limits.get(
-                        account_id, self.max_concurrent_probes,
-                    ),
-                ))
-                account_available = (
-                    self._account_active.get(account_id, 0) < limit
-                )
-                event_available = (
-                    not event
-                    or self._event_probes < max(1, self.max_concurrent_probes)
-                )
-                if account_available and event_available:
-                    self._account_active[account_id] = (
-                        self._account_active.get(account_id, 0) + 1
+            waiting = False
+            try:
+                while True:
+                    limit = max(1, min(
+                        self.max_concurrent_probes,
+                        self.account_probe_limits.get(
+                            account_id, self.max_concurrent_probes,
+                        ),
+                    ))
+                    account_available = (
+                        self._account_active.get(account_id, 0) < limit
+                        # A queued event probe takes the account's next free
+                        # slot; a pipeline run waits on it with no deadline.
+                        and (event or not self._event_waiting.get(account_id))
                     )
-                    if event:
-                        self._event_probes += 1
-                    break
-                await self._probe_condition.wait()
+                    event_available = (
+                        not event
+                        or self._event_probes < max(1, self.max_concurrent_probes)
+                    )
+                    if account_available and event_available:
+                        self._account_active[account_id] = (
+                            self._account_active.get(account_id, 0) + 1
+                        )
+                        if event:
+                            self._event_probes += 1
+                        break
+                    if event and not waiting and not account_available:
+                        self._event_waiting[account_id] = (
+                            self._event_waiting.get(account_id, 0) + 1
+                        )
+                        waiting = True
+                    elif event and waiting and account_available:
+                        # Free account, full event aggregate: stop holding
+                        # this account for bulk probes until it fills again.
+                        remaining = self._event_waiting[account_id] - 1
+                        if remaining:
+                            self._event_waiting[account_id] = remaining
+                        else:
+                            self._event_waiting.pop(account_id, None)
+                        waiting = False
+                        self._probe_condition.notify_all()
+                    await self._probe_condition.wait()
+            finally:
+                if waiting:
+                    remaining = self._event_waiting[account_id] - 1
+                    if remaining:
+                        self._event_waiting[account_id] = remaining
+                    else:
+                        self._event_waiting.pop(account_id, None)
+                    self._probe_condition.notify_all()
 
         try:
             yield
@@ -1287,10 +1325,18 @@ class StreamProber:
         result: Optional[dict] = None
         status = "success"
         error_message: Optional[str] = None
+        # A scheduled probe sets probe_timeout for its own run, and an event
+        # probe that runs beside it keeps the configured timeout.
+        if content:
+            from config import get_settings
+
+            probe_timeout = get_settings().stream_probe_timeout
+        else:
+            probe_timeout = self.probe_timeout
         try:
             logger.debug("[STREAM-PROBE] Running ffprobe for stream %s", stream_id)
             ffprobe_budget = (
-                (self.probe_timeout + 5) * (self.probe_retry_count + 1)
+                (probe_timeout + 5) * (self.probe_retry_count + 1)
                 + self.probe_retry_delay * self.probe_retry_count
                 + 5
             )
@@ -1301,7 +1347,7 @@ class StreamProber:
             if ffprobe_timeout <= 0:
                 return {}
             ffprobe_call = (
-                self._run_ffprobe(url, expires_at=expires_at)
+                self._run_ffprobe(url, expires_at=expires_at, probe_timeout=probe_timeout)
                 if expires_at is not None or content
                 else self._run_ffprobe(url)
             )
@@ -1310,7 +1356,7 @@ class StreamProber:
         except asyncio.TimeoutError:
             if _probe_seconds(expires_at, 1.0) <= 0:
                 return {}
-            logger.warning("[STREAM-PROBE] Stream %s probe timed out after %ss", stream_id, self.probe_timeout)
+            logger.warning("[STREAM-PROBE] Stream %s probe timed out after %ss", stream_id, probe_timeout)
             status = "timeout"
             error_message = PROBE_NETWORK_ROUTE_GUIDANCE
         except Exception as e:
@@ -1432,10 +1478,13 @@ class StreamProber:
         _retry_attempt: int = 0,
         *,
         expires_at: datetime | None = None,
+        probe_timeout: float | None = None,
     ) -> dict:
         """Run ffprobe and parse JSON output."""
         if _probe_seconds(expires_at, 1.0) <= 0:
             raise asyncio.TimeoutError
+        if probe_timeout is None:
+            probe_timeout = self.probe_timeout
         headers = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}
         async with validated_subprocess_input(
             url, headers=headers, scheme_downgrade=PROBE_SCHEME_DOWNGRADE
@@ -1455,7 +1504,7 @@ class StreamProber:
                 "-show_streams",
                 "-timeout",
                 str(int(_probe_seconds(
-                    expires_at, float(self.probe_timeout),
+                    expires_at, float(probe_timeout),
                 ) * 1000000)),
                 subprocess_input.argument,
             ]
@@ -1468,7 +1517,7 @@ class StreamProber:
 
             try:
                 communicate_timeout = _probe_seconds(
-                    expires_at, self.probe_timeout + 5,
+                    expires_at, probe_timeout + 5,
                 )
                 if communicate_timeout <= 0:
                     raise asyncio.TimeoutError
@@ -1504,6 +1553,7 @@ class StreamProber:
                     url,
                     _retry_attempt=_retry_attempt + 1,
                     expires_at=expires_at,
+                    probe_timeout=probe_timeout,
                 )
 
             if any(marker in error_text.lower() for marker in NETWORK_FAILURE_MARKERS):

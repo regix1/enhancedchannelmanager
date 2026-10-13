@@ -9,7 +9,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from sqlalchemy.orm import Session
 
 from cache import get_cache
@@ -62,6 +62,21 @@ class PatternVariantModel(BaseModel):
     # 1 because the engine honours a stored 0 instead of reading it as
     # "unset". [25]
     program_duration: Optional[int] = Field(default=None, ge=0, le=1440)
+    # The zone this variant's start: stamps are written in. Omitted or null
+    # reads them as UK time, as every stamp was read before the field
+    # existed; the UFC slots stamp in Central European time.
+    stamp_timezone: Optional[str] = None
+
+    @field_validator("stamp_timezone")
+    @classmethod
+    def _known_stamp_timezone(cls, value: Optional[str]) -> Optional[str]:
+        # The matcher opens this zone for every stamped name the variant
+        # reads, and pytz raises on a name it does not know.
+        import pytz
+
+        if value is not None and value not in pytz.all_timezones_set:
+            raise ValueError(f"unknown time zone {value!r}")
+        return value
 
 
 class ChannelMapping(BaseModel):
@@ -750,20 +765,39 @@ async def get_profile_coverage(profile_id: int, db: Session = Depends(get_sessio
 
     from dummy_epg_engine import get_xmltv_id
     from models import DummyEPGProfile
-    from services.epg_publication import _config_hash, read_publication
+    from services.epg_publication import _config_hash, read_publication, receipt_intervals
     from services.epg_programmes import prepare_profiles
 
     try:
         profile = db.query(DummyEPGProfile).filter(DummyEPGProfile.id == profile_id).first()
         if profile is None:
             raise HTTPException(status_code=404, detail="Profile not found")
+        try:
+            publication = read_publication(f"profile:{profile_id}")
+        except ValueError:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": {
+                        "code": "GUIDE_PUBLICATION_FAILED",
+                        "reason_codes": ["GUIDE_STATE_CORRUPT"],
+                    },
+                },
+            )
         channel_map = await _fetch_all_channels()
         p_dict = profile.to_dict()
         p_dict["channel_assignments"] = _resolve_group_assignments(
             p_dict.get("channel_group_ids", []), channel_map
         )
         p_dict["channel_map"] = channel_map
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        now = datetime.now(timezone.utc)
+        # Readiness must skip the staged channels the published guide covers
+        # from their receipts, as the publishing paths do.
+        if publication is not None:
+            intervals = receipt_intervals(publication["state"]["delivery"], channel_map, now)
+            if intervals:
+                p_dict["event_intervals"] = intervals
+        expires_at = now + timedelta(hours=24)
         prepared, coverage = await prepare_profiles(
             [p_dict], channel_map, get_client(), expires_at=expires_at,
         )
@@ -806,19 +840,6 @@ async def get_profile_coverage(profile_id: int, db: Session = Depends(get_sessio
                     "detail": {
                         "code": "GUIDE_PUBLICATION_FAILED",
                         "reason_codes": ["GUIDE_COVERAGE_INVALID"],
-                    },
-                },
-            )
-
-        try:
-            publication = read_publication(f"profile:{profile_id}")
-        except ValueError:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "detail": {
-                        "code": "GUIDE_PUBLICATION_FAILED",
-                        "reason_codes": ["GUIDE_STATE_CORRUPT"],
                     },
                 },
             )

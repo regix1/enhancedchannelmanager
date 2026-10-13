@@ -529,6 +529,46 @@ async def test_publication_only_entry_returns_explicit_result_and_updates_cache_
 
 
 @pytest.mark.asyncio
+async def test_sourced_profile_receives_staged_receipt_interval():
+    profile = MagicMock()
+    saved_profile = {"id": 7, "enabled": True, "epg_source_ids": [47]}
+    profile.to_dict.return_value = saved_profile
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [profile]
+    channels = {9: {"id": 9, "name": "Station", "channel_group_id": 4}}
+    start = datetime.now(timezone.utc) - timedelta(minutes=10)
+    stop = start + timedelta(hours=3)
+    stored = admitted_publication(saved_profile)
+    stored["state"]["delivery"]["pending_channels"] = {"event-1": {
+        "stage": "allocated",
+        "guide_attempt_id": "1" * 32,
+        "channel_id": 9,
+        "target_group_id": 4,
+        "start": start.isoformat(),
+        "stop": stop.isoformat(),
+        "title": "Dodgers X Braves",
+        "expires_at": stop.isoformat(),
+    }}
+    coverage = {"profiles": {"7": {
+        "owned_channel_ids": [], "can_publish": True, "reason_codes": [],
+    }}}
+    prepare = AsyncMock(return_value=([{**saved_profile, "channel_assignments": []}], coverage))
+
+    with patch("database.get_session", return_value=session), \
+         patch("tasks.dummy_epg_refresh.get_client", return_value=MagicMock()), \
+         patch("services.epg_programmes._fetch_all_channels", new=AsyncMock(return_value=channels)), \
+         patch("services.epg_programmes.prepare_profiles", new=prepare), \
+         patch("concurrency.run_cpu_bound", new=AsyncMock(return_value=PublicationResult())), \
+         patch("cache.get_cache"):
+        await DummyEPGRefreshTask()._regenerate_xmltv(publications={7: stored})
+
+    assert prepare.await_args.args[0][0]["event_intervals"] == {9: [{
+        "start": start.isoformat(), "stop": stop.isoformat(), "title": "Dodgers X Braves",
+        "receipt": True,
+    }]}
+
+
+@pytest.mark.asyncio
 async def test_superseded_publication_does_not_update_cache():
     profile = MagicMock()
     saved_profile = {"id": 7, "enabled": True, "epg_source_ids": []}

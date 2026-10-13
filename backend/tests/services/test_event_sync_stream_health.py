@@ -324,8 +324,10 @@ async def test_collector_reloads_after_targeted_probe(fixed_consumer_clock):
         cancelled=None,
         stop_when_playable=False,
         confirmed={1},
+        probed={},
         event_streams=None,
         checked_after=_CHECKED,
+        probe_first=frozenset(),
     )
 
 
@@ -1407,6 +1409,128 @@ async def test_positive_probe_cancels_only_owned_siblings(fixed_consumer_clock):
     assert prober._event_probes == 0
 
 
+async def _probe_order(cache, groups, probe_first, *, cancel_after=None):
+    """Run one probing pass where nothing plays; return the probe start order."""
+    stream_ids = sorted(set().union(*groups.values()))
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    started = []
+
+    async def probe(sid, url, name, **kwargs):
+        started.append(sid)
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock(base_url="http://dispatcharr.test")
+    # The provider answers in reverse id order.
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}",
+         "m3u_account": 2}
+        for sid in sorted(ids, reverse=True)
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=cache), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(return_value={})):
+        await _probe_and_collect_failures(
+            client, stream_ids, expires_at=None,
+            event_start_by_stream={sid: _START for sid in stream_ids},
+            stream_names={sid: f"s{sid}" for sid in stream_ids},
+            cancelled=(
+                (lambda: len(started) >= cancel_after)
+                if cancel_after is not None else None
+            ),
+            stop_when_playable=True,
+            event_streams=groups,
+            probe_first=probe_first,
+        )
+    return started
+
+
+@pytest.mark.asyncio
+async def test_priority_streams_are_probed_before_slot_channels(fixed_consumer_clock):
+    groups = {
+        "channel:1": frozenset({1}),
+        "channel:2": frozenset({2}),
+        "event:x": frozenset({5, 6}),
+    }
+
+    prioritized = await _probe_order(Cache(), groups, frozenset({5, 6}))
+    plain = await _probe_order(Cache(), groups, frozenset())
+
+    assert prioritized == [5, 6, 1, 2]
+    assert plain == [1, 2, 5, 6]
+    assert set(prioritized) == set(plain)
+
+
+@pytest.mark.asyncio
+async def test_priority_streams_lead_after_cursor_rotation(fixed_consumer_clock):
+    cache = Cache()
+    groups = {
+        "channel:1": frozenset({1}),
+        "channel:2": frozenset({2}),
+        "channel:3": frozenset({3}),
+        "event:x": frozenset({5, 6}),
+    }
+
+    first = await _probe_order(cache, groups, frozenset({5, 6}), cancel_after=3)
+    second = await _probe_order(cache, groups, frozenset({5, 6}))
+
+    assert first == [5, 6, 1]
+    # The slot tier resumes after the last slot probed; the priority tier
+    # still goes first.
+    assert second == [5, 6, 2, 3, 1]
+
+
+@pytest.mark.asyncio
+async def test_slot_channels_keep_their_turn_across_runs(fixed_consumer_clock):
+    cache = Cache()
+    slots = [1, 2, 3, 4, 5, 6]
+    groups = {
+        **{f"channel:{sid}": frozenset({sid}) for sid in slots},
+        "event:x": frozenset({101, 102}),
+    }
+    seen = []
+    with patch("services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 3):
+        for cancel_after in [None, 2, None, 2, None, None, None, None]:
+            started = await _probe_order(
+                cache, groups, frozenset({101, 102}), cancel_after=cancel_after,
+            )
+            seen.extend(sid for sid in started if sid in slots)
+
+    assert set(seen) == set(slots), seen
+
+
+@pytest.mark.asyncio
+async def test_capped_priority_streams_rotate_across_runs(fixed_consumer_clock):
+    cache = Cache()
+    groups = {f"event:{sid}": frozenset({sid}) for sid in [1, 2, 3, 4, 5]}
+    seen = []
+    with patch("services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 3):
+        for _ in range(3):
+            seen.extend(await _probe_order(cache, groups, frozenset(range(1, 6))))
+
+    assert set(seen) == {1, 2, 3, 4, 5}, seen
+
+
+@pytest.mark.asyncio
+async def test_capped_priority_streams_rotate_while_slot_channels_wait(fixed_consumer_clock):
+    cache = Cache()
+    priority = [1, 2, 3, 4, 5]
+    groups = {
+        **{f"event:{sid}": frozenset({sid}) for sid in priority},
+        "channel:6": frozenset({6}),
+        "channel:7": frozenset({7}),
+    }
+    runs = []
+    with patch("services.event_sync_stream_health.MAX_HEALTH_PROBES_PER_RUN", 3):
+        for _ in range(4):
+            runs.append(await _probe_order(cache, groups, frozenset(priority)))
+
+    # The cap cuts inside the priority tier, so two runs in a row cover it.
+    for first, second in zip(runs, runs[1:]):
+        assert set(first) | set(second) == set(priority), runs
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["url", "name", "account", "group_id", "group", "stale"])
 async def test_collector_rejects_changed_identity(change, fixed_consumer_clock):
@@ -1447,6 +1571,41 @@ async def test_collector_rejects_changed_identity(change, fixed_consumer_clock):
 
 
 @pytest.mark.asyncio
+async def test_early_stop_probes_the_sibling_when_the_playing_stream_moved(fixed_consumer_clock):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    stats = {}
+    rows = {
+        sid: {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}",
+              "m3u_account": {"id": 2}, "channel_group": {"id": 72}}
+        for sid in (1, 2)
+    }
+    probed = []
+
+    async def probe(stream_id, *args, **kwargs):
+        probed.append(stream_id)
+        stats[stream_id] = _stat(stream_id)
+        if stream_id == 1:
+            rows[1]["url"] = "http://example.com/moved"
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock()
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [rows[sid].copy() for sid in ids])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(
+             side_effect=lambda ids: {sid: stats[sid] for sid in ids if sid in stats},
+         )):
+        result = await collect_stream_flow(
+            [1, 2], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START, 2: _START}, stream_names={1: "s1", 2: "s2"},
+            expires_at=None, probe_missing=True, stop_when_playable=True, event_streams={"a": frozenset({1, 2})},
+        )
+    assert probed == [1, 2]
+    assert result == {1: None, 2: True}
+
+
+@pytest.mark.asyncio
 async def test_cached_positive_keeps_unknown_siblings_unprobed(fixed_consumer_clock):
     probe = AsyncMock()
     with patch("services.event_sync_stream_health._load_stats", AsyncMock(return_value={1: _stat(1)})), \
@@ -1465,7 +1624,7 @@ async def test_positive_reservations_do_not_rewind(fixed_consumer_clock):
     prober = _make_prober(max_concurrent_probes=1)
     prober.account_probe_limits = {2: 1}
     prober.refresh_account_probe_limits = AsyncMock()
-    prober.probe_stream = AsyncMock()
+    prober.probe_stream = AsyncMock(side_effect=lambda sid, *args, **kwargs: _stat(sid))
     cache = Cache()
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1626,6 +1785,236 @@ async def test_group_success_respects_the_callers_cutoff(fixed_consumer_clock):
         )
     assert result == {1: None, 2: True}
     assert [call.args[0] for call in prober.probe_stream.await_args_list] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_probe_saved_after_the_event_probe_keeps_its_proof(
+    fixed_consumer_clock,
+):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    stats = {}
+
+    async def probe(sid, url, name, **kwargs):
+        event_probe = _stat(
+            sid,
+            probed_at=_NOW - timedelta(seconds=10),
+            checked_at=_NOW - timedelta(seconds=10),
+        )
+        # The scheduled probe of the same stream saves next, with no
+        # content check, so the stored row has a newer probe than its
+        # content proof.
+        stats[sid] = _stat(
+            sid, probed_at=_NOW, checked_at=_NOW - timedelta(seconds=10),
+        )
+        return event_probe
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock(base_url="http://dispatcharr.test")
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}"} for sid in ids
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=Cache()), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(side_effect=lambda ids: stats.copy())):
+        result = await collect_stream_flow(
+            [1], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START}, stream_names={1: "s1"},
+            expires_at=None, probe_missing=True, probe_while_busy=True,
+        )
+    assert result == {1: True}
+
+
+@pytest.mark.asyncio
+async def test_event_probe_proof_stops_the_group_after_a_newer_scheduled_save(
+    fixed_consumer_clock,
+):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    stats = {}
+    event_probe_at = _NOW - timedelta(seconds=10)
+
+    async def probe(sid, url, name, **kwargs):
+        # The scheduled probe saves next with no content check, so the
+        # stored row alone no longer proves the stream.
+        stats[sid] = _stat(sid, probed_at=_NOW, checked_at=event_probe_at)
+        return _stat(sid, probed_at=event_probe_at, checked_at=event_probe_at)
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock(base_url="http://dispatcharr.test")
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}"} for sid in ids
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=Cache()), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(side_effect=lambda ids: stats.copy())):
+        result = await collect_stream_flow(
+            [1, 2], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START, 2: _START}, stream_names={1: "s1", 2: "s2"},
+            expires_at=None, probe_missing=True, probe_while_busy=True,
+            stop_when_playable=True, event_streams={"a": frozenset({1, 2})},
+        )
+    assert result == {1: True, 2: None}
+    assert [call.args[0] for call in prober.probe_stream.await_args_list] == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_status,scheduled_status,expected", [
+    # The newer scheduled failure decides over the older event success.
+    ("success", "failed", {1: False}),
+    # A newer scheduled success with no content check leaves the stream
+    # unproven instead of dead.
+    ("failed", "success", {1: None}),
+])
+async def test_newer_scheduled_probe_outcome_beats_the_event_probe(
+    fixed_consumer_clock, event_status, scheduled_status, expected,
+):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    stats = {}
+
+    def saved(sid, status, probed_at):
+        failed = status == "failed"
+        return _stat(
+            sid, status=status, failures=int(failed), measured=0 if failed else 4_000_000,
+            probed_at=probed_at, checked_at=_NOW - timedelta(seconds=10),
+        )
+
+    async def probe(sid, url, name, **kwargs):
+        stats[sid] = saved(sid, scheduled_status, _NOW)
+        return saved(sid, event_status, _NOW - timedelta(seconds=10))
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock(base_url="http://dispatcharr.test")
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}"} for sid in ids
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=Cache()), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(side_effect=lambda ids: stats.copy())):
+        result = await collect_stream_flow(
+            [1], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START}, stream_names={1: "s1"},
+            expires_at=None, probe_missing=True, probe_while_busy=True,
+        )
+    assert result == expected
+
+
+_EVENT_PROBE_AT = _NOW - timedelta(seconds=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own,scheduled,expected", [
+    # A newer scheduled save that measured no flow decides.
+    (
+        _stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, measured=0, probed_at=_NOW, checked_at=_EVENT_PROBE_AT),
+        {1: False},
+    ),
+    # This probe measured no flow; a newer scheduled save found flow.
+    (
+        _stat(1, measured=0, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, probed_at=_NOW, checked_at=_EVENT_PROBE_AT),
+        {1: None},
+    ),
+    # A black-screen scan after this probe, then a scheduled save with no
+    # content check.
+    (
+        _stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, dark=True, probed_at=_NOW, checked_at=_NOW - timedelta(seconds=5)),
+        {1: None},
+    ),
+    # The newer scheduled save ran its own content check.
+    (
+        _stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, dark=True, probed_at=_NOW, checked_at=_NOW),
+        {1: False},
+    ),
+    # A newer scheduled failure that measured nothing decides.
+    (
+        _stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, status="failed", failures=1, measured=None, probed_at=_NOW,
+              checked_at=_EVENT_PROBE_AT),
+        {1: False},
+    ),
+    # This probe failed without a measurement; the newer save decides.
+    (
+        _stat(1, status="failed", failures=1, measured=None,
+              probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, probed_at=_NOW, checked_at=_EVENT_PROBE_AT),
+        {1: None},
+    ),
+    # The stream was renamed before the newer scheduled save.
+    (
+        _stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+        _stat(1, name="renamed", probed_at=_NOW, checked_at=None),
+        {1: None},
+    ),
+])
+async def test_newer_scheduled_evidence_beats_the_event_probe_success(
+    fixed_consumer_clock, own, scheduled, expected,
+):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    stats = {}
+
+    async def probe(sid, url, name, **kwargs):
+        stats[sid] = scheduled
+        return own
+
+    prober.probe_stream = AsyncMock(side_effect=probe)
+    client = MagicMock(base_url="http://dispatcharr.test")
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}"} for sid in ids
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=Cache()), \
+         patch("services.event_sync_stream_health._load_stats", AsyncMock(side_effect=lambda ids: stats.copy())):
+        result = await collect_stream_flow(
+            [1], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START}, stream_names={1: "s1"},
+            expires_at=None, probe_missing=True, probe_while_busy=True,
+        )
+    assert result == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("load", [
+    # Only the reload after this probe fails.
+    AsyncMock(side_effect=[{}, {}, RuntimeError("database is locked")]),
+    # Only the read that rechecks the probed rows fails.
+    AsyncMock(side_effect=[{}, RuntimeError("database is locked"), {}]),
+    # Both reads after this probe fail.
+    AsyncMock(side_effect=[
+        {}, RuntimeError("database is locked"), RuntimeError("database is locked"),
+    ]),
+    # The saved row was deleted after this probe.
+    AsyncMock(return_value={}),
+])
+async def test_event_probe_success_stands_when_no_saved_row_is_read(fixed_consumer_clock, load):
+    prober = _make_prober(max_concurrent_probes=1)
+    prober.refresh_account_probe_limits = AsyncMock()
+    prober.probe_stream = AsyncMock(
+        return_value=_stat(1, probed_at=_EVENT_PROBE_AT, checked_at=_EVENT_PROBE_AT),
+    )
+    client = MagicMock(base_url="http://dispatcharr.test")
+    client.get_streams_by_ids = AsyncMock(side_effect=lambda ids: [
+        {"id": sid, "name": f"s{sid}", "url": f"http://example.com/{sid}"} for sid in ids
+    ])
+    with patch("stream_prober.ensure_prober", return_value=prober), \
+         patch("stream_prober.get_prober", return_value=prober), \
+         patch("services.event_sync_stream_health.get_cache", return_value=Cache()), \
+         patch("services.event_sync_stream_health._load_stats", load):
+        result = await collect_stream_flow(
+            [1], client=client, checked_after=_CHECKED,
+            event_start_by_stream={1: _START}, stream_names={1: "s1"},
+            expires_at=None, probe_missing=True, probe_while_busy=True,
+        )
+    assert result == {1: True}
 
 
 @pytest.mark.asyncio

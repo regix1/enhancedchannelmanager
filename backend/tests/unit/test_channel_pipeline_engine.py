@@ -175,16 +175,86 @@ class TestChannelPipelineEngineLoadData:
         self.client.get_channel_groups.assert_called_once()
 
     def test_load_existing_data_api_failure(self):
-        """Load existing data handles API failures gracefully."""
-        self.client.get_channels = AsyncMock(side_effect=Exception("API error"))
-        self.client.get_channel_groups = AsyncMock(side_effect=Exception("API error"))
+        """A failed read raises with its cause and keeps the last inventory."""
+        import httpx
 
-        asyncio.get_event_loop().run_until_complete(
-            self.engine._load_existing_data()
-        )
+        asyncio.get_event_loop().run_until_complete(self.engine._load_existing_data())
+        self.client.get_channels = AsyncMock(side_effect=httpx.ReadTimeout(""))
 
-        assert self.engine._existing_channels == []
-        assert self.engine._existing_groups == []
+        with pytest.raises(RuntimeError, match="ReadTimeout"):
+            asyncio.get_event_loop().run_until_complete(
+                self.engine._load_existing_data()
+            )
+
+        assert [channel["id"] for channel in self.engine._existing_channels] == [1, 2]
+        assert len(self.engine._existing_groups) == 2
+        assert self.engine._channels_complete is True
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_overlapping_load_keeps_the_running_runs_inventory(self, fails):
+        """Another run's load in flight, or failed, never empties this run's inventory."""
+        engine = ChannelPipelineEngine(self.client)
+        asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
+        gate = asyncio.Event()
+
+        async def second_read(**_kwargs):
+            await gate.wait()
+            if fails:
+                raise ConnectionError("Dispatcharr read timed out")
+            return {"count": 1, "results": [{"id": 3, "name": "Event"}]}
+
+        self.client.get_channels = AsyncMock(side_effect=second_read)
+
+        async def overlap():
+            other_run = asyncio.ensure_future(engine._load_existing_data())
+            await asyncio.sleep(0)
+            during = (engine._channels_complete, [c["id"] for c in engine._existing_channels])
+            gate.set()
+            await asyncio.gather(other_run, return_exceptions=True)
+            return during
+
+        during = asyncio.get_event_loop().run_until_complete(overlap())
+
+        assert during == (True, [1, 2])
+        assert engine._channels_complete is True
+        assert [c["id"] for c in engine._existing_channels] == ([1, 2] if fails else [3])
+
+    def test_run_stops_when_the_channel_list_cannot_be_read(self):
+        """A run that cannot read the channel list creates nothing and keeps its ledger."""
+        import httpx
+        from models import ChannelPipelineRule
+
+        rule = ChannelPipelineRule()
+        rule.id = 1
+        rule.name = "Linear"
+        rule.priority = 0
+        rule.enabled = True
+        rule.m3u_account_id = None
+        rule.target_group_id = None
+        rule.stop_on_first_match = True
+        rule.orphan_action = "delete"
+        rule.set_conditions([{"type": "always"}])
+        rule.set_actions([{"type": "create_channel", "name_template": "{stream_name}", "if_exists": "skip"}])
+        rule.set_managed_channel_ids([50])
+        self.client.get_channels = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        self.client.create_channel = AsyncMock(return_value={"id": 1000, "name": "ESPN"})
+        self.client.delete_channel = AsyncMock()
+        self.engine._load_rules = AsyncMock(return_value=[rule])
+        self.engine._fetch_streams = AsyncMock(return_value=[
+            StreamContext(stream_id=601, stream_name="ESPN", m3u_account_id=1),
+        ])
+        self.engine._create_execution = AsyncMock(return_value=MagicMock(id=1, mode=None))
+        self.engine._save_execution = AsyncMock()
+        self.engine._update_rule_stats = AsyncMock()
+
+        with patch("channel_pipeline_engine.get_session", return_value=MagicMock()), \
+                patch("channel_pipeline_executor.journal.log_entries"), \
+                pytest.raises(RuntimeError, match="ReadTimeout"):
+            asyncio.get_event_loop().run_until_complete(self.engine.run_pipeline(dry_run=False))
+
+        self.client.create_channel.assert_not_called()
+        self.client.delete_channel.assert_not_called()
+        assert rule.get_managed_channel_ids() == [50]
 
     def test_load_existing_data_empty_response(self):
         """Load existing data handles empty responses."""
@@ -639,6 +709,45 @@ class TestChannelPipelineEngineRunPipeline:
         with patch("normalization_engine.NormalizationEngine"), \
              patch("epg_matching.batch_find_epg_matches",
                    return_value=[_epg_match(7, "ESPN", 55, 95)]):
+            result = self._run_with_created(
+                mock_get_session, channels_created=0, dry_run=False,
+            )
+
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
+        assert result["epg_links_created"] == 1
+
+    @patch("channel_pipeline_engine.get_session")
+    def test_auto_link_leaves_a_staged_event_channel_to_its_own_guide(
+        self, mock_get_session,
+    ):
+        """A hidden event channel still waiting for its generated guide row is
+        not linked to another source's row, however well the name scores."""
+        self.client.get_channels = AsyncMock(return_value={
+            "count": 2,
+            "results": [
+                {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101]},
+                {"id": 900, "name": "Mlb: Dodgers At Braves", "epg_data_id": None,
+                 "streams": [], "hidden_from_output": True},
+            ],
+        })
+        self.client.get_epg_sources = AsyncMock(return_value=[
+            {"id": 46, "url": "http://ecm/api/dummy-epg/xmltv/1", "is_active": True},
+        ])
+        self.client.get_epg_data = AsyncMock(return_value=[])
+        self.client.get_streams_by_ids = AsyncMock(return_value=[])
+        self.client.update_channel = AsyncMock(return_value={})
+        publication = {"state": {"delivery": {"pending_channels": {
+            "event-1": {"channel_id": 900, "stage": "failed"},
+        }}}}
+
+        with patch("normalization_engine.NormalizationEngine"), \
+             patch("services.epg_publication.read_publication",
+                   side_effect=lambda scope: publication if scope == "profile:1" else None), \
+             patch("epg_matching.batch_find_epg_matches",
+                   side_effect=lambda channels, **kwargs: [
+                       _epg_match(channel["id"], channel["name"], 55, 95)
+                       for channel in channels
+                   ]):
             result = self._run_with_created(
                 mock_get_session, channels_created=0, dry_run=False,
             )
@@ -1786,6 +1895,10 @@ class TestChannelPipelineEngineStreamReorderUsesChannelNames:
             "name": "Test Channel",
             "streams": [{"id": 2, "name": "Bravo"}, {"id": 1, "name": "Alpha"}],
         }]
+        self.client.get_channels = AsyncMock(return_value=[{
+            "id": channel_id,
+            "streams": [{"id": 2, "name": "Bravo"}, {"id": 1, "name": "Alpha"}],
+        }])
 
         results = {"execution_log": [], "dry_run_results": []}
         asyncio.get_event_loop().run_until_complete(
@@ -1801,6 +1914,79 @@ class TestChannelPipelineEngineStreamReorderUsesChannelNames:
 
         # Should reorder to Alpha, Bravo (ids 1,2) and persist via API.
         self.client.update_channel.assert_awaited_once_with(channel_id, {"streams": [1, 2]})
+
+    def test_stream_sort_reads_the_channels_once_for_every_write(self):
+        rule = MagicMock()
+        rule.id = 1
+        rule.name = "Rule 1"
+        rule.stream_sort_field = "stream_name"
+        rule.stream_sort_order = "asc"
+
+        def channels():
+            return [{
+                "id": channel_id,
+                "name": f"Channel {channel_id}",
+                "streams": [
+                    {"id": channel_id + 2, "name": "Bravo"},
+                    {"id": channel_id + 1, "name": "Alpha"},
+                ],
+            } for channel_id in (10, 20)]
+
+        self.engine._existing_channels = channels()
+        self.client.get_channels = AsyncMock(return_value=channels())
+        self.client.get_channel = AsyncMock()
+
+        results = {"execution_log": [], "dry_run_results": []}
+        asyncio.get_event_loop().run_until_complete(
+            self.engine._reorder_channel_streams(
+                rules=[rule],
+                rule_channel_order={1: [10, 20]},
+                results=results,
+                dry_run=False,
+                settings=MagicMock(),
+                stream_m3u_map={},
+            )
+        )
+
+        self.client.get_channels.assert_awaited_once_with(
+            page=None, page_size=None, visibility_filter="all",
+        )
+        self.client.get_channel.assert_not_awaited()
+        assert [call.args for call in self.client.update_channel.await_args_list] == [
+            (10, {"streams": [11, 12]}),
+            (20, {"streams": [21, 22]}),
+        ]
+
+    def test_stream_sort_stops_after_its_channel_read_fails(self):
+        rule = MagicMock()
+        rule.id = 1
+        rule.name = "Rule 1"
+        rule.stream_sort_field = "stream_name"
+        rule.stream_sort_order = "asc"
+        self.engine._existing_channels = [{
+            "id": channel_id,
+            "name": f"Channel {channel_id}",
+            "streams": [
+                {"id": channel_id + 2, "name": "Bravo"},
+                {"id": channel_id + 1, "name": "Alpha"},
+            ],
+        } for channel_id in (10, 20, 30)]
+        self.client.get_channels = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        results = {"execution_log": [], "dry_run_results": []}
+        asyncio.get_event_loop().run_until_complete(
+            self.engine._reorder_channel_streams(
+                rules=[rule],
+                rule_channel_order={1: [10, 20, 30]},
+                results=results,
+                dry_run=False,
+                settings=MagicMock(),
+                stream_m3u_map={},
+            )
+        )
+
+        self.client.get_channels.assert_awaited_once()
+        self.client.update_channel.assert_not_awaited()
 
 
 class TestSortChannelGroupsPass:
@@ -2579,6 +2765,135 @@ class TestQualitySortDeprioritization:
         assert out == [1, 2]
 
 
+class TestQualitySortCountry:
+    """Every linear rule sorts by quality, so the country rank has to reach
+    that sort too: inside a height, never above one."""
+
+    @staticmethod
+    def _rule(tie_break: bool = True, field: str = "quality") -> MagicMock:
+        rule = MagicMock()
+        rule.stream_sort_field = field
+        rule.stream_sort_order = "desc"
+        rule.quality_tie_break_order = "desc"
+        rule.quality_m3u_tie_break_enabled = tie_break
+        return rule
+
+    @staticmethod
+    def _stream(name: str, resolution: str, group: str = "", **status: bool | str) -> dict:
+        stats = {"stream_name": name, "resolution": resolution, "probe_status": "success"}
+        if group:
+            stats["channel_group_name"] = group
+        return {**stats, **status}
+
+    def test_the_brand_prefixed_feed_no_longer_leads_an_equal_us_feed(self):
+        """Linear ESPN2: two 1080p feeds, and the one with the lower id is
+        the provider's Dutch feed."""
+        stats_cache = {
+            100: self._stream("T2| ESPN2 ᴿᴬᵂ", "1920x1080"),
+            200: self._stream("US (MAX) ESPN2 (FHD @ 11.1 Mbps @ 59 FPS)", "1920x1080"),
+            300: self._stream("US| ESPN 2 HD", "1280x720"),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200, 300], self._rule(), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [200, 100, 300]
+
+    @pytest.mark.parametrize("tie_break", [True, False])
+    def test_equal_height_puts_the_us_feed_first(self, tie_break):
+        stats_cache = {
+            100: self._stream("T2| ESPN2 ᴿᴬᵂ", "1920x1080"),
+            200: self._stream("US| ESPN2 FHD", "1920x1080"),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200], self._rule(tie_break), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [200, 100]
+
+    @pytest.mark.parametrize("field", ["quality", "smart_sort"])
+    def test_a_brand_prefix_takes_the_country_of_its_group(self, field):
+        """``T2|`` names no country, so by name alone it ties with a stream
+        that has none. Its M3U group says Dutch, which puts it last, in both
+        sorts that rank country. The US feed is listed first: one Dutch and
+        one US feed are an even split, which the first-listed stream decides."""
+        stats_cache = {
+            100: self._stream("T2| ESPN2 ᴿᴬᵂ", "1920x1080", "NL| TELE2 SPORT ᴿᴬᵂ ᴳᴼᴸᴰ"),
+            200: self._stream("ESPN2", "1920x1080", "Live"),
+            300: self._stream("US| ESPN2 FHD", "1920x1080", "US| SPORTS"),
+        }
+        out = _reorder_streams_for_rule(
+            [300, 100, 200], self._rule(field=field), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [300, 200, 100]
+
+    @pytest.mark.parametrize("field", ["quality", "smart_sort"])
+    def test_each_stream_counts_once_toward_the_channel_country(self, field):
+        """A feed labeled in its name and its group is still one feed, so two
+        US feeds outvote one British feed listed ahead of them."""
+        stats_cache = {
+            100: self._stream("UK| ESPN2 HD", "1920x1080", "UK| SPORTS"),
+            200: self._stream("US| ESPN2", "1920x1080", "Live Sports"),
+            300: self._stream("US| ESPN2 HD", "1920x1080", "Sports"),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200, 300], self._rule(field=field), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [200, 300, 100]
+
+    @pytest.mark.parametrize(
+        ("us_feed", "foreign_feed"),
+        [
+            (("TV| NFL NETWORK ᴿᴬᵂ", "US| TV ᴿᴬᵂ ⁶⁰ᶠᵖˢ"), ("DE| NFL NETWORK ᴴᴰ", "DE| DAZN EXCLUSIVE ᴴᴰ/ᴿᴬᵂ")),
+            (("TV| ESPN2 ᴿᴬᵂ", "US| TV ᴿᴬᵂ ⁶⁰ᶠᵖˢ"), ("UK| ESPN2 HD", "UK| SPORTS")),
+        ],
+        ids=["dazn", "uk"],
+    )
+    def test_a_feed_labeled_twice_does_not_outvote_one_labeled_once(self, us_feed, foreign_feed):
+        """The US feed carries its country only in its group, the foreign feed
+        in its name and its group. One vote each is an even split, so the
+        first-listed US feed keeps position 1."""
+        stats_cache = {
+            100: self._stream(us_feed[0], "1920x1080", us_feed[1]),
+            200: self._stream(foreign_feed[0], "1920x1080", foreign_feed[1]),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200], self._rule(), stats_cache, {}, "NFL Network", _mk_smart_sort_settings()
+        )
+        assert out == [100, 200]
+
+    def test_a_higher_resolution_foreign_feed_still_leads(self):
+        """Country breaks ties only; it never outranks resolution."""
+        stats_cache = {
+            100: self._stream("US| ESPN2 HD", "1280x720", "US| SPORTS"),
+            200: self._stream("T2| ESPN2 ᴿᴬᵂ", "1920x1080", "NL| TELE2 SPORT ᴿᴬᵂ ᴳᴼᴸᴰ"),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200], self._rule(), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [200, 100]
+
+    @pytest.mark.parametrize("tie_break", [True, False])
+    @pytest.mark.parametrize(
+        "status",
+        [
+            {"probe_status": "failed"},
+            {"is_black_screen": True},
+            {"is_low_fps": True},
+        ],
+        ids=["failed", "black_screen", "low_fps"],
+    )
+    def test_country_orders_equal_streams_inside_each_deprioritized_bucket(
+        self, status, tie_break,
+    ):
+        stats_cache = {
+            100: self._stream("T2| ESPN2 ᴿᴬᵂ", "1920x1080", **status),
+            200: self._stream("US| ESPN2 FHD", "1920x1080", **status),
+        }
+        out = _reorder_streams_for_rule(
+            [100, 200], self._rule(tie_break), stats_cache, {}, "ESPN2", _mk_smart_sort_settings()
+        )
+        assert out == [200, 100]
+
+
 class TestSortKey:
     """Tests for _sort_key with provider_order and channel_number."""
 
@@ -3096,6 +3411,7 @@ class TestOrdinaryStreamAdmission:
 
         client = MagicMock()
         client.update_channel = AsyncMock(return_value={})
+        client.get_channels = AsyncMock(return_value=[{"id": 7, "streams": [1, 2, 3]}])
         engine = ChannelPipelineEngine(client)
         engine._existing_channels = [{
             "id": 7,
@@ -5973,6 +6289,47 @@ class TestChannelPipelineEngineAutoLink:
         self.client.update_channel.assert_not_called()
         mock_batch.assert_not_called()
 
+    @pytest.mark.parametrize("staged_at", ["before_read", "during_guide_read"])
+    def test_event_target_group_channels_are_left_to_the_event_pipeline(self, staged_at):
+        """An event channel another run stages while this pass runs keeps no feed link."""
+        from models import ChannelPipelineRule
+
+        event_rule = ChannelPipelineRule()
+        event_rule.set_event_sync_config({"mode": "shared", "promote_target_group_id": 40})
+        self.client.get_channels = AsyncMock(return_value=[
+            {"id": 7, "name": "ESPN", "epg_data_id": None, "streams": [101], "channel_group_id": 1},
+            {"id": 900, "name": "Mlb: Dodgers At Braves", "epg_data_id": None, "streams": [], "channel_group_id": 40},
+        ])
+        self.client.get_epg_sources = AsyncMock(return_value=[
+            {"id": 46, "url": "http://ecm/api/dummy-epg/xmltv/1", "is_active": True},
+        ])
+        pending = {}
+        if staged_at == "before_read":
+            pending["event-1"] = {"channel_id": 900, "stage": "allocated"}
+
+        async def guide_rows():
+            # The overlapping run's allocated write lands after this pass read the staged set.
+            pending["event-1"] = {"channel_id": 900, "stage": "allocated"}
+            return [{"id": 55, "epg_source": 1}]
+
+        self.client.get_epg_data = AsyncMock(side_effect=guide_rows)
+        self.engine._load_rules = AsyncMock(return_value=[event_rule])
+        publication = {"state": {"delivery": {"pending_channels": pending}}}
+
+        with patch("channel_pipeline_engine.get_settings", return_value=_auto_link_settings(True)), \
+             patch("channel_pipeline_engine.get_session", MagicMock()), \
+             patch("normalization_engine.NormalizationEngine"), \
+             patch("services.epg_publication.read_publication",
+                   side_effect=lambda scope: publication if scope == "profile:1" else None), \
+             patch("epg_matching.batch_find_epg_matches",
+                   side_effect=lambda channels, **kwargs: [
+                       _epg_match(channel["id"], channel["name"], 55, 95) for channel in channels
+                   ]):
+            linked = asyncio.get_event_loop().run_until_complete(self.engine._link_unmatched_channels())
+
+        assert linked == 1
+        self.client.update_channel.assert_called_once_with(7, {"epg_data_id": 55})
+
     def test_only_channels_without_guide_data_are_considered(self):
         """A channel that already has a link is never matched and never written.
 
@@ -6130,7 +6487,8 @@ class TestChannelPipelineEngineAutoLink:
             programmes.extend(call.args[0] for call in self.client.update_channel.await_args_list)
             return True
 
-        with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=import_linked) as refresh:
+        with patch("tasks.dummy_epg_refresh.wait_for_epg_source_refresh", side_effect=import_linked) as refresh, \
+             patch("services.epg_publication.read_publication", return_value=None):
             linked, _ = self._link(matches=[
                 _epg_match(7, "Event 7", 55, 95), _epg_match(8, "Event 8", 56, 95),
             ])
@@ -6363,7 +6721,11 @@ class TestCompleteChannelInventory:
         elif case == "failed_groups":
             client.get_channel_groups.side_effect = RuntimeError("group read failed")
         engine = ChannelPipelineEngine(client)
-        asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
+        if case == "failed_groups":
+            with pytest.raises(RuntimeError, match="group read failed"):
+                asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
+        else:
+            asyncio.get_event_loop().run_until_complete(engine._load_existing_data())
         assert engine._channels_complete is (case == "valid")
         client.update_channel.assert_not_called()
 

@@ -769,6 +769,36 @@ class ChannelPipelineEngine:
                 return 0
 
             epg_sources = await self.client.get_epg_sources()
+            # A staged event channel waits for its own generated guide row;
+            # another source's row would keep it hidden until its event ends.
+            from services.epg_publication import read_publication
+            from tasks.event_visibility import _generated_scope
+
+            scopes = {_generated_scope(source) for source in epg_sources} - {None}
+            if "all" in scopes:
+                aggregate = read_publication("all")
+                scopes |= {
+                    f"profile:{profile_id}"
+                    for profile_id in (aggregate["state"]["members"] if aggregate is not None else ())
+                }
+            staged = {
+                receipt.get("channel_id")
+                for scope in scopes - {"all"}
+                if (row := read_publication(scope)) is not None
+                for receipt in row["state"]["delivery"]["pending_channels"].values()
+                if receipt.get("stage") != "complete"
+            }
+            # An overlapping run can create and stage an event channel after
+            # the read above, so the groups event rules create and adopt in
+            # stay out of this pass entirely; the event pipeline links them.
+            event_groups = {
+                (rule.get_event_sync_config() or {}).get("promote_target_group_id")
+                for rule in await self._load_rules() if rule.is_event_sync()
+            } - {None}
+            unlinked = [
+                c for c in unlinked
+                if c["id"] not in staged and c.get("channel_group_id") not in event_groups
+            ]
             stream_ids = sorted({
                 sid for channel in unlinked for sid in (channel.get("streams") or [])
                 if isinstance(sid, int)
@@ -1369,8 +1399,14 @@ class ChannelPipelineEngine:
     # =========================================================================
 
     async def _load_existing_data(self, channel_group_id: int | None = None):
-        """Load existing channels and groups from Dispatcharr."""
-        self._channels_complete = False
+        """Load existing channels and groups from Dispatcharr.
+
+        Overlapping runs share this engine, so the channels, groups and
+        completeness flag are replaced together after both reads, and a failed
+        read leaves the inventory another run is still using untouched. A
+        failed read raises: a run that went on with no channels would create a
+        second copy of every channel its rules manage.
+        """
         try:
             # Event channels wait hidden between events, and Dispatcharr lists
             # only visible channels unless asked for all of them. One unpaged
@@ -1397,25 +1433,24 @@ class ChannelPipelineEngine:
                 if channel_group_id is not None and channel.get("channel_group_id") != channel_group_id:
                     complete = False
                 seen.add(channel_id)
-            self._existing_channels = all_channels
 
             # get_channel_groups() returns a flat list
             groups = await self.client.get_channel_groups()
-            self._existing_groups = groups or []
-            group_ids = [group.get("id") if isinstance(group, dict) else None for group in self._existing_groups]
-            self._channels_complete = (
+            group_ids = [group.get("id") if isinstance(group, dict) else None for group in groups or []]
+            channels_complete = (
                 complete and len(all_channels) == total and isinstance(groups, list)
                 and all(type(group_id) is int and group_id > 0 for group_id in group_ids)
                 and len(set(group_ids)) == len(group_ids)
             )
-            logger.debug("[AUTO-CREATE-ENGINE] Loaded %s channels, %s groups", len(self._existing_channels), len(self._existing_groups))
-            if self._existing_channels:
-                channel_names = [c.get("name", "<no name>") for c in self._existing_channels]
-                logger.debug("[AUTO-CREATE-ENGINE] Existing channel names: %s", channel_names)
         except Exception as e:
-            logger.exception("[AUTO-CREATE-ENGINE] Failed to load existing data: %s", e)
-            self._existing_channels = []
-            self._existing_groups = []
+            raise RuntimeError(f"Could not read Dispatcharr's channels or groups: {type(e).__name__}: {e}") from e
+        self._existing_channels = all_channels
+        self._existing_groups = groups or []
+        self._channels_complete = channels_complete
+        logger.debug("[AUTO-CREATE-ENGINE] Loaded %s channels, %s groups", len(self._existing_channels), len(self._existing_groups))
+        if self._existing_channels:
+            channel_names = [c.get("name", "<no name>") for c in self._existing_channels]
+            logger.debug("[AUTO-CREATE-ENGINE] Existing channel names: %s", channel_names)
 
     async def _load_rules(self, rule_ids: list[int] = None) -> list[ChannelPipelineRule]:
         """Load enabled rules active on today's UTC calendar date."""
@@ -1956,6 +1991,7 @@ class ChannelPipelineEngine:
         custom_stream_ids: set[int] | None = None,
         catchup_stream_ids: set[int] | None = None,
         stream_name_map: dict | None = None,
+        stream_group_map: dict[int, str] | None = None,
     ):
         """
         Pass 3.5: Reorder streams within channels using smart sort.
@@ -1969,15 +2005,22 @@ class ChannelPipelineEngine:
         stats cache, which holds probed streams alone, so a quality sort over
         unprobed fallbacks saw no name to read a tier from and scored them all
         equal.
+
+        ``stream_group_map`` (stream_id -> M3U group name) lets the country rank
+        read a stream's group when its name carries a provider brand (``T2|``)
+        instead of a country.
         """
         if stream_m3u_map is None:
             stream_m3u_map = {}
         if stream_name_map is None:
             stream_name_map = {}
+        if stream_group_map is None:
+            stream_group_map = {}
         if custom_stream_ids is None:
             custom_stream_ids = set()
         if catchup_stream_ids is None:
             catchup_stream_ids = set()
+        held_by_id: dict[int, list] | None = None
 
         for rule in rules:
             if not rule.stream_sort_field:
@@ -2037,7 +2080,12 @@ class ChannelPipelineEngine:
                     for sid in current_streams
                 }
                 names = {sid: n for sid, n in names.items() if n}
-                if names:
+                groups = {
+                    sid: stream_group_map[sid]
+                    for sid in current_streams
+                    if sid in stream_group_map
+                }
+                if names or groups:
                     stats_cache = dict(self._stream_stats_cache)
                     for sid, sname in names.items():
                         existing = stats_cache.get(sid)
@@ -2046,6 +2094,8 @@ class ChannelPipelineEngine:
                                 stats_cache[sid] = {**existing, "stream_name": sname}
                         else:
                             stats_cache[sid] = {"stream_name": sname}
+                    for sid, group in groups.items():
+                        stats_cache[sid] = {**(stats_cache.get(sid) or {}), "channel_group_name": group}
 
                 # Respect rule.stream_sort_field (Provider Order, Quality, etc.).
                 # Previously this always used global smart-sort settings, so "Provider Order (M3U)"
@@ -2098,6 +2148,28 @@ class ChannelPipelineEngine:
                     })
                 else:
                     try:
+                        # The guide visibility check and an overlapping run
+                        # change channel streams while this run works, so the
+                        # sort keeps the streams the channel holds now. One
+                        # read before the first write serves the whole pass.
+                        if held_by_id is None:
+                            response = await self.client.get_channels(
+                                page=None, page_size=None, visibility_filter="all",
+                            )
+                            held_by_id = {
+                                value["id"]: [
+                                    s["id"] if isinstance(s, dict) else s
+                                    for s in value.get("streams", []) or []
+                                ]
+                                for value in (
+                                    response if isinstance(response, list)
+                                    else response.get("results", [])
+                                )
+                            }
+                        held = held_by_id[channel_id]
+                        sorted_streams = [
+                            sid for sid in sorted_streams if sid in held
+                        ] + [sid for sid in held if sid not in sorted_streams]
                         await self.client.update_channel(channel_id, {"streams": sorted_streams})
                         # Update cache
                         channel["streams"] = sorted_streams
@@ -2149,6 +2221,10 @@ class ChannelPipelineEngine:
                             "[AUTO-CREATE-ENGINE] Failed to reorder streams in '%s': %s",
                             channel_name, e
                         )
+                        # No write is safe without the channel read, and the
+                        # next channel would only send the same read again.
+                        if held_by_id is None:
+                            return
 
     async def _sort_channel_groups(
         self,
@@ -2474,7 +2550,9 @@ class ChannelPipelineEngine:
                     executor, results, executor._epg_sources,
                 )
             for work in executor._replayed_event_work:
-                pending = executor._event_pending.get(work["unit"].event_key)
+                pending = executor._event_pending.get(
+                    (work["profile_id"], work["unit"].event_key)
+                )
                 if pending is not None:
                     work["logged_promote_entries"] = pending.get(
                         "logged_promote_entries", 0,
@@ -2673,12 +2751,17 @@ class ChannelPipelineEngine:
         # arrives as bare ids, and only probed streams have a name in the
         # stats cache.
         stream_name_map: dict[int, str] = {}
+        # Groups for the country rank: a provider can put a brand where a name's
+        # country goes (``T2|``) and the country on the stream's M3U group.
+        stream_group_map: dict[int, str] = {}
         custom_stream_ids: set[int] = set()
         catchup_stream_ids: set[int] = set()
         for s in streams:
             stream_m3u_map[s.stream_id] = s.m3u_account_id
             if s.stream_name:
                 stream_name_map[s.stream_id] = s.stream_name
+            if s.group_name:
+                stream_group_map[s.stream_id] = s.group_name
             if getattr(s, "is_custom", False):
                 custom_stream_ids.add(s.stream_id)
             if getattr(s, "is_catchup", False):
@@ -3473,6 +3556,7 @@ class ChannelPipelineEngine:
                 custom_stream_ids=custom_stream_ids,
                 catchup_stream_ids=catchup_stream_ids,
                 stream_name_map=stream_name_map,
+                stream_group_map=stream_group_map,
             )
 
             # =================================================================
@@ -3523,6 +3607,8 @@ class ChannelPipelineEngine:
                 await self._refresh_dummy_epg_and_retry(
                     executor, results, epg_sources,
                     dry_run or not planning.allow_internal_side_effects,
+                    # The finish below reports what stays pending, once.
+                    report_pending=False,
                 )
             if not dry_run and planning.allow_internal_side_effects:
                 await self._refresh_linked_epg(executor, results, epg_sources)
@@ -4189,6 +4275,7 @@ class ChannelPipelineEngine:
             )
             all_group_settings = {}
 
+        prepared = []
         for rule in event_sync_rules:
             config = rule.get_event_sync_config()
             errors = (
@@ -4386,6 +4473,34 @@ class ChannelPipelineEngine:
                 finally:
                     db.close()
             exec_ctx = ExecutionContext(dry_run=dry_run)
+            if config.get("promote_unmatched") and config.get("retire_finished_events"):
+                # A channel waiting for a retry is finished before any rule
+                # tests its new-event streams, whichever rule owns it. When
+                # this fails, the rule's main pass takes its waiting channels
+                # up instead, and the other rules run as they would.
+                try:
+                    await executor.execute_event_sync_rule(
+                        rule.id, rule.name, config, secondary_streams, exec_ctx,
+                        decisions=decisions,
+                        effective_master_group_id=effective_master_group_id,
+                        exclusions=exclusions,
+                        early=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[EVENT-SYNC] Rule '%s' (id=%s): could not finish "
+                        "waiting events early",
+                        rule.name, rule.id,
+                    )
+            prepared.append((
+                rule, config, dedicated, secondary_streams, decisions,
+                exclusions, effective_master_group_id, exec_ctx,
+            ))
+
+        for (
+            rule, config, dedicated, secondary_streams, decisions,
+            exclusions, effective_master_group_id, exec_ctx,
+        ) in prepared:
             summary = await executor.execute_event_sync_rule(
                 rule.id, rule.name, config, secondary_streams, exec_ctx,
                 decisions=decisions,
@@ -5356,7 +5471,8 @@ class ChannelPipelineEngine:
         )
 
     async def _refresh_dummy_epg_and_retry(
-        self, executor, results: dict, epg_sources: list, dry_run: bool
+        self, executor, results: dict, epg_sources: list, dry_run: bool,
+        *, report_pending: bool = True,
     ):
         """
         Refresh dummy EPG sources and retry deferred assign_epg actions.
@@ -5900,15 +6016,15 @@ class ChannelPipelineEngine:
                 retry_success += 1
             else:
                 staged_key = next((
-                    event_key
-                    for event_key, work in executor._event_pending.items()
+                    key
+                    for key, work in executor._event_pending.items()
                     if work["profile_id"]
                     == executor._deferred_epg_profiles.get(channel_id)
                     and executor._event_publications.get(work["profile_id"])
                     and executor._event_publications[work["profile_id"]][
                         "state"
                     ]["delivery"]["pending_channels"].get(
-                        event_key, {}
+                        key[1], {}
                     ).get("channel_id") == channel_id
                 ), None)
                 if staged_key is not None:
@@ -5923,7 +6039,7 @@ class ChannelPipelineEngine:
                         continue
                     importing = await executor._write_event_receipt(
                         staged_publication,
-                        staged_key,
+                        staged_key[1],
                         {"allocated", "importing"},
                         {"stage": "importing", "reason": "guide_pending"},
                         guide_stage="importing",
@@ -6008,14 +6124,23 @@ class ChannelPipelineEngine:
             })
 
         if not dry_run:
-            await self._refresh_linked_epg(executor, results, epg_sources)
+            await self._refresh_linked_epg(
+                executor, results, epg_sources, report_pending=report_pending,
+            )
         logger.info(
             "[AUTO-CREATE-ENGINE] Pass 5 complete: %s succeeded, %s failed",
             retry_success, retry_failed
         )
 
-    async def _refresh_linked_epg(self, executor, results: dict, epg_sources: list) -> None:
-        """Import programmes after their channels have acquired guide links."""
+    async def _refresh_linked_epg(
+        self, executor, results: dict, epg_sources: list,
+        *, report_pending: bool = True,
+    ) -> None:
+        """Import programmes after their channels have acquired guide links.
+
+        A call that another finish follows in the same run passes
+        ``report_pending=False``, so an event left pending counts once.
+        """
         from services.epg_publication import get_session, read_publication
         from tasks.event_visibility import _generated_scope
 
@@ -6038,10 +6163,28 @@ class ChannelPipelineEngine:
             else:
                 profile_ids = [int(scope_kind.split(":", 1)[1])]
             for profile_id in profile_ids:
-                publication = (
-                    executor._event_publications.get(profile_id)
-                    or read_publication(f"profile:{profile_id}")
-                )
+                publication = executor._event_publications.get(profile_id)
+                stored = read_publication(f"profile:{profile_id}")
+                # A guide pass moves the stored revision during the run, so the
+                # import takes the stored row while its guide attempt and
+                # profile config are still the run's, the identity Pass 5 checks.
+                # An import attempt since the copy keeps the copy, so this run
+                # does not retry its own failed import, unless that import is
+                # already confirmed.
+                if publication is None or (
+                    stored is not None
+                    and stored["state"]["config_hash"]
+                    == publication["state"]["config_hash"]
+                    and (stored["state"]["delivery"].get("guide_attempt") or {}).get("attempt_id")
+                    == (publication["state"]["delivery"].get("guide_attempt") or {}).get("attempt_id")
+                    and (
+                        stored["state"]["delivery"]["source_refreshes"]
+                        == publication["state"]["delivery"]["source_refreshes"]
+                        or stored["state"]["delivery"]["confirmed_dispatcharr_hashes"].get(str(source_id))
+                        == stored["state"]["xmltv_hash"]
+                    )
+                ):
+                    publication = stored
                 if publication is None:
                     continue
                 executor._event_publications[profile_id] = publication
@@ -6157,6 +6300,10 @@ class ChannelPipelineEngine:
         pending_before = sum(
             promo.get("guide_pending", 0) for promo in promos.values()
         )
+        claimed_before = sum(
+            1 for work in executor._event_pending.values()
+            if work.get("claimed_elsewhere")
+        )
         delayed_entries = {}
         for work in executor._event_pending.values():
             entries = work.get("promote_entries")
@@ -6197,7 +6344,38 @@ class ChannelPipelineEngine:
         pending_after = sum(
             promo.get("guide_pending", 0) for promo in promos.values()
         )
-        if pending_after and pending_after >= pending_before:
+        # An event another run is finishing leaves the count without any
+        # progress by this run, so only the events left to this run compare.
+        claimed = sum(
+            1 for work in executor._event_pending.values()
+            if work.get("claimed_elsewhere")
+        ) - claimed_before
+        stalled = pending_after >= pending_before - claimed
+        if not report_pending:
+            # The report waits for the last finish of the run, which must
+            # still name an event this finish left pending even when it
+            # completes another one.
+            executor._event_finish_stalled = stalled
+            return
+        # A channel read that failed leaves its event pending; the summary
+        # names that error, not only the pending count.
+        for work in executor._event_pending.values():
+            if (
+                work.get("read_error") is not None
+                and not work.get("settled")
+                and not work.get("claimed_elsewhere")
+            ):
+                channel_id, error = work["read_error"]
+                self._record_failed_phase(
+                    results,
+                    phase="dummy_epg_refresh",
+                    entity_id=channel_id,
+                    stream_name="Complete staged event promotions",
+                    error=error,
+                )
+        if pending_after and (
+            stalled or getattr(executor, "_event_finish_stalled", False)
+        ):
             self._record_failed_phase(
                 results,
                 phase="dummy_epg_refresh",
@@ -7031,6 +7209,22 @@ class ChannelPipelineEngine:
 # Sort Helpers
 # =============================================================================
 
+def _country_ranks(stream_ids: list[int], stats_cache: dict) -> tuple[str | None, dict[int, int]]:
+    """The channel's country, and each stream's rank against it (match, unknown, mismatch).
+
+    The caller seeds a name and an M3U group for every stream the channel lists, so
+    both are readable here even when nothing on the channel has been probed.
+    """
+    from stream_prober import get_channel_country
+
+    names = {sid: (stats_cache.get(sid) or {}).get("stream_name") or "" for sid in stream_ids}
+    groups = {sid: (stats_cache.get(sid) or {}).get("channel_group_name") or "" for sid in stream_ids}
+    channel_country = get_channel_country(list(names.values()), list(groups.values()))
+    return channel_country, {
+        sid: get_country_rank(names[sid], channel_country, groups[sid]) for sid in stream_ids
+    }
+
+
 def _smart_sort_streams(
     stream_ids: list[int],
     stats_cache: dict,
@@ -7086,15 +7280,7 @@ def _smart_sort_streams(
 
     active_criteria = [c for c in sort_priority if sort_enabled.get(c, False)]
 
-    from stream_prober import get_channel_country
-
-    # The caller seeds a name-only entry for every stream the channel lists, so a
-    # name is readable here even when nothing on the channel has been probed.
-    sort_names = {
-        sid: (stats_cache.get(sid) or {}).get("stream_name") or ""
-        for sid in stream_ids
-    }
-    channel_country = get_channel_country(list(sort_names.values()))
+    channel_country, country_ranks = _country_ranks(stream_ids, stats_cache)
 
     logger.info(
         "[AUTO-CREATE-ENGINE] Channel '%s': smart sort with "
@@ -7189,7 +7375,7 @@ def _smart_sort_streams(
         # Sits last, so every criterion above still wins. It decides the ordinary
         # case, where nothing on the channel has been probed and the criteria
         # above all score equal. [23]
-        country_rank = get_country_rank(sort_names.get(sid, ""), channel_country)
+        country_rank = country_ranks[sid]
 
         # Deprioritize failed/missing streams
         if deprioritize_failed:
@@ -7354,7 +7540,9 @@ def _sort_streams_by_resolution_height(
 
     When *quality_m3u_tie_break_enabled* is True, equal resolutions are ordered by ECM M3U
     account priority (*quality_tie_break_order*: same semantics as Provider Order —
-    ``desc`` = higher priority value first). When False, ties use stream id only (stable).
+    ``desc`` = higher priority value first). Streams still tied go to the channel's own
+    country first, then those with no country, then foreign ones (the smart sort's
+    country rank), and stream id last.
     """
 
     tb = (quality_tie_break_order or "desc").lower()
@@ -7366,6 +7554,9 @@ def _sort_streams_by_resolution_height(
     if not fail_order:
         fail_order = ["failed", "black_screen", "low_fps"]
     failed_rank = {name: idx for idx, name in enumerate(fail_order)}
+    # Placed where the smart sort places it: after every quality criterion, so a
+    # higher resolution always wins and country only orders streams still tied.
+    _, country_ranks = _country_ranks(stream_ids, stats_cache)
 
     def sort_key(sid: int):
         stats = stats_cache.get(sid)
@@ -7381,8 +7572,8 @@ def _sort_streams_by_resolution_height(
                 if quality_m3u_tie_break_enabled:
                     pri = _m3u_account_priority_value(sid, stream_m3u_map, settings)
                     tb_key = -pri if tb == "desc" else pri
-                    return (1, rank, hk, tb_key, sid)
-                return (1, rank, hk, sid)
+                    return (1, rank, hk, tb_key, country_ranks[sid], sid)
+                return (1, rank, hk, country_ranks[sid], sid)
             if isinstance(stats, dict) and stats.get("is_black_screen"):
                 bucket = "black_screen"
                 rank = failed_rank.get(bucket, len(failed_rank))
@@ -7390,8 +7581,8 @@ def _sort_streams_by_resolution_height(
                 if quality_m3u_tie_break_enabled:
                     pri = _m3u_account_priority_value(sid, stream_m3u_map, settings)
                     tb_key = -pri if tb == "desc" else pri
-                    return (1, rank, hk, tb_key, sid)
-                return (1, rank, hk, sid)
+                    return (1, rank, hk, tb_key, country_ranks[sid], sid)
+                return (1, rank, hk, country_ranks[sid], sid)
             if isinstance(stats, dict) and stats.get("is_low_fps"):
                 bucket = "low_fps"
                 rank = failed_rank.get(bucket, len(failed_rank))
@@ -7399,15 +7590,15 @@ def _sort_streams_by_resolution_height(
                 if quality_m3u_tie_break_enabled:
                     pri = _m3u_account_priority_value(sid, stream_m3u_map, settings)
                     tb_key = -pri if tb == "desc" else pri
-                    return (1, rank, hk, tb_key, sid)
-                return (1, rank, hk, sid)
+                    return (1, rank, hk, tb_key, country_ranks[sid], sid)
+                return (1, rank, hk, country_ranks[sid], sid)
 
         hk = -h if order == "desc" else h
         if quality_m3u_tie_break_enabled:
             pri = _m3u_account_priority_value(sid, stream_m3u_map, settings)
             tb_key = -pri if tb == "desc" else pri
-            return (0, 0, hk, tb_key, sid)
-        return (0, 0, hk, sid)
+            return (0, 0, hk, tb_key, country_ranks[sid], sid)
+        return (0, 0, hk, country_ranks[sid], sid)
 
     sorted_ids = sorted(stream_ids, key=sort_key)
     if quality_m3u_tie_break_enabled:

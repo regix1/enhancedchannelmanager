@@ -109,6 +109,7 @@ __all__ = [
     "ResolvedStream",
     "SecondaryStream",
     "effective_patterns",
+    "group_timezone",
     "resolve_event_sync",
 ]
 
@@ -299,6 +300,19 @@ def effective_patterns(config: dict, group_id: int) -> list[dict] | None:
         if key in group_patterns:
             return group_patterns[key]
     return config.get("patterns")
+
+
+def group_timezone(config: dict, group_id: int) -> str | None:
+    """The zone one stream group's listing times are read in, or ``None``.
+
+    ``None`` keeps the matcher's default reading. Keys are looked up as both
+    int and str, as in :func:`effective_patterns`.
+    """
+    group_timezones = config.get("group_timezones") or {}
+    for key in (group_id, str(group_id)):
+        if key in group_timezones:
+            return group_timezones[key]
+    return None
 
 
 async def build_master_name_to_id(
@@ -856,6 +870,7 @@ def resolve_event_sync(
             now=now,
             assume_current_date=assume_current_date,
             event_timezone=event_timezone,
+            listing_timezone=group_timezone(config, group_id),
         )
         for stream, result in zip(streams, results):
             rs = _resolve_stream(

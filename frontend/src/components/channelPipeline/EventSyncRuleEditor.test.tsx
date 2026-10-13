@@ -18,6 +18,7 @@ import {
   createMockChannelGroup,
 } from '../../test/mocks/server';
 import { EventSyncRuleEditor } from './EventSyncRuleEditor';
+import { SHIPPED_EVENT_SYNC_PATTERNS } from './eventSyncDefaults';
 import type { ChannelPipelineRule } from '../../types/channelPipeline';
 import type { ProviderGroupScopeRow } from '../../services/api';
 import type { EventSyncConfig, EventSyncPreviewResponse } from '../../types/eventSync';
@@ -235,6 +236,108 @@ describe('EventSyncRuleEditor', () => {
       expect(onSave.mock.calls[0][0].event_sync_config).not.toHaveProperty(
         'max_attach_per_run'
       );
+    });
+  });
+
+  describe('per-group listing time zones', () => {
+    const ZONED_RULE: Partial<ChannelPipelineRule> = {
+      ...EXISTING_RULE,
+      event_sync_config: {
+        ...EXISTING_RULE.event_sync_config!,
+        group_timezones: { '2': 'Europe/London' },
+      },
+    };
+
+    async function openZones(user: ReturnType<typeof userEvent.setup>) {
+      await goToStep(user, 2);
+      await user.click(screen.getByText('Listing time zones', { selector: 'summary' }));
+    }
+
+    it('puts the chosen zone on the secondary group', async () => {
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />);
+
+      await openZones(user);
+      await user.click(screen.getByRole('button', { name: 'Secondary Events listing time zone' }));
+      await user.click(await screen.findByRole('option', { name: 'Europe/Berlin (CET)' }));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.group_timezones).toEqual({
+        '2': 'Europe/Berlin',
+      });
+    });
+
+    it('omits the zones for a rule that never set one', async () => {
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(<EventSyncRuleEditor rule={EXISTING_RULE} onSave={onSave} onCancel={vi.fn()} />);
+
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config).not.toHaveProperty('group_timezones');
+    });
+
+    it('shows and keeps a zone the rule already carries', async () => {
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(<EventSyncRuleEditor rule={ZONED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+
+      await openZones(user);
+      expect(
+        screen.getByRole('button', { name: 'Secondary Events listing time zone' })
+      ).toHaveTextContent('Europe/London (GMT/BST)');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.group_timezones).toEqual({
+        '2': 'Europe/London',
+      });
+    });
+
+    it('shows a stored zone the list does not offer', async () => {
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const rule: Partial<ChannelPipelineRule> = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          ...EXISTING_RULE.event_sync_config!,
+          group_timezones: { '2': 'America/Sao_Paulo' },
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      await openZones(user);
+      expect(
+        screen.getByRole('button', { name: 'Secondary Events listing time zone' })
+      ).toHaveTextContent('America/Sao_Paulo');
+    });
+
+    it('sends an empty object when the last zone is cleared', async () => {
+      // The backend keeps stored zones when the key is absent, so clearing
+      // has to send the key.
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const onSave = vi.fn();
+      render(<EventSyncRuleEditor rule={ZONED_RULE} onSave={onSave} onCancel={vi.fn()} />);
+
+      await openZones(user);
+      await user.click(screen.getByRole('button', { name: 'Secondary Events listing time zone' }));
+      await user.click(await screen.findByRole('option', { name: '-- None --' }));
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave.mock.calls[0][0].event_sync_config.group_timezones).toEqual({});
     });
   });
 
@@ -1132,6 +1235,29 @@ describe('EventSyncRuleEditor', () => {
         'custom-shared',
       ]);
       expect(saved.patterns[3].title_pattern).toBe('^(?P<title>.+?)\\s*@');
+    });
+
+    it('counts a saved copy of an earlier shipped pattern as that shipped pattern', async () => {
+      const user = userEvent.setup();
+      seedGroups();
+      stubGroupSettings({ 1: true, 2: false });
+      const explicitStart = SHIPPED_EVENT_SYNC_PATTERNS.find(
+        p => p.id === 'slot-title-explicit-start'
+      )!;
+      const rule: Partial<ChannelPipelineRule> = {
+        ...EXISTING_RULE,
+        event_sync_config: {
+          master_group_id: 1,
+          secondary_group_ids: [2],
+          patterns: [
+            { ...explicitStart.pattern, title_pattern: explicitStart.earlierTitlePatterns[0] },
+          ],
+        },
+      };
+      render(<EventSyncRuleEditor rule={rule} onSave={vi.fn()} onCancel={vi.fn()} />);
+
+      await goToStep(user, 2);
+      expect(screen.getByRole('checkbox', { name: /explicit start timestamp/i })).toBeChecked();
     });
   });
 

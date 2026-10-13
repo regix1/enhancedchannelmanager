@@ -56,6 +56,7 @@ import {
 } from '../../services/api';
 import { previewEventSync } from '../../services/channelPipelineApi';
 import { CustomSelect } from '../CustomSelect';
+import { timezoneOptions } from '../timezones';
 import { EventSyncTestPatternsPanel } from './EventSyncTestPatternsPanel';
 import type { LabeledEventSyncPattern } from './EventSyncTestPatternsPanel';
 import { EventSyncPreviewPanel } from './EventSyncPreviewPanel';
@@ -134,13 +135,16 @@ const EMPTY_GROUP_PATTERN: GroupPatternDraft = {
  * True when a saved pattern is VERBATIM one of the shipped patterns —
  * name AND all three regexes (bead z4y4a). Name-only matching would let a
  * hand-authored pattern that happens to reuse a shipped id be silently
- * replaced by the shipped regexes on resave.
+ * replaced by the shipped regexes on resave. A verbatim copy of an earlier
+ * shipped title regex also counts, since the matcher parses it as the
+ * current one.
  */
 function isShippedVerbatim(pattern: EventSyncPattern): boolean {
   return SHIPPED_EVENT_SYNC_PATTERNS.some(
     shipped =>
       pattern.name === shipped.id &&
-      pattern.title_pattern === shipped.pattern.title_pattern &&
+      (pattern.title_pattern === shipped.pattern.title_pattern ||
+        shipped.earlierTitlePatterns.includes(pattern.title_pattern)) &&
       (pattern.time_pattern ?? null) === (shipped.pattern.time_pattern ?? null) &&
       (pattern.date_pattern ?? null) === (shipped.pattern.date_pattern ?? null)
   );
@@ -330,6 +334,10 @@ export function EventSyncRuleEditor({
   );
   const [groupOverrides, setGroupOverrides] = useState<Record<number, GroupPatternDraft>>(
     initial.groupOverrides
+  );
+  // Listing time zones keyed by group ID as stored (JSON keys are strings).
+  const [groupTimezones, setGroupTimezones] = useState<Record<string, string>>(
+    config?.group_timezones ?? {}
   );
 
   // Advanced knobs. Threshold is kept as text while typing and clamped to the
@@ -1046,6 +1054,17 @@ export function EventSyncRuleEditor({
       built.group_patterns = groupPatternsOut;
     }
 
+    // The schema accepts zones only for the rule's secondary groups. A stored
+    // key is written back even when every zone is cleared, because the
+    // backend keeps the stored zones when the key is absent.
+    const secondaryIds = new Set(secondaryScopes.map(s => String(s.group_id)));
+    const groupTimezonesOut = Object.fromEntries(
+      Object.entries(groupTimezones).filter(([key]) => secondaryIds.has(key))
+    );
+    if (Object.keys(groupTimezonesOut).length > 0 || config?.group_timezones !== undefined) {
+      built.group_timezones = groupTimezonesOut;
+    }
+
     return built;
   };
 
@@ -1208,6 +1227,7 @@ export function EventSyncRuleEditor({
       !sameIds(selectedPatternIds, initial.patternIds) ||
       !sameDraft(customShared, customSharedMeta.draft) ||
       normalizeOverrides(groupOverrides) !== normalizeOverrides(initial.groupOverrides) ||
+      stableStringify(groupTimezones) !== stableStringify(config?.group_timezones ?? {}) ||
       timeWindowText !== String(config?.time_window_minutes ?? DEFAULT_TIME_WINDOW_MINUTES) ||
       thresholdText !== (config?.attach_threshold ?? EVENT_ATTACH_FLOOR).toFixed(2) ||
       enforceTimeWindow !== (config?.enforce_time_window ?? true) ||
@@ -1237,7 +1257,7 @@ export function EventSyncRuleEditor({
     );
   }, [
     name, description, enabled, activeFrom, activeUntil, dedicated, masterScope, secondaryScopes, selectedPatternIds,
-    customShared, groupOverrides, timeWindowText, thresholdText, enforceTimeWindow,
+    customShared, groupOverrides, groupTimezones, timeWindowText, thresholdText, enforceTimeWindow,
     autoRun, refreshProvidersBeforeRun, includeMasterGroupStreams, assumeCurrentDate,
     demoteStaleDateless, parseMasterFromStream, promoteUnmatched,
     promoteTargetGroupId, skipPastEvents, retireFinishedEvents, pastEventGraceText,
@@ -1411,6 +1431,10 @@ export function EventSyncRuleEditor({
   const overridesChanged = scopedGroups.filter(
     g => (groupOverrides[g.id]?.title_pattern ?? '').trim().length > 0
   ).length;
+  const secondaryGroups = scopedGroups.filter(
+    g => secondaryScopes.some(s => s.group_id === g.id)
+  );
+  const timezonesChanged = secondaryGroups.filter(g => groupTimezones[String(g.id)]).length;
   const automationChanged =
     (autoRun ? 1 : 0) + (refreshProvidersBeforeRun ? 1 : 0);
   const scopeExtChanged =
@@ -2195,6 +2219,40 @@ export function EventSyncRuleEditor({
                         </details>
                       );
                     })
+                  )}
+                </div>
+              </details>
+
+              <details className="modal-subgroup">
+                <summary>
+                  Listing time zones {changedBadge(timezonesChanged)}
+                </summary>
+                <div className="event-sync-details-body">
+                  <span className="form-hint">
+                    The zone a group&apos;s stream names write their times in.
+                    Blank reads them as US Eastern time, and a &quot;:Tennis
+                    NN&quot; listing as Central European time. A start: stamp
+                    keeps UK time. An event that already has its channel keeps
+                    its start until it ends.
+                  </span>
+                  {secondaryGroups.length === 0 ? (
+                    <span className="form-hint">Pick groups first.</span>
+                  ) : (
+                    secondaryGroups.map(group => (
+                      <div key={group.id} className="form-group">
+                        <label>{group.name}</label>
+                        <CustomSelect
+                          options={timezoneOptions(groupTimezones[String(group.id)] ?? '')}
+                          value={groupTimezones[String(group.id)] ?? ''}
+                          onChange={value => setGroupTimezones(zones => {
+                            const { [String(group.id)]: _previous, ...others } = zones;
+                            return value ? { ...others, [String(group.id)]: value } : others;
+                          })}
+                          ariaLabel={`${group.name} listing time zone`}
+                          disabled={isLoading}
+                        />
+                      </div>
+                    ))
                   )}
                 </div>
               </details>

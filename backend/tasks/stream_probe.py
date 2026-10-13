@@ -142,14 +142,15 @@ class StreamProbeTask(TaskScheduler):
         # Save original prober settings so we can restore them after
         original_timeout = self._prober.probe_timeout
         original_max_concurrent = self._prober.max_concurrent_probes
+        timeout_set = max_concurrent_set = None
 
         try:
             # Apply schedule parameter overrides if set
             if self._timeout_override is not None:
-                self._prober.probe_timeout = self._timeout_override
+                timeout_set = self._prober.probe_timeout = self._timeout_override
                 logger.info("[%s] Using schedule timeout: %ss", self.task_id, self._timeout_override)
             if self._max_concurrent_override is not None:
-                self._prober.max_concurrent_probes = max(1, min(16, self._max_concurrent_override))
+                max_concurrent_set = self._prober.max_concurrent_probes = max(1, min(16, self._max_concurrent_override))
                 logger.info("[%s] Using schedule max_concurrent: %s", self.task_id, self._prober.max_concurrent_probes)
 
             # Determine channel groups to use
@@ -336,9 +337,13 @@ class StreamProbeTask(TaskScheduler):
                 completed_at=datetime.utcnow(),
             )
         finally:
-            # Restore original prober settings
-            self._prober.probe_timeout = original_timeout
-            self._prober.max_concurrent_probes = original_max_concurrent
+            # Restore only a value this run set that nothing changed since: a
+            # settings save during the run writes the prober or swaps in a new
+            # one, and that save must stand.
+            if timeout_set is not None and self._prober.probe_timeout == timeout_set:
+                self._prober.probe_timeout = original_timeout
+            if max_concurrent_set is not None and self._prober.max_concurrent_probes == max_concurrent_set:
+                self._prober.max_concurrent_probes = original_max_concurrent
 
             # Clear all schedule parameter overrides
             self._channel_groups = None

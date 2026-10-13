@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from config import get_settings
 from services.event_sync_stream_health import _fresh_flow_state
 from stream_prober import StreamProber
 
@@ -605,6 +606,7 @@ async def test_probe_stream_threads_expiry_and_keeps_saved_result_when_push_is_c
 
     prober._run_ffprobe.assert_awaited_once_with(
         "http://media/7", expires_at=expires_at,
+        probe_timeout=get_settings().stream_probe_timeout,
     )
     prober._measure_stream_bitrate.assert_awaited_once_with(
         "http://media/7", expires_at=expires_at,
@@ -687,7 +689,10 @@ async def test_content_sample_without_loading_expiry(timeout):
     prober._push_stats_to_dispatcharr = AsyncMock()
     result = await prober.probe_stream(7, "http://media/7", "Seven", content=True, expires_at=None)
     assert result == {"stream_id": 7}
-    prober._run_ffprobe.assert_awaited_once_with("http://media/7", expires_at=None)
+    prober._run_ffprobe.assert_awaited_once_with(
+        "http://media/7", expires_at=None,
+        probe_timeout=get_settings().stream_probe_timeout,
+    )
     prober._measure_stream_bitrate.assert_awaited_once_with("http://media/7", expires_at=None)
     if timeout:
         prober._detect_black_screen.assert_not_awaited()
@@ -695,3 +700,35 @@ async def test_content_sample_without_loading_expiry(timeout):
     else:
         prober._detect_black_screen.assert_awaited_once_with("http://media/7", expires_at=None)
         assert prober._save_probe_result.call_args.args[3] == "success"
+
+
+@pytest.mark.asyncio
+async def test_event_probe_keeps_the_configured_timeout_during_a_scheduled_run(monkeypatch):
+    prober = _prober()
+    # A scheduled probe sets its own timeout on the shared prober for its run.
+    prober.probe_timeout = 5
+    monkeypatch.setattr("config.get_settings", lambda: SimpleNamespace(stream_probe_timeout=30))
+    commands = []
+
+    @asynccontextmanager
+    async def allowed(url, **_kwargs):
+        yield SimpleNamespace(argument=url, response=None, is_http_relay=False)
+
+    async def ffprobe(*args, **_kwargs):
+        commands.append(args)
+        process = MagicMock()
+        process.communicate = AsyncMock(return_value=(b'{"streams": [], "format": {}}', b""))
+        process.returncode = 0
+        return process
+
+    monkeypatch.setattr("stream_prober.validated_subprocess_input", allowed)
+    monkeypatch.setattr("stream_prober.asyncio.create_subprocess_exec", ffprobe)
+    prober._measure_stream_bitrate = AsyncMock(return_value=3000000)
+    prober._detect_black_screen = AsyncMock(return_value=False)
+    prober._save_probe_result = MagicMock(return_value={"stream_id": 7})
+    prober._push_stats_to_dispatcharr = AsyncMock()
+
+    await prober.probe_stream(7, "http://media/7", "Seven", content=True, expires_at=None)
+
+    command = commands[0]
+    assert command[command.index("-timeout") + 1] == "30000000"

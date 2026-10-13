@@ -1249,6 +1249,8 @@ def register(mcp: FastMCP):
 
         Args:
             event_sync_config: Full replacement object, not a nested patch. Omit to preserve.
+                An object without "group_timezones" keeps the stored per-group listing
+                time zones; send "group_timezones": {} to clear them.
             clear_event_sync_config: Explicitly clear the saved config; cannot accompany an object.
             rule_id: The rule ID to update
             name: New rule name
@@ -1404,8 +1406,10 @@ def register(mcp: FastMCP):
     async def get_channel_pipeline_run_failures(execution_id: int, limit: int = 50) -> str:
         """List the failed actions of one pipeline run with their error text.
 
-        The run summary only counts failures; this reads the run's stored log, which
-        also holds the Pass 5 guide refresh and guide-link retry errors.
+        Reads the run's stored log, which holds per-stream action errors. Phase
+        failures (such as a dummy EPG refresh) are stored only in the run summary,
+        so summary_failure_count and summary_failed_steps report the summary's
+        total and its distinct failed steps.
 
         Args:
             execution_id: Execution ID from list_channel_pipeline_executions.
@@ -1429,12 +1433,23 @@ def register(mcp: FastMCP):
                 for action in entry.get("actions_executed") or []
                 if action.get("success") is False
             ]
+            # Matches the engine's _summarize_failed_actions text; each step label
+            # starts with the rule name's repr (None or a quoted name) or "+N more".
+            summary = re.search(
+                r"(\d+) action\(s\) failed during this run \((.*?)\)\. Some channels",
+                run.get("error_message") or "",
+                re.S,
+            )
             return json.dumps({
                 "execution_id": execution_id,
                 "status": run.get("status"),
                 "error_message": run.get("error_message"),
                 "failure_count": len(failures),
                 "failures": failures[:limit],
+                "summary_failure_count": int(summary.group(1)) if summary else 0,
+                "summary_failed_steps": (
+                    re.split(r"; (?=None |'|\"|\+\d+ more$)", summary.group(2)) if summary else []
+                ),
             }, ensure_ascii=False)
         except Exception as e:
             logger.error("[MCP] get_channel_pipeline_run_failures failed: %s", e)

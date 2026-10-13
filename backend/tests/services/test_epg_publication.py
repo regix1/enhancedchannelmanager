@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 import database
 from models import DummyEPGProfile, GuidePublication
+from services.epg_programmes import programme_matches
 from services.epg_publication import (
     _config_hash,
     add_groups,
@@ -260,6 +261,68 @@ def test_lifecycle_publication_suppresses_only_unconfirmed_gaps():
         f"ecm-{channel_id}" for channel_id in channels
     }
     assert stop == prepared["guide_stop"]
+
+
+def test_sourced_receipt_interval_replaces_feed_programmes_until_its_stop():
+    now = datetime(2026, 10, 3, 18, 45, tzinfo=timezone.utc)
+    start = datetime(2026, 10, 3, 18, tzinfo=timezone.utc)
+    stop = start + timedelta(minutes=180)
+    receipt = {"start": start.isoformat(), "stop": stop.isoformat(), "title": "Dodgers X Braves"}
+
+    def source_programme(channel_id, title, end):
+        programme = ET.Element("programme", {
+            "channel": f"external-{channel_id}",
+            "start": start.strftime("%Y%m%d%H%M%S %z"),
+            "stop": end.strftime("%Y%m%d%H%M%S %z"),
+        })
+        ET.SubElement(programme, "title").text = title
+        return programme
+
+    def published(intervals):
+        prepared = external_profile(1, 2)
+        prepared["source_programmes"] = {
+            1: [source_programme(1, "Feed game", stop)],
+            2: [source_programme(2, "Feed show", start + timedelta(hours=2))],
+        }
+        if intervals is not None:
+            prepared["event_intervals"] = intervals
+        result = publish_profiles(
+            [prepared], channel_map(1, 2), coverage(1), observations={}, now=now,
+        )
+        document = ET.fromstring(result.xmltv_by_scope["profile:1"])
+        rows = [
+            {
+                "tvg_id": row.get("channel"),
+                "title": row.findtext("title"),
+                "start": datetime.strptime(row.get("start"), "%Y%m%d%H%M%S %z"),
+                "stop": datetime.strptime(row.get("stop"), "%Y%m%d%H%M%S %z"),
+            }
+            for row in document.findall("programme")
+        ]
+        events = {
+            row["channel_id"]: row["events"]
+            for row in result.states_by_profile[1]["channels"]
+        }
+        channel_2 = [
+            ET.tostring(row) for row in document.findall("programme[@channel='ecm-2']")
+        ]
+        return rows, events, channel_2
+
+    rows, events, channel_2 = published({1: [receipt]})
+    feed_rows, feed_events, feed_channel_2 = published(None)
+
+    assert programme_matches(
+        rows, xmltv_id="ecm-1", channel_uuid=None,
+        title="Dodgers X Braves", start=start, stop=stop,
+    )
+    assert [row["title"] for row in rows if row["tvg_id"] == "ecm-1"] == ["Dodgers X Braves"]
+    assert events[1] == [receipt]
+    assert channel_2 == feed_channel_2
+    assert events[2] == feed_events[2]
+    assert [event["title"] for event in events[2]] == ["Feed show"]
+    feed_titles = [row["title"] for row in feed_rows if row["tvg_id"] == "ecm-1"]
+    assert "Feed game" in feed_titles and "Dodgers X Braves" not in feed_titles
+    assert [event["title"] for event in feed_events[1]] == ["Feed game"]
 
 
 def test_complete_profile_and_aggregate_survive_a_fresh_read():
@@ -764,6 +827,22 @@ def test_slow_run_publishes_profiles_whose_guides_did_not_change():
     assert "GUIDE_PUBLICATION_SUPERSEDED" in result.reason_codes
     assert read_publication("profile:1")["state"]["xmltv_hash"] != expected["profile:1"]["xmltv_hash"]
     assert read_publication("profile:2")["state"]["xmltv_hash"] == newer_two
+
+
+def test_a_profile_with_an_unknown_stored_zone_fails_alone():
+    restored = profile(2)
+    # A backup restore stores the zone unchecked; the name path opens it.
+    restored["event_timezone"] = "Mars/Base"
+    restored["event_intervals"] = {}
+
+    result = publish_profiles(
+        [profile(1), restored], channel_map(1, 2), coverage(1, 2), observations={}, now=NOW,
+    )
+
+    assert result.published_profile_ids == (1,)
+    assert 2 not in result.published_profile_ids
+    assert "GUIDE_PUBLICATION_INVALID" in result.reason_codes
+    assert read_publication("profile:1") is not None
 
 
 def test_profile_capacity_failure_retains_the_last_complete_documents(monkeypatch):

@@ -118,6 +118,9 @@ def _publication_record(
                 "required_dispatcharr_hashes": required or {},
                 "confirmed_dispatcharr_hashes": confirmed or {},
                 "pending_emby": pending_emby,
+                "guide_attempt": None,
+                "source_refreshes": {},
+                "pending_channels": {},
             },
         },
     }
@@ -501,6 +504,79 @@ class TestUpdateProfile:
         assert data["enabled"] is False
         assert data["program_duration"] == 60
         assert data["include_live_tag"] is True
+
+    @pytest.mark.asyncio
+    async def test_round_trips_a_variant_stamp_timezone(self, async_client, test_session):
+        """A variant keeps the zone its start: stamps are read in, and a
+        variant sent without the field, as an older page sends it, stays
+        without it so its stamps keep UK time."""
+        profile = _create_profile(test_session)
+        variants = [
+            {"name": "ufc-iso-date", "title_pattern": r"^UFC (?P<title>.+)$",
+             "stamp_timezone": "Europe/Berlin"},
+            {"name": "mlb-iso-date", "title_pattern": r"^MLB (?P<title>.+)$"},
+        ]
+
+        with patch("routers.dummy_epg.cache"):
+            saved = await async_client.patch(
+                f"/api/dummy-epg/profiles/{profile.id}",
+                json={"pattern_variants": variants},
+            )
+            loaded = await async_client.get(f"/api/dummy-epg/profiles/{profile.id}")
+
+        assert saved.status_code == 200
+        assert loaded.json()["pattern_variants"] == variants
+
+    @pytest.mark.asyncio
+    async def test_rejects_an_unknown_stamp_timezone(self, async_client, test_session):
+        profile = _create_profile(test_session)
+
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.patch(
+                f"/api/dummy-epg/profiles/{profile.id}",
+                json={"pattern_variants": [{
+                    "name": "ufc-iso-date",
+                    "title_pattern": r"^UFC (?P<title>.+)$",
+                    "stamp_timezone": "Europe/Atlantis",
+                }]},
+            )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_one_changed_variant_field_leaves_every_other_stored_field_identical(
+        self, async_client, test_session
+    ):
+        """The live profile's variants hold only the keys they were saved
+        with. Sending the list back with one field changed stores exactly
+        that list: no field is added, dropped or reordered."""
+        import json
+
+        stored = [
+            {"name": "mlb-iso-date", "title_pattern": r"^MLB\s+\d+\s*\|\s*(?P<title>.+?)$",
+             "title_template": "{title}"},
+            {"name": "espn-iso-date",
+             "title_pattern": r"^US\s+\(ESPN\+\s+\d+\)\s*\|\s*(?P<title>.+?)\s*\((?P<year>\d{4})-",
+             "title_template": "{title}", "upcoming_title_template": "Upcoming: {title}",
+             "ended_title_template": "Ended: {title}"},
+        ]
+        profile = _create_profile(test_session, pattern_variants=json.dumps(stored))
+        changed = json.loads(json.dumps(stored))
+        changed[1]["title_pattern"] = (
+            r"^US\s+\(ESPN\+\s+\d+\)\s*\|\s*(?P<title>.+?)\s*\((?P<year>\d{4})[-\s]"
+        )
+
+        with patch("routers.dummy_epg.cache"):
+            response = await async_client.patch(
+                f"/api/dummy-epg/profiles/{profile.id}",
+                json={"pattern_variants": changed},
+            )
+
+        assert response.status_code == 200
+        row = test_session.query(DummyEPGProfile).filter(
+            DummyEPGProfile.id == profile.id
+        ).one()
+        assert row.pattern_variants == json.dumps(changed)
 
     @pytest.mark.asyncio
     async def test_updates_substitution_pairs(self, async_client, test_session):
@@ -1861,6 +1937,59 @@ class TestProgrammeSources:
             scope=publication["scope"],
         ).one()
         assert (saved.xmltv, saved.state, saved.revision) == before
+
+    @pytest.mark.asyncio
+    async def test_coverage_reads_readiness_with_the_staged_event_intervals(
+        self, async_client, test_session,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        profile = _create_profile(test_session)
+        profile.set_channel_group_ids([65])
+        test_session.commit()
+        channel_map = {10: {
+            "id": 10, "uuid": "channel-10", "name": "Dodgers X Braves",
+            "channel_number": 10, "channel_group_id": 65,
+        }}
+        prepared = {
+            **profile.to_dict(),
+            "channel_assignments": [{"channel_id": 10, "channel_name": "Dodgers X Braves"}],
+        }
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(minutes=30)).isoformat()
+        stop = (now + timedelta(minutes=150)).isoformat()
+        publication = _publication_record(profile.id, prepared)
+        publication["state"]["delivery"].update(
+            guide_attempt={"attempt_id": "2" * 32},
+            pending_channels={"dodgers x braves": {
+                "stage": "complete",
+                "guide_attempt_id": "1" * 32,
+                "channel_id": 10,
+                "channel_uuid": "channel-10",
+                "target_group_id": 65,
+                "start": start,
+                "stop": stop,
+                "title": "Dodgers X Braves",
+                "expires_at": stop,
+            }},
+        )
+        with patch(
+            "routers.dummy_epg._fetch_all_channels",
+            AsyncMock(return_value=channel_map),
+        ), patch(
+            "services.epg_programmes.prepare_profiles",
+            AsyncMock(return_value=([prepared], _coverage_result(profile.id))),
+        ) as prepare, patch(
+            "services.epg_publication.read_publication", return_value=publication,
+        ):
+            response = await async_client.get(
+                f"/api/dummy-epg/profiles/{profile.id}/coverage",
+            )
+
+        assert response.status_code == 200, response.text
+        assert prepare.await_args.args[0][0]["event_intervals"] == {
+            10: [{"start": start, "stop": stop, "title": "Dodgers X Braves", "receipt": True}],
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

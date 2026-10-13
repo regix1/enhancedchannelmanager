@@ -203,7 +203,8 @@ class TestAnEventSyncOnlyRunReachesTheSortWithNames:
 
         client = MagicMock()
         client.update_channel = AsyncMock(return_value={})
-        client.get_channels = AsyncMock(return_value={"count": 0, "results": []})
+        # The stream sort reads the channels right before it writes them.
+        client.get_channels = AsyncMock(return_value=[dict(channel)])
         client.get_m3u_accounts = AsyncMock(return_value=[])
         client.get_all_m3u_group_settings = AsyncMock(return_value={})
         # The masters' own streams, resolved by the one bulk read the attach
@@ -293,6 +294,28 @@ class TestAnEventSyncOnlyRunReachesTheSortWithNames:
         client.update_channel.assert_awaited_once_with(
             self.MASTER_CHANNEL_ID,
             {"streams": [self.NATIVE_STREAM_ID, self.ATTACHED_STREAM_ID]},
+        )
+
+    def test_a_mixed_run_hands_pass_one_groups_to_the_country_rank(self):
+        """``TV|`` is a provider brand; the provider's US group says where the
+        feed is from. Pass 1 already holds that group, so a US-group feed
+        moves ahead of an equal one that names no country, with no new read."""
+        client = self._run_pipeline_pass(
+            secondary_name="TV| ESPN2 ᴿᴬᵂ",
+            native_name="ESPN2",
+            stream_order=[self.NATIVE_STREAM_ID, self.ATTACHED_STREAM_ID],
+            catalogue_streams=[
+                StreamContext.from_dispatcharr_stream(
+                    {"id": self.ATTACHED_STREAM_ID,
+                     "name": "TV| ESPN2 ᴿᴬᵂ",
+                     "channel_group_name": "US| TV ᴿᴬᵂ ⁶⁰ᶠᵖˢ"},
+                    m3u_account_id=1,
+                ),
+            ],
+        )
+        client.update_channel.assert_awaited_once_with(
+            self.MASTER_CHANNEL_ID,
+            {"streams": [self.ATTACHED_STREAM_ID, self.NATIVE_STREAM_ID]},
         )
 
 

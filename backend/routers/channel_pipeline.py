@@ -442,6 +442,28 @@ def _parse_yaml_active_date(value, field_name: str) -> Optional[date]:
     raise ValueError(f"{field_name} must be a valid YYYY-MM-DD date")
 
 
+def _keep_stored_group_timezones(new_config: dict, current_config: dict | None) -> None:
+    """Carry the stored per-group listing zones into a validated config that omits them.
+
+    An editor, script or export older than the per-group listing zones sends
+    the whole config without them; keep the stored zones of the groups the
+    rule still reads instead of erasing them. An empty object clears them. A
+    backup restore stores the key unchecked, so a stored value that is not an
+    object is dropped rather than kept.
+    """
+    if (
+        "group_timezones" not in new_config
+        and isinstance(current_config, dict)
+        and isinstance(current_config.get("group_timezones"), dict)
+    ):
+        scope = {str(group_id) for group_id in new_config["secondary_group_ids"]}
+        new_config["group_timezones"] = {
+            key: zone
+            for key, zone in current_config["group_timezones"].items()
+            if key in scope
+        }
+
+
 def _resolve_normalization_group_ids(rule_data: dict, session) -> str | None:
     """Resolve normalization_group_ids from rule data, with backward compat for normalize_names."""
     norm_ids = rule_data.get("normalization_group_ids")
@@ -1070,6 +1092,7 @@ async def update_auto_creation_rule(rule_id: int, request: UpdateChannelPipeline
                             "message": "Invalid rule configuration",
                             "errors": es_errors
                         })
+                    _keep_stored_group_timezones(request.event_sync_config, current_config)
                 rule.set_event_sync_config(request.event_sync_config)
 
             _validate_rule_ownership(session, rule, prior_conflicts)
@@ -3234,6 +3257,8 @@ async def import_auto_creation_rules_yaml(request: ImportYAMLRequest, _admin=Req
                         ):
                             errors.append({"rule_index": i, "rule_name": rule_name, "errors": ["An existing event rule cannot change ownership mode"]})
                             continue
+                        if event_sync_config is not None:
+                            _keep_stored_group_timezones(event_sync_config, current_config)
                         # Update existing rule
                         existing.description = rule_data.get("description")
                         existing.enabled = rule_data.get("enabled", True)
@@ -3714,10 +3739,10 @@ async def _fetch_and_resolve_event_sync(
         from channel_pipeline_executor import validate_event_target
 
         engine = ChannelPipelineEngine(client)
-        await engine._load_existing_data(config["promote_target_group_id"])
-        if not engine._channels_complete:
-            raise HTTPException(status_code=409, detail="Dedicated target inventory is incomplete")
         try:
+            await engine._load_existing_data(config["promote_target_group_id"])
+            if not engine._channels_complete:
+                raise ValueError("Dedicated target inventory is incomplete")
             target_channels = validate_event_target(config, rule_id, engine._existing_channels, engine._existing_groups)
             accounts = await client.get_m3u_accounts()
             if (not isinstance(accounts, list)
@@ -4348,7 +4373,11 @@ async def preview_event_sync(
     if config.get("promote_unmatched"):
         from channel_number_prefix import channel_name_to_id
         from config import get_settings
-        from services.event_sync_promote import build_promotion_plan
+        from services.epg_publication import read_publication
+        from services.event_sync_promote import (
+            build_promotion_plan,
+            keep_earlier_keys,
+        )
 
         promote_target_group_id = config["promote_target_group_id"]
         target_channels: list[dict] = fetched.get("target_channels", [])
@@ -4410,6 +4439,32 @@ async def preview_event_sync(
         now = datetime.now(timezone.utc)
         preview_expires_at = now + timedelta(minutes=5)
 
+        profile_id = config.get("dummy_epg_profile_id")
+        try:
+            publication = (
+                read_publication(f"profile:{profile_id}")
+                if profile_id is not None else None
+            )
+        except ValueError:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": {
+                        "code": "GUIDE_PUBLICATION_FAILED",
+                        "reason_codes": ["GUIDE_STATE_CORRUPT"],
+                    },
+                },
+            )
+        # The same rows the run plans: an event already held under the key
+        # the earlier rules gave stays on its channel.
+        if request.rule_id is not None and publication is not None:
+            resolution = keep_earlier_keys(
+                resolution,
+                publication["state"]["delivery"]["pending_channels"],
+                request.rule_id,
+                existing_name_to_id,
+            )
+
         plan = build_promotion_plan(
             config, resolution.resolved, existing_name_to_id, now=now,
         )
@@ -4466,7 +4521,7 @@ async def preview_event_sync(
                     row.stream.stream_id for row in unit.rows
                     if row.stream.stream_id is not None
                 }
-                for unit in plan.units
+                for unit in (*plan.units, *plan.capped_units)
             }
             if current_unplayable:
                 # Annotate the losing rows from the pre-health plan, which
@@ -4565,11 +4620,32 @@ async def preview_event_sync(
             import copy
             from channel_pipeline_engine import ChannelPipelineEngine
 
+            lifecycle_units = (*plan.units, *plan.capped_units)
             eligible, event_states = await executor._event_lifecycle(
-                request.rule_id, config, (*plan.units, *plan.capped_units), now,
+                request.rule_id, config, lifecycle_units, now,
                 retirement_confirmed,
                 flow=flow,
                 expires_at=preview_expires_at,
+            )
+            executor._staged_event_states(
+                event_states,
+                (
+                    publication["state"]["delivery"]["pending_channels"]
+                    if publication is not None else {}
+                ),
+                unit_stream_ids_by_key,
+                # An event whose every stream the provider delisted is no
+                # longer listed, as in the run.
+                {
+                    event_key
+                    for event_key, stream_ids in unit_stream_ids_by_key.items()
+                    if stream_ids - {
+                        row.stream.stream_id
+                        for row in resolution.resolved
+                        if row.stream.is_stale
+                    }
+                },
+                now,
             )
             plan = build_promotion_plan(config, resolution.resolved, existing_name_to_id,
                                         now=now, dead_stream_ids=current_unplayable,
@@ -5218,8 +5294,11 @@ def _log_line_timestamp(line: str) -> str | None:
         if isinstance(timestamp, str):
             datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             return timestamp
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
         # Non-JSON lines may still use the legacy text timestamp parsed below.
+        # The decoder raises RecursionError for a line nested deeper than its
+        # recursion limit, such as a long run of "[", and one such line must
+        # not fail the whole bundle.
         pass
 
     prefix = line.split(" - ", 1)[0]

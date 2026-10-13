@@ -1734,7 +1734,14 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
         reasons = set(profile_coverage["reason_codes"])
         if profile.get("epg_source_ids") and catalogue_sources_pending:
             reasons.add("GUIDE_SOURCES_PENDING")
-        for query in queries:
+        # A channel with a receipt interval gets its guide row from that
+        # interval, so its query must not hold the profile back; it still joins
+        # the scan so it is covered once the interval ends.
+        ready_queries = [
+            query for query in queries
+            if query["channel_id"] not in (profile.get("event_intervals") or {})
+        ]
+        for query in ready_queries:
             if query.get("blocked"):
                 reasons.add("GUIDE_QUERY_PENDING")
                 if query["blocked"] == "mapping_unavailable":
@@ -1746,7 +1753,7 @@ async def prepare_profiles(profiles: list[dict], channel_map: dict, client, *, e
             entry = entries.get(source["id"], {})
             success = entry.get("success")
             selection = entry.get("selection") or {}
-            applicable = [query for query in queries if not query.get("blocked")]
+            applicable = [query for query in ready_queries if not query.get("blocked")]
             covered = (
                 success is not None
                 and all(query["key"] in selection.get("queries", ()) for query in applicable)

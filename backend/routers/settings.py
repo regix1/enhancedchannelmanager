@@ -2332,6 +2332,16 @@ async def _restart_background_services(settings: DispatcharrSettings) -> dict:
                 delete_by_source_callback=delete_notifications_by_source_internal
             )
             logger.info("[SETTINGS] Notification callbacks configured for stream prober")
+            if prober:
+                # stop() does not end an event probe already running, which
+                # keeps its provider connection, so the new prober counts it
+                # against the same per-account slots. The limits come along
+                # too, because the sequential bulk probe takes a slot without
+                # refreshing them first.
+                new_prober.account_probe_limits = prober.account_probe_limits
+                new_prober._probe_condition = prober._probe_condition
+                new_prober._account_active = prober._account_active
+                new_prober._event_waiting = prober._event_waiting
             set_prober(new_prober)
 
             # Connect the new prober to all prober-dependent tasks

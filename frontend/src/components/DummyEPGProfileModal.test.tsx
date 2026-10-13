@@ -284,6 +284,53 @@ describe('DummyEPGProfileModal per-variant program duration', () => {
   });
 });
 
+describe('DummyEPGProfileModal per-variant start stamp time zone', () => {
+  const STAMP_ZONE = 'Start Stamp Time Zone';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getChannelGroups.mockResolvedValue([]);
+    mocks.getProviderGroupSettingsByProvider.mockResolvedValue([]);
+    mocks.updateDummyEPGProfile.mockResolvedValue({});
+  });
+
+  it('shows no zone for a variant that sets none', async () => {
+    await renderModal([legacyVariant as PatternVariant]);
+
+    expect(screen.getByRole('button', { name: STAMP_ZONE }).textContent).toContain('-- None --');
+  });
+
+  it('puts the chosen zone on the variant', async () => {
+    await renderModal([legacyVariant as PatternVariant]);
+
+    fireEvent.click(screen.getByRole('button', { name: STAMP_ZONE }));
+    fireEvent.click(screen.getByRole('option', { name: 'Europe/Berlin (CET)' }));
+    const saved = await saveAndReadRequest();
+
+    expect(saved.pattern_variants?.[0].stamp_timezone).toBe('Europe/Berlin');
+  });
+
+  it('shows and keeps a zone the variant already carries', async () => {
+    await renderModal([{ ...legacyVariant, stamp_timezone: 'Europe/Berlin' }]);
+
+    expect(screen.getByRole('button', { name: STAMP_ZONE }).textContent).toContain(
+      'Europe/Berlin (CET)'
+    );
+    const saved = await saveAndReadRequest();
+    expect(saved.pattern_variants?.[0].stamp_timezone).toBe('Europe/Berlin');
+  });
+
+  it('shows and keeps a stored zone the list does not offer', async () => {
+    await renderModal([{ ...legacyVariant, stamp_timezone: 'America/Sao_Paulo' }]);
+
+    expect(screen.getByRole('button', { name: STAMP_ZONE }).textContent).toContain(
+      'America/Sao_Paulo'
+    );
+    const saved = await saveAndReadRequest();
+    expect(saved.pattern_variants?.[0].stamp_timezone).toBe('America/Sao_Paulo');
+  });
+});
+
 
 describe('Dummy EPG programme sources and coverage', () => {
   beforeEach(() => {

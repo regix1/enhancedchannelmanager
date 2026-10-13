@@ -239,7 +239,7 @@ async def _serve_pipeline_pipe():
     prober.account_probe_limits = {1: 1}
     prober.refresh_account_probe_limits = AsyncMock()
 
-    async def read_media(url, *, expires_at=None):
+    async def read_media(url, *, expires_at=None, probe_timeout=None):
         if url.endswith("/103"):
             raise RuntimeError("synthetic failed observation")
         height = 2160 if url.endswith("/102") else 1080
@@ -935,7 +935,7 @@ async def test_probe_route_persists_results_and_replays_fresh_exact_write(
     prober.account_probe_limits = {1: 1}
     prober.refresh_account_probe_limits = AsyncMock()
 
-    async def read_media(url, *, expires_at=None):
+    async def read_media(url, *, expires_at=None, probe_timeout=None):
         if url.endswith("/103"):
             raise RuntimeError("synthetic failed observation")
         height = 2160 if url.endswith("/102") else 1080

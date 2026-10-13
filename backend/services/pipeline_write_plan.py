@@ -41,7 +41,7 @@ _EVENT_FIELDS = frozenset({
     "rule_id", "rule_name", "config", "profile_id", "profile_hash",
     "source_id", "source_hashes", "expected_revision", "expected_hash",
     "unit", "allocation_writes", "default_profile_ids", "stale_streams",
-    "working_stream_ids", "channel_uuid",
+    "working_stream_ids", "channel_uuid", "recovered",
 })
 
 
@@ -256,6 +256,8 @@ def _event_operation(value: Any, result_id: Any) -> dict[str, Any]:
         raise ValueError("event working streams must be unique")
     if not set(working_ids) <= set(selected_ids) | set(stale_ids):
         raise ValueError("event working streams are outside the approved unit")
+    if not isinstance(value["recovered"], bool):
+        raise ValueError("event recovery decision is invalid")
     return copy.deepcopy(value)
 
 

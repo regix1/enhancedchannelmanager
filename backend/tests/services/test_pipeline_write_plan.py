@@ -75,6 +75,7 @@ def _event_write(result_id=-1, *, stream_count=1, stale_count=0):
         "default_profile_ids": [],
         "stale_streams": stale,
         "working_stream_ids": [row["stream"]["stream_id"] for row in rows],
+        "recovered": False,
     }
     return PlannedWrite(EVENT_PROMOTE_METHOD, [operation], {}, result_id)
 

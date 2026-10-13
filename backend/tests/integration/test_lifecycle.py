@@ -64,6 +64,41 @@ class TestStartupInitialization:
             )
 
     @pytest.mark.asyncio
+    async def test_startup_restores_saved_guide_scans_before_the_task_engine(self):
+        """A restart reuses saved guide scans only if they load before the first guide task."""
+        startup_order = []
+        with patch("main.init_db"), \
+             patch("main.get_settings") as mock_settings, \
+             patch("main.set_log_level"), \
+             patch("tls.https_server.is_https_subprocess", return_value=False), \
+             patch("main.get_client"), \
+             patch("main.BandwidthTracker"), \
+             patch("main.set_tracker"), \
+             patch("main.StreamProber") as mock_prober_cls, \
+             patch("main.set_prober"), \
+             patch("main.get_prober", return_value=None), \
+             patch("services.epg_programmes.restore_saved_scans", new_callable=AsyncMock) as mock_restore, \
+             patch("task_engine.start_engine", new_callable=AsyncMock) as mock_start, \
+             patch("task_engine.get_engine", return_value=MagicMock()), \
+             patch("main.asyncio"), \
+             patch("tls.settings.get_tls_settings", return_value=MagicMock(enabled=False)), \
+             patch("tls.https_server.start_https_if_configured", new_callable=AsyncMock):
+            settings = MagicMock()
+            settings.is_configured.return_value = False
+            settings.backend_log_level = None
+            settings.url = "http://test"
+            mock_settings.return_value = settings
+            mock_prober_cls.return_value = MagicMock(start=AsyncMock())
+            mock_restore.side_effect = lambda: startup_order.append("restore")
+            mock_start.side_effect = lambda: startup_order.append("engine")
+
+            from main import startup_event
+            await startup_event()
+
+            mock_restore.assert_awaited_once_with()
+            assert startup_order == ["restore", "engine"]
+
+    @pytest.mark.asyncio
     async def test_startup_loads_settings(self):
         """startup_event should load application settings."""
         with patch("main.init_db"), \

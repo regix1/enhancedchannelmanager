@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Sequence
 
@@ -317,8 +317,12 @@ _DATE_PATTERN_NUMERIC = (
 # disappear merely because the saved pattern set predates this format.
 _EXPLICIT_START_PATTERN = {
     "name": "slot-title-explicit-start",
+    # The same provider also writes "MLB 02  Brewers x Padres": a short
+    # capitalized slot code, its number and two spaces. Two spaces end a slot
+    # prefix only in that shape, which keeps "Formula 1  Grand Prix" and
+    # "Game 2  (Spanish)" whole.
     "title_pattern": (
-        r"^(?:[^@:|(]{0,40}?(?<!\d)\d{1,2}\s*[:|]\s*)?"
+        r"^(?:[^@:|(]{0,40}?(?<!\d)\d{1,2}\s*[:|]\s*|[A-Z]{2,6}\s?\d{1,2}\s{2,})?"
         r"\s*(?P<title>.+?)\s+start:\s*"
         r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"
         r"[T\s]\d{1,2}:\d{2}(?::\d{2})?.*$"
@@ -332,11 +336,41 @@ _EXPLICIT_START_PATTERN = {
     ),
 }
 
+# The earlier shipped copy of the explicit-start pattern read only ":" or "|"
+# as a slot delimiter. Rules that saved it still hold it, so a verbatim copy
+# parses as the current pattern instead.
+_EARLIER_EXPLICIT_START_TITLE = (
+    r"^(?:[^@:|(]{0,40}?(?<!\d)\d{1,2}\s*[:|]\s*)?"
+    r"\s*(?P<title>.+?)\s+start:\s*"
+    r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"
+    r"[T\s]\d{1,2}:\d{2}(?::\d{2})?.*$"
+)
+
 # The provider that writes start:/stop: stamps writes them in UK time. Its
 # MLB listings sit exactly five hours after Peacock's Eastern listings for the
 # same games, so reading them as Eastern opened each event five hours late,
-# after the game had ended.
+# after the game had ended. A pattern variant that reads another provider's
+# stamps names that provider's zone in its own ``stamp_timezone``.
 _START_STAMP_TIMEZONE = "Europe/London"
+
+# A name that opens with a category ("UFC: UFC 332 English @ Oct 3 3:00 PM
+# :Paramount+  08", "English Football League: Reading vs Bradford City @ ...")
+# leads its title with it. The category is not part of the event, so it is
+# dropped from the title and with it from the event key. A lead with a digit
+# ("UFC 317:", "Formula 1:", "Game 1:") names the event and is kept, and a
+# name that opens with its slot ("US (Paramount 098) | UFC Fight Night:
+# English (...)") keeps the service's own title whole. A lead holding a
+# matchup ("Arsenal vs Chelsea: Premier League @ ...") is the event as well:
+# taken off, two games listed that way at one kickoff got one title and one
+# event key.
+_CATEGORY_PREFIX = re.compile(r"^(?![^:]*\s(?:vs\.?|v\.?|x)\s)[^@:|(\d]{1,40}:\s+", re.IGNORECASE)
+
+# The provider that labels its tennis listings ":Tennis NN" writes their times
+# in Central European time. The ATP Beijing final, listed "Oct 6 13:00 PM",
+# began at 11:00 UTC by three other providers' listings; read in the rule's
+# Eastern zone it opened six hours late.
+_TENNIS_LISTING = re.compile(r":Tennis\s+\d{1,3}\s*$")
+_TENNIS_LISTING_TIMEZONE = "Europe/Berlin"
 
 DEFAULT_EVENT_PATTERNS: tuple[dict, ...] = (
     {
@@ -589,7 +623,9 @@ def _hour_24(hour: int, ampm: str | None) -> int:
         if marker.startswith("a"):
             return 0 if hour == 12 else hour
         if marker.startswith("p"):
-            return hour if hour == 12 else hour + 12
+            # A 24-hour clock with a stray marker ("13:00 PM") already names
+            # the afternoon hour, so it is used as given.
+            return hour if hour >= 12 else hour + 12
     return hour
 
 
@@ -656,6 +692,7 @@ def parse_event_name(
     event_timezone: str = DEFAULT_EVENT_TIMEZONE,
     now: datetime | None = None,
     assume_current_date: bool = False,
+    listing_timezone: str | None = None,
 ) -> ParsedEvent:
     """Parse one provider event name into a :class:`ParsedEvent`.
 
@@ -674,16 +711,33 @@ def parse_event_name(
     variant yields a complete date but the name carries a bare time-of-day,
     the CURRENT date (in ``event_timezone``) is filled so the time is
     matchable. Default False preserves the never-guess behavior exactly.
+
+    ``listing_timezone`` is the zone a rule reads one stream group's listing
+    times in. A ``start:`` stamp keeps its own zone; ``None`` reads every
+    other time in ``event_timezone``, except a ":Tennis NN" listing, which
+    is Central European time. The start is returned in ``event_timezone``.
     """
     variants = patterns if patterns is not None else DEFAULT_EVENT_PATTERNS
     if patterns is not None:
-        variants = (*variants, _EXPLICIT_START_PATTERN)
+        variants = (
+            *(
+                _EXPLICIT_START_PATTERN
+                if variant.get("name") == _EXPLICIT_START_PATTERN["name"]
+                and variant.get("title_pattern") == _EARLIER_EXPLICIT_START_TITLE
+                and variant.get("time_pattern") is None
+                and variant.get("date_pattern") == _EXPLICIT_START_PATTERN["date_pattern"]
+                else variant
+                for variant in variants
+            ),
+            _EXPLICIT_START_PATTERN,
+        )
     tz = pytz.timezone(event_timezone)
     if now is None:
         now = datetime.now(tz)
 
     complete_groups: dict | None = None
     complete_variant: str | None = None
+    complete_stamp_timezone: str | None = None
     dateless_groups: dict | None = None
     dateless_variant: str | None = None
     fallback_title: str | None = None
@@ -705,6 +759,7 @@ def parse_event_name(
         if _groups_have_complete_time(groups):
             complete_groups = groups
             complete_variant = variant.get("name") or title_pattern
+            complete_stamp_timezone = variant.get("stamp_timezone")
             break
         if (
             index < custom_count
@@ -762,14 +817,24 @@ def parse_event_name(
         return parsed
 
     if re.search(_EXPLICIT_START_PATTERN["date_pattern"], name):
-        # Operator patterns read the same stamp, so the stamp decides the zone.
+        # Operator patterns read the same stamp, so the stamp decides the zone
+        # unless the variant that read it names its provider's own.
+        stamp_timezone = complete_stamp_timezone or _START_STAMP_TIMEZONE
         start = _build_start(
-            complete_groups, pytz.timezone(_START_STAMP_TIMEZONE), _START_STAMP_TIMEZONE, now,
+            complete_groups, pytz.timezone(stamp_timezone), stamp_timezone, now,
         )
+        start = start.astimezone(tz) if start is not None else None
+    elif listing_timezone is not None or _TENNIS_LISTING.search(name):
+        # The zone the rule sets for the stream's group comes first.
+        zone = listing_timezone or _TENNIS_LISTING_TIMEZONE
+        start = _build_start(complete_groups, pytz.timezone(zone), zone, now)
         start = start.astimezone(tz) if start is not None else None
     else:
         start = _build_start(complete_groups, tz, event_timezone, now)
     title = _cap_title(complete_groups.get("title"))
+    category = _CATEGORY_PREFIX.match(name)
+    if title is not None and category is not None and title.startswith(category.group(0)):
+        title = _cap_title(title[category.end():])
     parsed = ParsedEvent(
         raw_name=name,
         title=title,
@@ -780,6 +845,35 @@ def parse_event_name(
     if logger.isEnabledFor(logging.DEBUG):
         _log_parsed_event(parsed)
     return parsed
+
+
+def earlier_title_parse(parsed: ParsedEvent) -> ParsedEvent | None:
+    """Return the parse the earlier title rules give, when its title differs
+    from ``parsed``.
+
+    The earlier rules kept a leading category ("UFC: UFC 332 English") and a
+    slot code ended by two spaces ("MLB 02  Brewers x Padres") in the title,
+    so an event they keyed is stored under another event key and channel
+    name than the current rules give.
+    """
+    title = None
+    category = _CATEGORY_PREFIX.match(parsed.raw_name)
+    if (
+        category is not None
+        and parsed.title is not None
+        and not parsed.title.startswith(category.group(0))
+    ):
+        # The category came off the capped title whole, so putting it back
+        # gives the earlier title exactly. A title that still starts with it
+        # is already the earlier one.
+        title = category.group(0) + parsed.title
+    elif parsed.matched_pattern == _EXPLICIT_START_PATTERN["name"]:
+        groups = extract_groups(parsed.raw_name, _EARLIER_EXPLICIT_START_TITLE)
+        # An operator variant saved under the same name may not fit this rule.
+        title = _cap_title(groups["title"]) if groups is not None else None
+    if title is None or title == parsed.title:
+        return None
+    return replace(parsed, title=title, teams=_split_teams(title))
 
 
 def _build_start(groups: dict, tz, event_timezone: str, now: datetime) -> datetime | None:
@@ -1628,6 +1722,7 @@ def match_streams(
     now: datetime | None = None,
     assume_current_date: bool = False,
     team_aliases: Sequence[Sequence[str]] | None = None,
+    listing_timezone: str | None = None,
 ) -> list[StreamMatchResult]:
     """Match every secondary stream name against the master channel names.
 
@@ -1643,6 +1738,8 @@ def match_streams(
     different name shapes, and parsing masters with the secondary group's
     override would silently fail or mis-title them. ``None`` keeps the
     original behavior (both sides share ``patterns``).
+    ``listing_timezone`` reads the stream names' times, not the masters'
+    (see :func:`parse_event_name`).
 
     Masters are identified by NAME only — the caller re-resolves channel
     IDs against Dispatcharr on every run.
@@ -1717,6 +1814,7 @@ def match_streams(
         parsed = parse_event_name(
             stream_name, patterns, event_timezone=event_timezone, now=now,
             assume_current_date=assume_current_date,
+            listing_timezone=listing_timezone,
         )
         if parsed.title is None:
             results.append(StreamMatchResult(

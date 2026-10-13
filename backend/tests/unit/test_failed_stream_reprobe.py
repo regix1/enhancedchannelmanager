@@ -77,6 +77,37 @@ class TestFailedStreamReprobeTask:
         assert call_kwargs["skip_m3u_refresh"] is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("saved", [False, True])
+    async def test_settings_saved_during_the_reprobe_stand(self, test_session, saved):
+        """The schedule's overrides are put back unless a save replaced them meanwhile."""
+        from models import StreamStats
+
+        test_session.add(StreamStats(stream_id=10, stream_name="s10", probe_status="failed", consecutive_failures=1))
+        test_session.commit()
+        task = self._make_task()
+        task.update_config({"timeout": 45, "max_concurrent": 3})
+        mock_prober = MagicMock()
+        mock_prober._probing_in_progress = False
+        mock_prober.probe_timeout = 30
+        mock_prober.max_concurrent_probes = 4
+        mock_prober._probe_success_streams = []
+        mock_prober._probe_failed_streams = []
+        mock_prober._last_probe_channel_stream_ids = {10}
+
+        async def save_while_probing(**kwargs):
+            if saved:
+                mock_prober.probe_timeout = 60
+                mock_prober.max_concurrent_probes = 2
+
+        mock_prober.probe_all_streams = AsyncMock(side_effect=save_while_probing)
+        task.set_prober(mock_prober)
+
+        with patch("tasks.failed_stream_reprobe.get_session", return_value=test_session):
+            await task.execute()
+
+        assert (mock_prober.probe_timeout, mock_prober.max_concurrent_probes) == ((60, 2) if saved else (30, 4))
+
+    @pytest.mark.asyncio
     async def test_prober_not_initialized(self):
         """Returns error when prober is not set."""
         task = self._make_task()

@@ -347,13 +347,15 @@ def strip_regional_suffix(name: str) -> str:
 # Quality sorting with provider interleaving
 # ---------------------------------------------------------------------------
 
-def get_country_rank(stream_name: str, channel_country: str | None) -> int:
+def get_country_rank(stream_name: str, channel_country: str | None, group_name: str = "") -> int:
     """Rank one stream against the channel's country: match, unknown, then mismatch.
 
     An unlabelled stream ranks between the two, so a channel whose streams carry no
-    country at all keeps the order it already had.
+    country at all keeps the order it already had. A name whose prefix is a provider
+    brand rather than a country (``T2| ESPN2``) takes the country of its M3U group
+    (``NL| TELE2 SPORT``), which is where that provider puts it.
     """
-    code = get_country_prefix(stream_name)
+    code = get_country_prefix(stream_name) or get_country_prefix(group_name)
     if code is None:
         return 1
     return 0 if COUNTRY_CODE_ALIASES.get(code, code) == channel_country else 2

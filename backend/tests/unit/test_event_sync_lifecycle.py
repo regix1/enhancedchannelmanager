@@ -364,6 +364,61 @@ async def test_fresh_lifecycle_evidence_can_mark_a_channel_active():
     assert prepare.await_args.kwargs["expires_at"] == expires_at
 
 
+@pytest.mark.asyncio
+async def test_lifecycle_probes_on_air_event_streams_first():
+    from types import SimpleNamespace
+
+    from services.event_sync_matcher import parse_event_name
+    from services.event_sync_promote import DISPOSITION_UNMATCHED
+    from tests.unit.test_event_sync_promotion import _resolved
+
+    now = datetime(2026, 7, 11, 22, 30, tzinfo=timezone.utc)
+    event_stream = "DAZN 07: Mercury vs. Aces @ 11 Jul 06:00 PM ET"
+    client, executor, session = _deadline_lifecycle()
+    client.get_streams_by_ids = AsyncMock(return_value=[
+        {"id": 9001, "name": STREAM_MERCURY, "is_stale": False},
+        {"id": 9002, "name": event_stream, "is_stale": False},
+    ])
+    executor = ActionExecutor(
+        client,
+        existing_channels=[
+            {"id": 100, "name": MASTER_MERCURY, "channel_group_id": 77,
+             "streams": [9001]},
+            {"id": 200, "name": "Peacock 15: Mercury vs. Aces @ 11 Jul 06:00 PM ET",
+             "channel_group_id": 77, "streams": [9002]},
+        ],
+    )
+    session.get(ChannelPipelineRule, 1).get_managed_channel_ids.return_value = [100, 200]
+    parsed = parse_event_name(event_stream, now=now, event_timezone="US/Eastern")
+    unit = SimpleNamespace(
+        event_key="mercury vs. aces",
+        existing_channel_id=200,
+        channel_name="Mercury vs. Aces",
+        rows=(_resolved(event_stream, DISPOSITION_UNMATCHED, parsed, stream_id=9002),),
+    )
+    collect = AsyncMock(return_value={})
+
+    with patch("database.get_session", return_value=session), \
+         patch("services.event_slots.validate_ownership", return_value=[]), \
+         patch("services.epg_programmes.prepare_profiles", new=AsyncMock(return_value=(
+             [], {"sources": [], "channels": []},
+         ))), \
+         patch("services.event_sync_stream_health.collect_stream_flow", new=collect), \
+         patch("channel_pipeline_executor.datetime", wraps=datetime) as clock:
+        clock.now.return_value = now
+        await executor._event_lifecycle(
+            1,
+            {"dummy_epg_profile_id": 1, "promote_target_group_id": 77},
+            (unit,),
+            now,
+            flow={},
+            expires_at=now + timedelta(minutes=5),
+        )
+
+    assert set(collect.await_args.args[0]) == {9001, 9002}
+    assert collect.await_args.kwargs["probe_first"] == frozenset({9002})
+
+
 class TestIdempotency:
     def test_second_run_on_unchanged_data_performs_zero_mutations(
         self, db_session_factory
